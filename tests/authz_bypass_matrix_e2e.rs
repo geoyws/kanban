@@ -4519,3 +4519,119 @@ fn a_removed_tasks_pre_tag_event_is_in_no_search_over_http() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Search scores: a denied document must not move a permitted hit's scores.
+// ---------------------------------------------------------------------------
+
+/// The lexical normalisation oracle (ACC-14): `lexical_scores` divided every
+/// bm25 by the strongest match on the whole board index, denied documents
+/// included, and served the quotient as `lexicalScore` (folded into `score`).
+/// A principal with board read could plant an anchor task carrying a unique
+/// token once in a long body, then read a denied token's prefix off the
+/// anchor's served scores: `lexicalScore < 1.0` exactly when a denied
+/// document matches the guessed prefix more strongly.
+///
+/// The anchor's served `lexicalScore` and `score` must therefore be identical
+/// with and without the denied document. The denied document is created after
+/// the first measurement, through the direct estate, so the principal's own
+/// authority never changes between the two reads.
+#[test]
+fn search_scores_are_a_function_of_permitted_documents_only() {
+    let estate = ManagedEstate::new("search-oracle");
+    let work_a = estate.work_a.clone();
+
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+
+    // Board read plus board write: untagged rows, and nothing tagged.
+    estate.bind_self(
+        "p-oracle",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+
+    // The anchor: a long body carrying the unique token `anchorqq` exactly
+    // once, so its bm25 is low. The filler carries no `zzqxj9`-prefixed
+    // token, so nothing visible matches the guessed prefix.
+    let filler = "The harbour ledger records each crossing in turn, noting the vessel name, \
+        the tide mark and the pilot on duty. Clerks copy the manifest lines into the day book \
+        before the evening bell, and the night watch signs every page. "
+        .repeat(8);
+    let anchor_body =
+        format!("{filler}The one token this probe carries is anchorqq, written exactly once.");
+    let anchor = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "Anchor probe document",
+            "--body",
+            &anchor_body,
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let anchor_id = anchor["id"].as_str().unwrap().to_owned();
+
+    fn anchor_scores(receipt: &Value, anchor_id: &str, what: &str) -> (f64, f64) {
+        let hit = receipt["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{what}: the receipt has no results: {receipt}"))
+            .iter()
+            .find(|hit| hit["sourceKind"] == "task" && hit["sourceId"] == anchor_id)
+            .unwrap_or_else(|| panic!("{what}: the anchor is missing: {receipt}"));
+        (
+            hit["lexicalScore"].as_f64().unwrap(),
+            hit["score"].as_f64().unwrap(),
+        )
+    }
+
+    let query = "anchorqq zzqxj9";
+    let before = estate.ok_json(&work_a, &["search", query, "--limit", "50", "--json"]);
+    let (lexical_before, score_before) = anchor_scores(&before, &anchor_id, "before");
+
+    // A tag-denied document matching the guessed prefix far more strongly:
+    // sixty repetitions in a short body. The principal holds no `secret`
+    // grant, so this row is invisible to them — but on the unfixed code its
+    // bm25 becomes the normalisation divisor.
+    estate.enforce("direct");
+    let denied_body = format!("A short vault note. {}", "zzqxj9vlt ".repeat(60));
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "Vault note",
+            "--body",
+            &denied_body,
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.enforce("managed");
+
+    let after = estate.ok_json(&work_a, &["search", query, "--limit", "50", "--json"]);
+    // The denied row itself stays hidden.
+    assert!(
+        !after.to_string().contains("Vault note") && !after.to_string().contains("zzqxj9vlt"),
+        "the denied row leaked into the receipt: {after}"
+    );
+    let (lexical_after, score_after) = anchor_scores(&after, &anchor_id, "after");
+    assert_eq!(
+        lexical_after, lexical_before,
+        "the anchor's lexicalScore moved from {lexical_before} to {lexical_after} when a \
+         denied document matching the guessed prefix appeared: the denied row is a score oracle"
+    );
+    assert_eq!(
+        score_after, score_before,
+        "the anchor's score moved from {score_before} to {score_after} when a denied document \
+         matching the guessed prefix appeared: the denied row is a score oracle"
+    );
+}

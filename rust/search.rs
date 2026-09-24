@@ -5,6 +5,7 @@ use crate::model::{
     UnreadableBoard,
 };
 use crate::registry::now_ms;
+use crate::store::SearchTagCache;
 use anyhow::{Result, bail};
 use rusqlite::{Connection, params, params_from_iter};
 use serde_json::json;
@@ -32,6 +33,13 @@ struct Document {
     source_hash: Option<String>,
     embedding_model: Option<String>,
     embedding: Option<Vec<u8>>,
+    /// An event document's row, read with the document by the JOIN in
+    /// [`load_documents`]: the event's own `task_id` and full `payload`, so
+    /// authorizing it costs no second SELECT. `None` on both for every other
+    /// source kind — and for an event document whose event row is gone, which
+    /// is the stale index entry [`document_row_tags`] keeps dropping.
+    event_task_id: Option<String>,
+    event_payload: Option<String>,
 }
 
 fn source_hash(document: &Document) -> String {
@@ -201,18 +209,30 @@ fn document_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         source_hash: row.get(12)?,
         embedding_model: row.get(13)?,
         embedding: row.get(14)?,
+        event_task_id: row.get(15)?,
+        event_payload: row.get(16)?,
     })
 }
 
 fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Vec<Document>> {
+    // The event arm of [`document_row_tags`] authorizes each event document
+    // against its event row's task and payload. Reading those two columns
+    // here, in the same round trip as the document, removes the second
+    // SELECT per event document without changing what the guard sees: a
+    // document whose event row is gone joins to NULLs, which authorizes as
+    // the same stale entry the re-SELECT path dropped. `source_id` is text,
+    // so the join casts it; a non-sequence casts to zero, which matches no
+    // event row and stays stale.
     let mut sql = String::from(
-        "SELECT seq,source_kind,source_id,task_id,title,body,status,lane,tags,\
-         created_at,updated_at,archived,source_hash,embedding_model,embedding \
-         FROM search_documents WHERE 1=1",
+        "SELECT d.seq,d.source_kind,d.source_id,d.task_id,d.title,d.body,d.status,d.lane,d.tags,\
+         d.created_at,d.updated_at,d.archived,d.source_hash,d.embedding_model,d.embedding,\
+         e.task_id,e.payload \
+         FROM search_documents d LEFT JOIN events e \
+         ON d.source_kind='event' AND e.seq=CAST(d.source_id AS INTEGER) WHERE 1=1",
     );
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if !options.include_archived {
-        sql.push_str(" AND archived=0");
+        sql.push_str(" AND d.archived=0");
     }
     for (column, value) in [
         ("source_kind", options.source.as_ref()),
@@ -220,20 +240,20 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
         ("lane", options.lane.as_ref()),
     ] {
         if let Some(value) = value {
-            sql.push_str(&format!(" AND {column}=?"));
+            sql.push_str(&format!(" AND d.{column}=?"));
             values.push(Box::new(value.clone()));
         }
     }
     for tag in &options.tags {
-        sql.push_str(" AND instr(' ' || tags || ' ',' ' || ? || ' ')>0");
+        sql.push_str(" AND instr(' ' || d.tags || ' ',' ' || ? || ' ')>0");
         values.push(Box::new(tag.clone()));
     }
     if let Some(after) = options.after {
-        sql.push_str(" AND updated_at>=?");
+        sql.push_str(" AND d.updated_at>=?");
         values.push(Box::new(after));
     }
     if let Some(before) = options.before {
-        sql.push_str(" AND updated_at<=?");
+        sql.push_str(" AND d.updated_at<=?");
         values.push(Box::new(before));
     }
     let mut statement = connection.prepare(&sql)?;
@@ -245,7 +265,22 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
         .map_err(Into::into)
 }
 
-fn lexical_scores(connection: &Connection, query: &str) -> Result<HashMap<i64, f64>> {
+/// The FTS5 lexical scores for one query, normalised to the strongest match.
+///
+/// `permitted` is the set of index rows the caller may read, decided BEFORE
+/// this runs: denied rows are dropped before the divisor is computed, so a
+/// document the caller cannot read cannot move a readable hit's
+/// `lexicalScore` (and through it, `score`) — the prefix oracle `t-e9c0127a`
+/// closes. `exact` and `semantic` need no such filter: both are per-document
+/// functions of the served row and the query text, so they already depend on
+/// permitted documents only. `None` is the unenforced path, where every row
+/// is readable and the divisor is taken over the same full match set as
+/// before, leaving unmanaged boards byte-identical.
+fn lexical_scores(
+    connection: &Connection,
+    query: &str,
+    permitted: Option<&HashSet<i64>>,
+) -> Result<HashMap<i64, f64>> {
     let Some(query) = fts_query(query) else {
         return Ok(HashMap::new());
     };
@@ -258,6 +293,9 @@ fn lexical_scores(connection: &Connection, query: &str) -> Result<HashMap<i64, f
     let mut ranked = Vec::new();
     for row in rows {
         let (seq, rank) = row?;
+        if permitted.is_some_and(|permitted| !permitted.contains(&seq)) {
+            continue;
+        }
         ranked.push((seq, (-rank).max(0.0)));
     }
     let strongest = ranked.iter().map(|(_, rank)| *rank).fold(0.0_f64, f64::max);
@@ -411,53 +449,46 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
 /// A document whose task no longer exists is a stale index entry with no
 /// source row left to authorize against, so it yields the tag that can never
 /// be satisfied — it is dropped rather than trusted.
-fn document_row_tags(connection: &Connection, document: &Document) -> Result<Vec<String>> {
+fn document_row_tags(
+    connection: &Connection,
+    document: &Document,
+    cache: &mut SearchTagCache,
+) -> Result<Vec<String>> {
     // An event document is authorized as the event it indexes, not as its
     // task: an event ABOUT an attention row carries that row's id, kind,
     // tags and choices in the indexed payload, so the task's tags alone
     // would hand a denied row to any caller who can read the task (ACC-14).
-    // [`crate::store::event_authorization_tags`] reads the same union the
-    // event tails filter on.
+    // [`crate::store::cached_event_authorization_tags`] reads the same union
+    // the event tails filter on, against the task and payload the document
+    // row already carries — no second SELECT, and a document whose event row
+    // is gone preloads no payload and stays stale.
     if document.source_kind == "event" {
-        return crate::store::event_authorization_tags(connection, &document.source_id);
+        return crate::store::cached_event_authorization_tags(
+            connection,
+            &document.source_id,
+            document
+                .event_payload
+                .clone()
+                .map(|payload| (document.event_task_id.clone(), payload)),
+            cache,
+        );
     }
     let mut tags = Vec::new();
     if let Some(task_id) = document.task_id.as_deref() {
-        let exists: i64 =
-            connection.query_row("SELECT COUNT(*) FROM tasks WHERE id=?", [task_id], |row| {
-                row.get(0)
-            })?;
-        if exists == 0 {
+        if !cache.task_exists(connection, task_id)? {
             return Ok(vec![STALE_INDEX_TAG.to_owned()]);
         }
-        let mut statement =
-            connection.prepare("SELECT tag FROM task_tags WHERE task_id=? ORDER BY tag")?;
-        tags.extend(
-            statement
-                .query_map([task_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
+        tags.extend(cache.task_tags(connection, task_id)?);
     }
     if document.source_kind == "attention" {
         // Defence in depth: the delete trigger removes the document with the
         // row, so no route reaches this today, but a stale index entry (a
         // partial restore, a rebuilt migration) must not authorize against
         // the empty tag set of a row that no longer exists.
-        let exists: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM attention WHERE id=?",
-            [document.source_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if exists == 0 {
+        if !cache.attention_exists(connection, document.source_id.as_str())? {
             return Ok(vec![STALE_INDEX_TAG.to_owned()]);
         }
-        let mut statement = connection
-            .prepare("SELECT tag FROM attention_tags WHERE attention_id=? ORDER BY tag")?;
-        tags.extend(
-            statement
-                .query_map([document.source_id.as_str()], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
+        tags.extend(cache.attention_tags(connection, document.source_id.as_str())?);
     }
     tags.sort();
     tags.dedup();
@@ -502,12 +533,33 @@ pub fn search(
     authz.check_read(&[])?;
     let query_words = words(&options.query);
     let query_vector = embed(&options.query);
-    let lexical = lexical_scores(connection, &options.query)?;
-    let mut results = Vec::new();
+    // Authorization before scoring (`t-e9c0127a`): the permitted candidate
+    // set is decided first, and the lexical divisor is taken over permitted
+    // rows only, so served `lexicalScore` and `score` are a function of
+    // permitted documents only. The tag sets behind the decision are memoized
+    // per request, and each event document already carries its event row —
+    // authorizing the whole corpus no longer costs a SELECT per event.
+    // Unenforced boards skip the decision entirely and pass no filter, so
+    // their scores and order are exactly what the unfiltered code produced.
+    let mut tag_cache = SearchTagCache::default();
+    let mut permitted = HashSet::new();
+    let mut candidates = Vec::new();
     for document in load_documents(connection, options)? {
-        if authz.is_enforcing() && !authz.permits_read(&document_row_tags(connection, &document)?) {
-            continue;
+        if authz.is_enforcing() {
+            if !authz.permits_read(&document_row_tags(connection, &document, &mut tag_cache)?) {
+                continue;
+            }
+            permitted.insert(document.seq);
         }
+        candidates.push(document);
+    }
+    let lexical = lexical_scores(
+        connection,
+        &options.query,
+        authz.is_enforcing().then_some(&permitted),
+    )?;
+    let mut results = Vec::new();
+    for document in candidates {
         let hash = source_hash(&document);
         let vector = if document.source_hash.as_deref() == Some(hash.as_str())
             && document.embedding_model.as_deref() == Some(EMBEDDING_MODEL)
@@ -763,9 +815,13 @@ fn embed_document(connection: &Connection, document: &Document) -> Result<()> {
 /// Returns how many rows were embedded.
 pub(crate) fn embed_missing(connection: &Connection) -> Result<i64> {
     let documents: Vec<Document> = {
+        // The trailing NULLs stand in for the event preload [`load_documents`]
+        // JOINs in: the write path only needs the embedding inputs, never an
+        // event row for authorization.
         let mut statement = connection.prepare(
             "SELECT seq,source_kind,source_id,task_id,title,body,status,lane,tags,\
-                    created_at,updated_at,archived,source_hash,embedding_model,embedding \
+                    created_at,updated_at,archived,source_hash,embedding_model,embedding,\
+                    NULL,NULL \
              FROM search_documents \
              WHERE embedding IS NULL OR embedding_model IS NULL OR source_hash IS NULL \
                 OR embedding_model != ?1",
@@ -1010,6 +1066,8 @@ mod tests {
             source_hash: None,
             embedding_model: None,
             embedding: None,
+            event_task_id: None,
+            event_payload: None,
         };
         let literal = Document {
             seq: 2,
@@ -1027,6 +1085,8 @@ mod tests {
             source_hash: None,
             embedding_model: None,
             embedding: None,
+            event_task_id: None,
+            event_payload: None,
         };
         let query_words = words("sub-deadbeef");
         assert_eq!(
@@ -1054,6 +1114,8 @@ mod tests {
             source_hash: None,
             embedding_model: None,
             embedding: None,
+            event_task_id: None,
+            event_payload: None,
         };
         let query_words = words("release ops");
         assert!(exact_score(&tagged, "release ops", &query_words) > 0.0);

@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, typ
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -681,6 +681,71 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// A per-search-request cache of tag sets and row-existence answers
+/// (`t-e9c0127a`). Authorizing every indexed document on every request used to
+/// cost, per event document, a primary-key SELECT of the full payload, a JSON
+/// parse, a `task_tags` query and — for attention events — an
+/// `attention_tags` query, repeated for every event sharing one task. The tag
+/// sets and the existence answers depend only on the source tables, which a
+/// search request never writes, so one request may memoize them keyed by row
+/// id. A miss reads exactly what the uncached lookup read, so every STALE
+/// rule below is unchanged.
+#[derive(Default)]
+pub(crate) struct SearchTagCache {
+    task_tags: HashMap<String, Vec<String>>,
+    task_exists: HashMap<String, bool>,
+    attention_tags: HashMap<String, Vec<String>>,
+    attention_exists: HashMap<String, bool>,
+}
+
+impl SearchTagCache {
+    pub(crate) fn task_tags(&mut self, connection: &Connection, id: &str) -> Result<Vec<String>> {
+        if let Some(tags) = self.task_tags.get(id) {
+            return Ok(tags.clone());
+        }
+        let tags = task_tags(connection, id)?;
+        self.task_tags.insert(id.to_owned(), tags.clone());
+        Ok(tags)
+    }
+
+    pub(crate) fn task_exists(&mut self, connection: &Connection, id: &str) -> Result<bool> {
+        if let Some(exists) = self.task_exists.get(id) {
+            return Ok(*exists);
+        }
+        let exists: i64 =
+            connection.query_row("SELECT COUNT(*) FROM tasks WHERE id=?", [id], |row| {
+                row.get(0)
+            })?;
+        self.task_exists.insert(id.to_owned(), exists != 0);
+        Ok(exists != 0)
+    }
+
+    pub(crate) fn attention_tags(
+        &mut self,
+        connection: &Connection,
+        id: &str,
+    ) -> Result<Vec<String>> {
+        if let Some(tags) = self.attention_tags.get(id) {
+            return Ok(tags.clone());
+        }
+        let tags = attention_tags(connection, id)?;
+        self.attention_tags.insert(id.to_owned(), tags.clone());
+        Ok(tags)
+    }
+
+    pub(crate) fn attention_exists(&mut self, connection: &Connection, id: &str) -> Result<bool> {
+        if let Some(exists) = self.attention_exists.get(id) {
+            return Ok(*exists);
+        }
+        let exists: i64 =
+            connection.query_row("SELECT COUNT(*) FROM attention WHERE id=?", [id], |row| {
+                row.get(0)
+            })?;
+        self.attention_exists.insert(id.to_owned(), exists != 0);
+        Ok(exists != 0)
+    }
+}
+
 /// The tags one EVENT exposes, which is more than the tags its row carries
 /// today.
 ///
@@ -719,8 +784,19 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 /// evidence remaining. An event whose attention row is gone yields, the same
 /// way, whatever that payload wrote down about it.
 pub(crate) fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
+    cached_event_tags(connection, event, &mut SearchTagCache::default())
+}
+
+/// [`event_tags`] with the live tag reads served from a per-request
+/// [`SearchTagCache`]. The union is identical; only the repeated source-table
+/// reads are memoized.
+pub(crate) fn cached_event_tags(
+    connection: &Connection,
+    event: &Event,
+    cache: &mut SearchTagCache,
+) -> Result<Vec<String>> {
     let mut tags = match event.task_id.as_deref() {
-        Some(id) => task_tags(connection, id)?,
+        Some(id) => cache.task_tags(connection, id)?,
         None => Vec::new(),
     };
     let recorded = |pointer: &str| -> Vec<String> {
@@ -739,7 +815,7 @@ pub(crate) fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<S
         .pointer("/attentionID")
         .and_then(Value::as_str)
     {
-        tags.extend(attention_tags(connection, attention_id)?);
+        tags.extend(cache.attention_tags(connection, attention_id)?);
         // What the raise, the resolve and the reopen wrote down under `tags`
         // and the update under `previousTags`, so a later retag or removal
         // cannot loosen the event that recorded it.
@@ -763,23 +839,41 @@ pub(crate) fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<S
 /// is not an event sequence yields the tag that can never be satisfied, so
 /// it is dropped rather than trusted — the same stale-entry rule
 /// [`crate::search::STALE_INDEX_TAG`] states.
-pub(crate) fn event_authorization_tags(
+///
+/// The live tag reads are served from a per-request [`SearchTagCache`], and —
+/// when `search.rs` already loaded the event row with its document (`t-e9c0127a`)
+/// — without the second SELECT. `preloaded` is the event's `(task_id, payload)`
+/// as the `load_documents` JOIN read it. `None` means the JOIN found no event
+/// row for the document, which is exactly the stale index entry the re-SELECT
+/// path drops, so the fail-closed behaviour is identical either way: an
+/// unparsable `source_id` or a missing event row yields
+/// [`crate::search::STALE_INDEX_TAG`], a task that no longer exists yields it
+/// too, and a payload that is not JSON is an error, never an untagged event.
+pub(crate) fn cached_event_authorization_tags(
     connection: &Connection,
     source_id: &str,
+    preloaded: Option<(Option<String>, String)>,
+    cache: &mut SearchTagCache,
 ) -> Result<Vec<String>> {
     let seq: i64 = match source_id.parse() {
         Ok(seq) => seq,
         Err(_) => return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]),
     };
-    let row: Option<(Option<String>, String)> = connection
-        .query_row(
-            "SELECT task_id, payload FROM events WHERE seq=?",
-            [seq],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((task_id, payload)) = row else {
-        return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
+    let (task_id, payload) = match preloaded {
+        Some(preloaded) => preloaded,
+        None => {
+            let row: Option<(Option<String>, String)> = connection
+                .query_row(
+                    "SELECT task_id, payload FROM events WHERE seq=?",
+                    [seq],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((task_id, payload)) = row else {
+                return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
+            };
+            (task_id, payload)
+        }
     };
     // The index outlives the row: the removal trigger re-inserts every event
     // document tied to the deleted task, whose live tags are gone with it.
@@ -787,20 +881,18 @@ pub(crate) fn event_authorization_tags(
     // nothing but its own snapshot, so the document is stale and stays
     // dropped — the same existence rule the task branch of `document_row_tags`
     // applies.
-    if let Some(task_id) = task_id.as_deref() {
-        let exists: i64 =
-            connection.query_row("SELECT COUNT(*) FROM tasks WHERE id=?", [task_id], |row| {
-                row.get(0)
-            })?;
-        if exists == 0 {
-            return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
-        }
+    let task_gone = match task_id.as_deref() {
+        Some(task_id) => !cache.task_exists(connection, task_id)?,
+        None => false,
+    };
+    if task_gone {
+        return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
     }
     // Fail closed: a payload the store cannot parse is an error, not an
     // untagged event.
     let payload: Value = serde_json::from_str(&payload)
         .with_context(|| format!("event {seq} carries a payload that is not JSON"))?;
-    event_tags(
+    cached_event_tags(
         connection,
         &Event {
             seq,
@@ -813,6 +905,7 @@ pub(crate) fn event_authorization_tags(
             prev_hash: None,
             event_hash: None,
         },
+        cache,
     )
 }
 
