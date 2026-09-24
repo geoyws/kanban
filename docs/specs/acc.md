@@ -247,6 +247,18 @@ and no check metadata; a caller who can read it gets the appropriate ACC-13 proj
 no cross-board, cross-tenant, tag or actor exception, and denial is indistinguishable for checked,
 unchecked, known and unknown rows.
 
+- 2026-09-25 — every by-id attention operation (`show_attention`,
+  `update_attention`, `resolve_attention`, `reopen_attention`,
+  `answer_check_with_authorization`) and `Store::require_task` map an absent
+  id to the same `DeniedOrNotFound` error the denied path uses when
+  enforcement is managed (`absent_as_denied` in `rust/store.rs`), so the reply
+  and reopen web routes and the CLI/MCP named reads inherit the collapse the
+  check POST previously special-cased by string-matching in `serve.rs`, which
+  is removed. Refusals past the guard keep their sentences; unmanaged boards
+  keep the plain `not found` messages. Requirement wording is unchanged: this
+  restores the indistinguishability for known and unknown rows it already
+  states.
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -535,7 +547,20 @@ status and resolution are unchanged. *Given* an open checked row, *when* its rai
 no check, the key is undeclared, or the actor is neither `geoyws` nor the raiser, *then* the
 command is refused naming why and nothing changes.
 
-### A20 — search scores depend on permitted documents only (`ACC-14`)
+### A20 — denied and unknown ids answer identically on every by-id surface (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it addresses a `secret` attention id and a never-created id on
+each web attention POST (check, reply, reopen) and on CLI `attention show`,
+`attention resolve`, `attention reopen`, `attention check` and `task show`,
+*then* each pair answers byte-identically — the same status and body over
+HTTP, the same exit code and stderr on the CLI — with the existing
+non-enumerating denial, and nothing is recorded. *When* the same caller
+answers a readable row's check with an undeclared key, *then* the refusal
+names the key rather than collapsing into the denial; *when* no enforcement
+applies, *then* an unknown id keeps its plain `not found` message.
+
+### A21 — search scores depend on permitted documents only (`ACC-14`)
 
 *Given* a principal with board read and write on untagged rows plants an anchor task carrying
 a unique token once in a long body, *when* they search the anchor token beside a prefix no
@@ -651,7 +676,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | always-redacted pre-answer show/list and mutation receipts, including the raiser's own reads, through the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit; the HTTP projection sweep pins the same omission in the browser bytes; post-answer reads carry answer, explanation and result, and reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
-| `ACC-14` | MUST | http/process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `search_scores_are_a_function_of_permitted_documents_only` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; a tag-denied document moves no permitted hit's served `lexicalScore` or `score` (A20) |
+| `ACC-14` | MUST | http/process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `search_scores_are_a_function_of_permitted_documents_only` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; a tag-denied document moves no permitted hit's served `lexicalScore` or `score` (A21) |
 | `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
 | `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
 | `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
@@ -723,7 +748,7 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   unique token once in a long body as a principal with board read and write on untagged rows,
   then adds a tag-denied document strongly matching a guessed prefix: the anchor's served
   `lexicalScore` and `score` are byte-identical with and without the denied row, which itself
-  appears in neither receipt (A20). The landing fixed the leak as a bug; requirement wording
+  appears in neither receipt (A21). The landing fixed the leak as a bug; requirement wording
   is unchanged. `lexical_scores` normalised every bm25 by the strongest match on the whole
   board index, denied documents included, so a denied row moved a permitted hit's served
   scores — a prefix oracle for denied text. The permitted candidate set is now decided before
