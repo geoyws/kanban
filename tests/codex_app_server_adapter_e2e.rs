@@ -617,12 +617,21 @@ impl Fixture {
             .adapter_command(client_request_hash, protocol_schema_hash, timeout_ms)
             .spawn()
             .unwrap();
-        child
+        // An adapter that refuses its probes or its schema exits without
+        // reading stdin, so this write races that exit: when the child wins,
+        // the pipe is closed and the write answers EPIPE. That is the child
+        // having already answered, not a failure — its exit code and stderr,
+        // read below, are what every caller asserts. Success paths read
+        // stdin, so EPIPE cannot occur there.
+        match child
             .stdin
             .as_mut()
             .unwrap()
             .write_all(serde_json::to_string(request).unwrap().as_bytes())
-            .unwrap();
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            result => result.unwrap(),
+        }
         drop(child.stdin.take());
         let output = child.wait_with_output().unwrap();
         assert_eq!(self.cwd_entries(), before);
@@ -1055,7 +1064,15 @@ fn compiled_process_rechecks_that_cwd_stays_empty_before_each_spawn() {
     );
     let request = serde_json::to_vec(&request()).unwrap();
     let mut child = command.spawn().unwrap();
-    child.stdin.as_mut().unwrap().write_all(&request).unwrap();
+    // The dirtied cwd fails this adapter inside its version probe, before it
+    // reads stdin, so this write races that exit: when the child wins, the
+    // pipe is closed and the write answers EPIPE. That is the child having
+    // already answered, not a failure — its exit code, asserted below, is
+    // what this test checks.
+    match child.stdin.as_mut().unwrap().write_all(&request) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        result => result.unwrap(),
+    }
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     writer.join().unwrap();
