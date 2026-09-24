@@ -578,11 +578,18 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
 /// sprints are board-only rows; neither carries board tags, so its containing
 /// scope is the whole authorization check.
 ///
-/// A NON-EVENT document whose task no longer exists is a stale index entry
-/// with no source row left to authorize against, so it yields the tag that
-/// can never be satisfied — it is dropped rather than trusted. Event
-/// documents are the exception: the event row outlives the task, and the
-/// tails authorize it against the task's last-known removal tags, so the
+/// A NON-EVENT document whose task no longer exists is usually a stale index
+/// entry with no source row left to authorize against, so it yields the tag
+/// that can never be satisfied — it is dropped rather than trusted. The
+/// exception is a document whose source row outlives the task: since
+/// `BOARD_V34` the sitrep, handoff, deployment and attention links keep the
+/// removed task's id, and the index authorizes those documents against the
+/// task's last-known removal tags — the same union the listings serve them
+/// through — so the index neither serves a task-less document to a denied
+/// caller nor drops what the owner may still read. A removed task with no
+/// removal record still fails closed with the stale-entry tag. Event
+/// documents are the older exception: the event row outlives the task, and
+/// the tails authorize it against the task's last-known removal tags, so the
 /// index does the same through `cached_event_authorization_tags` rather
 /// than dropping what the tails serve.
 fn document_row_tags(
@@ -612,9 +619,13 @@ fn document_row_tags(
     let mut tags = Vec::new();
     if let Some(task_id) = document.task_id.as_deref() {
         if !cache.task_exists(connection, task_id)? {
-            return Ok(vec![STALE_INDEX_TAG.to_owned()]);
+            match cache.removed_task_final_tags(connection, task_id)? {
+                Some(removed) => tags.extend(removed),
+                None => return Ok(vec![STALE_INDEX_TAG.to_owned()]),
+            }
+        } else {
+            tags.extend(cache.task_tags(connection, task_id)?);
         }
-        tags.extend(cache.task_tags(connection, task_id)?);
     }
     if document.source_kind == "attention" {
         // Defence in depth: the delete trigger removes the document with the

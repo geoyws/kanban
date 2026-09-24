@@ -841,6 +841,31 @@ fn absent_task_tags_oracle(
     }
 }
 
+/// The tags a row LINKED to a task authorizes against when the task itself
+/// may already be gone (ACC-14): a live id gates on its live `task_tags`,
+/// while an id whose row is gone gates on its last-known removal union
+/// through [`absent_task_tags_oracle`] — failing closed under enforcement
+/// when no removal record names it, and authorizing like an untagged row
+/// outside enforcement where the guard cannot deny.
+///
+/// Since `BOARD_V34` the sitrep, handoff, deployment and attention links are
+/// plain `TEXT` with no `ON DELETE SET NULL`, so a removed task's rows keep
+/// the orphaned id and reach this helper's second branch; before that
+/// migration the FK nulled the link and these rows wrongly read as board
+/// scope. The write paths below (`accept_handoff`, `retire_handoff`, the
+/// deployment gates) hold no per-request tag cache, hence this uncached
+/// read rather than `SearchTagCache::removed_task_final_tags`.
+fn removed_aware_linked_task_tags(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Vec<String>> {
+    if get_task(connection, id)?.is_some() {
+        return task_tags(connection, id);
+    }
+    absent_task_tags_oracle(connection, id, authz)
+}
+
 /// An absent row under managed enforcement answers the same generic denial a
 /// denied row answers, so a tag-denied id and a never-created id are
 /// indistinguishable (ACC-14). The by-id lookups below all read the row's
@@ -2675,6 +2700,52 @@ fn semantic_snapshot(
         "currentStatus": current_status,
     }))
 }
+/// The `_semanticV1` snapshot for an event naming a task that no longer
+/// exists (ACC-14): the union of the task's `task_removed` snapshots as
+/// `tags` — the same last-known evidence every read path gates the orphaned
+/// link on — with empty relations, since the live rows a traversal would
+/// read are gone.
+///
+/// The subject keeps the removed row's own `type`, read from the `task`
+/// object `remove_task` freezes into its `task_removed` payload, so watches
+/// filtering on the subject see the same shape the task's live events
+/// carried; a removal record without one (hand-restored history) falls back
+/// to `task`. The statuses are the event's own, as in
+/// [`semantic_snapshot`].
+///
+/// Fail-closed: with no removal record naming the id there is nothing
+/// truthful to freeze, so snapshotting is an error — never an untagged
+/// snapshot that would read as board scope. Every post-`BOARD_V34` removal
+/// writes its `task_removed` record before the DELETE, so reachable rows
+/// always carry one.
+fn removed_task_snapshot(
+    connection: &Connection,
+    id: &str,
+    prior_status: Option<&str>,
+    current_status: Option<&str>,
+) -> Result<Value> {
+    let tags = removed_task_tag_union_oracle(connection, id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "task {id} was removed without a removal record; refusing to snapshot its tags"
+        )
+    })?;
+    let task_type: Option<String> = connection
+        .query_row(
+            "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq DESC LIMIT 1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .and_then(|value| value.pointer("/task/type").and_then(Value::as_str).map(str::to_owned));
+    Ok(json!({
+        "subject": { "type": task_type.as_deref().unwrap_or("task"), "id": id },
+        "tags": tags,
+        "relations": [],
+        "priorStatus": prior_status,
+        "currentStatus": current_status,
+    }))
+}
 
 fn event_with_status(
     connection: &Connection,
@@ -2686,8 +2757,14 @@ fn event_with_status(
     current_status: Option<&str>,
 ) -> Result<()> {
     if let Some(task_id) = task_id {
-        payload["_semanticV1"] =
-            semantic_snapshot(connection, task_id, prior_status, current_status)?;
+        payload["_semanticV1"] = match get_task(connection, task_id)? {
+            Some(_) => semantic_snapshot(connection, task_id, prior_status, current_status)?,
+            // The row is gone but its linked rows outlive it (BOARD_V34), so
+            // a mutation touching one still audits against the same
+            // last-known evidence the read paths gate on — rather than
+            // failing the write outright.
+            None => removed_task_snapshot(connection, task_id, prior_status, current_status)?,
+        };
     } else {
         payload["_semanticV1"] = Value::Null;
     }
@@ -5931,8 +6008,12 @@ impl Store {
                 children.join(", ")
             );
         }
-        // The delete cascades this task's notes, checkpoints and handoffs, so
-        // record what is being destroyed before it is gone.
+        // The delete cascades this task's notes, checkpoints, claims, tags and
+        // edges, so record what is being destroyed before it is gone. The
+        // sitrep, handoff, deployment and attention links are plain TEXT with
+        // no FK since BOARD_V34: they keep the orphaned id and stay gated on
+        // the removal union this event freezes, rather than reading as board
+        // scope.
         let notes = transaction.query_row(
             "SELECT COUNT(*) FROM task_notes WHERE task_id=?",
             [id],
@@ -8281,7 +8362,10 @@ impl Store {
             })
             .optional()?;
         if let Some(Some(task_id)) = subject {
-            let tags = task_tags(&transaction, &task_id)?;
+            // A removed task's handoffs keep the orphaned id (BOARD_V34), so
+            // gate on its last-known removal tags rather than the empty live
+            // set — otherwise the row reads as a session handoff.
+            let tags = removed_aware_linked_task_tags(&transaction, &task_id, &self.authz)?;
             self.authz.check_write(&tags, &tags)?;
         }
         // An unknown id answers the generic denial under enforcement rather
@@ -8468,7 +8552,10 @@ impl Store {
             })
             .optional()?;
         if let Some(Some(task_id)) = subject {
-            let tags = task_tags(&transaction, &task_id)?;
+            // As in `accept_handoff`: a removed task's handoffs keep the
+            // orphaned id (BOARD_V34), so gate on its last-known removal
+            // tags — otherwise the row reads as a session handoff.
+            let tags = removed_aware_linked_task_tags(&transaction, &task_id, &self.authz)?;
             self.authz.check_write(&tags, &tags)?;
         }
         let existing = absent_as_denied(
@@ -9227,7 +9314,10 @@ impl Store {
             .optional()?;
         let attempt = absent_as_denied(row, "deployment", id, authz)?;
         let subject_tags = match attempt.task_id.as_deref() {
-            Some(task_id) => task_tags(connection, task_id)?,
+            // A removed task's attempts keep the orphaned id (BOARD_V34), so
+            // gate on its last-known removal tags — otherwise the attempt
+            // reads as a taskless deployment.
+            Some(task_id) => removed_aware_linked_task_tags(connection, task_id, authz)?,
             None => Vec::new(),
         };
         authz.check_write(&subject_tags, &subject_tags)?;
@@ -9240,13 +9330,16 @@ impl Store {
     /// Read live from `task_tags` rather than from anything stored on the
     /// deployment row: the attempt is immutable and its task can be retagged
     /// after the fact, so a copy taken at deploy time would authorize against
-    /// a tag set that no longer exists.
+    /// a tag set that no longer exists. A removed task's attempts keep the
+    /// orphaned id (BOARD_V34), so a missing row falls back to its
+    /// last-known removal tags rather than the empty set a taskless
+    /// deployment authorizes against.
     fn deployment_subject_tags(&self, attempt: &DeploymentAttempt) -> Result<Vec<String>> {
         if !self.authz.is_enforcing() {
             return Ok(Vec::new());
         }
         match attempt.task_id.as_deref() {
-            Some(task_id) => task_tags(&self.connection, task_id),
+            Some(task_id) => removed_aware_linked_task_tags(&self.connection, task_id, &self.authz),
             None => Ok(Vec::new()),
         }
     }

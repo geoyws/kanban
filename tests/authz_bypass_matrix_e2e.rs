@@ -6421,6 +6421,395 @@ fn subscription_relation_targets_withhold_a_tag_denied_task_on_read() {
         "the visible subscription lost its row: {visible_shown}"
     );
 }
+
+/// ACC-14, removed-task links: removing a `secret` task keeps its sitrep,
+/// handoff, untagged attention row and deployment attempt linked to the
+/// orphaned id, and every one of them stays gated on the task's last-known
+/// removal tags — on every listing, on search, on `/api/v1/lanes`, on the
+/// deployment listing, and on `handoff retire`, `handoff accept`,
+/// `attention show`, `deploy show` and `deploy finish` — while a removed id
+/// and a never-created id answer byte-identically everywhere.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The owner seeds rows on a `secret` task carrying a marker
+/// no other row carries, then removes the task; principal P holds board read
+/// and write but no `secret` scope. P sees no trace of the rows anywhere and
+/// gets the one generic denial on every by-id surface, while the owner still
+/// sees every row once enforcement is lifted.
+#[test]
+fn task_removal_keeps_linked_rows_tag_gated() {
+    let estate = ManagedEstate::new("acc14-removed-task-links");
+    let work_a = estate.work_a.clone();
+    let repo = work_a.to_string_lossy().into_owned();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the removed secret task",
+            "--id",
+            "t-gone-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "sitrep",
+            "post",
+            "gone secret sitrep zxqpayroll body",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            &repo,
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            "t-gone-secret",
+            "--json",
+        ],
+    );
+    let token = estate.ok_json(
+        &work_a,
+        &["claim", "t-gone-secret", "--as", "seed", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "handoff",
+            "create",
+            "t-gone-secret",
+            "--lease",
+            &token,
+            "--as",
+            "seed",
+            "--summary",
+            "gone secret handoff zxqpayroll summary",
+            "--intent",
+            "gone secret handoff intent",
+            "--next-action",
+            "gone secret handoff next",
+            "--repo",
+            &repo,
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    );
+    let attention_id = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "gone secret attention zxqpayroll question",
+            "--kind",
+            "decision",
+            "--as",
+            "seed",
+            "--task",
+            "t-gone-secret",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attempt_id = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            "t-gone-secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret_handoff = estate
+        .ok_json(
+            &work_a,
+            &["handoff", "list", "--task", "t-gone-secret", "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "pending")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok(
+        &work_a,
+        &["task", "remove", "t-gone-secret", "--as", "seed"],
+    );
+    estate.bind_self(
+        "p-gone-rows",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The `--task` listings succeed for the removed id and the unknown id
+    //    alike and hand over nothing: the removed filter withholds exactly
+    //    what the unknown filter cannot match.
+    for (base, what) in [
+        (&["sitrep", "list", "--task"][..], "sitrep list --task"),
+        (&["handoff", "list", "--task"][..], "handoff list --task"),
+        (
+            &["attention", "list", "--task"][..],
+            "attention list --task",
+        ),
+    ] {
+        let mut removed_args = base.to_vec();
+        removed_args.extend_from_slice(&["t-gone-secret", "--json"]);
+        let mut unknown_args = base.to_vec();
+        unknown_args.extend_from_slice(&["t-never-created", "--json"]);
+        let removed = estate.run(&work_a, &removed_args);
+        let unknown = estate.run(&work_a, &unknown_args);
+        assert!(
+            removed.status.success(),
+            "{what} with a removed id should succeed: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert!(
+            unknown.status.success(),
+            "{what} with an unknown id should succeed: {}",
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        assert_eq!(
+            removed.stdout, unknown.stdout,
+            "{what} output differs between a removed id and an unknown id"
+        );
+        let rows: Value = serde_json::from_slice(&removed.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            0,
+            "{what} with the removed id handed over a row the caller may not read: {rows}"
+        );
+    }
+    // 2. The unfiltered listings, search and the deployment listing carry no
+    //    trace of the removed task's rows — neither their markers nor the
+    //    orphaned id.
+    for (args, what) in [
+        (&["sitrep", "list", "--json"][..], "sitrep list"),
+        (&["handoff", "list", "--json"][..], "handoff list"),
+        (&["attention", "list", "--json"][..], "attention list"),
+        (&["deploy", "list", "--json"][..], "deploy list"),
+        (&["search", "zxqpayroll", "--json"][..], "search"),
+    ] {
+        let listed = estate.run(&work_a, args);
+        assert!(
+            listed.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+        // The search receipt echoes the query itself, so absence is pinned
+        // on the rows' content markers and the orphaned id, never on the
+        // query string.
+        assert!(
+            !body.contains("gone secret"),
+            "{what} served a row on the removed denied task: {body}"
+        );
+        assert!(
+            !body.contains("t-gone-secret"),
+            "{what} served the removed task's id: {body}"
+        );
+    }
+    // 3. Every by-id surface answers the removed row exactly like a
+    //    never-created id — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and records nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a removed id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a removed id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a removed id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &[
+            "handoff",
+            "retire",
+            &secret_handoff,
+            "--as",
+            "seed",
+            "--note",
+            "gone probe",
+        ],
+        &[
+            "handoff",
+            "retire",
+            "h-never-created",
+            "--as",
+            "seed",
+            "--note",
+            "gone probe",
+        ],
+        "handoff retire",
+    );
+    assert_by_id_identical(
+        &["handoff", "accept", &secret_handoff, "--as", "seed"],
+        &["handoff", "accept", "h-never-created", "--as", "seed"],
+        "handoff accept",
+    );
+    assert_by_id_identical(
+        &["attention", "show", &attention_id, "--json"],
+        &["attention", "show", "a-never-raised", "--json"],
+        "attention show",
+    );
+    assert_by_id_identical(
+        &["deploy", "show", &attempt_id, "--json"],
+        &["deploy", "show", "dep-never-started", "--json"],
+        "deploy show",
+    );
+    assert_by_id_identical(
+        &[
+            "deploy",
+            "finish",
+            &attempt_id,
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "gone probe",
+            "--as",
+            "seed",
+        ],
+        &[
+            "deploy",
+            "finish",
+            "d-never-started",
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "gone probe",
+            "--as",
+            "seed",
+        ],
+        "deploy finish",
+    );
+    // 4. `/api/v1/lanes` serves no trace of the removed task's sitrep.
+    let server = WebServer::start(&estate, &work_a, None);
+    let lanes = server.get_json("/api/v1/lanes");
+    let served = lanes.to_string();
+    assert!(
+        !served.contains("zxqpayroll") && !served.contains("t-gone-secret"),
+        "/api/v1/lanes served the removed task's sitrep: {lanes}"
+    );
+    drop(server);
+    // 5. The owner still sees every row, so the denials above came from the
+    //    guard and not from missing rows — and the refused writes recorded
+    //    nothing.
+    estate.enforce("direct");
+    // A `--task` filter naming a removed id cannot run even unenforced —
+    // there is no row left to filter on — so the owner reads the unfiltered
+    // listings, where the orphaned rows still carry their markers and id.
+    for (args, marker, what) in [
+        (
+            &["sitrep", "list", "--json"][..],
+            "gone secret sitrep zxqpayroll body",
+            "sitrep list",
+        ),
+        (
+            &["handoff", "list", "--json"][..],
+            "gone secret handoff zxqpayroll summary",
+            "handoff list",
+        ),
+        (
+            &["attention", "list", "--json"][..],
+            "gone secret attention zxqpayroll question",
+            "attention list",
+        ),
+        (
+            &["deploy", "list", "--json"][..],
+            &attempt_id,
+            "deploy list",
+        ),
+    ] {
+        let owned = estate.ok(&work_a, args);
+        assert!(
+            owned.contains(marker),
+            "the owner lost {what} on the removed task: {owned}"
+        );
+    }
+    let owned_search = estate.ok(&work_a, &["search", "zxqpayroll", "--json"]);
+    assert!(
+        owned_search.contains("zxqpayroll"),
+        "the owner lost the removed task's rows in search: {owned_search}"
+    );
+    let owned_attempt = estate.ok_json(&work_a, &["deploy", "show", &attempt_id, "--json"]);
+    assert_eq!(
+        owned_attempt["taskID"].as_str(),
+        Some("t-gone-secret"),
+        "the removed attempt lost its task link: {owned_attempt}"
+    );
+    let handoffs = estate.ok_json(&work_a, &["handoff", "list", "--json"]);
+    assert!(
+        handoffs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == secret_handoff && row["status"] == "pending"),
+        "a refused retire or accept moved a row: {handoffs}"
+    );
+}
 // ---------------------------------------------------------------------------
 // Task-attach writes: no board-write-only path may touch an unreadable task.
 // ---------------------------------------------------------------------------

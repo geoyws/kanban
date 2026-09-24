@@ -282,6 +282,23 @@ unchecked, known and unknown rows.
   this restores the authorize-as-the-containing-row rule the tag-checked
   writes (claim, sprint attachment, deployment finish) already applied.
 
+- 2026-09-25 — a removed task's sitrep, handoff, deployment and attention
+  rows keep the task's id instead of nulling it: the four links are plain
+  `TEXT` with no foreign key (board schema `33` → `34`, `BOARD_V34` in
+  `rust/db.rs`), so every read path gates the orphaned id on the task's
+  last-known removal tags — `task_linked_row_visible` in the listings,
+  counts and lanes, `document_row_tags` in search, `retire_handoff` and
+  `accept_handoff`, and the deployment subject gates — failing closed with
+  no removal record, exactly as `subscriptions.subject_task_id` already
+  does. A row naming no task keeps board scope: session handoffs, lanewide
+  sitreps and taskless deployments are unchanged, and rows already nulled
+  by an older removal stay NULL. Mutations that touch an orphaned row still
+  audit: the event's `_semanticV1` snapshot freezes the
+  same removal union (failing closed with no removal record) instead of
+  failing the write against the gone live row. Requirement wording is
+  unchanged: this restores the authorize-as-the-containing-row rule for the
+  removal case the `ON DELETE SET NULL` links had silently left.
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -662,6 +679,23 @@ event, the phantom children absent, and no subscription created. *When* no
 enforcement applies, *then* an unknown id keeps its plain `not found` message and
 authorized attaches work as before.
 
+### A25 — a removed task's linked rows stay tag-gated on every surface (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* the owner posts a sitrep `--task`, creates a handoff, raises an
+untagged attention row and starts a deployment `--task` on a `secret` task
+and then removes the task, *then* the caller sees none of them in any
+listing, in search, on served `/api/v1/lanes` or in the deployment listing,
+and `handoff retire`, `handoff accept`, `attention show`, `deploy show` and
+`deploy finish` answer exactly as for a never-created id — the same exit code
+and byte-identical stderr carrying the generic denial, with nothing recorded
+— while the owner still sees every row. *When* no enforcement applies, *then*
+an unknown id keeps its plain `not found` message. The board schema moves
+`33` → `34`: the four links become plain `TEXT` with no foreign key, so a
+removal keeps the orphaned id and every read path gates it on the task's
+last-known removal tags; rows already nulled by an older removal stay NULL,
+which the migration does not invent back.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -768,7 +802,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | always-redacted pre-answer show/list and mutation receipts, including the raiser's own reads, through the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit; the HTTP projection sweep pins the same omission in the browser bytes; post-answer reads carry answer, explanation and result, and reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
-| `ACC-14` | MUST | http + process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `search_scores_are_a_function_of_permitted_documents_only`; `search_scores_and_order_are_a_function_of_permitted_documents_only`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail_over_http`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `attention_by_id_withholds_rows_on_a_tag_denied_task`; `subscription_relation_targets_withhold_a_tag_denied_task_on_read`; `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; a tag-denied document moves no permitted hit's served `lexicalScore`, `score` or order (A21); every task route that names a row (task move/update/remove, claim, events --task, deploy show) refuses a denied and a never-created task id with identical stderr and exit code, and a task-filtered listing succeeds for both alike with byte-identical empty stdout; a sitrep, handoff, subscription or attention row naming a task is listed only for a caller who can read that task, with the unfiltered listings, the attention and handoff counts, served `/api/v1/lanes`, `handoff retire`/`accept` and `subscription show`/`pause`/`resume` obeying the same rule; an untagged attention row hung on a denied task answers every by-id surface like an unknown id, a subscription whose subject or relation target the caller cannot read is withheld on list, show, pause and resume, and a removal snapshot with no tags array fails closed with the stale-entry tag; notes, checkpoints and a named claim carry the same denial at store level, and heartbeat, release, sprint plan candidates and parent epics, deploy finish, abandon and retry-of, and removed-task watch and subscription subjects refuse a denied and a never-created id byte-identically with nothing recorded (A22); a removed task's events stay tag-gated on board-wide `events`, `watch` and served search for readers without the tag, and stay readable to a holder of it, while `events --task` on a removed row is refused for every caller because the row is gone (A23); every write that attaches a row to a task refuses a tag-denied task exactly like a never-created one and records nothing (A24) |
+| `ACC-14` | MUST | http + process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `search_scores_are_a_function_of_permitted_documents_only`; `search_scores_and_order_are_a_function_of_permitted_documents_only`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail_over_http`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `attention_by_id_withholds_rows_on_a_tag_denied_task`; `subscription_relation_targets_withhold_a_tag_denied_task_on_read`; `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`; `task_removal_keeps_linked_rows_tag_gated` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; a tag-denied document moves no permitted hit's served `lexicalScore`, `score` or order (A21); every task route that names a row (task move/update/remove, claim, events --task, deploy show) refuses a denied and a never-created task id with identical stderr and exit code, and a task-filtered listing succeeds for both alike with byte-identical empty stdout; a sitrep, handoff, subscription or attention row naming a task is listed only for a caller who can read that task, with the unfiltered listings, the attention and handoff counts, served `/api/v1/lanes`, `handoff retire`/`accept` and `subscription show`/`pause`/`resume` obeying the same rule; an untagged attention row hung on a denied task answers every by-id surface like an unknown id, a subscription whose subject or relation target the caller cannot read is withheld on list, show, pause and resume, and a removal snapshot with no tags array fails closed with the stale-entry tag; notes, checkpoints and a named claim carry the same denial at store level, and heartbeat, release, sprint plan candidates and parent epics, deploy finish, abandon and retry-of, and removed-task watch and subscription subjects refuse a denied and a never-created id byte-identically with nothing recorded (A22); a removed task's events stay tag-gated on board-wide `events`, `watch` and served search for readers without the tag, and stay readable to a holder of it, while `events --task` on a removed row is refused for every caller because the row is gone (A23); every write that attaches a row to a task refuses a tag-denied task exactly like a never-created one and records nothing (A24); a removed task's sitrep, handoff, attention and deployment rows keep the orphaned id and stay gated on the removal union on every listing, search, lanes and by-id surface (A25) |
 | `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
 | `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
 | `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
@@ -937,3 +971,21 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   array — pinned at store level by
   `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`;
   no existing fixture depended on the permissive shape.
+
+- 2026-09-25 — ACC-14 removed-task-link evidence landed (`t-2cffbe08`):
+  `task_removal_keeps_linked_rows_tag_gated` seeds a sitrep, a handoff, an
+  untagged attention row and a deployment attempt on a `secret` task and then
+  removes it: a caller holding only board read and write sees no trace of
+  the rows in any listing, in search, on served `/api/v1/lanes` or in the
+  deployment listing, and `handoff retire`, `handoff accept`, `attention
+  show`, `deploy show` and `deploy finish` answer byte-identically to a
+  never-created id — while the owner still sees every row (A25). The landing
+  fixed the leak as a bug; requirement wording is unchanged. The four links
+  were `ON DELETE SET NULL`, so removing the task rewrote each row's
+  `task_id` to NULL and every gate read the orphaned row as board scope.
+  The board schema moves `33` → `34`: the links are plain `TEXT` with no
+  foreign key — the `subscriptions.subject_task_id` precedent — so a removal
+  keeps the id and the listings, the index, the handoff transitions and the
+  deployment gates resolve it through the task's last-known removal tags,
+  failing closed with no record. Rows already nulled by an older removal
+  cannot be recovered and stay NULL; the migration invents no link back.
