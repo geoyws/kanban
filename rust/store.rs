@@ -3382,7 +3382,7 @@ pub(crate) struct ReadSnapshot<'a> {
 }
 
 impl<'a> ReadSnapshot<'a> {
-    fn open(connection: &'a Connection) -> Result<Self> {
+    pub(crate) fn open(connection: &'a Connection) -> Result<Self> {
         if !connection.is_autocommit() {
             return Ok(Self { connection: None });
         }
@@ -3392,7 +3392,7 @@ impl<'a> ReadSnapshot<'a> {
         })
     }
 
-    fn close(mut self) -> Result<()> {
+    pub(crate) fn close(mut self) -> Result<()> {
         // Commit first; a failed COMMIT leaves the transaction open, and Drop
         // must still be able to roll it back.
         if let Some(connection) = self.connection {

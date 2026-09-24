@@ -752,8 +752,13 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   is unchanged. `lexical_scores` normalised every bm25 by the strongest match on the whole
   board index, denied documents included, so a denied row moved a permitted hit's served
   scores — a prefix oracle for denied text. The permitted candidate set is now decided before
-  any normalisation and the divisor is taken over permitted rows only; per-request tag-set
+  any scoring and the served strengths are recomputed over it alone; per-request tag-set
   memoization plus the event row joined into the document query remove the per-event second
-  SELECT with the removed-task and removed-attention STALE rules unchanged. On unenforced
-  boards no filter is passed, so scores and order are exactly what the unfiltered code
-  produced.
+  SELECT with the removed-task and removed-attention STALE rules unchanged. Filtering only
+  the divisor proved insufficient on re-review (M1): FTS5's per-row bm25 folds whole-index
+  term frequencies, row count and average length into every strength, so under enforcement
+  FTS now decides only which rows match while `permitted_bm25_scores` recomputes the
+  strengths with N, df and avgdl over permitted rows only (same k1/b 1.2/0.75 and 8/2/4
+  title/body/tags weights); `search_scores_and_order_are_a_function_of_permitted_documents_only`
+  pins both hits' scores and their order. On unenforced boards the FTS5 strengths are kept
+  unchanged, so scores and order are exactly what the unfiltered code produced.

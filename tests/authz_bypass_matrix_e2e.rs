@@ -4964,3 +4964,132 @@ fn search_scores_are_a_function_of_permitted_documents_only() {
          matching the guessed prefix appeared: the denied row is a score oracle"
     );
 }
+
+/// The IDF follow-up to the divisor oracle (ACC-14, `t-e9c0127a` M1):
+/// filtering only the normalisation divisor is not enough, because FTS5's
+/// per-row bm25 folds whole-index statistics — per-term document frequency,
+/// row count, average length — into every score. A denied row containing a
+/// guessed prefix moves the IDF of that term, and with it the served
+/// `lexicalScore`, `score` and possibly the order of the permitted hits.
+///
+/// Two anchors each carry one side of the query: A the unique token
+/// `anchorqq` once in a long body, B the token `zzqxj9aaa` (matched by the
+/// guessed prefix `zzqxj9`) once in a long body. Both hits' served scores
+/// AND their relative order must be identical with and without a tag-denied
+/// document strongly matching the prefix.
+#[test]
+fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
+    let estate = ManagedEstate::new("search-oracle-idf");
+    let work_a = estate.work_a.clone();
+
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.bind_self(
+        "p-oracle-idf",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+
+    // The shared filler carries neither query token, so each anchor matches
+    // exactly one side of the query.
+    let filler = "The harbour ledger records each crossing in turn, noting the vessel name, \
+        the tide mark and the pilot on duty. Clerks copy the manifest lines into the day book \
+        before the evening bell, and the night watch signs every page. "
+        .repeat(8);
+    let add_anchor = |title: &str, body: &str| -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--body", body, "--as", "seed", "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let anchor_a = add_anchor(
+        "Anchor probe alpha",
+        &format!("{filler}The one token this probe carries is anchorqq, written exactly once."),
+    );
+    let anchor_b = add_anchor(
+        "Anchor probe beta",
+        &format!("{filler}The one token this probe carries is zzqxj9aaa, written exactly once."),
+    );
+
+    fn task_hit<'a>(receipt: &'a Value, anchor_id: &str, what: &str) -> &'a Value {
+        receipt["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{what}: the receipt has no results: {receipt}"))
+            .iter()
+            .find(|hit| hit["sourceKind"] == "task" && hit["sourceId"] == anchor_id)
+            .unwrap_or_else(|| panic!("{what}: the anchor is missing: {receipt}"))
+    }
+
+    fn order(receipt: &Value, anchor_a: &str, anchor_b: &str, what: &str) -> Vec<String> {
+        receipt["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{what}: the receipt has no results: {receipt}"))
+            .iter()
+            .filter(|hit| {
+                hit["sourceKind"] == "task"
+                    && (hit["sourceId"] == anchor_a || hit["sourceId"] == anchor_b)
+            })
+            .map(|hit| hit["sourceId"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    let query = "anchorqq zzqxj9";
+    let before = estate.ok_json(&work_a, &["search", query, "--limit", "50", "--json"]);
+    let order_before = order(&before, &anchor_a, &anchor_b, "before");
+    assert_eq!(
+        order_before.len(),
+        2,
+        "both anchors should be served before the denied row exists: {before}"
+    );
+
+    estate.enforce("direct");
+    let denied_body = format!("A short vault note. {}", "zzqxj9vlt ".repeat(60));
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "Vault note",
+            "--body",
+            &denied_body,
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.enforce("managed");
+
+    let after = estate.ok_json(&work_a, &["search", query, "--limit", "50", "--json"]);
+    assert!(
+        !after.to_string().contains("Vault note") && !after.to_string().contains("zzqxj9vlt"),
+        "the denied row leaked into the receipt: {after}"
+    );
+    for (anchor_id, name) in [(&anchor_a, "alpha"), (&anchor_b, "beta")] {
+        let hit_before = task_hit(&before, anchor_id, "before");
+        let hit_after = task_hit(&after, anchor_id, "after");
+        assert_eq!(
+            hit_after["lexicalScore"], hit_before["lexicalScore"],
+            "anchor {name}'s lexicalScore moved when a denied document matching the guessed \
+             prefix appeared: {before} vs {after}"
+        );
+        assert_eq!(
+            hit_after["score"], hit_before["score"],
+            "anchor {name}'s score moved when a denied document matching the guessed prefix \
+             appeared: {before} vs {after}"
+        );
+    }
+    assert_eq!(
+        order(&after, &anchor_a, &anchor_b, "after"),
+        order_before,
+        "the anchors' result order moved when a denied document appeared: {before} vs {after}"
+    );
+}

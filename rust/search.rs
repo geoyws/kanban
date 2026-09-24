@@ -265,6 +265,29 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
         .map_err(Into::into)
 }
 
+/// The raw FTS5 match strengths for one query: every indexed row the MATCH
+/// accepts, with its bm25 made non-negative. This decides only WHICH rows
+/// match — under enforcement the strengths are discarded and recomputed by
+/// [`permitted_bm25_scores`], because they fold whole-index statistics a
+/// denied row would otherwise leak through.
+fn fts_match_rows(connection: &Connection, query: &str) -> Result<Vec<(i64, f64)>> {
+    let Some(query) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection.prepare(
+        "SELECT rowid,bm25(search_fts,8.0,2.0,4.0) FROM search_fts WHERE search_fts MATCH ?",
+    )?;
+    let rows = statement.query_map([query], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let mut ranked = Vec::new();
+    for row in rows {
+        let (seq, rank) = row?;
+        ranked.push((seq, (-rank).max(0.0)));
+    }
+    Ok(ranked)
+}
+
 /// The FTS5 lexical scores for one query, normalised to the strongest match.
 ///
 /// `permitted` is the set of index rows the caller may read, decided BEFORE
@@ -276,27 +299,19 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
 /// permitted documents only. `None` is the unenforced path, where every row
 /// is readable and the divisor is taken over the same full match set as
 /// before, leaving unmanaged boards byte-identical.
+///
+/// Under enforcement this is NOT the served path — [`search`] uses FTS only
+/// for membership there and [`permitted_bm25_scores`] for the strengths —
+/// but it stays for the unenforced boards, whose scores must remain exactly
+/// what the unfiltered code produced.
 fn lexical_scores(
     connection: &Connection,
     query: &str,
     permitted: Option<&HashSet<i64>>,
 ) -> Result<HashMap<i64, f64>> {
-    let Some(query) = fts_query(query) else {
-        return Ok(HashMap::new());
-    };
-    let mut statement = connection.prepare(
-        "SELECT rowid,bm25(search_fts,8.0,2.0,4.0) FROM search_fts WHERE search_fts MATCH ?",
-    )?;
-    let rows = statement.query_map([query], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
-    })?;
-    let mut ranked = Vec::new();
-    for row in rows {
-        let (seq, rank) = row?;
-        if permitted.is_some_and(|permitted| !permitted.contains(&seq)) {
-            continue;
-        }
-        ranked.push((seq, (-rank).max(0.0)));
+    let mut ranked = fts_match_rows(connection, query)?;
+    if let Some(permitted) = permitted {
+        ranked.retain(|(seq, _)| permitted.contains(seq));
     }
     let strongest = ranked.iter().map(|(_, rank)| *rank).fold(0.0_f64, f64::max);
     let scores = ranked
@@ -313,6 +328,123 @@ fn lexical_scores(
         })
         .collect();
     Ok(scores)
+}
+
+/// BM25 strengths recomputed over the permitted candidate set only
+/// (`t-e9c0127a` M1).
+///
+/// Filtering only the normalisation divisor is not enough: FTS5's per-row
+/// bm25 folds whole-index statistics — the per-term document frequency, the
+/// row count, the average length — into every strength, so a denied row
+/// holding a guessed prefix still moves the non-max scores and possibly the
+/// order. The served strengths are therefore recomputed here, as a function
+/// of permitted documents only:
+///
+/// ```text
+/// score(d) = SUM_t idf(t) * tf_w(t,d)*(K1+1) / (tf_w(t,d) + K1*(1-B+B*len(d)/avgdl))
+/// idf(t)   = ln(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
+/// tf_w     = 8*title_hits + 2*body_hits + 4*tags_hits
+/// ```
+///
+/// with `N` the permitted candidate count, `df` and `avgdl` ranging over the
+/// permitted candidates alone, and `K1`/`B` FTS5's own 1.2/0.75. Term hits
+/// are prefix hits over `words` tokens stemmed with the existing `stem`, the
+/// same tokenization the query path uses, and the 8/2/4 title/body/tags
+/// weights match the `bm25(search_fts,8.0,2.0,4.0)` call — so the managed
+/// ranking keeps the same shape with denied-independent values. Only rows in
+/// `matched` (the FTS membership set, already permitted-filtered) are
+/// scored; the map is normalised to the strongest of them, like
+/// [`lexical_scores`].
+fn permitted_bm25_scores(
+    documents: &[Document],
+    matched: &HashSet<i64>,
+    query: &str,
+) -> HashMap<i64, f64> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    const WEIGHTS: [f64; 3] = [8.0, 2.0, 4.0];
+    // The query's prefix terms, stemmed like the indexed text: the same
+    // dedup-and-twelve cap `fts_query` applies, so scoring sees the terms
+    // matching saw.
+    let mut seen = HashSet::new();
+    let terms: Vec<String> = words(query)
+        .into_iter()
+        .filter(|token| seen.insert(token.clone()))
+        .take(12)
+        .map(|token| stem(&token).to_owned())
+        .collect();
+    if terms.is_empty() || documents.is_empty() {
+        return HashMap::new();
+    }
+    // One pass over the permitted corpus: per-document weighted hit counts
+    // per term plus the document frequencies. Only stack-local counts are
+    // kept, never the tokens.
+    let mut stats: Vec<(i64, u64, Vec<[u32; 3]>)> = Vec::with_capacity(documents.len());
+    let mut document_frequency = vec![0_u64; terms.len()];
+    let mut total_length = 0_u64;
+    for document in documents {
+        let mut hits = vec![[0_u32; 3]; terms.len()];
+        let mut length = 0_u64;
+        for (field, text) in [
+            (0, document.title.as_str()),
+            (1, document.body.as_str()),
+            (2, document.tags.as_str()),
+        ] {
+            for token in words(text) {
+                length += 1;
+                let stemmed = stem(&token);
+                for (index, term) in terms.iter().enumerate() {
+                    if stemmed.starts_with(term.as_str()) {
+                        hits[index][field] += 1;
+                    }
+                }
+            }
+        }
+        for (index, term_hits) in hits.iter().enumerate() {
+            if term_hits.iter().any(|count| *count > 0) {
+                document_frequency[index] += 1;
+            }
+        }
+        total_length += length;
+        stats.push((document.seq, length, hits));
+    }
+    let count = documents.len() as f64;
+    let average_length = total_length as f64 / count;
+    let inverse_frequency: Vec<f64> = document_frequency
+        .iter()
+        .map(|frequency| ((count - *frequency as f64 + 0.5) / (*frequency as f64 + 0.5) + 1.0).ln())
+        .collect();
+    // Score the FTS-matched rows only; the corpus statistics above already
+    // range over every permitted candidate, denied rows nowhere in sight.
+    let mut scores = HashMap::with_capacity(matched.len());
+    for (seq, length, hits) in &stats {
+        if !matched.contains(seq) {
+            continue;
+        }
+        let relative = if average_length > 0.0 {
+            *length as f64 / average_length
+        } else {
+            1.0
+        };
+        let mut score = 0.0;
+        for (index, term_hits) in hits.iter().enumerate() {
+            let weighted: f64 = term_hits
+                .iter()
+                .enumerate()
+                .map(|(field, count)| WEIGHTS[field] * *count as f64)
+                .sum();
+            score += inverse_frequency[index] * weighted * (K1 + 1.0)
+                / (weighted + K1 * (1.0 - B + B * relative));
+        }
+        scores.insert(*seq, score);
+    }
+    let strongest = scores.values().copied().fold(0.0_f64, f64::max);
+    if strongest > 0.0 {
+        for score in scores.values_mut() {
+            *score /= strongest;
+        }
+    }
+    scores
 }
 
 fn literal_exact_score(document: &Document, query: &str, query_words: &[String]) -> f64 {
@@ -531,16 +663,21 @@ pub fn search(
     // board is the context's, taken from the board file's own name — never the
     // `board` display label above, which is whatever the caller passed.
     authz.check_read(&[])?;
+    // One consistent view for the document scan, the FTS membership probe
+    // and the per-document authorization reads: without it a concurrent
+    // write could move a row between the three. A no-op inside an open
+    // scope, released at the end of the request.
+    let snapshot = crate::store::ReadSnapshot::open(connection)?;
     let query_words = words(&options.query);
     let query_vector = embed(&options.query);
     // Authorization before scoring (`t-e9c0127a`): the permitted candidate
-    // set is decided first, and the lexical divisor is taken over permitted
-    // rows only, so served `lexicalScore` and `score` are a function of
-    // permitted documents only. The tag sets behind the decision are memoized
-    // per request, and each event document already carries its event row —
-    // authorizing the whole corpus no longer costs a SELECT per event.
-    // Unenforced boards skip the decision entirely and pass no filter, so
-    // their scores and order are exactly what the unfiltered code produced.
+    // set is decided first, and served `lexicalScore` and `score` are a
+    // function of permitted documents only. The tag sets behind the decision
+    // are memoized per request, and each event document already carries its
+    // event row — authorizing the whole corpus no longer costs a SELECT per
+    // event. Unenforced boards skip the decision entirely and keep the FTS5
+    // strengths, so their scores and order are exactly what the unfiltered
+    // code produced.
     let mut tag_cache = SearchTagCache::default();
     let mut permitted = HashSet::new();
     let mut candidates = Vec::new();
@@ -553,11 +690,21 @@ pub fn search(
         }
         candidates.push(document);
     }
-    let lexical = lexical_scores(
-        connection,
-        &options.query,
-        authz.is_enforcing().then_some(&permitted),
-    )?;
+    // Under enforcement FTS decides only WHICH rows match; the strengths
+    // come from [`permitted_bm25_scores`], whose N, df and avgdl range over
+    // the permitted candidates alone — FTS5's whole-index statistics would
+    // otherwise leak a denied row's text through the non-max scores and the
+    // order (M1).
+    let lexical = if authz.is_enforcing() {
+        let matched: HashSet<i64> = fts_match_rows(connection, &options.query)?
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .filter(|seq| permitted.contains(seq))
+            .collect();
+        permitted_bm25_scores(&candidates, &matched, &options.query)
+    } else {
+        lexical_scores(connection, &options.query, None)?
+    };
     let mut results = Vec::new();
     for document in candidates {
         let hash = source_hash(&document);
@@ -635,6 +782,7 @@ pub fn search(
             .then_with(|| left.citation.cmp(&right.citation))
     });
     results.truncate(options.limit);
+    snapshot.close()?;
     Ok(results)
 }
 
