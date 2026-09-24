@@ -1065,12 +1065,13 @@ fn removed_aware_linked_task_tags(
     absent_task_tags_or_denied(connection, id, authz)
 }
 
-/// Whether a listing row linked to `task_id` stays visible (ACC-14): rows
-/// naming no task keep board scope, rows naming a live task read as their
-/// writers left them, and rows naming a removed task gate on the task's
-/// last-known removal union — hidden from a caller who cannot read it, and
-/// hidden from everyone when no removal record names it at all. Outside
-/// enforcement nothing can be denied and every row stays visible.
+/// Whether a listing row linked to `task_id` stays visible (ACC-14): a row
+/// linked to a task is visible only to a caller who can read that task. Rows
+/// naming no task keep board scope, rows naming a live task gate on its live
+/// tags, and rows naming a removed task gate on the task's last-known removal
+/// union — hidden from a caller who cannot read it, and hidden from everyone
+/// when no removal record names it at all. Outside enforcement nothing can be
+/// denied and every row stays visible.
 fn task_linked_row_visible(
     connection: &Connection,
     authz: &AuthzContext,
@@ -1083,7 +1084,7 @@ fn task_linked_row_visible(
         return Ok(true);
     };
     if get_task(connection, task_id)?.is_some() {
-        return Ok(true);
+        return Ok(authz.permits_read(&task_tags(connection, task_id)?));
     }
     match removed_task_tag_union(connection, task_id)? {
         Some(tags) => Ok(authz.permits_read(&tags)),
@@ -4644,14 +4645,29 @@ impl Store {
 
     pub fn require_subscription(&self, id: &str) -> Result<Subscription> {
         self.authz.check_read(&[])?;
-        self.connection
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))
+        let row = absent_as_denied(
+            self.connection
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // A subscription names the task its deliveries are about: a caller
+        // who cannot read that task learns neither the row nor whether the id
+        // exists — the denied id answers exactly like a never-created one.
+        if !task_linked_row_visible(
+            &self.connection,
+            &self.authz,
+            row.subject_task_id.as_deref(),
+        )? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(row)
     }
 
     pub fn subscriptions(
@@ -4681,13 +4697,32 @@ impl Store {
         }
         sql.push_str(" ORDER BY created_at,id");
         let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params_from_iter(values.iter().map(|value| value.as_ref())),
-            subscription_row,
-        );
-        rows?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let rows = statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                subscription_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // A subscription names the task its deliveries are about, so under
+        // managed enforcement each row passes `task_linked_row_visible`: a
+        // caller who cannot read the subject task never learns the
+        // subscription exists. There is no SQL bound here to move, only the
+        // filter. Outside enforcement every row stays visible.
+        if !self.authz.is_enforcing() {
+            return Ok(rows);
+        }
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if task_linked_row_visible(
+                &self.connection,
+                &self.authz,
+                row.subject_task_id.as_deref(),
+            )? {
+                visible.push(row);
+            }
+        }
+        Ok(visible)
     }
 
     fn set_subscription_paused(
@@ -4701,14 +4736,29 @@ impl Store {
         // Under the mutation lock: a concurrent write cannot slip between this
         // check and the UPDATE below.
         self.authz.check_write(&[], &[])?;
-        let current = transaction
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))?;
+        let current = absent_as_denied(
+            transaction
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // The row names the task its deliveries are about: pausing or resuming
+        // a subscription on a task the caller cannot read is refused with the
+        // generic denial rather than confirming the id exists — the denied id
+        // answers exactly like a never-created one, and nothing is recorded.
+        if !task_linked_row_visible(
+            &transaction,
+            &self.authz,
+            current.subject_task_id.as_deref(),
+        )? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
         let desired = if paused { "paused" } else { "active" };
         if current.status == desired {
             transaction.commit()?;
@@ -7511,12 +7561,14 @@ impl Store {
     /// true now", and the newest update is the answer. Archived rows are
     /// excluded by default and readable on request — hidden, never gone.
     ///
-    /// Board scope is the whole check: a sitrep carries no tags, so there is
-    /// no per-row filter to apply and `&[]` is the entire subject. The guard
-    /// lives here rather than at each caller because `serve::lane_groups`
-    /// reaches this method with a store it opened for a board the caller may
-    /// never have been granted (`t-c84850a1`); with the check at the source
-    /// both the CLI and `/api/v1/lanes` are refused by construction.
+    /// Board scope is the first check; the per-row check follows in the body:
+    /// a sitrep names its task, so under managed enforcement each row passes
+    /// `task_linked_row_visible` and a caller who cannot read the task never
+    /// sees the row — its body, branch or worktree. The guard lives here
+    /// rather than at each caller because `serve::lane_groups` reaches this
+    /// method with a store it opened for a board the caller may never have
+    /// been granted (`t-c84850a1`); with the check at the source both the CLI
+    /// and `/api/v1/lanes` are refused by construction.
     pub fn sitreps(
         &self,
         lane: Option<&str>,
@@ -9090,9 +9142,22 @@ impl Store {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "retire note")?.to_owned();
         let transaction = self.begin_write()?;
-        // Board scope, under the lock.
+        // Board scope, under the lock — then the handoff's task, the way
+        // `accept_handoff` authorizes it: a pending handoff on a task the
+        // caller cannot write is refused with the generic denial rather than
+        // handing over the full row. A session handoff names no task, so
+        // board scope is the whole check there.
         self.authz.check_write(&[], &[])?;
         reject_secret_shaped_text(&note, "retire note")?;
+        let subject: Option<Option<String>> = transaction
+            .query_row("SELECT task_id FROM handoffs WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(Some(task_id)) = subject {
+            let tags = task_tags(&transaction, &task_id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
         let existing = absent_as_denied(
             transaction
                 .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
