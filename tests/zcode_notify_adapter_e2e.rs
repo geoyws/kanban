@@ -164,12 +164,20 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
+        // An adapter that refuses its flags exits without reading stdin, so
+        // this write races that exit: when the child wins, the pipe is closed
+        // and the write answers EPIPE. That is the child having already
+        // answered, not a failure — its exit code and stderr, read below, are
+        // what every caller asserts.
+        match child
             .stdin
             .as_mut()
             .unwrap()
             .write_all(&serde_json::to_vec(request).unwrap())
-            .unwrap();
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            result => result.unwrap(),
+        }
         child.wait_with_output().unwrap()
     }
 }
