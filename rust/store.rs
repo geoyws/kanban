@@ -5457,11 +5457,14 @@ impl Store {
     /// nothing: the [`FilteredEventTail`] they get back names the furthest
     /// raw sequence examined, and adopting it as the next cursor walks the
     /// denied stretch a bounded page per scan instead of re-reading it whole
-    /// on every revision. Advancing past denied rows cannot skip a visible
-    /// row: the scan walks ascending `seq` inside one snapshot, so every row
-    /// at or below the new position passed through this scan's own filter —
-    /// delivered if visible, rejected if denied — and anything newer is still
-    /// past the cursor for the next scan to meet.
+    /// on every revision. Advancing past denied rows cannot skip a row that
+    /// is visible under the authority and tags current at scan time: the
+    /// scan walks ascending `seq` inside one snapshot, so every row at or
+    /// below the new position passed through this scan's own filter —
+    /// delivered if visible, rejected if denied — and anything newer is
+    /// still past the cursor for the next scan to meet. A later grant or
+    /// retag does not replay history already passed: rows the scan rejected
+    /// stay behind the cursor it adopted.
     #[allow(clippy::too_many_arguments)]
     pub fn events_since_filtered_tail(
         &self,
