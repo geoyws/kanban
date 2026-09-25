@@ -57,6 +57,25 @@ set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
+# A child that marks our stdout/stderr non-blocking poisons every later
+# writer to the same pipe: O_NONBLOCK lives on the open file description, so
+# it survives the child that set it, and the next burst write to a momentarily
+# full pipe fails with EAGAIN instead of blocking. Inside the Linux container
+# our stdout is the one docker log pipe shared with `bun install` and every
+# web tool that runs before cargo, and libtest's burst print of a failing
+# test then dies as `error: io error when listing tests: Os { code: 11,
+# kind: WouldBlock }` with no verdict line (gate-acc14-0d2f527, step 18).
+# Clear the flag up front. Perl is Debian-essential and ships on macOS too;
+# a missing perl skips the heal rather than failing the gate.
+if command -v perl >/dev/null 2>&1; then
+    perl -MFcntl=F_GETFL,F_SETFL,O_NONBLOCK -e '
+for my $fh (*STDOUT, *STDERR) {
+    if (defined(my $flags = fcntl($fh, F_GETFL, 0))) {
+        fcntl($fh, F_SETFL, $flags & ~O_NONBLOCK);
+    }
+}' || true
+fi
+
 # A value that names nothing executable is an operator mistake, and the
 # discovery order would quietly resolve to some other browser -- which is a
 # green run measuring a browser nobody chose.
@@ -74,7 +93,12 @@ run() {
     shift
     step=$((step + 1))
     printf '\nrelease-gate: [%d] %s\n' "$step" "$label"
-    if ! "$@"; then
+    # Each step writes through `cat`, so the step's stdout/stderr is a private
+    # pipe of this step: a child that flips O_NONBLOCK can at worst poison
+    # this step's pipe, never the shared log stream the later steps write to.
+    # The step's own status still rules the gate (`pipefail` is set above, so
+    # a failing step fails the pipeline; `cat` only forwards bytes).
+    if ! "$@" 2>&1 | cat; then
         printf '\nrelease-gate: FAILED at step %d: %s\n' "$step" "$label" >&2
         printf 'release-gate: command was: %s\n' "$*" >&2
         exit 1

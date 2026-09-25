@@ -137,6 +137,19 @@ as_gate() {
 mkdir -p /tmp/gate-home
 chown "$uid:$gid" /tmp/gate-home
 (cd /work/web && as_gate bun install)
+# `bun install` runs first with the container log pipe as its stdout; if
+# anything under it leaves O_NONBLOCK set, every later burst
+# write to that pipe can fail with EAGAIN (see scripts/release-gate.sh).
+# Heal the flag here so the loop iterations and their verdict echoes below
+# never inherit a poisoned stream. Gate mode heals again itself: release-gate
+# clears the flag at startup and gives each step a private pipe through `cat`.
+# Double quotes (never single quotes or $ sigils): this whole block is a
+# single-quoted string on the host passed to the container through
+# `bash -c "$inner"`, so a $ here would be eaten by the container shell
+# before perl ever saw it. The straight-line form has no variables at all.
+if command -v perl >/dev/null 2>&1; then
+    perl -MFcntl=F_GETFL,F_SETFL,O_NONBLOCK -e "fcntl(STDOUT, F_SETFL, fcntl(STDOUT, F_GETFL, 0) & ~O_NONBLOCK); fcntl(STDERR, F_SETFL, fcntl(STDERR, F_GETFL, 0) & ~O_NONBLOCK)" || true
+fi
 cd /work
 if [[ -z "$loop_target" ]]; then
     as_gate bash scripts/release-gate.sh
