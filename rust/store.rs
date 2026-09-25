@@ -6223,7 +6223,44 @@ impl Store {
                     bail!("dependency {dependency} would create a cycle");
                 }
             }
+            // A replacement keeps the edges this caller cannot read: deleting
+            // them would let a writer on this row silently remove a gate the
+            // owner set. Refusing instead would confirm a hidden edge exists,
+            // so the hidden edges stay and only the visible ones are replaced
+            // — keep over refuse. The listing still withholds them
+            // (`Store::dependencies` filters per row) while the gate keeps
+            // honouring every edge (`require_no_blocking_gates` reads the raw
+            // table), so a kept gate still blocks claims. `--clear-dependencies`
+            // arrives here as an empty list and keeps them the same way. The
+            // parent edge needs no such treatment: the row's own `parentID`
+            // carries it, so replacing or clearing the parent drops an edge the
+            // caller already sees. Subscription relations are create-only —
+            // `add_subscription` gates each target and nothing rewrites them —
+            // so there is no replacement path to keep through.
+            let mut hidden: Vec<String> = Vec::new();
+            if self.authz.is_enforcing() {
+                let mut statement = transaction
+                    .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?")?;
+                let existing = statement
+                    .query_map([id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                for prerequisite in existing {
+                    if !self
+                        .authz
+                        .permits_read(&task_tags(&transaction, &prerequisite)?)
+                    {
+                        hidden.push(prerequisite);
+                    }
+                }
+            }
             transaction.execute("DELETE FROM task_dependencies WHERE task_id=?", [id])?;
+            for prerequisite in &hidden {
+                transaction.execute(
+                    "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
+                    params![id, prerequisite],
+                )?;
+            }
             for dependency in unique {
                 transaction.execute(
                     "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",

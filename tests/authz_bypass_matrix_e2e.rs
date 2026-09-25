@@ -7230,6 +7230,146 @@ fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
     estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
 }
 
+/// ACC-14, dependency replacement keeps the edges the caller cannot read: the
+/// owner gates `t-visible` on `t-secret`, and a managed caller holding board
+/// read and write (plus `visible` at both capabilities) but no `secret` scope
+/// replaces the list with `t-other`. The write succeeds — refusing would
+/// confirm a hidden edge exists — but the hidden edge survives: the caller's
+/// own listing still shows only `t-other`, the gate still names `t-secret`,
+/// and the claim is still refused while it is open. The owner sees both.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate, selecting by the stable ids `t-visible`, `t-secret` and
+/// `t-other`. Removing the keep in `update_task` fails this test: the owner
+/// reads only `t-other` and the claim refusal stops naming `t-secret`.
+#[test]
+fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
+    let estate = ManagedEstate::new("acc14-dep-replace");
+    let work_a = estate.work_a.clone();
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, title, tag) in [
+        ("t-secret", "secret prerequisite", "secret"),
+        ("t-other", "other prerequisite", "visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", tag, "--as", "seed", "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "visible row",
+            "--id",
+            "t-visible",
+            "--tag",
+            "visible",
+            "--depends-on",
+            "t-secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-visible-only",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+    // The replacement succeeds: refusing would tell the caller an edge it
+    // cannot see exists. The receipt carries the row, never the hidden edge.
+    let receipt = estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "p",
+        ],
+    );
+    assert!(
+        !receipt.contains("t-secret"),
+        "the update receipt revealed the hidden edge: {receipt}"
+    );
+    // The caller's own view still shows only the edge it named.
+    let shown = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        shown["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-other".to_owned()],
+        "the listing handed over the hidden edge: {shown}"
+    );
+    // The gate still holds on the hidden edge: its id and status stay, its
+    // title stays blanked.
+    assert_eq!(
+        shown["blockingGates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| {
+                (
+                    gate["prerequisiteID"].as_str().unwrap().to_owned(),
+                    gate["prerequisiteStatus"].as_str().unwrap().to_owned(),
+                    gate["prerequisiteTitle"].clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "t-other".to_owned(),
+                "todo".to_owned(),
+                serde_json::json!("other prerequisite"),
+            ),
+            ("t-secret".to_owned(), "todo".to_owned(), Value::Null),
+        ],
+        "the gate lost the hidden edge: {shown}"
+    );
+    // So the claim is still refused while the hidden prerequisite is open —
+    // and the refusal still names it.
+    let refused = estate.run(&work_a, &["claim", "t-visible", "--as", "p"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        !refused.status.success(),
+        "the kept gate let a claim through: {stderr}"
+    );
+    assert!(
+        stderr.contains("t-secret is todo"),
+        "the claim refusal no longer names the hidden edge: {stderr}"
+    );
+    // The owner sees both edges, so the assertions above came from the tag
+    // and not from a missing row.
+    estate.grant("p-visible-only", &owner_of(&estate.id_a));
+    let owned = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        owned["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-secret".to_owned(), "t-other".to_owned()],
+        "the owner lost an edge: {owned}"
+    );
+}
+
 /// ACC-14 residual oracles: heartbeat and release, sprint plan candidates and
 /// parent epics, deploy finish/abandon/retry-of, and removed-task watch and
 /// subscription subjects.
