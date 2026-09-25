@@ -392,6 +392,14 @@ fn normalize_and_insert(
     counts: ImportCounts,
     options: ImportOptions,
 ) -> Result<ImportReceipt> {
+    // Whole-board write before any work (ACC-14): an import rewrites arbitrary
+    // rows, deletes claims and dependencies on `--reconcile`, and seizes live
+    // leases with `--force`, so only a principal holding the whole board may
+    // run it. The gate sits ahead of the overlap listing, the dry-run receipt
+    // and the reuse refusal alike: each of those names existing ids, and none
+    // of them is reachable without this authority. Unmanaged boards stay
+    // unchanged — the gate is a no-op where nothing enforces.
+    store.require_whole_board_write()?;
     if actor.trim().is_empty() {
         bail!("actor is required");
     }
@@ -628,6 +636,11 @@ fn verify(
     source: String,
     counts: ImportCounts,
 ) -> Result<ParityReceipt> {
+    // The same whole-board write gate as the import itself (ACC-14): the
+    // receipt names missing and differing ids and carries board field values,
+    // read across every tag the source happens to name, so a caller who may
+    // not run the import may not preview its answers either.
+    store.require_whole_board_write()?;
     const FIELDS: [&str; 16] = [
         "type",
         "parentID",

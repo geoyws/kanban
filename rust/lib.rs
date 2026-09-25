@@ -6389,12 +6389,14 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
             let task_links = store.orphaned_task_links()?;
+            let reused_links = store.reused_task_links()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
                 && task_links.is_empty()
+                && reused_links.is_empty()
                 && future.is_empty()
                 && search_index.healthy
                 && audit.healthy;
@@ -6409,6 +6411,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             value.insert("integrity".into(), json!(check));
             value.insert("orphanedRows".into(), json!(orphans));
             value.insert("orphanedTaskLinks".into(), json!(task_links));
+            value.insert("reusedTaskLinks".into(), json!(reused_links));
             value.insert("futureDatedTasks".into(), json!(future));
             value.insert("searchIndex".into(), json!(search_index));
             value.insert("audit".into(), json!(audit));

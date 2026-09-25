@@ -8049,3 +8049,177 @@ fn reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny() {
         "re-adding a removed id answers a denial where no guard can deny: {gone_stderr}"
     );
 }
+
+/// ACC-14 import gate, at the layer `process`: an import rewrites arbitrary
+/// rows, deletes claims and dependencies with `--reconcile`, and seizes live
+/// leases with `--force`, so only a principal holding the whole board may run
+/// it — including its previews, whose overlap listing names existing ids.
+///
+/// The fixture holds a live `secret` task beside an untagged-visible one. A
+/// read-only caller and a caller holding board write plus the `visible` tag
+/// scope — both without whole-board authority — are refused the one generic
+/// denial on `import atmux-json` with and without `--reconcile`, write
+/// nothing, and see neither live id on stderr. Granting the same principal
+/// the board tag wildcard turns the same source into a successful reconcile.
+#[test]
+fn import_requires_whole_board_write_and_names_no_denied_id() {
+    let estate = ManagedEstate::new("acc14-import-gate");
+    let work_a = estate.work_a.clone();
+    for tag in ["secret", "visible"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, title, tag) in [
+        ("t-imp-secret", "the import secret task", "secret"),
+        ("t-imp-visible", "the import visible task", "visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", tag, "--as", "seed", "--json",
+            ],
+        );
+    }
+    let source = estate.root.join("import-source.json");
+    fs::write(
+        &source,
+        serde_json::to_vec(&serde_json::json!({
+            "epics": [],
+            "stories": [],
+            "tasks": [
+                {"id": "t-imp-fresh", "subject": "a fresh import row", "status": "todo"},
+                {"id": "t-imp-secret", "subject": "an overwrite attempt", "status": "todo"},
+            ],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let source_arg = source.to_string_lossy().into_owned();
+    let attempt = |extra: &[&str]| {
+        let mut args = vec![
+            "import",
+            "atmux-json",
+            &source_arg,
+            "--as",
+            "seed",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        estate.run(&work_a, &args)
+    };
+    let refused_silently = |output: &std::process::Output, what: &str| {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "{what} succeeded but must be refused\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains(DENIED),
+            "{what} was refused with the wrong message\nstderr: {stderr}"
+        );
+        for id in ["t-imp-secret", "t-imp-visible", "t-imp-fresh"] {
+            assert!(
+                !stderr.contains(id),
+                "{what} named an existing id on stderr: {stderr}"
+            );
+        }
+    };
+    // What "nothing is written" means here: the board file itself is
+    // byte-identical and holds no new row or event. The registry is out of
+    // scope for the byte comparison — resolving a board by working directory
+    // stamps `last_used_at` on every command, refused or not.
+    let board_bytes = || fs::read(&estate.board_a).unwrap();
+    let board_row_count = |sql: &str| -> i64 {
+        Connection::open(&estate.board_a)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    };
+    estate.bind_self("p-import", &[board_scope("read", &estate.id_a)]);
+    estate.enforce("managed");
+    let pristine = board_bytes();
+    for extra in [&[][..], &["--reconcile"][..]] {
+        let output = attempt(extra);
+        refused_silently(&output, &format!("read-only import {extra:?}"));
+    }
+    assert_eq!(
+        board_bytes(),
+        pristine,
+        "a refused read-only import wrote to the board file"
+    );
+
+    estate.enforce("direct");
+    estate.grant(
+        "p-import",
+        &[
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+    for extra in [&[][..], &["--reconcile"][..]] {
+        let output = attempt(extra);
+        refused_silently(&output, &format!("tag-scoped import {extra:?}"));
+    }
+    assert_eq!(
+        board_bytes(),
+        pristine,
+        "a refused tag-scoped import wrote to the board file"
+    );
+    assert_eq!(
+        board_row_count("SELECT COUNT(*) FROM tasks"),
+        2,
+        "a refused import added a task row"
+    );
+    assert_eq!(
+        board_row_count(
+            "SELECT COUNT(*) FROM events WHERE kind IN ('tasks_imported','lease_seized')"
+        ),
+        0,
+        "a refused import left an audit event"
+    );
+
+    estate.enforce("direct");
+    estate.grant(
+        "p-import",
+        &[
+            (
+                "read",
+                vec![format!("board:{}", estate.id_a), "*".to_owned()],
+            ),
+            (
+                "write",
+                vec![format!("board:{}", estate.id_a), "*".to_owned()],
+            ),
+        ],
+    );
+    estate.enforce("managed");
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-secret", "--json"])["title"],
+        serde_json::json!("the import secret task"),
+        "a refused import overwrote the secret row before the owner ran",
+    );
+    let receipt = estate.ok_json(
+        &work_a,
+        &[
+            "import",
+            "atmux-json",
+            &source_arg,
+            "--as",
+            "seed",
+            "--reconcile",
+            "--json",
+        ],
+    );
+    assert_eq!(receipt["created"], serde_json::json!(1), "{receipt}");
+    assert_eq!(receipt["updated"], serde_json::json!(1), "{receipt}");
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-secret", "--json"])["title"],
+        serde_json::json!("an overwrite attempt"),
+    );
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-fresh", "--json"])["title"],
+        serde_json::json!("a fresh import row"),
+    );
+}

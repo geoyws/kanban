@@ -891,9 +891,11 @@ fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContex
 /// its id cannot be reused`, replacing the raw `UNIQUE constraint failed`.
 /// Under enforcement both answers are read-gated first, so a caller who
 /// cannot read the id's tags (the live tags, or the removal union for a
-/// removed id) gets the generic denial exactly like a never-created id,
-/// while a caller who can read keeps the plain message. Outside enforcement
-/// the guard cannot deny and the plain message stays.
+/// removed id) gets the generic denial — indistinguishable from any other
+/// unreadable id, but not from a free one, which succeeds: that residual is
+/// inherent while callers may choose ids in a shared namespace, and each
+/// such probe leaves an audited row. Outside enforcement the guard cannot
+/// deny and the plain message stays.
 pub(crate) fn refuse_reused_task_id(
     connection: &Connection,
     id: &str,
@@ -9185,6 +9187,55 @@ impl Store {
                 let (id, task_id) = row?;
                 out.push(format!(
                     "{table} row {id} references missing task {task_id}"
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// NULL-linked rows whose creation event names a task id that was removed
+    /// and is live again, as `doctor` reports them (ACC-14 A26). The V34
+    /// backfill deliberately leaves these at board scope — re-linking to the
+    /// new incarnation would re-parent surviving rows under the new row's
+    /// tags — so they are for the owner to review or remove, not to certify.
+    /// Board scope, in the `foreign_key_check` shape like `orphaned_task_links`:
+    /// the descriptions name tables and row ids, which is diagnostic rather
+    /// than row content, and a caller with no board read gets none of it.
+    /// Unlike an orphan, the named task is live, so under enforcement each
+    /// line is further filtered by the live row's real tags — a `doctor`
+    /// projection must not become the list of task ids a caller cannot
+    /// otherwise see.
+    pub fn reused_task_links(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
+        let mut out = Vec::new();
+        for (table, kind, key) in [
+            ("sitreps", "sitrep_posted", "$.sitrepID"),
+            ("handoffs", "handoff_created", "$.handoffID"),
+            ("deployments", "deployment_started", "$.deploymentID"),
+            ("attention", "attention_raised", "$.attentionID"),
+        ] {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT {table}.id,e.task_id FROM {table} \
+                 JOIN events e ON e.kind='{kind}' AND json_extract(e.payload,'{key}')={table}.id \
+                 WHERE {table}.task_id IS NULL AND e.task_id IS NOT NULL \
+                 AND EXISTS (SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id) \
+                 AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=e.task_id) \
+                 ORDER BY {table}.id"
+            ))?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, task_id) = row?;
+                if self.authz.is_enforcing()
+                    && !self
+                        .authz
+                        .permits_read(&task_tags(&self.connection, &task_id)?)
+                {
+                    continue;
+                }
+                out.push(format!(
+                    "{table} row {id} nulled from reused task {task_id}"
                 ));
             }
         }

@@ -58132,3 +58132,110 @@ fn compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it() {
         "doctor did not report the dangling task link: {links}"
     );
 }
+
+#[test]
+fn compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id() {
+    let fixture = Fixture::new("reused-task-link");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ReusedLink", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "secret", "--as", "seed", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "the reused secret task",
+            "--id",
+            "t-reused",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "reusedlink body on the removed secret task",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/reused-link-probe",
+            "--branch",
+            "main",
+            "--head",
+            "0000000000000000000000000000000000000000",
+            "--dirty",
+            "clean",
+            "--task",
+            "t-reused",
+            "--json",
+        ],
+    );
+    let removed = fixture.run(
+        &fixture.main,
+        &["task", "remove", "t-reused", "--as", "seed"],
+    );
+    assert!(
+        removed.status.success(),
+        "could not remove the secret task: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // What the reuse refusal now forbids, planted the way history left it: a
+    // pre-V34 removal nulled the sitrep link, and the id was re-added before
+    // the refusal existed, so the row is NULL-linked while its creation event
+    // names a removed-but-live-again id. The stale search documents go first:
+    // the delete trigger re-embeds surviving rows, so any re-INSERT would
+    // otherwise collide with the history index on its own documents.
+    let planted = Connection::open(&board).unwrap();
+    planted
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             UPDATE sitreps SET task_id=NULL WHERE task_id='t-reused';
+             DELETE FROM search_documents WHERE task_id='t-reused';
+             INSERT INTO tasks(id,type,title,status,created_at,updated_at)
+               VALUES('t-reused','task','reused incarnation','todo',1,1);",
+        )
+        .unwrap();
+    let sitrep_id: String = planted
+        .query_row("SELECT id FROM sitreps", [], |row| row.get(0))
+        .unwrap();
+    drop(planted);
+    // The old key stays quiet — the id has a removal record — and the new key
+    // names the row for the owner to review, refusing to certify the board.
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !checked.status.success(),
+        "doctor certified a board with a nulled row from a reused task id"
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(
+        report["projects"][0]["orphanedTaskLinks"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the reused id was reported as an orphan: {}",
+        report["projects"][0]["orphanedTaskLinks"]
+    );
+    let links = report["projects"][0]["reusedTaskLinks"].clone();
+    assert!(
+        links
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap()
+                == format!("sitreps row {sitrep_id} nulled from reused task t-reused")),
+        "doctor did not report the nulled row from the reused task id: {links}"
+    );
+}
