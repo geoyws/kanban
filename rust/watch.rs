@@ -332,31 +332,51 @@ fn resolve_with_source(
 
 /// What one poll observed, taken from a single database snapshot.
 ///
-/// `tail_seq` is the highest sequence the unfiltered tail saw in the same
-/// snapshot that produced `batch`, so every row up to it was offered to the
-/// filtered scan and rejected. That is what makes it safe to move the cursor
-/// there: the rows being stepped over are known non-matches, not rows that
-/// arrived after the filtered scan had already run.
+/// `tail_seq` is the furthest sequence the poll may move the cursor to
+/// without delivering: every row up to it is a known non-match — either the
+/// filtered scan examined it in this snapshot and rejected it, or the
+/// filtered scan's SQL could never have materialised it (a kinds, task or
+/// archival mismatch) and the tail walk confirmed it. That is what makes it
+/// safe to move the cursor there: the rows being stepped over were ruled
+/// out, not rows that arrived after the scan had already run.
 struct Poll {
     batch: Vec<Event>,
     tail_seq: Option<i64>,
 }
 
-/// Read one poll's batch and tail from one snapshot of one connection.
+/// Read one poll's batch and advance from one snapshot of one connection.
 ///
-/// The two reads used to run on two connections opened moments apart, which is
-/// two snapshots. A matching event committing between them was invisible to
-/// the filtered scan and visible to the tail, so the tail advanced the cursor
-/// past it and the next poll started after it. The event was never delivered
-/// and never reported missing. Both reads now sit inside one deferred read
-/// transaction, so a commit landing mid-poll is invisible to both and is
-/// picked up whole by the next poll.
+/// The board arm pairs one bounded [`Store::events_since_filtered_tail`]
+/// scan with one bounded unfiltered walk, and both reads sit in this one
+/// snapshot — so a commit landing mid-poll is invisible to both and is
+/// picked up whole by the next poll. (The two reads used to run on two
+/// connections opened moments apart — two snapshots — and a matching event
+/// committing between them was invisible to the filtered scan and visible
+/// to the tail, which advanced the cursor past it: never delivered, never
+/// reported missing. The registry arm below still has that two-snapshot
+/// history behind it and keeps its seam test; the board arm's pair shares
+/// one snapshot, and the walk stops at the first row the scan has not ruled
+/// out, so no interleaving left can step over a match.)
 fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
     match &spec.source {
         Source::Board { path, .. } => {
             let store = Store::open_readonly_as_caller(path)?;
             read_snapshot(&store, |store| {
-                let batch = store.events_since_filtered(
+                // The filtered scan examines a bounded raw stretch and
+                // reports how far it got; the unfiltered tail then walks at
+                // most `limit` rows past rows the scan already ruled out.
+                // Both reads sit in this one snapshot, so a commit landing
+                // mid-poll is invisible to both and is picked up whole by
+                // the next poll. (The two reads used to run on two
+                // connections opened moments apart — two snapshots — and a
+                // matching event committing between them was invisible to
+                // the filtered scan and visible to the tail, which advanced
+                // the cursor past it: never delivered, never reported
+                // missing. The registry arm below still has that two-scan
+                // shape and keeps its seam test; the board arm's filtered
+                // scan is capped but the window it shares with its tail is
+                // still exactly one snapshot.)
+                let tail = store.events_since_filtered_tail(
                     spec.key.selector_value.as_deref(),
                     &spec.key.kinds,
                     &spec.key.relations,
@@ -367,20 +387,40 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
                     spec.limit,
                     spec.key.archived,
                 )?;
-                let tail_seq = if batch.is_empty() && spec.follow {
-                    store
-                        .events_since(
-                            None,
-                            between_scans(&store.connection, cursor),
-                            spec.limit,
-                            spec.key.archived,
-                        )?
-                        .last()
-                        .map(|event| event.seq)
+                let mut advance = tail.scanned_through;
+                if tail.events.is_empty() && spec.follow {
+                    // Step over rows the filtered scan never materialised:
+                    // its SQL binds the kinds, task, archival and semantic
+                    // predicates, so a row those reject is a known
+                    // non-match without ever being read. The walk stops at
+                    // the first row past the examined range that MIGHT
+                    // still match — stepping over that one could skip a
+                    // visible row the capped scan has not reached — so the
+                    // cursor only ever covers ruled-out rows.
+                    for event in store.events_since(
+                        None,
+                        between_scans(&store.connection, cursor),
+                        spec.limit,
+                        spec.key.archived,
+                    )? {
+                        if event.seq <= tail.scanned_through
+                            || statically_rejected(&spec.key, &event)
+                        {
+                            advance = event.seq;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let tail_seq = if tail.events.is_empty() && spec.follow && advance != cursor {
+                    Some(advance)
                 } else {
                     None
                 };
-                Ok(Poll { batch, tail_seq })
+                Ok(Poll {
+                    batch: tail.events,
+                    tail_seq,
+                })
             })
         }
         Source::Registry { root } => {
@@ -411,9 +451,37 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
     }
 }
 
-/// Runs after a poll's filtered scan and before its tail scan, inside the
-/// poll's snapshot. Empty in every build but the unit tests, which use it to
-/// commit an event into exactly the window a two-snapshot poll used to leak.
+/// Whether this row can never match the poll's static predicates.
+///
+/// Only the equality predicates the SQL binds verbatim — kinds, task and
+/// archival — are answered here, from the same key the SQL was built from,
+/// so the two cannot disagree. The semantic predicates (relations, statuses,
+/// tags) stay SQL-side: a row those alone would reject is NOT reported
+/// rejected here, and the advance walk stops instead. That is conservative —
+/// the cursor may wait one more poll for the filtered scan's own examined
+/// range to carry it past such a row — and conservatism there is correctness,
+/// because guessing a JSON predicate in Rust is how a visible row gets
+/// skipped.
+fn statically_rejected(key: &StreamKey, event: &Event) -> bool {
+    if !key.kinds.is_empty() && !key.kinds.iter().any(|kind| kind == &event.kind) {
+        return true;
+    }
+    if let Some(task) = key.selector_value.as_deref()
+        && event.task_id.as_deref() != Some(task)
+    {
+        return true;
+    }
+    if event.archived && !key.archived {
+        return true;
+    }
+    false
+}
+
+/// Runs after the registry poll's filtered scan and before its tail scan,
+/// inside the poll's snapshot. Empty in every build but the unit tests, which
+/// use it to commit an event into exactly the window a two-snapshot poll used
+/// to leak. The board arm is a single scan and has no such window, so only
+/// the registry arm calls this.
 ///
 /// It returns the cursor the tail scan reads from, and is `#[must_use]`, so the
 /// tail scan consumes its result and the seam cannot drift after the tail scan
@@ -425,8 +493,8 @@ fn between_scans(_connection: &Connection, cursor: i64) -> i64 {
     cursor
 }
 
-/// Fires inside a poll's snapshot, between the two scans, and returns the
-/// cursor the tail scan then reads from.
+/// Fires inside the registry poll's snapshot, between the two scans, and
+/// returns the cursor the tail scan then reads from.
 #[cfg(test)]
 type BetweenScansHook = Box<dyn FnMut(&Connection, i64) -> i64>;
 

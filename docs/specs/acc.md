@@ -695,9 +695,16 @@ of more than 1` truncation notice, and `deploy list --status started --limit 1`
 and `--status failed --limit 1` each return the newest visible attempt —
 none of them naming the hidden rows — while the owner still reads the
 denied rows first on every listing, and granting
-`secret` restores exactly those rows to the caller. *When* no enforcement
-applies, *then* the listings keep their SQL bound and read exactly what
-they asked for, byte-identical.
+`secret` restores exactly those rows to the caller. *When* three hundred
+denied events sit ahead of the visible history, *then* board-wide `events
+--limit 5` still returns the five newest visible events newest-first, with
+no duplicates and the `showing 5 of more than 5` notice. *When* a restricted
+follower polls the tail over that denied stretch, *then* each scan examines
+a bounded page, the cursor advances past the denied rows already read, and
+the visible event waiting past the stretch is still delivered — a delay,
+never a skip, and never a re-read of the whole stretch. *When* no
+enforcement applies, *then* the listings keep their SQL bound and read
+exactly what they asked for, byte-identical.
 
 ## 5. Contracts and data
 
@@ -1034,3 +1041,19 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   until the readable bound is filled, following the attention listing's
   filter-first pattern; unmanaged boards keep the SQL bound, byte-identical,
   and the unbound `current_deployments` is unchanged.
+
+- 2026-09-25 — ACC-14 page-fill follow-up (`t-b694bc83` review): the chunked
+  scans now page by keyset instead of LIMIT/OFFSET — `seq < last` newest-first
+  and `seq > last` on the ascending tails, `(created_at, id)` on deployments —
+  inside one read snapshot per page, so each chunk is an indexed seek and a
+  write between chunks can neither duplicate nor skip a row. The
+  cursor-driven tails (`events_since_filtered` and the watch poll) cap the raw rows examined per scan and advance the cursor past
+  denied rows already read, so a long denied tail is walked a bounded page
+  per scan instead of re-read whole on every revision; advancing past denied
+  rows cannot skip a visible one, because the ascending cursor moves only
+  over rows its own snapshot examined. Pinned by the extended
+  `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` (three
+  hundred denied events ahead of the visible history, with a five-row
+  no-duplicates page) and the new
+  `store::tests::managed_ascending_tail_walks_a_denied_stretch_in_bounded_scans`
+  (A26).
