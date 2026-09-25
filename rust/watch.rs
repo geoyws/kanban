@@ -372,7 +372,7 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
                     cursor,
                     spec.limit,
                 )?;
-                let tail_seq = if batch.is_empty() {
+                let tail_seq = if batch.is_empty() && spec.follow {
                     registry
                         .rule_events_since(
                             spec.key.selector_value.as_deref(),
@@ -446,18 +446,23 @@ fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll>
             }
         }
     }
-    // No `follow` gate: a one-shot poll behind a denied stretch longer than
-    // the raw cap would otherwise come back empty with no cursor, and a
-    // consumer re-running `kb watch --cursor C` would re-read the same
-    // denied rows forever. The stream emits this advance as one `advanced`
-    // heartbeat — the envelope ADR-031 already obliges consumers to persist
-    // — so each run walks one more bounded page. Still silent when nothing
-    // moved: an empty poll at the head carries no cursor.
-    let tail_seq = if tail.events.is_empty() && advance != cursor {
-        Some(advance)
-    } else {
-        None
-    };
+    // The `follow` gate is gone only under managed enforcement: a one-shot
+    // poll behind a denied stretch longer than the raw cap would otherwise
+    // come back empty with no cursor, and a consumer re-running
+    // `kb watch --cursor C` would re-read the same denied rows forever. The
+    // stream emits this advance as one `advanced` heartbeat — the envelope
+    // ADR-031 already obliges consumers to persist — so each run walks one
+    // more bounded page. Only a managed scan caps its raw work per poll, so
+    // only there can an empty batch hide a denied stretch worth walking;
+    // anywhere else an empty one-shot stays silent, byte-identical to
+    // before. Still silent when nothing moved: an empty poll at the head
+    // carries no cursor either way.
+    let tail_seq =
+        if tail.events.is_empty() && advance != cursor && (spec.follow || store.is_enforcing()) {
+            Some(advance)
+        } else {
+            None
+        };
     Ok(Poll {
         batch: tail.events,
         tail_seq,
@@ -2217,6 +2222,58 @@ mod tests {
             decode_cursor(&second_out[0].cursor, &second.key).expect("decode event cursor"),
             last_visible,
             "the resumed run did not deliver the visible row past the denied stretch"
+        );
+    }
+
+    /// Off enforcement an empty one-shot stays silent, byte-identical to
+    /// before the heartbeat fix.
+    ///
+    /// No raw cap applies outside enforcement, so an empty batch means no
+    /// row the filter could deliver — never a denied stretch hiding past
+    /// the cap. The static walk still steps over kinds-rejected rows, but a
+    /// one-shot poll must not publish that step: a filtered replay resumed
+    /// from its last cursor prints nothing when nothing new matches, and
+    /// the e2e removed-subjects replay pins exactly that silence.
+    #[test]
+    fn an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows() {
+        let root = temp_watch_dir("oneshot-silence");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for seq in 1..=3 {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                "board_changed",
+                "codex",
+                "{}",
+                seq,
+            )
+            .expect("append an unmatched event");
+        }
+
+        let mut spec = follow_spec(&path, 1);
+        spec.follow = false;
+        let poll = poll_board_once(&store, &spec, 1).expect("one-shot poll");
+        assert!(poll.batch.is_empty());
+        assert_eq!(
+            poll.tail_seq, None,
+            "an unenforced one-shot carried a cursor where no denied stretch can hide"
+        );
+
+        let mut out = Vec::new();
+        stream_with(
+            &spec,
+            &mut |envelope| {
+                out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("an empty one-shot watch must terminate");
+        assert!(
+            out.is_empty(),
+            "an unenforced one-shot printed {} envelope(s) where it used to print none",
+            out.len()
         );
     }
 

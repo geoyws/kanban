@@ -125,10 +125,12 @@ Semantics:
 - Idle heartbeats do not advance the durable cursor. When predicates skip a
   committed tail with no matching event, an `advanced` heartbeat moves the
   opaque cursor to the last scanned row so follow mode does not rescan the same
-  unmatched rows forever. A one-shot run that scanned but delivered nothing
-  emits that heartbeat once and stops, so a polling consumer re-running from
-  the persisted cursor walks one more bounded page per run; an empty run at
-  the head stays silent. Continuing the scan past the raw cap inside one run
+  unmatched rows forever. On a managed board, a one-shot run that scanned
+  but delivered nothing emits that heartbeat once and stops, so a polling
+  consumer re-running from the persisted cursor walks one more bounded page
+  per run; an empty run at the head stays silent, and off enforcement an
+  empty one-shot stays silent too — only a capped scan can hide a denied
+  stretch worth walking. Continuing the scan past the raw cap inside one run
   is rejected: the cap bounds one scan's work, and any larger bound only
   moves the stall further out.
 - Secrets are redacted recursively before payloads are emitted.
