@@ -261,6 +261,19 @@ unchecked, known and unknown rows.
   existing board scope. Requirement wording is unchanged: this restores the
   authorize-as-the-containing-row rule the tag-checked writes already applied.
 
+- 2026-09-25 — replacing a task's dependency list keeps the edges the caller
+  cannot read (`update_task` in `rust/store.rs`): the new edges are still
+  authorized one by one as task-attach writes, but the delete drops only the
+  edges the caller could see and re-inserts the hidden ones beside the new
+  list, so a writer on the row cannot silently remove a gate the owner set.
+  Refusing the replacement instead would confirm a hidden edge exists, so the
+  write succeeds — keep over refuse. The receipt and the dependency listing
+  still withhold the kept edges while the gate keeps honouring every edge, so
+  a kept gate still blocks claims. `--clear-dependencies` arrives as an empty
+  list and keeps them the same way. Requirement wording is unchanged: this
+  restores the authorize-as-the-containing-row rule for the replacement the
+  whole-row delete had silently left.
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -613,6 +626,20 @@ not, through `task add` and through import, because the rows that outlive a
 removal keep the orphaned id and would otherwise re-parent under the new
 row's tags.
 
+### A2X — a dependency replacement keeps the edges the caller cannot read (`ACC-14`)
+
+*Given* the owner gates a `visible` task `t-visible` on a `secret` task
+`t-secret`, *when* a managed caller holding board read and write but no
+`secret` tag scope runs `task update t-visible --depends-on t-other` for a
+readable `t-other`, *then* the write succeeds — refusing would confirm a
+hidden edge exists — but the hidden edge survives: the caller's own
+`task show` still lists only `t-other` in `dependencies`, the update receipt
+names no hidden id, and `blockingGates` still carries `t-secret` as `todo`
+with its title blanked, so `claim t-visible` is still refused while
+`t-secret` is open. The owner still reads both `t-secret` and `t-other`.
+*When* no enforcement applies, *then* a replacement rewrites the whole list
+as before, because there is no hidden edge to keep.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -878,3 +905,15 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   refuses any id naming a live row, a `task_removed` record or any event
   history — read-gated under enforcement so a caller who cannot read the
   id's tags gets the generic denial — on `task add` and on import alike.
+
+- 2026-09-25 — ACC-14 dependency-replacement evidence landed (`t-c718c024`):
+  replacing a task's dependency list keeps the edges the caller cannot read
+  instead of deleting them, so a writer on the row cannot silently remove a
+  gate the owner set; the write still succeeds, because refusing would confirm
+  a hidden edge exists. The receipt and the listing still withhold the kept
+  edges while the gate keeps honouring every edge — pinned by
+  `dependency_replacement_keeps_a_tag_denied_prerequisite` (A2X). The parent
+  edge needs no such treatment — the row's own `parentID` carries it, so a
+  replacement drops an edge the caller already sees — and subscription
+  relations are create-only, with each target gated at add and no rewrite
+  path.
