@@ -287,6 +287,21 @@ unchecked, known and unknown rows.
   this restores the authorize-as-the-containing-row rule the tag-checked
   writes (claim, sprint attachment, deployment finish) already applied.
 
+- 2026-09-25 — paged listings whose rows are filtered per row
+  (`events_with_bounds`, `events_since_filtered`, `deployments`) apply the
+  caller's bound to the rows the caller may READ, not to the raw rows: under
+  managed enforcement the SQL `LIMIT` ran before the tag test, so a denied
+  row consumed a slot and the page came back short — `events --task
+  t-visible --limit 1` answered `[]` while newer visible history waited,
+  leaking hidden activity and its timing — and every caller's `+1`
+  truncation probe with it. The scan now pages through the SQL in chunks
+  until the bound is filled (`scan_visible` in `rust/store.rs`, following
+  the attention listing's pattern), keeping the probe correct; unmanaged
+  boards keep the SQL bound, byte-identical. `current_deployments` takes no
+  bound and is unchanged. Requirement wording is unchanged: this restores
+  the filter-before-truncate rule the attention, sitrep, handoff and
+  resolved listings already apply (`t-b694bc83`).
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -668,6 +683,22 @@ reads every surviving edge and can still drop any of them. *When* no
 enforcement applies, *then* a replacement rewrites the whole list as before,
 because there is no hidden or read-only edge to keep.
 
+### A26 — pages are bound by readable rows, not raw rows (`ACC-14`)
+
+*Given* a managed caller holding board read and the `visible` tag but no
+`secret` scope, *when* the two newest events
+concern a `secret` attention row raised and settled on the readable task
+`t-visible` and the newest deployment attempts name the denied task
+`t-secret`, *then* `events --task t-visible --limit 1` and board-wide
+`events --limit 1` each return the newest visible event with the `showing 1
+of more than 1` truncation notice, and `deploy list --status started --limit 1`
+and `--status failed --limit 1` each return the newest visible attempt —
+none of them naming the hidden rows — while the owner still reads the
+denied rows first on every listing, and granting
+`secret` restores exactly those rows to the caller. *When* no enforcement
+applies, *then* the listings keep their SQL bound and read exactly what
+they asked for, byte-identical.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -768,7 +799,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -988,3 +1019,18 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   still come from the permitted-only recomputation. The three comments that
   said denied rows are "never materialised" now state exactly what is and is
   not materialised.
+
+- 2026-09-25 — ACC-14 page-fill evidence landed (`t-b694bc83`):
+  `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` seeds
+  a `secret` attention row raised and settled on the readable `t-visible`
+  plus newer-denied deployment attempts beside older visible ones: a caller
+  holding board read and the `visible` tag gets a full page of visible rows
+  from `events --task`, board-wide `events` and `deploy list` with a true
+  `+1` truncation probe — while the owner still reads the denied rows first
+  and granting `secret` restores them (A26). The landing fixed the leak as a bug; requirement wording is
+  unchanged. The SQL `LIMIT` ran before the per-row tag test, so a denied
+  row consumed a page slot and `events --task t-visible --limit 1` answered
+  `[]` while visible history waited. The three listings now scan in chunks
+  until the readable bound is filled, following the attention listing's
+  filter-first pattern; unmanaged boards keep the SQL bound, byte-identical,
+  and the unbound `current_deployments` is unchanged.
