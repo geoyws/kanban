@@ -316,7 +316,7 @@ became a MUST on 2026-09-18. By layer,
 test at the layer §3 assigns it. WEB-40 moved from `unit` to `chrome` with
 `t-bf255880` wave 1.
 
-## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-61
+## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-62
 
 One row per requirement, on branch `docs/t-eed0a923-spa-spec` at 2026-09-19:
 commit `e3ae94a`. The specification is at `Draft — gate requested 2026-09-19`;
@@ -402,9 +402,10 @@ measures rather than re-pointed at the new one (SPA-51).
 | `SPA-59` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: seeds `t-rows-namespaced` tagged `ifca/aix-chat` and asserts exactly one `.tag-chip` on its row, `data-tag` the full slash spelling, `.tag-estate` reading `ifca` at computed opacity `0.75`, `.tag-sub` reading `aix-chat` at computed weight `700`. `the_card_reads_in_the_adr_042_order_in_real_chrome` asserts the same chip split on the deck eyebrow. |
 | `SPA-60` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the journey proves percent-encoded navigation generally — it follows the opaque id as `/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23` and the task page mounts. No route carries a tag yet (recon 2026-09-23: the Boards index lists no tags, the router names no tag parameter), so the rule is prospective and this case is its standing encoding proof, not a tag-URL assertion. |
 | `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
+| `SPA-62` | MUST | process | `attention_raise_stores_lane_and_list_matches_both_routes` | landed with `t-14e6feb7`, over the compiled binary: raises the three-route matrix above plus the no-stored-lane control, asserts the `--lane` listing returns exactly the three cards, asserts the stored value round-trips on show/JSON, and asserts an unused lane reads empty. |
 
-61 requirements: 61 MUST, no SHOULD and no MAY. By layer, 47 `chrome`, 6
-`http`, 5 `unit` and 3 `process`. A requirement *preserves* a `WEB-nn` when
+62 requirements: 62 MUST, no SHOULD and no MAY. By layer, 47 `chrome`, 6
+`http`, 5 `unit` and 4 `process`. A requirement *preserves* a `WEB-nn` when
 its specification `Source` line says so, which excludes SPA-51 — it retires
 two WEB requirements rather than preserving any: on that rule 42 requirements
 preserve at least one `WEB-nn` (SPA-10, SPA-13, SPA-14..SPA-47 and
@@ -583,7 +584,7 @@ each row says `no e2e coverage` plainly.
 
 7 requirements: 7 MUST, no SHOULD or MAY. The sixth kind raises, lists, shows,
 resolves, reopens and migrates through the existing attention machinery; the
-board schema stands at 33.
+board schema stands at 34.
 
 ## Watch coverage note
 

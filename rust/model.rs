@@ -1776,6 +1776,10 @@ pub struct Attention {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check: Option<AttentionCheck>,
     pub raised_by: String,
+    /// The lane `--lane` named at raise (SPA-62), or `None` when the card
+    /// was raised without one — as every pre-v34 row was. A `None` row still
+    /// reads through the raiser-suffix and task-lane routes.
+    pub lane: Option<String>,
     pub created_at: i64,
     pub status: String,
     pub priority: i64,

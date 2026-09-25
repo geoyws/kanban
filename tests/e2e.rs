@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 33);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 33);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 33);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 34);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 34);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 34);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -21372,6 +21372,189 @@ fn a_listing_can_be_narrowed_to_a_lane_and_projected_to_the_keys_asked_for() {
         assert_eq!(kind("fields"), "value");
         assert_eq!(kind("no-body"), "boolean");
     }
+}
+
+#[test]
+fn attention_raise_stores_lane_and_list_matches_both_routes() {
+    // SPA-62 (A18): a raised card carries its lane, and the lane queue reads
+    // the stored lane and both older routes — raiser `<anything>@<lane>`,
+    // or the task the row is about carrying that lane.
+    let fixture = Fixture::new("attention-lane-queue");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LANES", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Lane work",
+            "--id",
+            "t-lane",
+            "--lane",
+            "driver-2",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Unlaned work", "--id", "t-plain", "--json"],
+    );
+    let raise = |args: &[&str]| fixture.ok_json(&fixture.main, args);
+    // Route one: the stored lane, by an actor with no lane suffix, about no
+    // task, so neither older route can claim it.
+    let stored = raise(&[
+        "attention",
+        "raise",
+        "stored route",
+        "--as",
+        "geoyws",
+        "--lane",
+        "driver-2",
+        "--json",
+    ]);
+    assert_eq!(stored["lane"], "driver-2");
+    // Route two: no stored lane, raiser `worker@driver-2`, untagged task.
+    let by_raiser = raise(&[
+        "attention",
+        "raise",
+        "raiser route",
+        "--as",
+        "worker@driver-2",
+        "--task",
+        "t-plain",
+        "--json",
+    ]);
+    assert!(by_raiser["lane"].is_null(), "{}", by_raiser);
+    // Route three: no stored lane, about the lane's task, raised by a laned
+    // actor of another lane.
+    let by_task = raise(&[
+        "attention",
+        "raise",
+        "task route",
+        "--as",
+        "worker@driver-3",
+        "--task",
+        "t-lane",
+        "--json",
+    ]);
+    assert!(by_task["lane"].is_null(), "{}", by_task);
+    // A fourth card in no route to `driver-2`.
+    raise(&[
+        "attention",
+        "raise",
+        "elsewhere",
+        "--as",
+        "worker@driver-3",
+        "--task",
+        "t-plain",
+        "--json",
+    ]);
+    let id_of = |row: &Value| row["id"].as_str().unwrap().to_owned();
+    let stored_id = id_of(&stored);
+    let by_raiser_id = id_of(&by_raiser);
+    let by_task_id = id_of(&by_task);
+
+    let mut ids: Vec<String> = raise(&["attention", "list", "--lane", "driver-2", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(id_of)
+        .collect();
+    ids.sort();
+    let mut expected = vec![stored_id.clone(), by_raiser_id.clone(), by_task_id.clone()];
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "the lane queue reads all three routes and no fourth"
+    );
+    // The stored value round-trips on show and on the listing's JSON row.
+    assert_eq!(
+        raise(&["attention", "show", stored_id.as_str(), "--json"])["lane"],
+        "driver-2"
+    );
+    assert!(raise(&["attention", "show", by_raiser_id.as_str(), "--json"])["lane"].is_null());
+    let listed = raise(&["attention", "list", "--lane", "driver-2", "--json"]);
+    let listed_stored = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == stored_id)
+        .unwrap();
+    assert_eq!(listed_stored["lane"], "driver-2");
+    // A lane no row uses reads empty rather than an error.
+    let empty = raise(&["attention", "list", "--lane", "driver-9", "--json"]);
+    assert_eq!(empty.as_array().unwrap().len(), 0);
+
+    // Control: the same three shapes raised without any stored lane answer
+    // exactly as before this change — the two older routes and nothing else.
+    let control = Fixture::new("attention-lane-queue-control");
+    control.ok_json(&control.main, &["init", "--name", "LANES", "--json"]);
+    control.ok_json(
+        &control.main,
+        &[
+            "task",
+            "add",
+            "Lane work",
+            "--id",
+            "t-lane",
+            "--lane",
+            "driver-2",
+            "--json",
+        ],
+    );
+    control.ok_json(
+        &control.main,
+        &["task", "add", "Unlaned work", "--id", "t-plain", "--json"],
+    );
+    let raise_control = |args: &[&str]| control.ok_json(&control.main, args);
+    raise_control(&[
+        "attention",
+        "raise",
+        "stored route",
+        "--as",
+        "geoyws",
+        "--json",
+    ]);
+    let control_raiser = id_of(&raise_control(&[
+        "attention",
+        "raise",
+        "raiser route",
+        "--as",
+        "worker@driver-2",
+        "--task",
+        "t-plain",
+        "--json",
+    ]));
+    let control_task = id_of(&raise_control(&[
+        "attention",
+        "raise",
+        "task route",
+        "--as",
+        "worker@driver-3",
+        "--task",
+        "t-lane",
+        "--json",
+    ]));
+    raise_control(&[
+        "attention",
+        "raise",
+        "elsewhere",
+        "--as",
+        "worker@driver-3",
+        "--task",
+        "t-plain",
+        "--json",
+    ]);
+    let mut control_ids: Vec<String> =
+        raise_control(&["attention", "list", "--lane", "driver-2", "--json"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(id_of)
+            .collect();
+    control_ids.sort();
+    let mut control_expected = vec![control_raiser, control_task];
+    control_expected.sort();
+    assert_eq!(control_ids, control_expected);
 }
 
 #[test]

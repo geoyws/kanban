@@ -1398,6 +1398,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         },
         check: attention_check(row)?,
         raised_by: row.get("raised_by")?,
+        lane: row.get("lane")?,
         created_at: row.get("created_at")?,
         status: row.get("status")?,
         priority: row.get("priority")?,
@@ -6413,6 +6414,7 @@ impl Store {
         tags: &[String],
         card: &DecisionCard,
         check_input: Option<&AttentionCheckInput>,
+        lane: Option<&str>,
     ) -> Result<Attention> {
         // Authorization is the first observable decision: an unauthorized caller
         // must not learn which check field or semantic rule its input violates.
@@ -6421,6 +6423,9 @@ impl Store {
         validate_priority(Some(priority))?;
         let body = nonempty(body, "attention body")?.to_owned();
         let raised_by = nonempty(raised_by, "raised by")?.to_owned();
+        // Validated with the listing's own filter, so raise and list refuse
+        // the same empty value with the same sentence.
+        let lane = lane.map(lane_filter).transpose()?.map(str::to_owned);
         // Before the write lock: malformed card/check definitions are refused
         // without taking it, after authorization has hidden their validators.
         card.validate()?;
@@ -6438,7 +6443,7 @@ impl Store {
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision,check_question,check_choices,check_answer,check_explanation,check_about) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL,?,?,?,?,?)",
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision,check_question,check_choices,check_answer,check_about,lane) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL,?,?,?,?,?,?)",
             params![
                 id,
                 task_id,
@@ -6455,6 +6460,7 @@ impl Store {
                 check.and_then(|value| value.answer.as_deref()),
                 check.and_then(|value| value.explanation.as_deref()),
                 check.map(|value| value.about.as_str()),
+                lane,
             ],
         )?;
         set_attention_tags(&transaction, &id, tags)?;
@@ -6463,7 +6469,7 @@ impl Store {
             task_id,
             "attention_raised",
             Some(&raised_by),
-            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority), "tags": tags, "choices": card.choices}),
+            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority), "tags": tags, "choices": card.choices, "lane": lane}),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
@@ -6479,10 +6485,11 @@ impl Store {
     /// age breaks priority ties oldest-first. Explicit priority comes first:
     /// a new P0 must not sit behind an old routine P2.
     ///
-    /// `lane` is the kb-att rule: a row belongs to a lane when its raiser is
-    /// `<anything>@<lane>` or when the task it is about carries that lane.
-    /// Both routes are one SQL clause, so `limit` bounds the lane's rows and
-    /// not a page that was filtered after the fact.
+    /// `lane` is the kb-att rule: a row belongs to a lane when its stored
+    /// lane matches, when its raiser is `<anything>@<lane>`, or when the task
+    /// it is about carries that lane. All three routes are one SQL clause, so
+    /// `limit` bounds the lane's rows and not a page that was filtered after
+    /// the fact.
     ///
     /// A row whose tags this caller may not read is not in the answer, on the
     /// same all-of-tag test a named read is refused with, and exactly as
@@ -6797,12 +6804,15 @@ impl Store {
             // `substr` with a negative start counts from the end, so this is
             // an exact suffix test that no `%` or `_` in the lane can widen the
             // way LIKE would. The suffix is bound twice because every other
-            // placeholder in this statement is positional.
+            // placeholder in this statement is positional; the stored lane
+            // compares directly, and a `NULL` stored lane never matches it.
             clauses.push(
-                "(substr(raised_by, -length(?)) = ? \
+                "(lane=? \
+                 OR substr(raised_by, -length(?)) = ? \
                  OR task_id IN (SELECT id FROM tasks WHERE lane=?))",
             );
             let lane = lane_filter(lane)?;
+            values.push(Box::new(lane.to_owned()));
             values.push(Box::new(format!("@{lane}")));
             values.push(Box::new(format!("@{lane}")));
             values.push(Box::new(lane.to_owned()));
@@ -6848,6 +6858,8 @@ impl Store {
     /// Correct an open attention row without settling it. The event retains
     /// the text, tags and card that were superseded; resolved rows are
     /// immutable.
+    /// The lane is set once at raise and stays out of this update:
+    /// re-queueing a card into another lane is a new raise, not a correction.
     ///
     /// A card arrives as the halves the caller named: the question/context
     /// pair replaces the row's pair when it is given, and the choices replace
@@ -10067,6 +10079,7 @@ mod tests {
                 &["beta".to_owned()],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("seed attention");
             b.add_note("t-b", "seed", "progress", "a note on the other board")
@@ -10183,6 +10196,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 None,
+                None,
             ),
             "attention raise",
         );
@@ -10207,6 +10221,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 Some(&malformed),
+                None,
             ),
             "attention raise malformed check",
         );
@@ -10477,6 +10492,7 @@ mod tests {
                 &["visible".to_owned()],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("raise visible");
             // More urgent than every readable row, so a SQL `LIMIT` bound
@@ -10490,6 +10506,7 @@ mod tests {
                     0,
                     &["secret".to_owned()],
                     &DecisionCard::default(),
+                    None,
                     None,
                 )
                 .expect("raise secret")
@@ -10507,6 +10524,7 @@ mod tests {
                     &["visible".to_owned()],
                     &DecisionCard::default(),
                     None,
+                    None,
                 )
                 .expect("raise another visible");
             }
@@ -10519,6 +10537,7 @@ mod tests {
                 &["visible".to_owned(), "secret".to_owned()],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("raise both");
             secret_resolved = seed
@@ -10530,6 +10549,7 @@ mod tests {
                     1,
                     &["secret".to_owned()],
                     &DecisionCard::default(),
+                    None,
                     None,
                 )
                 .expect("raise secret decision")
@@ -10545,6 +10565,7 @@ mod tests {
                     1,
                     &["visible".to_owned()],
                     &DecisionCard::default(),
+                    None,
                     None,
                 )
                 .expect("raise visible decision")
@@ -10789,6 +10810,7 @@ mod tests {
                     1,
                     &[tag.to_owned()],
                     &DecisionCard::default(),
+                    None,
                     None,
                 )
                 .expect("raise")
@@ -11263,6 +11285,7 @@ mod tests {
                 &["alpha".to_owned()],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("seed attention")
         };
@@ -11417,6 +11440,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("raise web attention");
         let cli_attention = store
@@ -11429,6 +11453,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("raise cli attention");
         let forbidden_attention = store
@@ -11440,6 +11465,7 @@ mod tests {
                 0,
                 &[],
                 &DecisionCard::default(),
+                None,
                 None,
             )
             .expect("raise forbidden attention");
@@ -14724,6 +14750,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .unwrap();
 
@@ -15264,7 +15291,11 @@ mod tests {
         store.initialize("LANES", "geoyws").unwrap();
         insert_lane_task(&store, "t-lane", Some("driver-2"));
         insert_lane_task(&store, "t-other", Some("driver-3"));
-        let raise = |store: &mut Store, body: &str, raiser: &str, task: Option<&str>| {
+        let raise = |store: &mut Store,
+                     body: &str,
+                     raiser: &str,
+                     task: Option<&str>,
+                     lane: Option<&str>| {
             store
                 .raise_attention(
                     body,
@@ -15275,19 +15306,37 @@ mod tests {
                     &[],
                     &DecisionCard::default(),
                     None,
+                    lane,
                 )
                 .expect("raise")
-                .id
         };
         // Route one: the raiser is `<name>@driver-2`, about no task.
-        let by_raiser = raise(&mut store, "raiser route", "worker@driver-2", None);
+        let by_raiser = raise(&mut store, "raiser route", "worker@driver-2", None, None);
         // Route two: raised by someone else, about a task in driver-2.
-        let by_task = raise(&mut store, "task route", "geoyws", Some("t-lane"));
+        let by_task = raise(&mut store, "task route", "geoyws", Some("t-lane"), None);
+        // Route three: the stored lane, by a raiser with no suffix and about
+        // no task, so neither older route can claim it.
+        let stored = raise(&mut store, "stored route", "geoyws", None, Some("driver-2"));
         // Neither: the raiser's lane is another, and so is the task's.
-        raise(&mut store, "elsewhere", "worker@driver-3", Some("t-other"));
+        raise(
+            &mut store,
+            "elsewhere",
+            "worker@driver-3",
+            Some("t-other"),
+            None,
+        );
         // `driver-2` is a suffix of `@driver-2` only after the `@`: a raiser
         // in a lane that merely ends the same way must not match.
-        raise(&mut store, "near miss", "worker@xdriver-2", None);
+        raise(&mut store, "near miss", "worker@xdriver-2", None, None);
+        // The stored value round-trips on the row itself: present when named
+        // at raise, absent on every row raised without `--lane`.
+        assert_eq!(stored.lane.as_deref(), Some("driver-2"));
+        assert_eq!(by_raiser.lane, None);
+        assert_eq!(by_task.lane, None);
+        assert_eq!(
+            store.show_attention(&stored.id).unwrap().lane.as_deref(),
+            Some("driver-2")
+        );
 
         let ids = |lane: Option<&str>, limit: i64| {
             store
@@ -15299,14 +15348,14 @@ mod tests {
         };
         let mut matched = ids(Some("driver-2"), 100);
         matched.sort();
-        let mut expected = vec![by_raiser.clone(), by_task.clone()];
+        let mut expected = vec![by_raiser.id.clone(), by_task.id.clone(), stored.id.clone()];
         expected.sort();
         assert_eq!(matched, expected);
         // The filter is applied before the limit, not to a page after it.
         assert_eq!(ids(Some("driver-2"), 1).len(), 1);
         assert!(expected.contains(&ids(Some("driver-2"), 1)[0]));
         assert_eq!(ids(Some("driver-3"), 100).len(), 1);
-        assert_eq!(ids(None, 100).len(), 4, "no filter is every row");
+        assert_eq!(ids(None, 100).len(), 5, "no filter is every row");
     }
 
     /// One artifact-identity attempt and one Git attempt on the same board,
@@ -16326,6 +16375,7 @@ mod tests {
                         &[],
                         &DecisionCard::default(),
                         Some(&input),
+                        None,
                     )
                     .unwrap();
                 let key = if index < correct { "store" } else { "client" };
@@ -16356,6 +16406,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 Some(&open_input),
+                None,
             )
             .unwrap();
         let plain = store
@@ -16367,6 +16418,7 @@ mod tests {
                 0,
                 &[],
                 &DecisionCard::default(),
+                None,
                 None,
             )
             .unwrap();
@@ -16446,6 +16498,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 Some(&original_input),
+                None,
             )
             .unwrap();
         assert_eq!(raised.check.as_ref(), Some(&original));
@@ -16683,6 +16736,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 Some(&native_check_input(&original)),
+                None,
             )
             .unwrap();
         // The web card's write path records the one answer while the row is
@@ -16810,6 +16864,7 @@ mod tests {
                 &[],
                 &DecisionCard::default(),
                 Some(&native_check_input(&original)),
+                None,
             )
             .unwrap();
         fn stored_check(store: &Store, id: &str) -> Option<AttentionCheck> {

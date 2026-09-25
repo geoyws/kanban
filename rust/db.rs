@@ -2248,6 +2248,17 @@ BEGIN
  SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
 END;
 "#;
+/// The lane a card was raised in (SPA-62): one nullable `lane` on `attention`,
+/// forward-only, existing rows `NULL`.
+///
+/// A plain `ALTER TABLE` on the `BOARD_V32` precedent: no CHECK names the
+/// column and no trigger reads it, so there is nothing to rebuild. A row
+/// raised without `--lane` stores `NULL` exactly as every pre-v34 row does,
+/// and keeps reading through the raiser-suffix and task-lane routes.
+const BOARD_V34: &str = r#"
+ALTER TABLE attention ADD COLUMN lane TEXT;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
@@ -2549,7 +2560,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 33;
+pub const BOARD_SCHEMA_VERSION: usize = 34;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -3088,6 +3099,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
+    BOARD_V34,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4519,6 +4531,54 @@ mod tests {
                 .contains("attention check result must be absent or complete"),
             "{stranded}"
         );
+    }
+
+    #[test]
+    fn v34_lane_column_is_nullable_and_old_rows_keep_reading() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..33]).expect("migrate through v33");
+        assert_eq!(schema_version(&connection).unwrap(), 33);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6)",
+                [],
+            )
+            .expect("insert a pre-lane row");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        // The old row survived with no stored lane, so it keeps reading
+        // through the raiser-suffix and task-lane routes.
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-old'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lane, None);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,lane
+                 ) VALUES('a-new','decision','body','geoyws',2,'open',0,6,'driver-2')",
+                [],
+            )
+            .expect("insert a stored-lane row");
+        let matched: Vec<String> = connection
+            .prepare(
+                "SELECT id FROM attention WHERE lane=? \
+                 OR substr(raised_by, -length(?)) = ? \
+                 OR task_id IN (SELECT id FROM tasks WHERE lane=?)",
+            )
+            .unwrap()
+            .query_map(["driver-2", "@driver-2", "@driver-2", "driver-2"], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matched.contains(&"a-old".to_owned()), "{matched:?}");
+        assert!(matched.contains(&"a-new".to_owned()), "{matched:?}");
     }
 
     fn index_sql(connection: &Connection, name: &str) -> String {

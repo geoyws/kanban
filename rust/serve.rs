@@ -2327,6 +2327,7 @@ mod tests {
                 &["ops".to_owned(), "release".to_owned()],
                 &DecisionCard::default(),
                 None,
+                None,
             )
             .expect("raise attention");
         store
@@ -3863,6 +3864,7 @@ mod tests {
                         0,
                         &[],
                         &DecisionCard::default(),
+                        None,
                         None,
                     )
                     .expect("raise an open item");
@@ -5409,6 +5411,7 @@ mod tests {
                         0,
                         &[AUTHZ_TAG.to_owned()],
                         &DecisionCard::default(),
+                        None,
                         None,
                     )
                     .expect("raise an open item")

@@ -205,7 +205,7 @@ Usage:
   kanban rule consolidate --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk|complaint]
              [--priority P0|P1|P2|0-9]
-             [--task ID] [--tag NAME ...] [--json]
+             [--task ID] [--lane LANE] [--tag NAME ...] [--json]
              [--question TEXT --context TEXT]
              [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
              [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
@@ -1313,6 +1313,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "as",
             "kind",
             "task",
+            "lane",
             "priority",
             "tag",
             "question",
@@ -4373,7 +4374,7 @@ const TASK_GATED_FIELDS: [(&str, &str); 3] = [
 ];
 
 /// The keys of one `attention list` row, exactly as a caller sees them.
-const ATTENTION_FIELDS: [&str; 22] = [
+const ATTENTION_FIELDS: [&str; 23] = [
     "id",
     "taskID",
     "kind",
@@ -4383,6 +4384,7 @@ const ATTENTION_FIELDS: [&str; 22] = [
     "choices",
     "check",
     "raisedBy",
+    "lane",
     "createdAt",
     "status",
     "priority",
@@ -7439,6 +7441,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 &args.many("tag"),
                 &args.decision_card()?,
                 Some(&check_input),
+                args.one("lane"),
             )?,
             args.has("json"),
         );
@@ -9853,6 +9856,7 @@ mod tests {
                 answered_at: None,
             }),
             raised_by: "worker@driver-2".into(),
+            lane: None,
             created_at: 1,
             status: "open".into(),
             priority: 0,

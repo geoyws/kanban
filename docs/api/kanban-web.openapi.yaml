@@ -1699,6 +1699,10 @@ components:
             projection carries the full definition and result triple, and a
             reopen returns the row to the redacted shape.
         raisedBy: { type: string }
+        lane:
+          type: string
+          nullable: true
+          description: The lane `attention raise --lane` named (SPA-62); `null` on rows raised without one, as every pre-v34 row is. Additive — the projection stays `v1`.
         createdAt: { $ref: "#/components/schemas/EpochMillis" }
         status: { type: string }
         priority: { type: integer }

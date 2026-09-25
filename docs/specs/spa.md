@@ -421,6 +421,27 @@ The page carries exactly one `role=status` connection line, whose text is only e
 state, and exactly one separate `role=log` region that carries notices and receipts. Neither
 claims the other's role, and no third live region exists.
 
+### The lane queue
+
+**SPA-62** — a raised card carries its lane, and the lane queue reads every route to it.
+Strength: MUST · Layer: process · Source: George 2026-09-25 walkthrough decision
+`a-009521bc` (stored `--lane` on raise, both-match on list); feeds SPA-06's CLI-side
+queue comparison.
+`attention raise --lane LANE` persists the lane on the row; omitted, the row carries
+no stored lane and every existing row keeps reading exactly as before. `attention list
+--lane LANE` returns a row when the stored lane matches OR when either existing route
+matches — raiser `<anything>@<lane>`, or the task the row is about carrying that lane —
+in one SQL clause, so `limit` bounds the lane's rows and not a page filtered after the
+fact. Refusal wording is unchanged: an unknown flag, a malformed lane value and the
+existing validation sentences stay byte-identical.
+*Data rules:* the attention row gains one nullable `lane`; schema `33` → `34`,
+forward-only, existing rows `NULL`. The JSON projection carries `lane` (additive —
+`null` on legacy rows — so the projection stays `v1` and `docs/api/kanban-web.openapi.yaml`
+gains the field without a version move). The `attention_raised` event payload carries
+`lane` for receipts.
+*Note:* landed 2026-09-26 with `t-14e6feb7`, proved by
+`attention_raise_stores_lane_and_list_matches_both_routes` (§8).
+
 ### The read pages
 
 **SPA-35** — a row is a title and one sentence, with one pill.
@@ -909,6 +930,18 @@ task page mounts; no tag or id ever travels as two bare segments.
 *then* the clause reads `tagged ifca/aix-chat` with a slash, and the same slash spelling is
 what every chip's text and `data-tag` carry — nowhere does the hyphen form appear.
 
+### A18 — the lane queue reads the stored lane and both older routes (SPA-62)
+
+*Given* a board where lane `driver-2` owns task `t-lane`, a card raised with
+`--lane driver-2` by an actor with no lane suffix, a card raised without `--lane`
+by `worker@driver-2` on an untagged task, and a card raised without `--lane` on
+`t-lane` by a laned actor of another lane,
+*when* the operator lists `--lane driver-2`,
+*then* all three cards are returned and no fourth is; *when* the same three cards
+are raised without any stored lane, *then* the listing answers exactly as before
+this change; *and when* `--lane` names no lane any row uses, *then* the listing is
+empty rather than an error.
+
 ### Categories deliberately not exercised here, and why
 
 - **Authentication and session handling.** Not applicable: kanban implements none and there is no
@@ -917,8 +950,9 @@ what every chip's text and `data-tag` carry — nowhere does the hyphen form app
 - **Multi-user concurrency and tenancy isolation.** Not applicable: there is one operator. The
   concurrency that does exist — agent lanes writing to the ledger while the operator reads it —
   is exercised by A7 and A8, which are the two ways it reaches the browser.
-- **Migration and rollback of stored data.** Not applicable: this slice stores nothing and
-  migrates nothing (§5).
+- **Migration and rollback of stored data.** Applicable to exactly one change: schema
+  `34` adds the nullable `lane` column on `attention` (SPA-62), forward-only, existing
+  rows `NULL`. Everything else in this slice stores nothing and migrates nothing (§5).
 - **Load, capacity and failover.** Deliberately unexercised: ADR-048 §3 says plainly that this
   change does not reduce measured server CPU and was not chosen for that, and ADR-047 §9 forbids
   inventing a commitment here. §7 OQ-5 carries the one number that is in scope.
@@ -941,9 +975,12 @@ what every chip's text and `data-tag` carry — nowhere does the hyphen form app
   (SPA-09, SPA-49). The ADR-042 §5 card order is preserved in the rendered card (SPA-51). The
   decision record and its resolution stay derived by the store's composer, never by the client
   (SPA-20).
-- **Migration:** none. No board schema change, no column, no event kind, no stored-shape change
-  in either direction. The change is entirely in how the same data reaches the same reader.
-- **Compatibility:** the CLI and MCP surfaces are untouched and see the same boards. A browser
+- **Migration:** schema `33` → `34`: one nullable `lane` column on `attention`, no
+  backfill (existing rows keep reading through the raiser-suffix and task-lane routes),
+  forward migration only. No column, event kind or stored shape changes in either
+  direction beyond that.
+- **Compatibility:** the CLI gains exactly one flag (`attention raise --lane`) and the
+  MCP surface is untouched and sees the same boards. A browser
   with scripting disabled loses the page (SPA-51) — that is the one compatibility loss, accepted
   by ADR-048 §6 and recorded rather than mitigated. Whether the server-rendered pages stay
   reachable during the cutover is §7 OQ-2, owned by `t-1f495a7f`.
@@ -1077,15 +1114,16 @@ row that must write one.
 | `SPA-59` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: seeds `t-rows-namespaced` tagged `ifca/aix-chat` and asserts exactly one `.tag-chip` on its row, `data-tag` the full slash spelling, `.tag-estate` reading `ifca` at computed opacity `0.75`, `.tag-sub` reading `aix-chat` at computed weight `700`. `the_card_reads_in_the_adr_042_order_in_real_chrome` asserts the same chip split on the deck eyebrow. |
 | `SPA-60` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the journey proves percent-encoded navigation generally — it follows the opaque id as `/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23` and the task page mounts. No route carries a tag yet (recon 2026-09-23: the Boards index lists no tags, the router names no tag parameter), so the rule is prospective and this case is its standing encoding proof, not a tag-URL assertion. |
 | `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
+| `SPA-62` | MUST | process | `attention_raise_stores_lane_and_list_matches_both_routes` | landed with `t-14e6feb7`, over the compiled binary: raises the three-route matrix above plus the no-stored-lane control, asserts the `--lane` listing returns exactly the three cards, asserts the stored value round-trips on show/JSON, and asserts an unused lane reads empty. |
 
-**Counts.** 61 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 47 `chrome`, 6
-`http`, 5 `unit`, 3 `process`. By group: identity 3 (`SPA-01`..`SPA-03`), readiness 2
+**Counts.** 62 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 47 `chrome`, 6
+`http`, 5 `unit`, 4 `process`. By group: identity 3 (`SPA-01`..`SPA-03`), readiness 2
 (`SPA-04`..`SPA-05`), the JSON projection 8 (`SPA-06`..`SPA-13`), the Needs-you deck 21
 (`SPA-14`..`SPA-34`), the read pages 8 (`SPA-35`..`SPA-42`), decided/plans/subscriptions/sprints
 and deployments 5 (`SPA-43`..`SPA-47`), the live channel 2 (`SPA-48`..`SPA-49`), payload 1
 (`SPA-50`), what is retired 1 (`SPA-51`), the rendered result keeping ADR-046 6
-(`SPA-52`..`SPA-57`), a board that cannot be read 1 (`SPA-58`), and tag namespaces 3
-(`SPA-59`..`SPA-61`).
+(`SPA-52`..`SPA-57`), a board that cannot be read 1 (`SPA-58`), tag namespaces 3
+(`SPA-59`..`SPA-61`), and the lane queue 1 (`SPA-62`).
 
 **How the WEB figures below are counted.** A requirement *preserves* a `WEB-nn` when its
 `Source` line says so; `SPA-51` is excluded because it retires two WEB requirements rather than
@@ -1197,3 +1235,9 @@ absent from both the detail and the index).
   hyphen form is superseded here. §8 names the three carrier cases and A15–A17 prove one
   requirement each.
   `docs/testing/compiled-rust-e2e-matrix.md` carries the same rows verbatim.
+- `2026-09-26` — `t-14e6feb7` added `SPA-62` (the lane queue): `attention raise --lane`
+  persists the lane (schema `34`, nullable, existing rows `NULL`), and `attention list
+  --lane` matches the stored lane or either older route in one SQL clause. A18 proves the
+  three-route matrix plus the no-stored-lane control. §8 names
+  `attention_raise_stores_lane_and_list_matches_both_routes`, and
+  `docs/testing/compiled-rust-e2e-matrix.md` carries the same row verbatim.
