@@ -8600,6 +8600,24 @@ fn managed_pages_fill_past_denied_rows_with_a_true_truncation_probe() {
             [],
         )
         .unwrap();
+    // Three hundred denied events about the `secret` task, newer than every
+    // visible one: plain task-scoped rows carry their task's live tags, so a
+    // caller without `secret` sees none of them. Together with the two
+    // denied attention envelopes raised below, the visible history sits more
+    // than one 256-row scan chunk down — every page that fills past them
+    // crosses a chunk boundary.
+    for index in 0..300 {
+        board
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES('t-secret','task_updated','seed','{}',?1,0,'0000000000000000000000000000000000000000000000000000000000000000',?2)",
+                rusqlite::params![
+                    2_100_000_i64 + index,
+                    format!("{:064x}", 2_000_000 + index),
+                ],
+            )
+            .unwrap();
+    }
     drop(board);
 
     // Two newest events, both denied: a `secret` attention row raised on the
@@ -8762,6 +8780,38 @@ fn managed_pages_fill_past_denied_rows_with_a_true_truncation_probe() {
     assert!(
         String::from_utf8_lossy(&board_page.stderr).contains("showing 1 of more than 1"),
         "the board page hid its truncation: {board_stdout}"
+    );
+    // A wider board page across the same stretch: five visible rows, no
+    // duplicates across the chunk boundary, still newest-first from the
+    // newest visible event, and an honest truncation flag. Three hundred
+    // denied rows sit ahead of it, so filling this page crosses two chunk
+    // boundaries.
+    let wide_page = estate.run(&work_a, &["events", "--limit", "5", "--all", "--json"]);
+    assert!(wide_page.status.success());
+    let wide_stdout = String::from_utf8_lossy(&wide_page.stdout).into_owned();
+    let wide_rows: Vec<Value> = serde_json::from_str(&wide_stdout).unwrap();
+    let wide_seqs: Vec<i64> = wide_rows
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        wide_seqs,
+        vec![
+            newest_visible,
+            newest_visible - 1,
+            newest_visible - 2,
+            newest_visible - 3,
+            newest_visible - 4,
+        ],
+        "the wide board page duplicated or skipped visible rows across chunks: {wide_stdout}"
+    );
+    assert!(
+        !wide_stdout.contains(&secret_attention) && !wide_stdout.contains("secret"),
+        "the wide board page carried the hidden row: {wide_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&wide_page.stderr).contains("showing 5 of more than 5"),
+        "the wide board page hid its truncation: {wide_stdout}"
     );
     let starts = estate.ok(
         &work_a,

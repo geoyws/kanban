@@ -3179,6 +3179,18 @@ const CURRENT_SITREPS_PER_LANE: i64 = 10;
 /// page for an unbounded read, so the scan goes in pages of this many rows
 /// and stops the moment the bound is filled.
 const MANAGED_SCAN_PAGE: i64 = 256;
+/// Fewest raw rows one managed ascending-tail scan examines before it may stop.
+///
+/// Cursor-driven tails ([`Store::events_since_filtered_tail`], and through it
+/// the websocket notices and `watch --follow`) advance past denied rows they
+/// have already read, so a narrow cursor must still make progress through a
+/// denied stretch at a reasonable rate: a `--limit 1` follower capped at its
+/// own limit would otherwise walk one raw row per poll. The cap on any one
+/// scan is the caller's own `limit` when that is larger, so this floor never
+/// widens a scan the caller did not ask for — it only keeps a narrow one
+/// from stalling to a crawl. One scan's work stays bounded either way, which
+/// is the property the tail readers depend on.
+const MANAGED_TAIL_SCAN_FLOOR: usize = 500;
 
 // Nothing deletes a sitrep.
 //
@@ -3816,6 +3828,31 @@ impl Drop for ReadSnapshot<'_> {
     }
 }
 
+/// What one bounded ascending-tail scan examined.
+///
+/// The cursor-driven tails — the websocket notices and `watch --follow` —
+/// poll this on every ledger revision, so one scan must do bounded work and
+/// the cursor must still move when the scan delivers nothing: otherwise each
+/// open socket re-reads a growing denied tail on every write. The scan
+/// therefore reports the range it covered as well as the rows it delivered.
+pub struct FilteredEventTail {
+    /// The visible rows, oldest first, at most the caller's `limit`.
+    pub events: Vec<Event>,
+    /// The furthest raw sequence this scan examined. When the delivery
+    /// filled, this is the last delivered row's sequence; otherwise it is
+    /// the last raw row read, denied rows included. A caller that stores
+    /// this as its cursor never re-reads denied rows it has already walked
+    /// past — and cannot step over a row it has not examined, because the
+    /// scan walks ascending `seq` inside one snapshot, so every row at or
+    /// below the new position passed through this scan's filter.
+    pub scanned_through: i64,
+    /// False when raw rows may remain unread past `scanned_through`: the
+    /// delivery filled, or the raw cap below stopped the scan. True only
+    /// after a short page, which is the one observation that proves the
+    /// tail ended.
+    pub exhausted: bool,
+}
+
 impl Store {
     /// Open a write scope: the one way a write path in this file takes the
     /// mutation lock.
@@ -4105,40 +4142,72 @@ impl Store {
         Ok(out)
     }
 
-    /// Fill a page from raw rows this caller may READ, scanning in chunks.
+    /// Fill a page from raw rows this caller may READ, scanning by keyset.
     ///
-    /// `base_sql` is the listing's SELECT with its filters and ORDER BY but
-    /// no bound; `base` is that query's parameters. Each page of
-    /// [`MANAGED_SCAN_PAGE`] raw rows passes through `keep` — the listing's
-    /// own visibility filter — and the scan stops the moment `want` readable
-    /// rows are held, so a page costs pages, not the table. Only listings
-    /// whose bound is the readable rows' call this; unmanaged boards keep
-    /// their SQL `LIMIT` at the call site and never reach here.
+    /// `base_sql` is the listing's SELECT with its filters but no ordering
+    /// and no bound; `order_by` is that listing's own `ORDER BY`, and
+    /// `cursor_predicate` re-states the ordering as a range off the last raw
+    /// row the previous chunk examined (`AND seq < ?` for a newest-first
+    /// event listing, `AND (created_at, id) < (?, ?)` for deployments).
+    /// `cursor_of` builds that predicate's parameters from such a row. The
+    /// first chunk has no previous row and reads without the predicate;
+    /// every later chunk seeks straight to it, so each chunk is an indexed
+    /// seek where OFFSET used to step over every earlier row again — and a
+    /// write landing between two chunks can neither duplicate nor skip a
+    /// row, where OFFSET counted positions that a head insert or a row
+    /// leaving the filter had just shifted. The whole scan holds a
+    /// [`ReadSnapshot`], a no-op inside a caller's wider scope as on the
+    /// watch poll path, so one page reads one consistent view.
+    ///
+    /// Each page of [`MANAGED_SCAN_PAGE`] raw rows passes through `keep` —
+    /// the listing's own visibility filter — and the scan stops the moment
+    /// `want` readable rows are held, so a page costs pages, not the table.
+    /// Only listings whose bound is the readable rows' call this; unmanaged
+    /// boards keep their SQL `LIMIT` at the call site and never reach here.
+    /// The cursor advances over RAW rows, denied ones included: `cursor_of`
+    /// runs on the page's last row before `keep` consumes it, so denied rows
+    /// already walked are never re-read by a later chunk of the same page.
+    #[allow(clippy::too_many_arguments)]
     fn scan_visible<T>(
         &self,
         base_sql: &str,
         base: &[Box<dyn rusqlite::ToSql>],
+        order_by: &str,
+        cursor_predicate: &str,
         want: usize,
         map: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
         mut keep: impl FnMut(Vec<T>) -> Result<Vec<T>>,
+        mut cursor_of: impl FnMut(&T) -> Vec<Box<dyn rusqlite::ToSql>>,
     ) -> Result<Vec<T>> {
         if want == 0 {
             return Ok(Vec::new());
         }
+        let _snapshot = ReadSnapshot::open(&self.connection)?;
         let mut out = Vec::new();
-        let mut offset: i64 = 0;
+        let mut cursor: Option<Vec<Box<dyn rusqlite::ToSql>>> = None;
         loop {
-            let sql = format!("{base_sql} LIMIT ? OFFSET ?");
+            let mut sql = String::from(base_sql);
+            if cursor.is_some() {
+                sql.push_str(cursor_predicate);
+            }
+            sql.push_str(order_by);
+            sql.push_str(" LIMIT ?");
             let mut refs: Vec<&dyn rusqlite::ToSql> =
                 base.iter().map(|value| value.as_ref()).collect();
+            if let Some(key) = &cursor {
+                refs.extend(key.iter().map(|value| value.as_ref()));
+            }
             refs.push(&MANAGED_SCAN_PAGE);
-            refs.push(&offset);
             let mut statement = self.connection.prepare(&sql)?;
             let page = statement
                 .query_map(params_from_iter(refs), map)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             let fresh = page.len();
+            if fresh == 0 {
+                return Ok(out);
+            }
+            cursor = page.last().map(&mut cursor_of);
             let mut kept = keep(page)?;
             out.append(&mut kept);
             if out.len() >= want {
@@ -4148,7 +4217,6 @@ impl Store {
             if fresh < MANAGED_SCAN_PAGE as usize {
                 return Ok(out);
             }
-            offset += fresh as i64;
         }
     }
 
@@ -5224,7 +5292,10 @@ impl Store {
         if !include_archived {
             sql.push_str(" AND archived=0");
         }
-        sql.push_str(" ORDER BY seq DESC");
+        // The ordering stays out of the filter SQL: the managed scan appends
+        // it after each chunk's keyset predicate, and the direct estate
+        // appends it with its bound, so every path reads newest first.
+        let order_by = " ORDER BY seq DESC";
         // Filtered by each row's REAL tags AND its own frozen snapshot, so an
         // invisible row is not reconstructible from its trail and a retag
         // event does not name the tag that hid it. See [`event_tags`].
@@ -5233,13 +5304,14 @@ impl Store {
             // the tag test, so a denied row would consume a slot and the page
             // would come back short — or empty, leaking hidden activity and
             // its timing (`events --task t-visible --limit 1` answering `[]`
-            // when the newest event concerns a denied attention row). Scan in
-            // pages until the bound is filled instead, so every caller's `+1`
+            // when the newest event concerns a denied attention row). Scan by
+            // keyset until the bound is filled instead, so every caller's `+1`
             // truncation probe still observes a next page. A negative bound is
             // SQLite's "no bound" and stays one here. Outside managed
             // enforcement nothing can be denied, so the direct estate keeps
             // the SQL bound below and reads exactly what it asked for.
             if limit < 0 {
+                sql.push_str(order_by);
                 let mut statement = self.connection.prepare(&sql)?;
                 let rows = statement
                     .query_map(
@@ -5252,11 +5324,15 @@ impl Store {
             return self.scan_visible(
                 &sql,
                 &values,
+                order_by,
+                " AND seq<?",
                 usize::try_from(limit).unwrap_or(usize::MAX),
                 board_event_row,
                 |rows| self.visible_events(rows),
+                |event| vec![Box::new(event.seq) as Box<dyn rusqlite::ToSql>],
             );
         }
+        sql.push_str(order_by);
         sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
@@ -5292,9 +5368,12 @@ impl Store {
 
     /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
     ///
-    /// Deliberately board-wide: watch reads this as the tail that lets a cursor
-    /// move past rows its filtered scan rejected, so it has to see the rows
-    /// that do not match. It used to take a `task` parameter the SQL never
+    /// Deliberately board-wide: it used to be the tail `watch::poll_once`
+    /// read to move a cursor past rows its filtered scan rejected, so it had
+    /// to see the rows that do not match. The poll now advances from the
+    /// filtered scan's own examined range instead — one scan, one snapshot —
+    /// and this stays as the unfiltered board tail its contract describes.
+    /// It used to take a `task` parameter the SQL never
     /// bound, so a caller could pass a selector and silently receive board-wide
     /// rows anyway; the parameter is removed rather than honoured, because a
     /// task-scoped board tail would stall the cursor behind other tasks'
@@ -5308,14 +5387,15 @@ impl Store {
     /// tail is always safe. Do not "fix" the registry to match this one.
     ///
     /// Authorization: board scope only, and deliberately so. This is the one
-    /// event read whose PURPOSE is to see rows the caller's filter rejected,
-    /// so per-row filtering here would stall the cursor behind another task's
-    /// traffic and re-scan the same window forever. Its only caller —
-    /// `watch::poll_once` — takes `.last().seq` from it and nothing else, so
-    /// what leaves this function is a sequence number, not row content. The
-    /// rows a watcher is actually HANDED come from `events_since_filtered`,
-    /// which filters per row. A caller that returned these rows to a consumer
+    /// event read whose PURPOSE is to see rows a filter would reject, so
+    /// per-row filtering here would stall a cursor driven from it behind
+    /// another task's traffic and re-scan the same window forever. The rows a
+    /// watcher is actually HANDED come from `events_since_filtered`, which
+    /// filters per row. A caller that returned these rows to a consumer
     /// would be a new leak, and would need the filter that this one skips.
+    // Production reads go through the filtered tails; this stays as the
+    // unfiltered board tail above describes, pinned by its unit tests.
+    #[allow(dead_code)]
     pub fn events_since(
         &self,
         kind: Option<&str>,
@@ -5351,17 +5431,30 @@ impl Store {
 
     /// Ascending watch rows with semantic predicates applied before LIMIT.
     ///
-    /// Watch filters must bound delivered events rather than the raw ledger
-    /// page: a sparse match at sequence 500 is still the first event in a
-    /// `--limit 1` request. The JSON predicates deliberately require the
-    /// private semantic snapshot, so legacy rows never match a semantic
-    /// filter.
+    /// Watch filters bound delivered events rather than the raw ledger page:
+    /// a sparse match at sequence 500 is still the first event in a
+    /// `--limit 1` request — up to the raw cap below. The JSON predicates
+    /// deliberately require the private semantic snapshot, so legacy rows
+    /// never match a semantic filter.
     ///
     /// This is the watch DELIVERY path — every row it returns is handed to a
     /// subscriber — so it filters per row by each event's real tags, through
     /// [`Store::visible_events`]. Because `watch` re-opens its store on every
     /// poll, the authority this filter uses is re-minted every poll: a
     /// revocation stops the very next batch rather than the next reconnect.
+    ///
+    /// One call examines a bounded stretch of tail — the caller's `limit`
+    /// plus at most [`MANAGED_TAIL_SCAN_FLOOR`] raw rows — so a selective
+    /// filter with a longer denied stretch ahead comes back short though
+    /// matches wait beyond the cap. The cursor-driven tails (the websocket
+    /// notices, `watch --follow`) adopt the examined range as their next
+    /// cursor and deliver those matches on later polls, instead of re-reading
+    /// the whole stretch on every revision. See
+    /// [`Store::events_since_filtered_tail`].
+    // The cursor-driven production tails call `events_since_filtered_tail`
+    // directly; this Vec form stays for one-shot delivery reads and its unit
+    // tests.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn events_since_filtered(
         &self,
@@ -5375,6 +5468,47 @@ impl Store {
         limit: i64,
         include_archived: bool,
     ) -> Result<Vec<Event>> {
+        Ok(self
+            .events_since_filtered_tail(
+                task,
+                kinds,
+                relations,
+                prior_statuses,
+                current_statuses,
+                tags,
+                cursor,
+                limit,
+                include_archived,
+            )?
+            .events)
+    }
+
+    /// The same tail with the examined range reported for cursor advancement.
+    ///
+    /// The websocket notices and `watch --follow` poll this on every ledger
+    /// revision, so one scan must do bounded work even across a long denied
+    /// stretch, and the cursor must still move when the scan delivers
+    /// nothing: the [`FilteredEventTail`] they get back names the furthest
+    /// raw sequence examined, and adopting it as the next cursor walks the
+    /// denied stretch a bounded page per scan instead of re-reading it whole
+    /// on every revision. Advancing past denied rows cannot skip a visible
+    /// row: the scan walks ascending `seq` inside one snapshot, so every row
+    /// at or below the new position passed through this scan's own filter —
+    /// delivered if visible, rejected if denied — and anything newer is still
+    /// past the cursor for the next scan to meet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn events_since_filtered_tail(
+        &self,
+        task: Option<&str>,
+        kinds: &[String],
+        relations: &[String],
+        prior_statuses: &[String],
+        current_statuses: &[String],
+        tags: &[String],
+        cursor: i64,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<FilteredEventTail> {
         validate_event_limit(limit)?;
         let mut sql = String::from(
             "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
@@ -5395,7 +5529,8 @@ impl Store {
                 semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
             },
         );
-        sql.push_str(" ORDER BY seq ASC");
+        // No ORDER BY or bound here: the managed scan appends its own keyset
+        // paging below, and the direct estate appends the bound after it.
         // The tag filter runs before the bound for the reason
         // [`Store::events_with_bounds`] gives: a denied row must not consume
         // a delivery slot, or a watch page comes back short and the cursor a
@@ -5403,15 +5538,11 @@ impl Store {
         // managed enforcement nothing can be denied, so the direct estate
         // keeps the SQL bound below.
         if self.authz.is_enforcing() {
-            return self.scan_visible(
-                &sql,
-                &values,
-                usize::try_from(limit).unwrap_or(usize::MAX),
-                board_event_row,
-                |rows| self.visible_events(rows),
-            );
+            let want = usize::try_from(limit).unwrap_or(usize::MAX);
+            let raw_cap = want.max(MANAGED_TAIL_SCAN_FLOOR);
+            return self.scan_event_tail(&sql, &values, cursor, want, raw_cap);
         }
-        sql.push_str(" LIMIT ?");
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
@@ -5420,7 +5551,106 @@ impl Store {
                 board_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.visible_events(rows)
+        // The SQL bound read everything there was when the page came back
+        // short, so `exhausted` is exact here rather than conservative.
+        let exhausted = rows.len() < usize::try_from(limit).unwrap_or(usize::MAX);
+        let scanned_through = rows.last().map(|event| event.seq).unwrap_or(cursor);
+        let events = self.visible_events(rows)?;
+        Ok(FilteredEventTail {
+            events,
+            scanned_through,
+            exhausted,
+        })
+    }
+
+    /// One bounded ascending pass over newer raw rows, oldest first.
+    ///
+    /// `base_sql` is the tail's SELECT with its filters but no ordering and
+    /// no bound; chunks append `AND seq>?` off the last raw row examined —
+    /// `seq` is the rowid, so each chunk is an indexed seek — followed by
+    /// `ORDER BY seq ASC`. The whole scan holds a [`ReadSnapshot`], a no-op
+    /// inside a caller's wider scope as on the watch poll path, so the
+    /// examined range is one consistent view and the returned cursor is safe
+    /// to adopt: see [`Store::events_since_filtered_tail`].
+    ///
+    /// The scan stops at the first of: `want` visible rows held, `raw_cap`
+    /// raw rows examined, a short page. When the delivery fills mid-page the
+    /// cursor stops at the last DELIVERED row, not the page's end: rows past
+    /// it are re-examined by the next scan — at most one page of them, so
+    /// still bounded — and re-examination there can only delay a visible row,
+    /// never skip it, because the cursor still sits below it.
+    fn scan_event_tail(
+        &self,
+        base_sql: &str,
+        base: &[Box<dyn rusqlite::ToSql>],
+        cursor: i64,
+        want: usize,
+        raw_cap: usize,
+    ) -> Result<FilteredEventTail> {
+        if want == 0 {
+            return Ok(FilteredEventTail {
+                events: Vec::new(),
+                scanned_through: cursor,
+                exhausted: false,
+            });
+        }
+        let _snapshot = ReadSnapshot::open(&self.connection)?;
+        let mut out = Vec::new();
+        let mut frontier = cursor;
+        let mut raw: usize = 0;
+        loop {
+            let sql = format!("{base_sql} AND seq>? ORDER BY seq ASC LIMIT ?");
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                base.iter().map(|value| value.as_ref()).collect();
+            refs.push(&frontier);
+            refs.push(&MANAGED_SCAN_PAGE);
+            let mut statement = self.connection.prepare(&sql)?;
+            let page = statement
+                .query_map(params_from_iter(refs), board_event_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let fresh = page.len();
+            if fresh == 0 {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                    exhausted: true,
+                });
+            }
+            raw += fresh;
+            let last_raw = page.last().map(|event| event.seq).unwrap_or(frontier);
+            let kept = self.visible_events(page)?;
+            let space = want - out.len();
+            if kept.len() >= space {
+                // The delivery filled inside this page. The cursor stops at
+                // the last row handed out; anything past it waits for the
+                // next scan. A short page still proves the tail ended even
+                // though nothing more was asked for.
+                out.extend(kept.into_iter().take(space));
+                let scanned = out.last().map(|event| event.seq).unwrap_or(frontier);
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: scanned,
+                    exhausted: fresh < MANAGED_SCAN_PAGE as usize,
+                });
+            }
+            out.extend(kept);
+            frontier = last_raw;
+            if fresh < MANAGED_SCAN_PAGE as usize {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                    exhausted: true,
+                });
+            }
+            if raw >= raw_cap {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                    exhausted: false,
+                });
+            }
+        }
     }
 
     /// Fan every new event out to the subscriptions that match it.
@@ -9751,12 +9981,18 @@ impl Store {
             sql.push_str(" AND tier=?");
             values.push(Box::new(value.to_owned()));
         }
-        sql.push_str(" ORDER BY created_at DESC,id DESC");
+        // The ordering stays out of the filter SQL: the managed scan appends
+        // it after each chunk's keyset predicate, and the direct estate
+        // appends it with its bound. `(created_at, id)` is this listing's
+        // total order — `id` breaks `created_at` ties — and the row-value
+        // range below seeks the status and task indexes that lead with those
+        // same columns.
+        let order_by = " ORDER BY created_at DESC,id DESC";
         // The bound is the READABLE attempts': a `LIMIT` in SQL runs before
         // the subject-tag test, so a denied attempt would consume a slot and
         // the page would come back short — and the served `/deployments`
         // index over-fetches by one to observe its `truncated` flag, which a
-        // short page would clear while readable rows waited. Scan in pages
+        // short page would clear while readable rows waited. Scan by keyset
         // until the bound is filled instead, for the reason
         // [`Store::events_with_bounds`] gives. A negative bound is SQLite's
         // "no bound" and stays one here. Outside managed enforcement nothing
@@ -9764,6 +10000,7 @@ impl Store {
         // reads exactly what it asked for.
         if self.authz.is_enforcing() {
             if limit < 0 {
+                sql.push_str(order_by);
                 let mut statement = self.connection.prepare(&sql)?;
                 let rows = statement
                     .query_map(
@@ -9776,11 +10013,20 @@ impl Store {
             return self.scan_visible(
                 &sql,
                 &values,
+                order_by,
+                " AND (created_at,id)<(?,?)",
                 usize::try_from(limit).unwrap_or(usize::MAX),
                 deployment_row,
                 |rows| self.visible_deployments(rows),
+                |attempt| {
+                    vec![
+                        Box::new(attempt.created_at) as Box<dyn rusqlite::ToSql>,
+                        Box::new(attempt.id.clone()) as Box<dyn rusqlite::ToSql>,
+                    ]
+                },
             );
         }
+        sql.push_str(order_by);
         sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
@@ -12212,6 +12458,210 @@ mod tests {
                 "the direct estate stopped replaying its own {kind} envelopes"
             );
         }
+    }
+
+    /// A restricted tail walks a long denied stretch in bounded scans and
+    /// still delivers the visible row after it.
+    ///
+    /// Six hundred plain events about the `secret` task sit between two
+    /// visible events — more than two scan pages, so every scan here crosses
+    /// a chunk boundary. The first tail scan delivers nothing but advances a
+    /// bounded stretch (no more than two 256-row pages for the 500-row
+    /// floor); the second delivers the visible row and reports the head
+    /// reached; the third is empty and stays put. No scan re-reads the whole
+    /// denied stretch, and no row is delivered twice or skipped: the union
+    /// of the three batches is exactly the later visible row.
+    ///
+    /// The one-shot read is capped the same way: it comes back empty though
+    /// a match waits beyond the cap. Before the cap it filled past all six
+    /// hundred denied rows and answered the visible one here, so that
+    /// assertion fails on the old code and passes on the new. The
+    /// cursor-driven tails (the websocket notices, `watch --follow`) adopt
+    /// the examined range as their next cursor instead, and deliver that
+    /// same row on the very next poll — which is what the poll-by-poll
+    /// assertions prove. The newest-first page assert is the companion
+    /// guard: it passes on the old code too, and pins that the keyset
+    /// continuation fills the same page the OFFSET continuation did.
+    #[test]
+    fn managed_ascending_tail_walks_a_denied_stretch_in_bounded_scans() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-9999-4999-8999-999999999999";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-tail-walk-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let first_visible;
+        let last_visible;
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret row",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret");
+            let mut clock = 100_i64;
+            let mut append = |task: &str| -> i64 {
+                clock += 1;
+                crate::audit::append_board_event(
+                    &seed.connection,
+                    Some(task),
+                    "task_updated",
+                    "seed",
+                    "{}",
+                    clock,
+                )
+                .expect("append event");
+                seed.event_head_seq().expect("head after append")
+            };
+            first_visible = append("t-visible");
+            for _ in 0..600 {
+                append("t-secret");
+            }
+            last_visible = append("t-visible");
+        }
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+
+        // Newest-first page-fill crosses the denied stretch as well: the two
+        // visible rows lead, newest first, though six hundred denied rows sit
+        // above the older one.
+        let page = store
+            .events_with_bounds(None, None, None, None, 2, true)
+            .expect("newest-first page past denied rows");
+        assert_eq!(
+            board_event_seqs(&page),
+            vec![last_visible, first_visible],
+            "the newest-first page lost a visible row behind denied ones"
+        );
+
+        // The capped one-shot comes back empty though a match waits beyond
+        // the cap: bounded work per scan is the contract, and the
+        // cursor-driven tails advance past the examined rows instead.
+        let oneshot = store
+            .events_since_filtered(None, &[], &[], &[], &[], &[], first_visible, 2, true)
+            .expect("capped one-shot tail");
+        assert!(
+            oneshot.is_empty(),
+            "the one-shot tail read past its raw cap: {}",
+            board_event_seqs(&oneshot)
+                .iter()
+                .map(|seq| seq.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // First poll: nothing delivered, but the cursor moves past the
+        // denied rows the scan already read — and only those.
+        let first = store
+            .events_since_filtered_tail(None, &[], &[], &[], &[], &[], first_visible, 2, true)
+            .expect("first tail scan");
+        assert!(
+            first.events.is_empty(),
+            "the first scan delivered past its raw cap"
+        );
+        assert!(
+            !first.exhausted,
+            "the first scan stopped early yet claimed the tail ended"
+        );
+        assert!(
+            first.scanned_through > first_visible,
+            "the cursor did not move past denied rows it already read"
+        );
+        assert!(
+            first.scanned_through - first_visible <= 512,
+            "one scan examined more than two pages over a denied stretch: {} rows",
+            first.scanned_through - first_visible
+        );
+
+        // Second poll: resumes where the first stopped and delivers the
+        // visible row waiting past the stretch, reaching the head.
+        let second = store
+            .events_since_filtered_tail(
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                first.scanned_through,
+                2,
+                true,
+            )
+            .expect("second tail scan");
+        assert_eq!(
+            board_event_seqs(&second.events),
+            vec![last_visible],
+            "the resumed scan lost the visible row past the denied stretch"
+        );
+        assert_eq!(
+            second.scanned_through, last_visible,
+            "the delivering scan did not stop at the row it handed out"
+        );
+        assert!(
+            second.exhausted,
+            "the scan reached the head yet claimed rows may remain"
+        );
+
+        // Third poll: empty, and the cursor stays put — the denied stretch
+        // is never re-read.
+        let third = store
+            .events_since_filtered_tail(
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                second.scanned_through,
+                2,
+                true,
+            )
+            .expect("third tail scan");
+        assert!(
+            third.events.is_empty(),
+            "the settled tail delivered a row twice"
+        );
+        assert_eq!(
+            third.scanned_through, last_visible,
+            "the settled tail moved a cursor with nothing new to examine"
+        );
+        assert!(
+            third.exhausted,
+            "the settled tail claimed rows may remain with the head reached"
+        );
     }
 
     /// The relations of a READABLE row: a prerequisite the caller may not read

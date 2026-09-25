@@ -1492,16 +1492,20 @@ fn notice_scan(positions: &mut HashMap<PathBuf, i64>) -> NoticeScan {
 
 /// One board's newly-visible rows, as frames, and where its position lands.
 ///
-/// Every row here came through [`Store::events_since_filtered`], which runs
-/// each one past `visible_events` — so a row the operator may not see is
-/// never named in a frame. The unfiltered `events_since` has no place on this
-/// path: its purpose is to move a cursor past rows a filter rejected, and a
-/// notice built from it would name exactly those rows.
+/// Every row here came through [`Store::events_since_filtered_tail`], which
+/// runs each one past `visible_events` — so a row the operator may not see
+/// is never named in a frame.
 ///
-/// The position advances only over rows this connection was actually handed,
-/// so nothing is skipped. A trailing run of rows the operator may not see is
-/// therefore re-examined by the next scan, which costs one indexed query and
-/// sends no frame.
+/// The position advances past every raw row the scan examined — delivered or
+/// denied — up to the scan's raw cap, and a scan that stopped with raw rows
+/// possibly unread reports `truncated`, so the next tick resumes where this
+/// one stopped instead of re-reading the whole denied tail on every
+/// revision. Advancing past denied rows cannot skip a visible one: the scan
+/// walks ascending `seq` inside one snapshot, so every row at or below the
+/// new position passed through this scan's own filter, and anything newer is
+/// still past it for the next scan to meet. A board that keeps producing
+/// only denied rows is therefore walked a bounded page per tick — a delay,
+/// never a skip, and never an unbounded re-read.
 fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<BoardNotices> {
     let head = store.event_head_seq()?;
     let Some(cursor) = cursor else {
@@ -1523,7 +1527,7 @@ fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<Boar
             truncated: false,
         });
     }
-    let visible = store.events_since_filtered(
+    let tail = store.events_since_filtered_tail(
         None,
         &[],
         &[],
@@ -1534,14 +1538,15 @@ fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<Boar
         NOTICE_SCAN_LIMIT,
         false,
     )?;
-    let Some(last) = visible.last().map(|event| event.seq) else {
+    if tail.events.is_empty() {
         return Ok(BoardNotices {
             frames: Vec::new(),
-            cursor,
-            truncated: false,
+            cursor: tail.scanned_through,
+            truncated: !tail.exhausted,
         });
-    };
-    let rows = visible
+    }
+    let rows = tail
+        .events
         .iter()
         .map(|event| NoticeRow {
             seq: event.seq,
@@ -1553,15 +1558,14 @@ fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<Boar
         frames: notice_batch(board, &rows, |id| {
             store.require_task(id).ok().map(|task| task.title)
         }),
-        cursor: last,
-        // A full page means more may be waiting, so scan again next tick
-        // rather than sitting on it until the next write. Exact while the
-        // filter passes everything, which is `serve`'s own case; under
-        // managed enforcement a page trimmed by the filter reads as short,
-        // and the remainder then waits for the next revision change. The
-        // position has still advanced only over what was delivered, so that
-        // is a delay and never a skip.
-        truncated: visible.len() as i64 == NOTICE_SCAN_LIMIT,
+        cursor: tail.scanned_through,
+        // A scan that stopped with raw rows possibly unread sets `truncated`,
+        // so the socket scans again on the next tick rather than waiting for
+        // the next write. Exact in both estates: outside enforcement nothing
+        // is denied and a short page proves the head; under enforcement the
+        // flag also covers a page trimmed by the filter or stopped by the raw
+        // cap, and the advanced position is what keeps that re-scan bounded.
+        truncated: !tail.exhausted,
     })
 }
 
