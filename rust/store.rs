@@ -6547,8 +6547,10 @@ impl Store {
                 }
             }
             // The edges already on the row, read before anything is
-            // authorized: re-listing an edge is not a new link, so — as with
-            // the unchanged parent above — it needs no new authority.
+            // authorized: re-listing a readable edge is not a new link, so —
+            // as with the unchanged parent above — it needs no new authority.
+            // An unreadable id is authorized either way, so probing a hidden
+            // edge answers exactly like probing an id that was never an edge.
             let existing: Vec<String> = if self.authz.is_enforcing() {
                 let mut statement = transaction
                     .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?")?;
@@ -6561,9 +6563,17 @@ impl Store {
                 Vec::new()
             };
             for dependency in &unique {
-                // Only a NEW edge names its prerequisite: an edge already on
-                // the row was authorized when it was written.
-                if !existing.contains(dependency) {
+                // Only a NEW edge, or an existing edge the caller can still
+                // read, skips the attach gate: re-listing a hidden edge would
+                // otherwise confirm it exists (an unreadable id succeeds when
+                // it is already an edge but is refused as denied-or-not-found
+                // when it is not), while re-listing a readable edge needs no
+                // new authority, as with the unchanged parent above.
+                let relisted_readable = existing.contains(dependency)
+                    && self
+                        .authz
+                        .permits_read(&task_tags(&transaction, dependency)?);
+                if !relisted_readable {
                     authorize_task_attach(&transaction, &self.authz, dependency)?;
                 }
                 if dependency == id {

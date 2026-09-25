@@ -7240,14 +7240,10 @@ fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
 /// `t-ops` beside `t-other` while withholding `t-secret`, the gate still names
 /// both kept prerequisites, and the claim is still refused while either is
 /// open. Re-listing the read-only edge needs no new authority, clearing the
-/// list keeps both, and the owner can still drop any edge.
-///
-/// INTEGRATION, at the layer `process`: the real binary against a real
-/// managed estate, selecting by the stable ids `t-visible`, `t-secret`,
-/// `t-ops` and `t-other`. Removing the keep in `update_task` fails this test:
-/// the owner reads only `t-other` and the claim refusal stops naming
-/// `t-secret`; keeping only the unreadable edges fails it too, by dropping
-/// the `t-ops` gate on the first replacement.
+/// list keeps both, and the owner can still drop any edge. Re-listing the
+/// hidden edge is refused byte-identically to naming an id that was never an
+/// edge — the re-list skip applies only to edges the caller can read — with
+/// nothing written either way.
 #[test]
 fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
     let estate = ManagedEstate::new("acc14-dep-replace");
@@ -7359,8 +7355,59 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
         ],
         "the gates lost a kept edge: {shown}"
     );
+    // Re-listing the hidden edge answers exactly like naming an id that was
+    // never an edge: the re-list skip applies only to edges the caller can
+    // read, so guessing the hidden prerequisite confirms nothing. Same exit
+    // code, byte-identical stderr carrying the generic denial, nothing
+    let hidden = estate.run(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-secret",
+            "--as",
+            "p",
+        ],
+    );
+    let unknown = estate.run(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-nonexistent",
+            "--as",
+            "p",
+        ],
+    );
+    assert!(
+        !hidden.status.success(),
+        "re-listing the hidden edge succeeded but must be refused"
+    );
+    assert_eq!(
+        hidden.status.code(),
+        unknown.status.code(),
+        "re-listing a hidden edge exits differently from naming an unknown id"
+    );
+    assert_eq!(
+        hidden.stderr, unknown.stderr,
+        "re-listing a hidden edge reads differently from naming an unknown id"
+    );
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr).contains(DENIED),
+        "the hidden-edge probe did not answer the non-enumerating denial: {}",
+        String::from_utf8_lossy(&hidden.stderr)
+    );
+    let reread = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        reread, shown,
+        "a refused edge probe wrote to the row: {reread}"
+    );
     // Re-listing the read-only edge alongside the new one is accepted:
-    // an edge already on the row needs no new authority.
+    // a readable edge already on the row needs no new authority.
     estate.ok(
         &work_a,
         &[

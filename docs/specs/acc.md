@@ -780,10 +780,15 @@ survive: the caller's own `task show` still lists `t-ops` beside `t-other`
 while withholding `t-secret`, the update receipt names no hidden id, and
 `blockingGates` still carries both `t-secret` (with its title blanked) and
 `t-ops` as `todo`, so `claim t-visible` is still refused while either is open.
-Re-listing `t-ops` beside `t-other` is accepted — an edge already on the row
-needs no new authority, as with the unchanged parent — and
-`--clear-dependencies` keeps both the hidden and the read-only edges while
-dropping the writable `t-other` edge, because removing a gate is a write
+Re-listing `t-ops` beside `t-other` is accepted — a readable edge already on
+the row needs no new authority, as with the unchanged parent — while
+naming `t-secret` in the new list is refused byte-identically to naming an
+id that was never an edge (the same exit code and stderr, nothing written):
+the skip applies only to edges the caller can read, so guessing a hidden
+prerequisite confirms nothing, and the kept loop still preserves the hidden
+edge on every accepted replacement. `--clear-dependencies` keeps both the
+hidden and the read-only edges while dropping the writable `t-other` edge,
+because removing a gate is a write
 against the prerequisite's scope as much as the dependent's. The owner still
 reads every surviving edge and can still drop any of them. *When* no
 enforcement applies, *then* a replacement rewrites the whole list as before,
@@ -1187,6 +1192,15 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   replacement drops an edge the caller already sees — and subscription
   relations are create-only, with each target gated at add and no rewrite
   path.
+
+- 2026-09-25 — ACC-14 dependency-replacement oracle closed (`t-c718c024`
+  review): the re-list skip in `update_task` applies only to existing edges
+  the caller can read — re-listing the hidden `t-secret` is refused
+  byte-identically to naming `t-nonexistent` (same exit code and stderr,
+  nothing written), so guessing a hidden prerequisite confirms nothing,
+  while re-listing the readable but read-only `t-ops` still needs no new
+  authority and the kept loop still preserves the hidden edge. Pinned by the
+  extended `dependency_replacement_keeps_a_tag_denied_prerequisite` (A27).
 
 - 2026-09-25 — ACC-14 page-fill evidence landed (`t-b694bc83`):
   `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` seeds
