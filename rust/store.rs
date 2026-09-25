@@ -6316,9 +6316,26 @@ impl Store {
                     unique.push(dependency);
                 }
             }
+            // The edges already on the row, read before anything is
+            // authorized: re-listing an edge is not a new link, so — as with
+            // the unchanged parent above — it needs no new authority.
+            let existing: Vec<String> = if self.authz.is_enforcing() {
+                let mut statement = transaction
+                    .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?")?;
+                let rows = statement
+                    .query_map([id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                rows
+            } else {
+                Vec::new()
+            };
             for dependency in &unique {
-                // Replaced edges are new links: same gate as the parent.
-                authorize_task_attach(&transaction, &self.authz, dependency)?;
+                // Only a NEW edge names its prerequisite: an edge already on
+                // the row was authorized when it was written.
+                if !existing.contains(dependency) {
+                    authorize_task_attach(&transaction, &self.authz, dependency)?;
+                }
                 if dependency == id {
                     bail!("task cannot depend on itself");
                 }
@@ -6326,13 +6343,19 @@ impl Store {
                     bail!("dependency {dependency} would create a cycle");
                 }
             }
-            // A replacement keeps the edges this caller cannot read: deleting
+            // A replacement keeps every edge this caller cannot write: deleting
             // them would let a writer on this row silently remove a gate the
-            // owner set. Refusing instead would confirm a hidden edge exists,
-            // so the hidden edges stay and only the visible ones are replaced
-            // — keep over refuse. The listing still withholds them
-            // (`Store::dependencies` filters per row) while the gate keeps
-            // honouring every edge (`require_no_blocking_gates` reads the raw
+            // owner set, and removing a gate is a write against the
+            // prerequisite's scope as much as the dependent's. The unwritable
+            // edges are a superset of the unreadable ones — a caller who cannot
+            // read an edge cannot write it either — so the hidden edges stay
+            // for the same reason as before, and a readable but read-only edge
+            // stays too. Refusing instead would confirm a hidden edge exists,
+            // so the kept edges stay and only the writable ones are replaced
+            // — keep over refuse. The listing still withholds the unreadable
+            // ones (`Store::dependencies` filters per row) while a readable
+            // kept edge stays visible as usual, and the gate keeps honouring
+            // every edge (`require_no_blocking_gates` reads the raw
             // table), so a kept gate still blocks claims. `--clear-dependencies`
             // arrives here as an empty list and keeps them the same way. The
             // parent edge needs no such treatment: the row's own `parentID`
@@ -6340,25 +6363,24 @@ impl Store {
             // caller already sees. Subscription relations are create-only —
             // `add_subscription` gates each target and nothing rewrites them —
             // so there is no replacement path to keep through.
-            let mut hidden: Vec<String> = Vec::new();
+            let mut kept: Vec<String> = Vec::new();
             if self.authz.is_enforcing() {
-                let mut statement = transaction
-                    .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?")?;
-                let existing = statement
-                    .query_map([id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                drop(statement);
-                for prerequisite in existing {
-                    if !self
-                        .authz
-                        .permits_read(&task_tags(&transaction, &prerequisite)?)
+                for prerequisite in &existing {
+                    let tags = task_tags(&transaction, prerequisite)?;
+                    if !self.authz.permits_read(&tags)
+                        || self.authz.check_write(&tags, &tags).is_err()
                     {
-                        hidden.push(prerequisite);
+                        kept.push(prerequisite.clone());
                     }
                 }
             }
             transaction.execute("DELETE FROM task_dependencies WHERE task_id=?", [id])?;
-            for prerequisite in &hidden {
+            for prerequisite in &kept {
+                // A kept edge the caller also re-listed is inserted once,
+                // below, with the new edges.
+                if unique.contains(prerequisite) {
+                    continue;
+                }
                 transaction.execute(
                     "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
                     params![id, prerequisite],

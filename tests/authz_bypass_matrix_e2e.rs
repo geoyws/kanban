@@ -7230,27 +7230,34 @@ fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
     estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
 }
 
-/// ACC-14, dependency replacement keeps the edges the caller cannot read: the
-/// owner gates `t-visible` on `t-secret`, and a managed caller holding board
-/// read and write (plus `visible` at both capabilities) but no `secret` scope
-/// replaces the list with `t-other`. The write succeeds — refusing would
-/// confirm a hidden edge exists — but the hidden edge survives: the caller's
-/// own listing still shows only `t-other`, the gate still names `t-secret`,
-/// and the claim is still refused while it is open. The owner sees both.
+/// ACC-14, dependency replacement keeps the edges the caller cannot read — and
+/// the ones it can read but not write: the owner gates `t-visible` on
+/// `t-secret` (unreadable to the caller) and on `t-ops` (readable but
+/// read-only), and a managed caller holding board read and write (plus
+/// `visible` at both capabilities and `ops` read only) replaces the list with
+/// `t-other`. The write succeeds — refusing would confirm a hidden edge
+/// exists — but both kept edges survive: the caller's own listing still shows
+/// `t-ops` beside `t-other` while withholding `t-secret`, the gate still names
+/// both kept prerequisites, and the claim is still refused while either is
+/// open. Re-listing the read-only edge needs no new authority, clearing the
+/// list keeps both, and the owner can still drop any edge.
 ///
 /// INTEGRATION, at the layer `process`: the real binary against a real
-/// managed estate, selecting by the stable ids `t-visible`, `t-secret` and
-/// `t-other`. Removing the keep in `update_task` fails this test: the owner
-/// reads only `t-other` and the claim refusal stops naming `t-secret`.
+/// managed estate, selecting by the stable ids `t-visible`, `t-secret`,
+/// `t-ops` and `t-other`. Removing the keep in `update_task` fails this test:
+/// the owner reads only `t-other` and the claim refusal stops naming
+/// `t-secret`; keeping only the unreadable edges fails it too, by dropping
+/// the `t-ops` gate on the first replacement.
 #[test]
 fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
     let estate = ManagedEstate::new("acc14-dep-replace");
     let work_a = estate.work_a.clone();
-    for tag in ["visible", "secret"] {
+    for tag in ["visible", "secret", "ops"] {
         estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
     }
     for (id, title, tag) in [
         ("t-secret", "secret prerequisite", "secret"),
+        ("t-ops", "ops prerequisite", "ops"),
         ("t-other", "other prerequisite", "visible"),
     ] {
         estate.ok_json(
@@ -7272,6 +7279,8 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
             "visible",
             "--depends-on",
             "t-secret",
+            "--depends-on",
+            "t-ops",
             "--as",
             "seed",
             "--json",
@@ -7284,11 +7293,13 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
             board_scope("write", &estate.id_a),
             tag_scope("read", &estate.id_a, "visible"),
             tag_scope("write", &estate.id_a, "visible"),
+            tag_scope("read", &estate.id_a, "ops"),
         ],
     );
     estate.enforce("managed");
     // The replacement succeeds: refusing would tell the caller an edge it
-    // cannot see exists. The receipt carries the row, never the hidden edge.
+    // cannot see exists. The receipt carries the row, never the edges, so it
+    // names no prerequisite either way.
     let receipt = estate.ok(
         &work_a,
         &[
@@ -7305,7 +7316,8 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
         !receipt.contains("t-secret"),
         "the update receipt revealed the hidden edge: {receipt}"
     );
-    // The caller's own view still shows only the edge it named.
+    // The caller's own view still shows the edge it named beside the
+    // readable kept edge, and still withholds the hidden one.
     let shown = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
     assert_eq!(
         shown["dependencies"]
@@ -7314,11 +7326,11 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
             .iter()
             .map(|row| row["id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        vec!["t-other".to_owned()],
-        "the listing handed over the hidden edge: {shown}"
+        vec!["t-ops".to_owned(), "t-other".to_owned()],
+        "the listing lost the read-only edge or handed over the hidden one: {shown}"
     );
-    // The gate still holds on the hidden edge: its id and status stay, its
-    // title stays blanked.
+    // Both gates still hold: each id and status stays, the hidden title stays
+    // blanked while the readable one stays visible.
     assert_eq!(
         shown["blockingGates"]
             .as_array()
@@ -7334,39 +7346,122 @@ fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
             .collect::<Vec<_>>(),
         vec![
             (
+                "t-ops".to_owned(),
+                "todo".to_owned(),
+                serde_json::json!("ops prerequisite"),
+            ),
+            (
                 "t-other".to_owned(),
                 "todo".to_owned(),
                 serde_json::json!("other prerequisite"),
             ),
             ("t-secret".to_owned(), "todo".to_owned(), Value::Null),
         ],
-        "the gate lost the hidden edge: {shown}"
+        "the gates lost a kept edge: {shown}"
     );
-    // So the claim is still refused while the hidden prerequisite is open —
-    // and the refusal still names it.
-    let refused = estate.run(&work_a, &["claim", "t-visible", "--as", "p"]);
-    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
-    assert!(
-        !refused.status.success(),
-        "the kept gate let a claim through: {stderr}"
+    // Re-listing the read-only edge alongside the new one is accepted:
+    // an edge already on the row needs no new authority.
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-ops",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "p",
+        ],
     );
-    assert!(
-        stderr.contains("t-secret is todo"),
-        "the claim refusal no longer names the hidden edge: {stderr}"
+    // Clearing the list keeps both the hidden and the read-only edges: only
+    // the writable `t-other` edge is dropped.
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--clear-dependencies",
+            "--as",
+            "p",
+        ],
     );
-    // The owner sees both edges, so the assertions above came from the tag
-    // and not from a missing row.
-    estate.grant("p-visible-only", &owner_of(&estate.id_a));
-    let owned = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    let cleared = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
     assert_eq!(
-        owned["dependencies"]
+        cleared["dependencies"]
             .as_array()
             .unwrap()
             .iter()
             .map(|row| row["id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        vec!["t-secret".to_owned(), "t-other".to_owned()],
+        vec!["t-ops".to_owned()],
+        "clearing dropped a kept edge or handed over the hidden one: {cleared}"
+    );
+    let mut gate_ids = cleared["blockingGates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gate| gate["prerequisiteID"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    gate_ids.sort();
+    assert_eq!(
+        gate_ids,
+        vec!["t-ops".to_owned(), "t-secret".to_owned()],
+        "clearing lost a kept gate: {cleared}"
+    );
+    // So the claim is still refused while a kept prerequisite is open — and
+    // the refusal still names the hidden edge.
+    let refused = estate.run(&work_a, &["claim", "t-visible", "--as", "p"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        !refused.status.success(),
+        "the kept gates let a claim through: {stderr}"
+    );
+    assert!(
+        stderr.contains("t-secret is todo"),
+        "the claim refusal no longer names the hidden edge: {stderr}"
+    );
+    // The owner sees every surviving edge, so the assertions above came from
+    // the tag scopes and not from missing rows — and the owner can still drop
+    // any edge, kept or not.
+    estate.grant("p-visible-only", &owner_of(&estate.id_a));
+    let owned = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    let mut owned_ids = owned["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    owned_ids.sort();
+    assert_eq!(
+        owned_ids,
+        vec!["t-ops".to_owned(), "t-secret".to_owned()],
         "the owner lost an edge: {owned}"
+    );
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "owner",
+        ],
+    );
+    let dropped = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        dropped["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-other".to_owned()],
+        "the owner could not drop the kept edges: {dropped}"
     );
 }
 

@@ -772,16 +772,22 @@ named rows by hand; no verb removes or re-links them.
 ### A27 — a dependency replacement keeps the edges the caller cannot read (`ACC-14`)
 
 *Given* the owner gates a `visible` task `t-visible` on a `secret` task
-`t-secret`, *when* a managed caller holding board read and write but no
-`secret` tag scope runs `task update t-visible --depends-on t-other` for a
-readable `t-other`, *then* the write succeeds — refusing would confirm a
-hidden edge exists — but the hidden edge survives: the caller's own
-`task show` still lists only `t-other` in `dependencies`, the update receipt
-names no hidden id, and `blockingGates` still carries `t-secret` as `todo`
-with its title blanked, so `claim t-visible` is still refused while
-`t-secret` is open. The owner still reads both `t-secret` and `t-other`.
-*When* no enforcement applies, *then* a replacement rewrites the whole list
-as before, because there is no hidden edge to keep.
+`t-secret` and on an `ops` task `t-ops`, *when* a managed caller holding board
+read and write but no `secret` tag scope and only `ops` read runs `task update
+t-visible --depends-on t-other` for a readable `t-other`, *then* the write
+succeeds — refusing would confirm a hidden edge exists — but both kept edges
+survive: the caller's own `task show` still lists `t-ops` beside `t-other`
+while withholding `t-secret`, the update receipt names no hidden id, and
+`blockingGates` still carries both `t-secret` (with its title blanked) and
+`t-ops` as `todo`, so `claim t-visible` is still refused while either is open.
+Re-listing `t-ops` beside `t-other` is accepted — an edge already on the row
+needs no new authority, as with the unchanged parent — and
+`--clear-dependencies` keeps both the hidden and the read-only edges while
+dropping the writable `t-other` edge, because removing a gate is a write
+against the prerequisite's scope as much as the dependent's. The owner still
+reads every surviving edge and can still drop any of them. *When* no
+enforcement applies, *then* a replacement rewrites the whole list as before,
+because there is no hidden or read-only edge to keep.
 
 ### A28 — pages are bound by readable rows, not raw rows (`ACC-14`)
 
@@ -1144,17 +1150,30 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   removed-but-live-again task id under `reusedTaskLinks` as an advisory that
   does not affect `healthy` or the exit code — a known historical residual no
   verb can clear — each line filtered by read on the live task's tags and on
-  the prior incarnation's removal union, failing closed under enforcement, so
-  the owner can review the named rows by hand — pinned by
-  `import_requires_whole_board_write_and_names_no_denied_id` and
-  `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id`
-  (A26).
-
 - 2026-09-25 — ACC-14 dependency-replacement evidence landed (`t-c718c024`):
   replacing a task's dependency list keeps the edges the caller cannot read
   instead of deleting them, so a writer on the row cannot silently remove a
   gate the owner set; the write still succeeds, because refusing would confirm
   a hidden edge exists. The receipt and the listing still withhold the kept
+  edges while the gate keeps honouring every edge — pinned by
+  `dependency_replacement_keeps_a_tag_denied_prerequisite` (A27). The parent
+  edge needs no such treatment — the row's own `parentID` carries it, so a
+  replacement drops an edge the caller already sees — and subscription
+  relations are create-only, with each target gated at add and no rewrite
+  path.
+
+- 2026-09-25 — ACC-14 dependency-replacement follow-up (`t-c718c024`): the
+  keep now covers every edge the caller cannot write, not just the unreadable
+  ones — removing a gate is a write against the prerequisite's scope as much
+  as the dependent's — and re-listing an edge already on the row needs no new
+  authority, as with the unchanged parent. A readable but read-only kept edge
+  stays visible in the listing as usual while the gate keeps honouring it;
+  `--clear-dependencies` keeps the hidden and read-only edges the same way.
+  Pinned by the extended `dependency_replacement_keeps_a_tag_denied_prerequisite`
+  (A27): the owner gates `t-visible` on the unreadable `t-secret` and the
+  read-only `t-ops`, and the caller keeps both across `--depends-on t-other`,
+  a re-list of `t-ops`, and `--clear-dependencies`, while the owner can still
+  drop any edge.
   edges while the gate keeps honouring every edge — pinned by
   `dependency_replacement_keeps_a_tag_denied_prerequisite` (A27). The parent
   edge needs no such treatment — the row's own `parentID` carries it, so a
