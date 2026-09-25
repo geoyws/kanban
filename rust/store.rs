@@ -1332,7 +1332,7 @@ fn whole_board_read_on(authz: &AuthzContext, connection: &Connection) -> Result<
 /// The bulk-write gate: the same union, at `write`, on both sides — a
 /// board-wide mutation leaves every row's tag set where it found it, so the
 /// old and the resulting sets are the same set.
-fn whole_board_write_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
+pub(crate) fn whole_board_write_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
     if !authz.is_enforcing() {
         return Ok(());
     }
@@ -9197,14 +9197,17 @@ impl Store {
     /// and is live again, as `doctor` reports them (ACC-14 A26). The V34
     /// backfill deliberately leaves these at board scope — re-linking to the
     /// new incarnation would re-parent surviving rows under the new row's
-    /// tags — so they are for the owner to review or remove, not to certify.
-    /// Board scope, in the `foreign_key_check` shape like `orphaned_task_links`:
+    /// tags — and no verb deletes these rows or re-links them, so the report
+    /// is advisory: it does not affect `healthy` or the exit code. Board
+    /// scope, in the `foreign_key_check` shape like `orphaned_task_links`:
     /// the descriptions name tables and row ids, which is diagnostic rather
     /// than row content, and a caller with no board read gets none of it.
     /// Unlike an orphan, the named task is live, so under enforcement each
-    /// line is further filtered by the live row's real tags — a `doctor`
-    /// projection must not become the list of task ids a caller cannot
-    /// otherwise see.
+    /// line is further filtered by the live row's real tags AND the removal
+    /// union of the prior incarnation the creation event names — a `doctor`
+    /// projection must not disclose that a board-scope row once belonged to
+    /// an incarnation the caller cannot read. A missing removal snapshot
+    /// fails closed: the line is withheld.
     pub fn reused_task_links(&self) -> Result<Vec<String>> {
         self.authz.check_read(&[])?;
         let mut out = Vec::new();
@@ -9227,12 +9230,17 @@ impl Store {
             })?;
             for row in rows {
                 let (id, task_id) = row?;
-                if self.authz.is_enforcing()
-                    && !self
+                if self.authz.is_enforcing() {
+                    if !self
                         .authz
                         .permits_read(&task_tags(&self.connection, &task_id)?)
-                {
-                    continue;
+                    {
+                        continue;
+                    }
+                    match removed_task_tag_union_oracle(&self.connection, &task_id)? {
+                        Some(prior) if self.authz.permits_read(&prior) => {}
+                        _ => continue,
+                    }
                 }
                 out.push(format!(
                     "{table} row {id} nulled from reused task {task_id}"

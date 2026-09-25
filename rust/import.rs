@@ -1,6 +1,6 @@
 use crate::model::{TASK_STATUSES, TASK_TYPES};
 use crate::registry::now_ms;
-use crate::store::{Store, event, live_claims, refuse_reused_task_id};
+use crate::store::{Store, event, live_claims, refuse_reused_task_id, whole_board_write_on};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -398,7 +398,9 @@ fn normalize_and_insert(
     // run it. The gate sits ahead of the overlap listing, the dry-run receipt
     // and the reuse refusal alike: each of those names existing ids, and none
     // of them is reachable without this authority. Unmanaged boards stay
-    // unchanged — the gate is a no-op where nothing enforces.
+    // unchanged — the gate is a no-op where nothing enforces. This early call
+    // is the fast refusal; the authorizing read repeats inside the IMMEDIATE
+    // transaction below, in the snapshot the overwrite sweeps.
     store.require_whole_board_write()?;
     if actor.trim().is_empty() {
         bail!("actor is required");
@@ -461,6 +463,11 @@ fn normalize_and_insert(
     let transaction = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Inside the mutation lock, before the first id-revealing read: the early
+    // gate above is a fast refusal, but the tag universe is read here, in the
+    // same snapshot the overwrite sweeps, so a concurrent retag cannot slip
+    // between the check and the write (ACC-14, like `archive_settled`).
+    whole_board_write_on(&authz, &transaction)?;
     let existing = {
         let mut statement = transaction.prepare("SELECT id FROM tasks")?;
         statement

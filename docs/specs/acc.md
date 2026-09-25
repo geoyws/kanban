@@ -723,14 +723,23 @@ audited row.
 
 *Given* a managed caller without whole-board write — read-only, or holding
 board write plus a tag scope that does not cover the board — *when* the
-caller runs `import atmux-json`, with or without `--reconcile`, *then* the
-command is refused with the generic denial before any work: nothing is
-written and stderr names no existing id. The `--dry-run` preview and the
-`--verify` comparison answer the same gate, because their receipts list ids
-too. An owner holding the whole board still imports. A NULL-linked row whose
-creation event names a task id that was removed and is live again is not
-re-linked and not certified: `doctor` reports it for the owner under
-`reusedTaskLinks`.
+caller runs `import atmux-json` or `import atmux-sqlite`, with no flags or
+with `--reconcile`, `--dry-run` or `--verify` (`--verify` stands alone and
+cannot be combined with the write flags), *then* the command is refused with
+the generic denial before any work: nothing is written and stderr names no
+existing id. The `--dry-run` preview and the `--verify` comparison answer the
+same gate, because their receipts list ids too. An owner holding the whole
+board still imports. The import gate is read inside the `IMMEDIATE`
+transaction it protects, in the snapshot the overwrite sweeps, so a
+concurrent retag cannot slip between the check and the write. A NULL-linked
+row whose creation event names a task id that was removed and is live again
+is not re-linked: `doctor` reports it for the owner under `reusedTaskLinks`
+as an advisory that does not affect `healthy` or the exit code, because it
+describes a known historical residual that no verb can clear. Each reported
+line is filtered by read on the live task's tags and on the removal union of
+the prior incarnation, failing closed under enforcement, so the report never
+discloses an incarnation the caller cannot read. The owner can review the
+named rows by hand; no verb removes or re-links them.
 
 ## 5. Contracts and data
 
@@ -1065,11 +1074,17 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   `--verify` comparison now require whole-board write before any work, ahead
   of the overlap listing, the dry-run receipt and the reuse refusal; every
   other authority answers the generic denial with nothing written and no id
-  on stderr, and unmanaged boards are unchanged. The reuse-refusal comment
-  now says what holds: an unreadable id is indistinguishable from any other
-  unreadable id, but not from a free one. `doctor` reports NULL-linked rows
-  whose creation event names a removed-but-live-again task id under
-  `reusedTaskLinks` for the owner to review — pinned by
+  on stderr, and unmanaged boards are unchanged. The whole-board read repeats
+  inside the `IMMEDIATE` transaction, in the snapshot the overwrite sweeps,
+  so a concurrent retag cannot slip between the check and the write. The
+  reuse-refusal comment now says what holds: an unreadable id is
+  indistinguishable from any other unreadable id, but not from a free one.
+  `doctor` reports NULL-linked rows whose creation event names a
+  removed-but-live-again task id under `reusedTaskLinks` as an advisory that
+  does not affect `healthy` or the exit code — a known historical residual no
+  verb can clear — each line filtered by read on the live task's tags and on
+  the prior incarnation's removal union, failing closed under enforcement, so
+  the owner can review the named rows by hand — pinned by
   `import_requires_whole_board_write_and_names_no_denied_id` and
   `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id`
   (A26).

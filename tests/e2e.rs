@@ -58212,14 +58212,24 @@ fn compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id() {
         .query_row("SELECT id FROM sitreps", [], |row| row.get(0))
         .unwrap();
     drop(planted);
+    // The plant is raw SQL, so it bypasses the inline embedding writer and
+    // leaves unembedded documents behind; rebuilding restores the "otherwise
+    // healthy" premise without touching the residual itself.
+    fixture.ok_json(&fixture.main, &["search-rebuild", "--as", "seed", "--json"]);
     // The old key stays quiet — the id has a removal record — and the new key
-    // names the row for the owner to review, refusing to certify the board.
+    // names the row for the owner to review. The residual is advisory: no verb
+    // can clear it, so it does not affect `healthy` or the exit code.
     let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
     assert!(
-        !checked.status.success(),
-        "doctor certified a board with a nulled row from a reused task id"
+        checked.status.success(),
+        "doctor failed on an otherwise healthy board over the advisory reused-task residual: {}",
+        String::from_utf8_lossy(&checked.stderr)
     );
     let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(
+        report["healthy"].as_bool().unwrap(),
+        "doctor marked an otherwise healthy board unhealthy over the advisory residual: {report}"
+    );
     assert!(
         report["projects"][0]["orphanedTaskLinks"]
             .as_array()

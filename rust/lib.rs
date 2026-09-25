@@ -6393,10 +6393,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
+            // `reusedTaskLinks` is advisory and stays out of `healthy`: it
+            // names a known historical residual — a NULL-linked row whose
+            // creation event names a removed-but-live-again id, left by
+            // ordinary pre-V34 product behaviour — that no verb can clear, so
+            // failing on it would hold every such board red permanently.
+            // `orphanedTaskLinks` still fails: a dangling link is corruption.
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
                 && task_links.is_empty()
-                && reused_links.is_empty()
                 && future.is_empty()
                 && search_index.healthy
                 && audit.healthy;

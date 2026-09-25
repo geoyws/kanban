@@ -8058,7 +8058,8 @@ fn reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny() {
 /// The fixture holds a live `secret` task beside an untagged-visible one. A
 /// read-only caller and a caller holding board write plus the `visible` tag
 /// scope — both without whole-board authority — are refused the one generic
-/// denial on `import atmux-json` with and without `--reconcile`, write
+/// denial on `import atmux-json` with no flags and with `--reconcile`,
+/// `--dry-run` and `--verify`, and on one `atmux-sqlite` source, write
 /// nothing, and see neither live id on stderr. Granting the same principal
 /// the board tag wildcard turns the same source into a successful reconcile.
 #[test]
@@ -8094,15 +8095,21 @@ fn import_requires_whole_board_write_and_names_no_denied_id() {
     )
     .unwrap();
     let source_arg = source.to_string_lossy().into_owned();
-    let attempt = |extra: &[&str]| {
-        let mut args = vec![
-            "import",
-            "atmux-json",
-            &source_arg,
-            "--as",
-            "seed",
-            "--json",
-        ];
+    // The same rows through the sqlite mapping, so the refused loop below pins
+    // the gate for the second source kind as well: the tolerant mapper needs
+    // only these columns.
+    let sqlite_source = estate.root.join("import-source.db");
+    Connection::open(&sqlite_source)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE tasks(id TEXT,subject TEXT,status TEXT);
+             INSERT INTO tasks VALUES('t-imp-fresh','a fresh import row','todo');
+             INSERT INTO tasks VALUES('t-imp-secret','an overwrite attempt','todo');",
+        )
+        .unwrap();
+    let sqlite_arg = sqlite_source.to_string_lossy().into_owned();
+    let attempt = |sub: &str, path: &str, extra: &[&str]| {
+        let mut args = vec!["import", sub, path, "--as", "seed", "--json"];
         args.extend_from_slice(extra);
         estate.run(&work_a, &args)
     };
@@ -8138,10 +8145,19 @@ fn import_requires_whole_board_write_and_names_no_denied_id() {
     estate.bind_self("p-import", &[board_scope("read", &estate.id_a)]);
     estate.enforce("managed");
     let pristine = board_bytes();
-    for extra in [&[][..], &["--reconcile"][..]] {
-        let output = attempt(extra);
+    // `--verify` stands alone: the CLI refuses to combine it with the write
+    // flags, so it is its own case rather than another flag in the loop.
+    for extra in [
+        &[][..],
+        &["--reconcile"][..],
+        &["--dry-run"][..],
+        &["--verify"][..],
+    ] {
+        let output = attempt("atmux-json", &source_arg, extra);
         refused_silently(&output, &format!("read-only import {extra:?}"));
     }
+    let output = attempt("atmux-sqlite", &sqlite_arg, &[]);
+    refused_silently(&output, "read-only import atmux-sqlite");
     assert_eq!(
         board_bytes(),
         pristine,
@@ -8158,8 +8174,13 @@ fn import_requires_whole_board_write_and_names_no_denied_id() {
         ],
     );
     estate.enforce("managed");
-    for extra in [&[][..], &["--reconcile"][..]] {
-        let output = attempt(extra);
+    for extra in [
+        &[][..],
+        &["--reconcile"][..],
+        &["--dry-run"][..],
+        &["--verify"][..],
+    ] {
+        let output = attempt("atmux-json", &source_arg, extra);
         refused_silently(&output, &format!("tag-scoped import {extra:?}"));
     }
     assert_eq!(
