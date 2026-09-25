@@ -3170,6 +3170,16 @@ fn require_free_lease(
 /// distinction that makes bounding this safe.
 const CURRENT_SITREPS_PER_LANE: i64 = 10;
 
+/// How many raw rows one managed-enforcement scan page reads before filtering.
+///
+/// Listings that hide tag-denied rows apply the caller's bound to the rows the
+/// caller may READ, not to the raw rows — a `LIMIT` in SQL runs before the tag
+/// test, so a denied row would consume a slot and the page would come back
+/// short. Reading the whole table to serve one page would trade the short
+/// page for an unbounded read, so the scan goes in pages of this many rows
+/// and stops the moment the bound is filled.
+const MANAGED_SCAN_PAGE: i64 = 256;
+
 // Nothing deletes a sitrep.
 //
 // A hard retention cap was written here and then removed. It would have been
@@ -4093,6 +4103,53 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Fill a page from raw rows this caller may READ, scanning in chunks.
+    ///
+    /// `base_sql` is the listing's SELECT with its filters and ORDER BY but
+    /// no bound; `base` is that query's parameters. Each page of
+    /// [`MANAGED_SCAN_PAGE`] raw rows passes through `keep` — the listing's
+    /// own visibility filter — and the scan stops the moment `want` readable
+    /// rows are held, so a page costs pages, not the table. Only listings
+    /// whose bound is the readable rows' call this; unmanaged boards keep
+    /// their SQL `LIMIT` at the call site and never reach here.
+    fn scan_visible<T>(
+        &self,
+        base_sql: &str,
+        base: &[Box<dyn rusqlite::ToSql>],
+        want: usize,
+        map: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        mut keep: impl FnMut(Vec<T>) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let sql = format!("{base_sql} LIMIT ? OFFSET ?");
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                base.iter().map(|value| value.as_ref()).collect();
+            refs.push(&MANAGED_SCAN_PAGE);
+            refs.push(&offset);
+            let mut statement = self.connection.prepare(&sql)?;
+            let page = statement
+                .query_map(params_from_iter(refs), map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let fresh = page.len();
+            let mut kept = keep(page)?;
+            out.append(&mut kept);
+            if out.len() >= want {
+                out.truncate(want);
+                return Ok(out);
+            }
+            if fresh < MANAGED_SCAN_PAGE as usize {
+                return Ok(out);
+            }
+            offset += fresh as i64;
+        }
     }
 
     /// Search reaches rows through an INDEX, so the guard cannot be applied
@@ -5167,7 +5224,40 @@ impl Store {
         if !include_archived {
             sql.push_str(" AND archived=0");
         }
-        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        sql.push_str(" ORDER BY seq DESC");
+        // Filtered by each row's REAL tags AND its own frozen snapshot, so an
+        // invisible row is not reconstructible from its trail and a retag
+        // event does not name the tag that hid it. See [`event_tags`].
+        if self.authz.is_enforcing() {
+            // The bound is the READABLE rows': a `LIMIT` in SQL runs before
+            // the tag test, so a denied row would consume a slot and the page
+            // would come back short — or empty, leaking hidden activity and
+            // its timing (`events --task t-visible --limit 1` answering `[]`
+            // when the newest event concerns a denied attention row). Scan in
+            // pages until the bound is filled instead, so every caller's `+1`
+            // truncation probe still observes a next page. A negative bound is
+            // SQLite's "no bound" and stays one here. Outside managed
+            // enforcement nothing can be denied, so the direct estate keeps
+            // the SQL bound below and reads exactly what it asked for.
+            if limit < 0 {
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params_from_iter(values.iter().map(|value| value.as_ref())),
+                        board_event_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                return self.visible_events(rows);
+            }
+            return self.scan_visible(
+                &sql,
+                &values,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                board_event_row,
+                |rows| self.visible_events(rows),
+            );
+        }
+        sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
@@ -5176,9 +5266,6 @@ impl Store {
                 board_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        // Filtered by each row's REAL tags AND its own frozen snapshot, so an
-        // invisible row is not reconstructible from its trail and a retag
-        // event does not name the tag that hid it. See [`event_tags`].
         self.visible_events(rows)
     }
 
@@ -5308,7 +5395,23 @@ impl Store {
                 semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
             },
         );
-        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        sql.push_str(" ORDER BY seq ASC");
+        // The tag filter runs before the bound for the reason
+        // [`Store::events_with_bounds`] gives: a denied row must not consume
+        // a delivery slot, or a watch page comes back short and the cursor a
+        // caller advances over it stalls behind rows it cannot see. Outside
+        // managed enforcement nothing can be denied, so the direct estate
+        // keeps the SQL bound below.
+        if self.authz.is_enforcing() {
+            return self.scan_visible(
+                &sql,
+                &values,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                board_event_row,
+                |rows| self.visible_events(rows),
+            );
+        }
+        sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
@@ -9626,7 +9729,37 @@ impl Store {
             sql.push_str(" AND tier=?");
             values.push(Box::new(value.to_owned()));
         }
-        sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
+        sql.push_str(" ORDER BY created_at DESC,id DESC");
+        // The bound is the READABLE attempts': a `LIMIT` in SQL runs before
+        // the subject-tag test, so a denied attempt would consume a slot and
+        // the page would come back short — and the served `/deployments`
+        // index over-fetches by one to observe its `truncated` flag, which a
+        // short page would clear while readable rows waited. Scan in pages
+        // until the bound is filled instead, for the reason
+        // [`Store::events_with_bounds`] gives. A negative bound is SQLite's
+        // "no bound" and stays one here. Outside managed enforcement nothing
+        // can be denied, so the direct estate keeps the SQL bound below and
+        // reads exactly what it asked for.
+        if self.authz.is_enforcing() {
+            if limit < 0 {
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params_from_iter(values.iter().map(|value| value.as_ref())),
+                        deployment_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                return self.visible_deployments(rows);
+            }
+            return self.scan_visible(
+                &sql,
+                &values,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                deployment_row,
+                |rows| self.visible_deployments(rows),
+            );
+        }
+        sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement

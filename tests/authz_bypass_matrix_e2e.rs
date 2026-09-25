@@ -8384,3 +8384,424 @@ fn import_requires_whole_board_write_and_names_no_denied_id() {
         serde_json::json!("a fresh import row"),
     );
 }
+
+/// Paged listings are bound by readable rows, not raw rows (ACC-14).
+///
+/// Under enforcement the SQL `LIMIT` used to run before the tag filter, so a
+/// page came back short when denied rows fell in range — and the callers'
+/// `+1` truncation probes with it: `events --task t-visible --limit 1`
+/// answered `[]` when the newest events concerned a denied attention row,
+/// and the served `/deployments` index cleared its `truncated` flag while
+/// readable attempts waited behind a denied one. A managed reader holding
+/// board read but no `secret` tag now gets a full page of visible
+/// rows on the CLI and over HTTP with a true probe, while the owner still
+/// sees every row on both surfaces.
+#[test]
+fn managed_pages_fill_past_denied_rows_with_a_true_truncation_probe() {
+    let estate = ManagedEstate::new("page-fill");
+    let work_a = estate.work_a.clone();
+
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "visible", "--as", "seed", "--json"],
+    );
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "visible row",
+            "--id",
+            "t-visible",
+            "--tag",
+            "visible",
+            "--as",
+            "seed",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "secret row",
+            "--id",
+            "t-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+        ],
+    );
+
+    // Fifty-five visible events about the readable task, so the served task
+    // detail (bound fifty, over-fetched by one) has a full page to prove.
+    // Inserted directly: the filter reads live task tags, so plain
+    // task-scoped rows with no frozen snapshot are visible to anyone who can
+    // read the task, exactly like the CLI-written ones below them. The
+    // placeholder hashes keep the audit head initialized for the CLI writes
+    // that follow; chain verification is not what this test measures (the
+    // direct-estate `UPDATE events` precedent in `tests/e2e.rs` mutates rows
+    // the same way).
+    let board = Connection::open(&estate.board_a).unwrap();
+    for index in 0..55 {
+        board
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES('t-visible','task_updated','seed','{}',?1,0,'0000000000000000000000000000000000000000000000000000000000000000',?2)",
+                rusqlite::params![
+                    2_000_000_i64 + index,
+                    format!("{:064x}", 1_000_000 + index),
+                ],
+            )
+            .unwrap();
+    }
+    let newest_visible: i64 = board
+        .query_row("SELECT max(seq) FROM events", [], |row| row.get(0))
+        .unwrap();
+    for index in 0..101 {
+        board
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+                 host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+                 VALUES(?1,'t-visible','kanban','git',\
+                 '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+                 'geoywsMBP','http://localhost:9999','started','seed',?2,?3,?3,NULL)",
+                rusqlite::params![
+                    format!("d-s{index:03}"),
+                    format!("token-s{index:03}"),
+                    3_000_000_i64 + index,
+                ],
+            )
+            .unwrap();
+    }
+    for index in 0..31 {
+        board
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+                 host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+                 VALUES(?1,'t-visible','kanban','git',\
+                 '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+                 'geoywsMBP','http://localhost:9999','failed','seed',?2,?3,?3,?3)",
+                rusqlite::params![
+                    format!("d-f{index:02}"),
+                    format!("token-f{index:02}"),
+                    4_000_000_i64 + index,
+                ],
+            )
+            .unwrap();
+    }
+    // The denied failure is newer than every visible one, so it sits in
+    // range of the failures page.
+    board
+        .execute(
+            "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+             host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+             VALUES('d-fsec','t-secret','kanban','git',\
+             '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+             'geoywsMBP','http://localhost:9999','failed','seed','token-fsec',4_000_031,4_000_031,\
+             4_000_031)",
+            [],
+        )
+        .unwrap();
+    drop(board);
+
+    // Two newest events, both denied: a `secret` attention row raised on the
+    // readable task, then settled. Each envelope unions the row's live tags,
+    // so a caller without `secret` sees neither — but the task-scoped read
+    // must still answer the visible history beneath them.
+    let secret_attention = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "the secret question",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--task",
+            "t-visible",
+            "--tag",
+            "secret",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &secret_attention,
+            "--as",
+            "seed",
+            "--choice",
+            "approve",
+        ],
+    );
+    // The denied start is newer than every visible one, so it sits in range
+    // of the starts page.
+    let denied_start = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            "t-secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The owner's view, taken while enforcement is still direct: the newest
+    // rows are the denied ones, on every listing.
+    let owner_task_page = estate.ok(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        owner_task_page.contains(&secret_attention),
+        "the owner lost the newest task event before enforcement: {owner_task_page}"
+    );
+    let owner_starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        owner_starts.contains(&denied_start),
+        "the owner lost the newest start before enforcement: {owner_starts}"
+    );
+    let owner_failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        owner_failures.contains("d-fsec"),
+        "the owner lost the newest failure before enforcement: {owner_failures}"
+    );
+
+    // Board read on Beta too: the served `/deployments` index reads every
+    // board, and a board with no grants would refuse the whole estate
+    // listing. Beta holds no rows, so it contributes nothing either way.
+    estate.bind_self(
+        "p-page",
+        &[
+            board_scope("read", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            board_scope("read", &estate.id_b),
+        ],
+    );
+    estate.enforce("managed");
+
+    // The CLI pages: full, visible, and honest about the remainder. Before
+    // the fix each of these came back short — the task page empty — because
+    // the SQL bound ran ahead of the tag test.
+    let task_page = estate.run(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        task_page.status.success(),
+        "task page failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&task_page.stdout),
+        String::from_utf8_lossy(&task_page.stderr)
+    );
+    let task_stdout = String::from_utf8_lossy(&task_page.stdout).into_owned();
+    let task_rows: Vec<Value> = serde_json::from_str(&task_stdout).unwrap();
+    assert_eq!(
+        task_rows.len(),
+        1,
+        "the task page came back short behind denied rows: {task_stdout}"
+    );
+    assert_eq!(
+        task_rows[0]["seq"].as_i64().unwrap(),
+        newest_visible,
+        "the task page skipped the newest visible event: {task_stdout}"
+    );
+    assert!(
+        !task_stdout.contains(&secret_attention) && !task_stdout.contains("secret"),
+        "the task page carried the hidden row: {task_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&task_page.stderr).contains("showing 1 of more than 1"),
+        "the task page hid its truncation: {task_stdout}"
+    );
+    let board_page = estate.run(&work_a, &["events", "--limit", "1", "--all", "--json"]);
+    assert!(board_page.status.success());
+    let board_stdout = String::from_utf8_lossy(&board_page.stdout).into_owned();
+    let board_rows: Vec<Value> = serde_json::from_str(&board_stdout).unwrap();
+    assert_eq!(
+        board_rows.len(),
+        1,
+        "the board page came back short behind denied rows: {board_stdout}"
+    );
+    assert_eq!(
+        board_rows[0]["seq"].as_i64().unwrap(),
+        newest_visible,
+        "the board page skipped the newest visible event: {board_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&board_page.stderr).contains("showing 1 of more than 1"),
+        "the board page hid its truncation: {board_stdout}"
+    );
+    let starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    let starts_rows: Vec<Value> = serde_json::from_str(&starts).unwrap();
+    assert_eq!(
+        starts_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["d-s100"],
+        "the starts page came back short behind a denied attempt: {starts}"
+    );
+    let failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    let failures_rows: Vec<Value> = serde_json::from_str(&failures).unwrap();
+    assert_eq!(
+        failures_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["d-f30"],
+        "the failures page came back short behind a denied attempt: {failures}"
+    );
+
+    // The served pages: the same full answers with observed — not inferred —
+    // truncation flags.
+    let server = WebServer::start(&estate, &work_a, None);
+    let detail = server.get_json("/api/v1/task/Alpha/t-visible");
+    assert_eq!(
+        detail["events"]["returned"].as_u64().unwrap(),
+        50,
+        "the served task page came back short: {}",
+        detail["events"]["returned"]
+    );
+    assert!(
+        detail["events"]["truncated"].as_bool().unwrap(),
+        "the served task page hid its truncation"
+    );
+    assert_eq!(
+        detail["events"]["items"][0]["seq"].as_i64().unwrap(),
+        newest_visible,
+        "the served task page skipped the newest visible event"
+    );
+    assert!(
+        !serde_json::to_string(&detail["events"])
+            .unwrap()
+            .contains(&secret_attention),
+        "the served task page carried the hidden row"
+    );
+    let deployments = server.get_json("/api/v1/deployments");
+    assert_eq!(
+        deployments["active"]["returned"].as_u64().unwrap(),
+        100,
+        "the served starts page came back short"
+    );
+    assert!(
+        deployments["active"]["truncated"].as_bool().unwrap(),
+        "the served starts page hid its truncation"
+    );
+    assert_eq!(
+        deployments["active"]["items"][0]["deployment"]["id"]
+            .as_str()
+            .unwrap(),
+        "d-s100",
+        "the served starts page skipped the newest visible attempt"
+    );
+    assert_eq!(
+        deployments["failures"]["returned"].as_u64().unwrap(),
+        30,
+        "the served failures page came back short"
+    );
+    assert!(
+        deployments["failures"]["truncated"].as_bool().unwrap(),
+        "the served failures page hid its truncation"
+    );
+    assert_eq!(
+        deployments["failures"]["items"][0]["deployment"]["id"]
+            .as_str()
+            .unwrap(),
+        "d-f30",
+        "the served failures page skipped the newest visible attempt"
+    );
+    let served = serde_json::to_string(&deployments).unwrap();
+    assert!(
+        !served.contains(&denied_start) && !served.contains("d-fsec"),
+        "the served index carried a denied attempt: {served}"
+    );
+    drop(server);
+
+    // Granting `secret` makes exactly the withheld rows appear, which is
+    // what proves the tag was the reason — and the owner's newest-first
+    // order is unchanged.
+    estate.enforce("direct");
+    estate.grant(
+        "p-page",
+        &[
+            tag_scope("read", &estate.id_a, "secret"),
+            tag_scope("write", &estate.id_a, "secret"),
+        ],
+    );
+    estate.enforce("managed");
+    let granted_task_page = estate.ok(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        granted_task_page.contains(&secret_attention),
+        "granting the tag did not restore the newest task event: {granted_task_page}"
+    );
+    let granted_starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        granted_starts.contains(&denied_start),
+        "granting the tag did not restore the newest start: {granted_starts}"
+    );
+    let granted_failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        granted_failures.contains("d-fsec"),
+        "granting the tag did not restore the newest failure: {granted_failures}"
+    );
+}
