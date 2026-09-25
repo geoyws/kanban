@@ -1500,10 +1500,12 @@ fn notice_scan(positions: &mut HashMap<PathBuf, i64>) -> NoticeScan {
 /// denied — up to the scan's raw cap, and a scan that stopped with raw rows
 /// possibly unread reports `truncated`, so the next tick resumes where this
 /// one stopped instead of re-reading the whole denied tail on every
-/// revision. Advancing past denied rows cannot skip a visible one: the scan
-/// walks ascending `seq` inside one snapshot, so every row at or below the
-/// new position passed through this scan's own filter, and anything newer is
-/// still past it for the next scan to meet. A board that keeps producing
+/// revision. Advancing past denied rows cannot skip a row that is visible
+/// under the authority and tags current at scan time: the scan walks
+/// ascending `seq` inside one snapshot, so every row at or below the new
+/// position passed through this scan's own filter, and anything newer is
+/// still past it for the next scan to meet. A later grant or retag does not
+/// replay history already passed. A board that keeps producing
 /// only denied rows is therefore walked a bounded page per tick — a delay,
 /// never a skip, and never an unbounded re-read.
 fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<BoardNotices> {
