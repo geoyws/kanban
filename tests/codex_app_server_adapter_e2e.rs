@@ -693,6 +693,26 @@ fn assert_failure(output: &Output) {
     assert!(stderr.len() < 8192, "stderr too long: {}", stderr.len());
 }
 
+fn has_listen_stage(records: &[Value], stage: &str, phase: &str) -> bool {
+    records.iter().any(|record| {
+        record["mode"] == "listen-stage" && record["stage"] == stage && record["phase"] == phase
+    })
+}
+
+/// The fake writes its `listen` teardown record on clean EOF exit, which races
+/// with the adapter's SIGTERM/SIGKILL abort: a fail-closed run may or may not
+/// leave one behind. What the teardown record must never show is progress past
+/// the validation point, so bound its stage instead of forbidding it.
+fn assert_listen_teardown_at_most(records: &[Value], max_stage: u8) {
+    for record in records.iter().filter(|record| record["mode"] == "listen") {
+        let stage = record["stage"].as_str().unwrap().parse::<u8>().unwrap();
+        assert!(
+            stage <= max_stage,
+            "listen teardown advanced past stage {max_stage}: {record:?}"
+        );
+    }
+}
+
 fn pid_exists(pid: i32) -> bool {
     // SAFETY: signal 0 only checks process existence/permission.
     let result = unsafe { libc::kill(pid, 0) };
@@ -1105,7 +1125,14 @@ fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
     );
     assert_failure(&output);
     let records = fixture.capture_records();
-    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+    // Fail-closed at response1: the adapter sent `initialize`, rejected the
+    // drifted user agent, and never sent `thread/start`, so the fake never saw
+    // `turn/start` either. The trailing `listen` teardown record is left to a
+    // close-vs-kill race, so its stage is bounded instead of forbidden.
+    assert!(has_listen_stage(&records, "initialize", "received"));
+    assert!(!has_listen_stage(&records, "thread/start", "received"));
+    assert!(!has_listen_stage(&records, "turn/start", "received"));
+    assert_listen_teardown_at_most(&records, 1);
 }
 
 #[test]
@@ -1155,7 +1182,13 @@ fn compiled_process_thread_cli_version_drift_is_fail_closed() {
     );
     assert_failure(&output);
     let records = fixture.capture_records();
-    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+    // Fail-closed at response2: the adapter sent `thread/start`, rejected the
+    // drifted thread cliVersion, and never sent `turn/start`. The trailing
+    // `listen` teardown record is left to a close-vs-kill race, so its stage
+    // is bounded instead of forbidden.
+    assert!(has_listen_stage(&records, "thread/start", "received"));
+    assert!(!has_listen_stage(&records, "turn/start", "received"));
+    assert_listen_teardown_at_most(&records, 2);
 }
 
 #[test]
@@ -1791,8 +1824,11 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
             .collect::<Vec<_>>();
         match label {
             "init-codex-home-mismatch" => {
+                // The trailing `listen` teardown record is left to a close-vs-kill
+                // race, so it is excluded here and bounded below instead.
                 let modes = records
                     .iter()
+                    .filter(|record| record["mode"] != "listen")
                     .map(|record| record["mode"].as_str().unwrap())
                     .collect::<Vec<_>>();
                 assert!(
@@ -1842,8 +1878,11 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
                 }
             }
             "init-user-agent-missing" => {
+                // The trailing `listen` teardown record is left to a close-vs-kill
+                // race, so it is excluded here and bounded below instead.
                 let modes = records
                     .iter()
+                    .filter(|record| record["mode"] != "listen")
                     .map(|record| record["mode"].as_str().unwrap())
                     .collect::<Vec<_>>();
                 assert!(
@@ -1894,7 +1933,13 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
             }
             _ => unreachable!("unexpected case label {label}"),
         }
-        assert!(!records.iter().any(|record| record["mode"] == "listen"));
+        // Fail-closed at response1 in both cases: the adapter never sent
+        // `thread/start`, so the fake never saw `thread/start` or `turn/start`.
+        // The trailing `listen` teardown record is left to a close-vs-kill race,
+        // so its stage is bounded instead of forbidden.
+        assert!(!has_listen_stage(&records, "thread/start", "received"));
+        assert!(!has_listen_stage(&records, "turn/start", "received"));
+        assert_listen_teardown_at_most(&records, 1);
     }
 }
 
