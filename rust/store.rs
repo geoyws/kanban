@@ -3848,8 +3848,10 @@ pub struct FilteredEventTail {
     pub scanned_through: i64,
     /// False when raw rows may remain unread past `scanned_through`: the
     /// delivery filled, or the raw cap below stopped the scan. True only
-    /// after a short page, which is the one observation that proves the
-    /// tail ended.
+    /// after a short page with nothing undelivered past the cursor — a
+    /// delivery that filled mid-page still leaves its page's tail rows for
+    /// the next scan — which is the one observation that proves the tail
+    /// ended.
     pub exhausted: bool,
 }
 
@@ -5491,11 +5493,14 @@ impl Store {
     /// nothing: the [`FilteredEventTail`] they get back names the furthest
     /// raw sequence examined, and adopting it as the next cursor walks the
     /// denied stretch a bounded page per scan instead of re-reading it whole
-    /// on every revision. Advancing past denied rows cannot skip a visible
-    /// row: the scan walks ascending `seq` inside one snapshot, so every row
-    /// at or below the new position passed through this scan's own filter —
-    /// delivered if visible, rejected if denied — and anything newer is still
-    /// past the cursor for the next scan to meet.
+    /// on every revision. Advancing past denied rows cannot skip a row that
+    /// is visible under the authority and tags current at scan time: the
+    /// scan walks ascending `seq` inside one snapshot, so every row at or
+    /// below the new position passed through this scan's own filter —
+    /// delivered if visible, rejected if denied — and anything newer is
+    /// still past the cursor for the next scan to meet. A later grant or
+    /// retag does not replay history already passed: rows the scan rejected
+    /// stay behind the cursor it adopted.
     #[allow(clippy::too_many_arguments)]
     pub fn events_since_filtered_tail(
         &self,
@@ -5624,14 +5629,17 @@ impl Store {
             if kept.len() >= space {
                 // The delivery filled inside this page. The cursor stops at
                 // the last row handed out; anything past it waits for the
-                // next scan. A short page still proves the tail ended even
-                // though nothing more was asked for.
+                // next scan. `exhausted` holds only when that cut consumed
+                // the page's last raw row: a short page whose tail rows were
+                // left undelivered still has unread rows past the cursor,
+                // and claiming otherwise parks the websocket notices until
+                // some later write moves the revision.
                 out.extend(kept.into_iter().take(space));
                 let scanned = out.last().map(|event| event.seq).unwrap_or(frontier);
                 return Ok(FilteredEventTail {
                     events: out,
                     scanned_through: scanned,
-                    exhausted: fresh < MANAGED_SCAN_PAGE as usize,
+                    exhausted: fresh < MANAGED_SCAN_PAGE as usize && scanned == last_raw,
                 });
             }
             out.extend(kept);
@@ -12671,6 +12679,99 @@ mod tests {
         assert!(
             third.exhausted,
             "the settled tail claimed rows may remain with the head reached"
+        );
+    }
+
+    /// A delivery that fills mid-page on a short final page is not exhausted.
+    ///
+    /// Five hundred ten visible events arrive as a full 256-row page and a
+    /// short 254-row one; a scan asking for 500 rows delivers the first 244
+    /// of that second page and stops with ten visible rows still unread past
+    /// the cursor. Reporting `exhausted` there parks the websocket notices
+    /// until some later write moves the revision, so the flag must hold only
+    /// when the delivered cut consumed the page's last raw row. This fails
+    /// on the old `fresh < MANAGED_SCAN_PAGE` test, which read the short
+    /// page as the tail ending though nothing more had been asked for.
+    #[test]
+    fn scan_event_tail_reports_unexhausted_when_delivery_fills_mid_short_page() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-1111-4111-8111-111111111111";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-tail-midpage-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let base;
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            base = seed.event_head_seq().expect("head before events");
+            let mut clock = 100_i64;
+            for _ in 0..510 {
+                clock += 1;
+                crate::audit::append_board_event(
+                    &seed.connection,
+                    Some("t-visible"),
+                    "task_updated",
+                    "seed",
+                    "{}",
+                    clock,
+                )
+                .expect("append event");
+            }
+        }
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under full tag authority");
+
+        let tail = store
+            .events_since_filtered_tail(None, &[], &[], &[], &[], &[], base, 500, true)
+            .expect("mid-page tail scan");
+        assert_eq!(
+            tail.events.len(),
+            500,
+            "the scan did not deliver the rows it asked for"
+        );
+        assert_eq!(
+            board_event_seqs(&tail.events),
+            (base + 1..=base + 500).collect::<Vec<_>>(),
+            "the scan skipped or reordered rows filling mid-page"
+        );
+        assert_eq!(
+            tail.scanned_through,
+            base + 500,
+            "the delivering scan did not stop at the row it handed out"
+        );
+        assert!(
+            !tail.exhausted,
+            "the scan filled mid-page with ten rows still unread yet claimed the tail ended"
         );
     }
 

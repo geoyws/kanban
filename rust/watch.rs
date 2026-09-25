@@ -361,67 +361,7 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
     match &spec.source {
         Source::Board { path, .. } => {
             let store = Store::open_readonly_as_caller(path)?;
-            read_snapshot(&store, |store| {
-                // The filtered scan examines a bounded raw stretch and
-                // reports how far it got; the unfiltered tail then walks at
-                // most `limit` rows past rows the scan already ruled out.
-                // Both reads sit in this one snapshot, so a commit landing
-                // mid-poll is invisible to both and is picked up whole by
-                // the next poll. (The two reads used to run on two
-                // connections opened moments apart — two snapshots — and a
-                // matching event committing between them was invisible to
-                // the filtered scan and visible to the tail, which advanced
-                // the cursor past it: never delivered, never reported
-                // missing. The registry arm below still has that two-scan
-                // shape and keeps its seam test; the board arm's filtered
-                // scan is capped but the window it shares with its tail is
-                // still exactly one snapshot.)
-                let tail = store.events_since_filtered_tail(
-                    spec.key.selector_value.as_deref(),
-                    &spec.key.kinds,
-                    &spec.key.relations,
-                    &spec.key.prior_statuses,
-                    &spec.key.current_statuses,
-                    &spec.key.tags,
-                    cursor,
-                    spec.limit,
-                    spec.key.archived,
-                )?;
-                let mut advance = tail.scanned_through;
-                if tail.events.is_empty() && spec.follow {
-                    // Step over rows the filtered scan never materialised:
-                    // its SQL binds the kinds, task, archival and semantic
-                    // predicates, so a row those reject is a known
-                    // non-match without ever being read. The walk stops at
-                    // the first row past the examined range that MIGHT
-                    // still match — stepping over that one could skip a
-                    // visible row the capped scan has not reached — so the
-                    // cursor only ever covers ruled-out rows.
-                    for event in store.events_since(
-                        None,
-                        between_scans(&store.connection, cursor),
-                        spec.limit,
-                        spec.key.archived,
-                    )? {
-                        if event.seq <= tail.scanned_through
-                            || statically_rejected(&spec.key, &event)
-                        {
-                            advance = event.seq;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                let tail_seq = if tail.events.is_empty() && spec.follow && advance != cursor {
-                    Some(advance)
-                } else {
-                    None
-                };
-                Ok(Poll {
-                    batch: tail.events,
-                    tail_seq,
-                })
-            })
+            read_snapshot(&store, |store| poll_board_once(store, spec, cursor))
         }
         Source::Registry { root } => {
             let registry = Registry::open_readonly_at(root)?;
@@ -432,7 +372,7 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
                     cursor,
                     spec.limit,
                 )?;
-                let tail_seq = if batch.is_empty() && spec.follow {
+                let tail_seq = if batch.is_empty() {
                     registry
                         .rule_events_since(
                             spec.key.selector_value.as_deref(),
@@ -449,6 +389,79 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
             })
         }
     }
+}
+
+/// One board poll's batch and advance from an already-open store.
+///
+/// Split from [`poll_once`] so tests can drive the managed-estate path:
+/// `poll_once` resolves its authority from the kernel and the canonical
+/// registry, which a unit test cannot mint, while this takes the store
+/// as-is — including one opened with an explicit managed context. The
+/// production path is unchanged: open, snapshot, delegate.
+fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll> {
+    // The filtered scan examines a bounded raw stretch and reports how far
+    // it got; the unfiltered walk then extends that frontier past rows the
+    // scan never materialised. Both reads sit in the caller's one snapshot,
+    // so a commit landing mid-poll is invisible to both and is picked up
+    // whole by the next poll. (The two reads used to run on two connections
+    // opened moments apart — two snapshots — and a matching event committing
+    // between them was invisible to the filtered scan and visible to the
+    // tail, which advanced the cursor past it: never delivered, never
+    // reported missing. The registry arm still has that two-scan shape and
+    // keeps its seam test; the board arm's filtered scan is capped but the
+    // window it shares with its walk is still exactly one snapshot.)
+    let tail = store.events_since_filtered_tail(
+        spec.key.selector_value.as_deref(),
+        &spec.key.kinds,
+        &spec.key.relations,
+        &spec.key.prior_statuses,
+        &spec.key.current_statuses,
+        &spec.key.tags,
+        cursor,
+        spec.limit,
+        spec.key.archived,
+    )?;
+    // The walk starts at the scan frontier, never back at the cursor: the
+    // scan already examined every row up to `scanned_through`, so starting
+    // lower re-covers them one `limit` at a time and drags a `--limit 1`
+    // follower to a crawl across a long denied stretch. From the frontier
+    // it steps only over rows the filtered scan never materialised: its SQL
+    // binds the kinds, task, archival and semantic predicates, so a row
+    // those reject is a known non-match without ever being read. The walk
+    // stops at the first row past the frontier that MIGHT still match —
+    // stepping over that one could skip a visible row the capped scan has
+    // not reached — so the cursor only ever covers ruled-out rows.
+    let mut advance = tail.scanned_through;
+    if tail.events.is_empty() {
+        for event in store.events_since(
+            None,
+            between_scans(&store.connection, tail.scanned_through),
+            spec.limit,
+            spec.key.archived,
+        )? {
+            if statically_rejected(&spec.key, &event) {
+                advance = event.seq;
+            } else {
+                break;
+            }
+        }
+    }
+    // No `follow` gate: a one-shot poll behind a denied stretch longer than
+    // the raw cap would otherwise come back empty with no cursor, and a
+    // consumer re-running `kb watch --cursor C` would re-read the same
+    // denied rows forever. The stream emits this advance as one `advanced`
+    // heartbeat — the envelope ADR-031 already obliges consumers to persist
+    // — so each run walks one more bounded page. Still silent when nothing
+    // moved: an empty poll at the head carries no cursor.
+    let tail_seq = if tail.events.is_empty() && advance != cursor {
+        Some(advance)
+    } else {
+        None
+    };
+    Ok(Poll {
+        batch: tail.events,
+        tail_seq,
+    })
 }
 
 /// Whether this row can never match the poll's static predicates.
@@ -477,11 +490,12 @@ fn statically_rejected(key: &StreamKey, event: &Event) -> bool {
     false
 }
 
-/// Runs after the registry poll's filtered scan and before its tail scan,
-/// inside the poll's snapshot. Empty in every build but the unit tests, which
-/// use it to commit an event into exactly the window a two-snapshot poll used
-/// to leak. The board arm is a single scan and has no such window, so only
-/// the registry arm calls this.
+/// Runs after a poll's filtered scan and before its tail walk, inside the
+/// poll's snapshot. Empty in every build but the unit tests, which use it
+/// to commit an event into exactly the window a two-snapshot poll used to
+/// leak. The board arm hands it the scan frontier — the walk starts there,
+/// not at the cursor — while the registry arm hands it the cursor, so only
+/// the registry arm can shift what the walk then reads.
 ///
 /// It returns the cursor the tail scan reads from, and is `#[must_use]`, so the
 /// tail scan consumes its result and the seam cannot drift after the tail scan
@@ -492,9 +506,8 @@ fn statically_rejected(key: &StreamKey, event: &Event) -> bool {
 fn between_scans(_connection: &Connection, cursor: i64) -> i64 {
     cursor
 }
-
-/// Fires inside the registry poll's snapshot, between the two scans, and
-/// returns the cursor the tail scan then reads from.
+/// Fires inside the poll's snapshot, between the two scans, and returns the
+/// cursor the tail walk then reads from.
 #[cfg(test)]
 type BetweenScansHook = Box<dyn FnMut(&Connection, i64) -> i64>;
 
@@ -564,14 +577,26 @@ fn watch(spec: WatchSpec) -> Result<()> {
 /// that is visible. A sink that returns `Err` ends the stream, which is the
 /// same path a closed pipe already takes in production.
 fn stream(spec: &WatchSpec, sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>) -> Result<()> {
+    stream_with(spec, sink, &mut |spec, cursor| poll_once(spec, cursor))
+}
+
+/// The follow loop with its poll behind a seam.
+///
+/// Production passes [`poll_once`], which resolves its authority from the
+/// kernel and the canonical registry. Tests pass a closure over a store
+/// they opened themselves — the only way to drive the managed-estate path,
+/// where tag-denied rows exercise the scan floor and the one-shot
+/// heartbeat, through the real loop rather than a test-only copy of it.
+fn stream_with(
+    spec: &WatchSpec,
+    sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>,
+    poll: &mut dyn FnMut(&WatchSpec, i64) -> Result<Poll>,
+) -> Result<()> {
     let mut cursor = spec.cursor;
     let mut cursor_token = encode_cursor(&spec.key, cursor)?;
     loop {
-        let poll = poll_once(spec, cursor)?;
+        let poll = poll(spec, cursor)?;
         if poll.batch.is_empty() {
-            if !spec.follow {
-                return Ok(());
-            }
             if let Some(tail_seq) = poll.tail_seq
                 && needs_advanced_heartbeat(Some(cursor), tail_seq)
             {
@@ -584,8 +609,17 @@ fn stream(spec: &WatchSpec, sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>) 
                     kind: "heartbeat",
                     payload: json!({"state":"advanced"}),
                 })?;
+                // One shot behind a denied stretch reports its progress as
+                // this single heartbeat and stops; the caller re-runs from
+                // the persisted cursor to walk the next page.
+                if !spec.follow {
+                    return Ok(());
+                }
                 sleep(POLL_INTERVAL);
                 continue;
+            }
+            if !spec.follow {
+                return Ok(());
             }
             sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
@@ -1940,6 +1974,249 @@ mod tests {
             Some(2),
             "the tail scan did not read its cursor through the seam, so the seam is no \
              longer sitting between the two scans and every race test using it is vacuous"
+        );
+    }
+
+    /// Seed a board holding one visible event, six hundred tag-denied events,
+    /// and a closing visible event: more than two scan pages of denied rows,
+    /// so every tail here crosses a chunk boundary and the raw cap.
+    ///
+    /// Returns the board path, its board id, and the two visible sequences.
+    /// `poll_once` mints its authority from the kernel and cannot run under
+    /// this caller, so the tests open the managed store themselves and drive
+    /// [`poll_board_once`] (or [`stream_with`]) with it.
+    fn seed_denied_stretch_board(label: &str) -> (PathBuf, String, i64, i64) {
+        use uuid::Uuid;
+
+        let board = format!(
+            "dddddddd-0000-4000-8000-{:012x}",
+            Uuid::new_v4().as_u128() & 0xffffffffffff
+        );
+        let dir = std::env::temp_dir().join(format!("kanban-watch-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let (first_visible, last_visible);
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(crate::model::AddTask {
+                id: Some("t-visible".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: "visible row".to_owned(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: serde_json::json!({}),
+                actor: Some("seed".to_owned()),
+                allowed_models: Vec::new(),
+                tags: vec!["visible".to_owned()],
+            })
+            .expect("seed visible");
+            seed.add_task(crate::model::AddTask {
+                id: Some("t-secret".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: "secret row".to_owned(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: serde_json::json!({}),
+                actor: Some("seed".to_owned()),
+                allowed_models: Vec::new(),
+                tags: vec!["secret".to_owned()],
+            })
+            .expect("seed secret");
+            let mut clock = 100_i64;
+            let mut append = |task: &str| -> i64 {
+                clock += 1;
+                crate::audit::append_board_event(
+                    &seed.connection,
+                    Some(task),
+                    "task_updated",
+                    "seed",
+                    "{}",
+                    clock,
+                )
+                .expect("append event");
+                seed.event_head_seq().expect("head after append")
+            };
+            first_visible = append("t-visible");
+            for _ in 0..600 {
+                append("t-secret");
+            }
+            last_visible = append("t-visible");
+        }
+        (path, board, first_visible, last_visible)
+    }
+
+    /// Open a board for a caller holding board read and the `visible` tag but
+    /// not `secret`: the denied stretch is invisible, the bracketing events
+    /// are not.
+    fn open_visible_only(path: &Path, board: &str) -> Store {
+        use crate::authz::AuthzContext;
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        Store::open_with_authz(
+            path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority")
+    }
+
+    /// A board-wide spec over the denied stretch: no kinds, no tags, so every
+    /// row is a candidate and only the per-row tag filter denies.
+    fn stretch_spec(path: &Path, cursor: i64, limit: i64, follow: bool) -> WatchSpec {
+        WatchSpec {
+            source: Source::Board {
+                path: path.to_path_buf(),
+                board_name: None,
+            },
+            key: StreamKey {
+                source_kind: "board".to_owned(),
+                source: canonical_source_path(path).expect("canonical source"),
+                selector_kind: "board".to_owned(),
+                selector_value: None,
+                kind: None,
+                kinds: Vec::new(),
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor,
+            limit,
+            follow,
+        }
+    }
+
+    /// A `--limit 1` follower moves by the scan floor, not one row per poll.
+    ///
+    /// Six hundred denied rows sit ahead of the cursor with a visible row
+    /// past them. The old walk started at the cursor and stepped a single
+    /// row, so `tail_seq` came back one past the cursor while each poll
+    /// re-examined five hundred rows — the visible row arriving thousands of
+    /// polls late. Starting the walk at the scan frontier carries the whole
+    /// examined range forward instead.
+    #[test]
+    fn a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows() {
+        let (path, board, first_visible, _) = seed_denied_stretch_board("poll-floor");
+        let store = open_visible_only(&path, &board);
+        let spec = stretch_spec(&path, first_visible, 1, true);
+
+        let poll = poll_board_once(&store, &spec, first_visible).expect("poll over denied stretch");
+        assert!(
+            poll.batch.is_empty(),
+            "the capped scan delivered past its raw cap"
+        );
+        let tail_seq = poll
+            .tail_seq
+            .expect("the scan examined rows yet moved nowhere");
+        assert!(
+            tail_seq >= first_visible + 500,
+            "the poll advanced one row instead of the scan floor: tail_seq={tail_seq} from {first_visible}"
+        );
+    }
+
+    /// A one-shot watch behind a denied stretch longer than the raw cap hands
+    /// the consumer progress instead of silence.
+    ///
+    /// The first run delivers nothing but emits exactly one `advanced`
+    /// heartbeat carrying the scan frontier — the envelope ADR-031 already
+    /// obliges consumers to persist — and the second run from that cursor
+    /// delivers the visible row waiting past the stretch. On the old code
+    /// the first run emitted nothing at all, so a polling consumer re-ran
+    /// from the same cursor and re-read the same denied rows forever.
+    ///
+    /// A bare continue-scan in one-shot mode is the rejected alternative:
+    /// the raw cap exists to bound one scan's work, and any larger bound
+    /// only moves the stall further out. The heartbeat keeps every run
+    /// bounded while the persisted cursor walks the stretch a page per run.
+    #[test]
+    fn a_one_shot_watch_behind_denied_rows_reports_progress_not_silence() {
+        let (path, board, first_visible, last_visible) =
+            seed_denied_stretch_board("oneshot-heartbeat");
+        let store = open_visible_only(&path, &board);
+
+        let first = stretch_spec(&path, first_visible, 50, false);
+        let mut first_out = Vec::new();
+        stream_with(
+            &first,
+            &mut |envelope| {
+                first_out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("a one-shot watch must terminate on its own");
+        assert_eq!(
+            first_out.len(),
+            1,
+            "the stalled run emitted {} envelopes instead of one advancing heartbeat",
+            first_out.len()
+        );
+        assert_eq!(first_out[0].kind, "heartbeat");
+        assert_eq!(envelope_state(&first_out[0]), "advanced");
+        let advanced =
+            decode_cursor(&first_out[0].cursor, &first.key).expect("decode advanced cursor");
+        assert!(
+            advanced >= first_visible + 500,
+            "the heartbeat carried no progress: cursor={advanced} from {first_visible}"
+        );
+
+        let second = stretch_spec(&path, advanced, 50, false);
+        let mut second_out = Vec::new();
+        stream_with(
+            &second,
+            &mut |envelope| {
+                second_out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("the resumed one-shot watch must terminate on its own");
+        assert_eq!(
+            second_out.len(),
+            1,
+            "the resumed run did not deliver exactly the visible row past the stretch"
+        );
+        assert_eq!(second_out[0].kind, "event");
+        assert_eq!(
+            decode_cursor(&second_out[0].cursor, &second.key).expect("decode event cursor"),
+            last_visible,
+            "the resumed run did not deliver the visible row past the denied stretch"
         );
     }
 

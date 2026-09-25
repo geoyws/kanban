@@ -47,7 +47,11 @@ The watch cursor is opaque. It binds the exact source, selector, predicate set,
 archive state, and last consumed ledger `seq` together. Consumers persist the
 cursor from every event or advancing-heartbeat envelope and resume from the
 next ledger row. Literal `0` is the only bootstrap cursor. Wall clock time,
-file mtime, WAL fingerprints, and payload hashes are not cursors.
+file mtime, WAL fingerprints, and payload hashes are not cursors. Visibility
+is evaluated at scan time: once a cursor has advanced past a row its scan
+denied, a later grant or retag does not replay that history — the consumer
+resumes from the next ledger row, which is the `noticesFrom: now` semantic
+the socket notices already carry.
 
 Reusing a cursor against a different scope, selector, kind, archive state, or
 future sequence must fail closed rather than silently replaying the wrong
@@ -121,7 +125,12 @@ Semantics:
 - Idle heartbeats do not advance the durable cursor. When predicates skip a
   committed tail with no matching event, an `advanced` heartbeat moves the
   opaque cursor to the last scanned row so follow mode does not rescan the same
-  unmatched rows forever.
+  unmatched rows forever. A one-shot run that scanned but delivered nothing
+  emits that heartbeat once and stops, so a polling consumer re-running from
+  the persisted cursor walks one more bounded page per run; an empty run at
+  the head stays silent. Continuing the scan past the raw cap inside one run
+  is rejected: the cap bounds one scan's work, and any larger bound only
+  moves the stall further out.
 - Secrets are redacted recursively before payloads are emitted.
 
 Each delivery is an NDJSON envelope containing:
