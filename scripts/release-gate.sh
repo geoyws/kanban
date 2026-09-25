@@ -65,16 +65,23 @@ cd "$here"
 # web tool that runs before cargo, and libtest's burst print of a failing
 # test then dies as `error: io error when listing tests: Os { code: 11,
 # kind: WouldBlock }` with no verdict line (gate-acc14-0d2f527, step 18).
-# Clear the flag up front. Perl is Debian-essential and ships on macOS too;
-# a missing perl skips the heal rather than failing the gate.
-if command -v perl >/dev/null 2>&1; then
-    perl -MFcntl=F_GETFL,F_SETFL,O_NONBLOCK -e '
+# Clear the flag up front and again before every step below: when the gate
+# runs on a TTY (a host run, or `docker run -it`), fds 0, 1 and 2 are usually
+# dups of one pty description, so a child that sets O_NONBLOCK on its stdin
+# sets it on the stream `cat` and `printf` write to as well. Perl is
+# Debian-essential and ships on macOS too; a missing perl skips the heal
+# rather than failing the gate.
+heal_nonblock() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -MFcntl=F_GETFL,F_SETFL,O_NONBLOCK -e '
 for my $fh (*STDOUT, *STDERR) {
     if (defined(my $flags = fcntl($fh, F_GETFL, 0))) {
         fcntl($fh, F_SETFL, $flags & ~O_NONBLOCK);
     }
 }' || true
-fi
+    fi
+}
+heal_nonblock
 
 # A value that names nothing executable is an operator mistake, and the
 # discovery order would quietly resolve to some other browser -- which is a
@@ -92,13 +99,23 @@ run() {
     local label="$1"
     shift
     step=$((step + 1))
+    # Re-heal before the step's `cat` writes: the previous step may have left
+    # O_NONBLOCK set on the shared description (see above), and the heal up
+    # front cannot cover that.
+    heal_nonblock
     printf '\nrelease-gate: [%d] %s\n' "$step" "$label"
     # Each step writes through `cat`, so the step's stdout/stderr is a private
     # pipe of this step: a child that flips O_NONBLOCK can at worst poison
     # this step's pipe, never the shared log stream the later steps write to.
-    # The step's own status still rules the gate (`pipefail` is set above, so
-    # a failing step fails the pipeline; `cat` only forwards bytes).
-    if ! "$@" 2>&1 | cat; then
+    # The step never reads stdin: every step is a non-interactive batch
+    # command (checked: the only `read` loops under the invoked scripts take
+    # explicit `<file`, `< <(...)` or `<<<` input, and cargo/git/bun never
+    # prompt for these args), so detaching it from our stdin keeps a child
+    # from flipping O_NONBLOCK on the description our own stdin may share
+    # with stdout/stderr on a TTY. The step's own status still rules the gate
+    # (`pipefail` is set above, so a failing step fails the pipeline; `cat`
+    # only forwards bytes).
+    if ! "$@" </dev/null 2>&1 | cat; then
         printf '\nrelease-gate: FAILED at step %d: %s\n' "$step" "$label" >&2
         printf 'release-gate: command was: %s\n' "$*" >&2
         exit 1
