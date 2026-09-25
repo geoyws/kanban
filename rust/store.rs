@@ -5368,6 +5368,15 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Whether this store filters rows by caller authority.
+    ///
+    /// The watch poll gates its one-shot advancing heartbeat on this: only a
+    /// managed scan caps its raw work per poll, so only there can an empty
+    /// one-shot batch hide a denied stretch the consumer must walk. Anywhere
+    /// else an empty one-shot stays silent, byte-identical to before.
+    pub(crate) fn is_enforcing(&self) -> bool {
+        self.authz.is_enforcing()
+    }
     /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
     ///
     /// Deliberately board-wide: it used to be the tail `watch::poll_once`
