@@ -4813,6 +4813,9 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
     }
 
+    // The cast below is dead on Linux (`st_dev` is already `u64`) and required
+    // on macOS (`st_dev` is `i32` there): allow the lint only where it fires.
+    #[cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
     fn fd_identity(fd: i32) -> (u64, u64) {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         unsafe {

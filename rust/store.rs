@@ -6443,7 +6443,7 @@ impl Store {
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision,check_question,check_choices,check_answer,check_about,lane) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL,?,?,?,?,?,?)",
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision,check_question,check_choices,check_answer,check_explanation,check_about,lane) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL,?,?,?,?,?,?)",
             params![
                 id,
                 task_id,

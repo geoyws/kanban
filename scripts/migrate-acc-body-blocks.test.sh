@@ -22,7 +22,7 @@ export KANBAN_DATA_DIR="$WORK/data"
 
 pass=0
 fail=0
-export KB_BIN="$here/target/debug/kanban"
+export KB_BIN="${CARGO_TARGET_DIR:-$here/target}/debug/kanban"
 KB="$KB_BIN"
 assert() {
   local label="$1"; shift
