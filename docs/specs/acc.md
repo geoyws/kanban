@@ -967,3 +967,24 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   while re-listing the readable but read-only `t-ops` still needs no new
   authority and the kept loop still preserves the hidden edge. Pinned by the
   extended `dependency_replacement_keeps_a_tag_denied_prerequisite` (A25).
+
+- 2026-09-25 — ACC-14 search-restriction evidence landed (`t-5f7daa1b`):
+  `restricted_match_agrees_with_filter_afterwards_on_both_branches` now also
+  covers a large mixed permitted set past the old 900-row chunk boundary
+  (more than one old batch). The landing removes the `rowid IN` restriction
+  it once pinned: a throwaway probe on the bundled SQLite 3.50.2 showed
+  EXPLAIN QUERY PLAN printing a full `SCAN ... INDEX 0:=M1` for `MATCH ?
+  AND rowid IN (...)` — FTS5 has no rowid seek to push a restriction into
+  — and measured one MATCH execution per IN element (~2.7s for 2000
+  permitted + 5000 denied, ~562ms for 500 permitted, against ~3–4.5ms for a
+  single walk; `rowid = ?` per id and a VALUES join scaled the same way),
+  so batching the restriction would run the denied-driven walk once per id
+  instead of once per call. The probe was deleted afterwards.
+  `fts_match_permitted` now runs exactly one rowid-only MATCH walk on every
+  path with the permitted intersect in Rust: denied seqs are materialised as
+  bare i64 rowids — MATCH time still grows with the denied rows holding the
+  query's terms, one shared walk being the minimum FTS5 permits — while no
+  denied content, snippet, or bm25 is ever read and the served strengths
+  still come from the permitted-only recomputation. The three comments that
+  said denied rows are "never materialised" now state exactly what is and is
+  not materialised.

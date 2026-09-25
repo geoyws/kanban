@@ -269,12 +269,18 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
 ///
 /// The unenforced path keeps the whole-index MATCH in [`fts_match_rows`]:
 /// every row is readable there, so its scores stay exactly what the
-/// unfiltered code produced. Under enforcement the MATCH itself must not see
-/// denied rows: running it over the whole index with a per-row bm25 and
-/// dropping denied rowids afterwards materialises every denied match, so
-/// latency grows with the number of denied rows holding a guessed prefix.
-/// The MATCH is therefore restricted to the permitted seqs — denied rows
-/// are never materialised, no denied content or bm25 is ever read. The FTS
+/// unfiltered code produced. Under enforcement the MATCH still walks the
+/// whole index once, rowids only: FTS5 has no rowid seek to push a
+/// restriction into (EXPLAIN QUERY PLAN prints a full `SCAN ... INDEX
+/// 0:=M1` for `MATCH ? AND rowid IN (...)` on the bundled SQLite 3.50.2),
+/// and a throwaway probe measured the restricted shapes multiplying the
+/// walk — one MATCH execution per IN element, ~2.7s for 2000 permitted +
+/// 5000 denied against ~4.5ms for the single walk. So exactly one MATCH
+/// runs per call and the permitted intersect happens in Rust: denied seqs
+/// ARE materialised here, as bare i64 rowids, and MATCH time still grows
+/// with the denied rows holding the query's terms — one shared walk is the
+/// minimum FTS5 permits. What is never read for a denied row is any
+/// content, snippet, or bm25. The FTS
 /// table is external-content (`content='search_documents'`,
 /// `content_rowid='seq'`), so its `rowid` IS the document `seq` and the
 /// restriction needs no mapping.
@@ -301,37 +307,11 @@ fn fts_match_permitted(
     let Some(query) = fts_query(query) else {
         return Ok(matched);
     };
-    // Bound parameters keep the restriction a read, but the variable-number
-    // limit predates the search schema on some builds (999), so a permitted
-    // set larger than one chunk takes the single whole-index rowid walk with
-    // the permitted intersect in Rust instead: repeating the MATCH walk per
-    // chunk would cost more than the one walk whose bm25 this skips anyway.
-    // Either way no bm25 is computed and no denied row is materialised.
-    const CHUNK: usize = 900;
-    if permitted.len() <= CHUNK {
-        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(permitted.len() + 1);
-        values.push(Box::new(query));
-        let mut placeholders = String::new();
-        for (index, seq) in permitted.iter().enumerate() {
-            if index > 0 {
-                placeholders.push(',');
-            }
-            placeholders.push('?');
-            values.push(Box::new(*seq));
-        }
-        let sql = format!(
-            "SELECT rowid FROM search_fts WHERE search_fts MATCH ? AND rowid IN ({placeholders})"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params_from_iter(values.iter().map(|value| value.as_ref())),
-            |row| row.get::<_, i64>(0),
-        )?;
-        for row in rows {
-            matched.insert(row?);
-        }
-        return Ok(matched);
-    }
+    // Exactly one MATCH execution on every path: each execution walks the
+    // whole posting list for the query's terms (measured, not assumed —
+    // see the doc comment), so batching the permitted seqs into IN lists
+    // would run the denied-driven walk once per id instead of once per
+    // call. No bm25 is computed and no denied content is read here.
     let mut statement =
         connection.prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH ?")?;
     let rows = statement.query_map([query], |row| row.get::<_, i64>(0))?;
@@ -786,10 +766,12 @@ pub fn search(
         }
         candidates.push(document);
     }
-    // Under enforcement FTS decides only WHICH rows match, and the MATCH
-    // itself is restricted to the permitted seqs (`t-5f7daa1b`): denied rows
-    // are never materialised, so a guessed prefix they hold costs no MATCH
-    // time. The strengths come from [`permitted_bm25_scores`], whose N, df
+    // Under enforcement FTS decides only WHICH rows match, with one
+    // rowid-only MATCH walk per call (`t-5f7daa1b`): denied seqs are read
+    // as bare rowids and intersected away in Rust — never as content,
+    // snippets, or bm25 — so a guessed prefix they hold costs one shared
+    // walk, the minimum FTS5 permits, and no per-row scoring work. The
+    // strengths come from [`permitted_bm25_scores`], whose N, df
     // and avgdl range over the permitted candidates alone — FTS5's
     // whole-index statistics would otherwise leak a denied row's text
     // through the non-max scores and the order (M1).
@@ -1229,12 +1211,14 @@ pub fn health(connection: &Connection) -> Result<SearchIndexHealth> {
 mod tests {
     use super::*;
     /// The restricted membership probe agrees with the filter-afterwards set
-    /// on every branch (`t-5f7daa1b`): the `rowid IN` path for small
-    /// permitted sets, the rowid walk with the Rust intersect past the
-    /// variable-number chunk size, the empty permitted set, and a query with
-    /// no indexable tokens. The large-set branch is unreachable through the
-    /// existing process tests, so without this a wrong branch there — a
-    /// dropped match, a widened one — would slip through them all.
+    /// at every size (`t-5f7daa1b`): a small permitted set, a large mixed
+    /// set past the old 900-row chunk boundary (more than one old batch),
+    /// the whole index readable, the empty permitted set, and a query with
+    /// no indexable tokens. The probe runs one rowid-only MATCH walk with
+    /// the permitted intersect in Rust — FTS5 has no rowid seek for an IN
+    /// restriction (a batched IN measured ~600x slower), so the large sets
+    /// are the load-bearing cases here: without them a dropped or widened
+    /// match past the old chunk size would slip through every process test.
     #[test]
     fn restricted_match_agrees_with_filter_afterwards_on_both_branches() {
         let connection = Connection::open_in_memory().unwrap();
@@ -1296,13 +1280,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Large permitted set: every row is readable, past the chunk size, so
-        // the rowid walk with the Rust intersect answers.
+        // Large permitted set: every row is readable.
         let all: HashSet<i64> = (1..=1200_i64).collect();
         let restricted = fts_match_permitted(&connection, "harbourq", &all).unwrap();
         assert_eq!(restricted, full);
-        // Repeated calls agree: the probe binds its own seqs and leaves no
-        // per-connection state behind.
+        // Large mixed set past the old 900-row chunk boundary — more than
+        // one old batch — with readable and denied rows interleaved.
+        let mixed: HashSet<i64> = (1..=1100_i64).collect();
+        let restricted = fts_match_permitted(&connection, "harbourq", &mixed).unwrap();
+        let mixed_expected: HashSet<i64> = full.intersection(&mixed).copied().collect();
+        assert_eq!(restricted, mixed_expected);
+        assert_eq!(restricted.len(), 550);
+        // Repeated calls agree: the probe leaves no per-connection state
+        // behind.
         let again = fts_match_permitted(&connection, "harbourq", &permitted).unwrap();
         assert_eq!(again, expected);
     }
