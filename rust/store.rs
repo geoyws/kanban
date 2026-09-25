@@ -5362,6 +5362,46 @@ impl Store {
         self.visible_events(rows)
     }
 
+    /// Whether this store filters rows by caller authority.
+    ///
+    /// The watch poll gates its one-shot advancing heartbeat on this: only a
+    /// managed scan caps its raw work per poll, so only there can an empty
+    /// one-shot batch hide a denied stretch the consumer must walk. Anywhere
+    /// else an empty one-shot stays silent, byte-identical to before.
+    pub(crate) fn is_enforcing(&self) -> bool {
+        self.authz.is_enforcing()
+    }
+
+    /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
+    ///
+    /// Deliberately board-wide: it used to be the tail `watch::poll_once`
+    /// read to move a cursor past rows its filtered scan rejected, so it had
+    /// to see the rows that do not match. The poll now advances from the
+    /// filtered scan's own examined range instead — one scan, one snapshot —
+    /// and this stays as the unfiltered board tail its contract describes.
+    /// It used to take a `task` parameter the SQL never
+    /// bound, so a caller could pass a selector and silently receive board-wide
+    /// rows anyway; the parameter is removed rather than honoured, because a
+    /// task-scoped board tail would stall the cursor behind other tasks'
+    /// traffic. Subject-scoped reads belong in `events_since_filtered`.
+    ///
+    /// This reasoning is about the board tail only. The registry twin,
+    /// `Registry::rule_events_since`, does bind its selector, so a
+    /// `--rule R --follow` watch has exactly the rule-scoped tail argued
+    /// against here. That asymmetry is deliberate and pre-existing: rule trails
+    /// are sparse enough that a stalled cursor costs little, and narrowing a
+    /// tail is always safe. Do not "fix" the registry to match this one.
+    ///
+    /// Authorization: board scope only, and deliberately so. This is the one
+    /// event read whose PURPOSE is to see rows a filter would reject, so
+    /// per-row filtering here would stall a cursor driven from it behind
+    /// another task's traffic and re-scan the same window forever. The rows a
+    /// watcher is actually HANDED come from `events_since_filtered`, which
+    /// filters per row. A caller that returned these rows to a consumer
+    /// would be a new leak, and would need the filter that this one skips.
+    // Production reads go through the filtered tails; this stays as the
+    // unfiltered board tail above describes, pinned by its unit tests.
+    #[allow(dead_code)]
     pub fn events_since(
         &self,
         kind: Option<&str>,
