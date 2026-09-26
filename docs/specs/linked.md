@@ -565,10 +565,10 @@ verbatim. `Layer` is named precisely and is never `e2e` for an in-process test.
 existing-gates-still-hold rule — has such tests, named semicolon-separated in its one row
 `(`tests/e2e.rs:3729`, `:4250`, `:49403`, `:49150`, `:2264`, `:56139`, `:56242`, `:16808`,
 in row order): they prove today's gates on today's surface, and the implementation re-runs
-them unchanged beside the new scope gate. Full `cargo test -- --list` enumeration is owed by
-the implementing lane under a gate slot before the SPEC-READY stamp — the containerise rule
-forbids native macOS gate builds, so this writer substituted byte-exact source verification
-and says so. Every other requirement is greenfield registry behaviour with no observing test
+them unchanged beside the new scope gate. Full `cargo test --locked --test e2e -- --list`
+enumeration ran 2026-09-26 in the Linux container (`kanban-gate:1.95-chrome-u501`, image
+`f542f975e2dc`, host gate slot): 439 tests, each of the eight names present exactly once.
+Every other requirement is greenfield registry behaviour with no observing test
 at the baseline, so its row is `none` and its Note says `no e2e coverage` plainly and names
 the owning implementation row — `t-0dcbb1a9` (companions and claim scope per its work-package
 title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257` (contributions and

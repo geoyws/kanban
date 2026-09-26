@@ -602,9 +602,9 @@ or `t-db6937ba` (exposure and workflow proof per its work-package title,
 existing tests (`tests/e2e.rs:3729`, `:4250`, `:49403`, `:49150`, `:2264`, `:56139`,
 `:56242`, `:16808`, in row order), verified as `fn <name>(` in this build; they prove
 today's gates on today's surface and are re-run unchanged beside the new scope gate. Full
-`cargo test -- --list` enumeration is owed by the implementing lane under a gate slot before
-the SPEC-READY stamp — the containerise rule forbids native macOS gate builds, so this writer
-substituted byte-exact source verification and says so. No test name below is invented: where
+`cargo test --locked --test e2e -- --list` enumeration ran 2026-09-26 in the Linux container
+(`kanban-gate:1.95-chrome-u501`, image `f542f975e2dc`, host gate slot): 439 tests, each of the
+eight names present exactly once. No test name below is invented: where
 no test observes the behaviour, the row is `none`, following the precedent `docs/specs/spa.md`
 set at creation (`cd55cbc`).
 
