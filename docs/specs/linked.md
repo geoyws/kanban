@@ -259,7 +259,7 @@ binding is the authorized exit in LINKED-14's third ending, recorded as an audit
 stating the reason; it ends taking immediately, while leases already granted keep their
 heartbeat until expiry or release — but those leases cannot take new work and cannot be handed
 to another lane. The only permitted ending for such a lease is `release ID --lease TOKEN`
-(`rust/lib.rs:168`), returning the task to its board's claimable set.`
+(`rust/lib.rs:169`), returning the task to its board's claimable set.`
 `Failure behaviour: a claim against a frozen set is refused naming the freeze; a new claim or a
 forward handoff on a revoked binding is refused naming the revocation; in both cases live leases
 are untouched.`
@@ -638,3 +638,8 @@ reachable from §4 and from §8.
   pair's order and compensation defined in LINKED-25 with no implementation dependency on
   `e-df626704`; the 24 `none` rows owned by `t-0dcbb1a9`/`t-9eff9257`/`t-db6937ba`. ADR-051 §§2–3
   and the matrix section move in the same change.
+- `2026-09-26` — independent-review round 2/3 fixes (still `DRAFT — gate requested`): §7 heading
+  restored; LINKED-02 sentence repaired; `none`-row owners regrouped to the parent's work-package
+  titles (`t-0dcbb1a9` LINKED-01..08/10..14, `t-9eff9257` LINKED-15..21, `t-db6937ba` LINKED-22..25);
+  `cargo test --locked --test e2e -- --list` enumerated in the Linux container (439 tests, eight
+  LINKED-09 names each present once); revoked-lease release cited at `rust/lib.rs:169`.
