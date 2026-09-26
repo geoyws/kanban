@@ -6,7 +6,7 @@
   refinements; numbering is by creation, grouping is by topic.
 - **Baseline:** `2026-09-26` at commit `ae2fb8f51ff14844d76317da6739b011a90de391` on branch
   `kanban-geoyws-driver`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `DRAFT — gate requested 2026-09-26`.
+- **Status:** `SPEC-READY` on 2026-09-26 (independent gate by a reviewer applying the SDD §1 exit criteria over four rounds; eight findings closed — LINKED-09 merged to one trace row, resumption bound to the existing `claim --session`/`handoff accept --session` entry points, revocation stated as LINKED-14's authorized exit with audited UNFREEZE and release-only revoked leases, the ordered pair's order and compensation defined in LINKED-25 with no dependency on `e-df626704`, §7 heading restored, LINKED-02 repaired, `none`-row owners grounded in the parent's work packages with `--list` enumeration recorded, and the release citation corrected to `rust/lib.rs:169`). It authorises neither implementation nor release.
   <!-- SPEC-READY is stamped here by an independent reviewer against the SDD reference's §1 exit
   criteria, not by the writer of this document. It authorises neither implementation nor rollout
   nor release. -->

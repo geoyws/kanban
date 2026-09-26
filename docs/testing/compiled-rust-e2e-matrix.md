@@ -587,9 +587,9 @@ board schema stands at 33.
 ## Requirements trace — `docs/specs/linked.md` LINKED-01..LINKED-25
 
 One row per requirement, on branch `wt/t-fe137b57-spec-w1` at 2026-09-26: commit
-`ae2fb8f51ff14844d76317da6739b011a90de391`, where the specification is at `DRAFT —
-gate requested 2026-09-26` and ADR-051 is `Proposed`, so these rows land with the
-specification and the gate reviewer reads the trace rather than a promise of one.
+`ae2fb8f51ff14844d76317da6739b011a90de391`, where the specification is `SPEC-READY` on
+2026-09-26 and ADR-051 is `Proposed`, so these rows land with the specification and the
+gate reviewer reads the trace rather than a promise of one.
 `Layer` uses the specification's own vocabulary, where `process` is a compiled-binary
 process-boundary exchange with no HTTP and no browser, and `chrome` is a compiled-binary
 test driving real Chrome. Of the 25 requirements — all `MUST` — 1 is proved at `chrome`
