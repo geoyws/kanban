@@ -1121,6 +1121,113 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     stream.wait_for_event(APPEAR);
 }
 
+/// ACC-14 (A11): a checked row stays non-enumerating to an unauthorized
+/// actor. The caller owns board B and nothing on board A: the same-key check
+/// post and every read of A's checked row get the existing generic denial
+/// with no check metadata anywhere, and flipping back to direct afterwards
+/// shows the check still unanswered with no result from the denied attempts.
+#[test]
+fn checked_row_stays_non_enumerating_to_an_unauthorized_actor() {
+    let estate = ManagedEstate::new("checked-non-enumerating");
+    let work_a = estate.work_a.clone();
+    // Raised in direct mode, the way a real estate reaches managed with
+    // boards already in it. Sentinels stand in for every check secret.
+    let raised = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "Choose after demonstrating the Store boundary.",
+            "--as",
+            "seed",
+            "--check",
+            "Which layer owns traversal QUIZSENTINEL?",
+            "--check-choice",
+            "store=Label SENTINELLABEL one",
+            "--check-choice",
+            "client=Label SENTINELLABEL two",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "Explanation SENTINEL EXPLAIN holds the answer.",
+            "--check-about",
+            "src/store.rs",
+            "--json",
+        ],
+    );
+    let id = raised["id"].as_str().unwrap().to_owned();
+
+    // The caller owns board B and nothing on board A.
+    estate.bind_self("p-b-owner", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+
+    let sentinels = [
+        "QUIZSENTINEL",
+        "SENTINELLABEL",
+        "SENTINEL EXPLAIN",
+        "src/store.rs",
+    ];
+    let mut refused_any = false;
+    for args in [
+        vec!["attention", "show", id.as_str(), "--json"],
+        vec![
+            "attention",
+            "check",
+            id.as_str(),
+            "--as",
+            "seed",
+            "--key",
+            "store",
+            "--json",
+        ],
+        vec![
+            "attention",
+            "resolve",
+            id.as_str(),
+            "--as",
+            "seed",
+            "--check-answered",
+            "store",
+            "--json",
+        ],
+    ] {
+        let output = estate.run(&work_a, &args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "{args:?} succeeded for an actor with no authority on this board\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains(DENIED),
+            "{args:?} was refused without the generic denial\nstderr: {stderr}"
+        );
+        for sentinel in sentinels {
+            assert!(
+                !stdout.contains(sentinel) && !stderr.contains(sentinel),
+                "{args:?} leaked check metadata {sentinel:?}\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        refused_any = true;
+    }
+    assert!(refused_any, "no denied attempt ran");
+
+    // Back to direct: the check is still unanswered with no result from the
+    // denied attempts, so nothing was written on the way out.
+    estate.enforce("direct");
+    let shown = estate.ok_json(&work_a, &["attention", "show", id.as_str(), "--json"]);
+    assert!(
+        shown["check"]["answered"].is_null(),
+        "a denied post recorded an answer: {}",
+        shown["check"]
+    );
+    assert!(
+        shown["check"].get("result").is_none(),
+        "a denied post recorded a result: {}",
+        shown["check"]
+    );
+}
+
 /// How many of these lines are event envelopes rather than heartbeats.
 fn events_in(lines: &[String]) -> usize {
     lines
