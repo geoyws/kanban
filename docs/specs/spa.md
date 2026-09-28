@@ -2,8 +2,9 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `SPA`. Requirement IDs are `SPA-01` .. `SPA-58`, stable across wording
-  refinements; numbering is by creation, grouping is by topic.
+- **Slice ID:** `SPA`. Requirement IDs are `SPA-01` .. `SPA-63`, stable across wording
+  refinements; numbering is by creation, grouping is by topic. `SPA-63` is the Needs-you
+  filtering requirement proposed by `t-0fa71043` (§3, §4 A19).
 - **Baseline:** `2026-09-19` at commit `e3ae94a` on branch `docs/t-eed0a923-spa-spec`. Every
   "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-19 (independent gate by a reviewer applying the SDD §1 exit criteria over three rounds: eleven findings, all closed; specification readiness only - it authorises neither implementation nor rollout nor release).
@@ -762,6 +763,72 @@ hyphen form (`geoyws-orchestration`) is superseded wherever this slice writes.
 *Failure behaviour:* a rendered tag reading `estate-subsystem` with a hyphen where the namespace
 rule writes a slash fails this requirement.
 
+### Needs-you filtering
+
+**SPA-63** — the open queue answers board, kind, priority and age filters.
+Strength: MUST · Layer: http · Source: kb `t-0fa71043`; ADR-048 §5; `SPA-08`.
+`GET /api/v1/needs-you` accepts four optional query parameters — `board`
+(repeatable), `kind` (repeatable), `priority` (repeatable) and `age` (single) —
+that narrow the merged open queue. With none of the four present the route answers
+exactly what it answers today: the same rows in deck order (`sort_open_queue`:
+priority, then oldest, then id, then board — `rust/serve.rs:1764`-`rust/serve.rs:1773`)
+inside the same `ListEnvelope` with the per-board cap `1000` (`rust/serve.rs:104`) as
+`limit`.
+*Semantics.* `board` names a registered board exactly, case-sensitively; the merged set
+is restricted to the named boards, and repeated values are deduplicated. No length bound
+is placed on a `board` value beyond non-empty: the registry publishes no bound a length
+check could cite, so a value that names no registered board is resolved as a name, not
+measured as a string (see *Permissions*). `kind` names attention kinds from the closed
+vocabulary `ATTENTION_KINDS` (`rust/model.rs:933`-`rust/model.rs:940`: `approval`,
+`blocking`, `complaint`, `decision`, `review`, `risk`); repeated values are a union — a
+row is kept iff its `kind` equals any named kind — read through the shared `Store` query
+path as one narrow read per named kind per board (`Store::attention` takes a single
+kind), merged in deck order. `priority` names levels `P0`, `P1` or `P2`; a row is kept
+iff `model::priority_level` maps its durable `priority` to a named level (`0..=2` is
+`P0`, `3..=5` is `P1`, `6..=9` is `P2`; `rust/model.rs:472`-`rust/model.rs:479`). A row
+whose priority maps to no level matches no level and is dropped whenever `priority` is
+present. `age` is whole days; a row is kept iff `now - createdAt >= age × 86_400_000`,
+where `now` is the server's clock at the request and `createdAt` is epoch millis.
+`age=0` is no age filtering.
+*Store-side before the cap.* `kind`, `priority` and `age` narrow inside the `Store`
+query before the per-board cap and its `+1` probe — through the shared CLI/MCP `Store`
+query path on the ledger's terms (ADR-048 §5), never as a narrowing of capped rows in
+the projection. Counterexample: 1000 new high-priority rows plus one old `P2` row at
+rank 1001 — narrowing after the cap loses the `P2` row; narrowing in the store returns
+it. A second query implementation in the web layer fails this requirement even if its
+output agrees on the day. The filtered response is therefore a subset of the *uncapped*
+authorised rows for the same principal on the same estate — not of the capped default
+response: a filtered row past rank 1000 of the unfiltered order is still returned.
+*Bounds.* An empty `board` value, more than 64 `board` values, a `kind` outside the
+closed vocabulary, a `priority` outside `P0`/`P1`/`P2`, or an `age` that is not a single
+integer in `0..=36500` — including a repeated `age` — is `400` with the `Error` shape
+(`{"error":"<sentence>"}`), refused before any board is opened; the sentence may echo
+the supplied filter value, which came from the caller, and never board state.
+Unrecognised query parameters are ignored, so additive parameters keep this route on
+`v1`.
+*Permissions (`SPA-08`).* The unfiltered aggregate keeps skipping a board the typed guard
+refuses and answers an empty `200` envelope when none is permitted. A `board` value
+naming an unknown, retired, ambiguous or unauthorised board answers the one
+non-enumerating `404` (`{"error":"denied or not found"}`) for the whole request — naming
+is not listing, so a named refusal is never skipped, and the body never says which value
+failed or why. Operational failures (schema, corruption, SQLite, I/O) still fail the whole
+request whether or not filters are present.
+*Precedence.* Method and path first (`405`/`404` as today), then query-syntax validation
+(`400`), then board-scope resolution (named-board `404`), then the per-board store reads
+with `kind`, `priority` and `age` applied store-side, then deck order, then the envelope.
+The per-board cap and its `+1` probe apply to the narrowed store reads: each per-kind
+read carries the probe, the per-board merge is cut to `1000` in deck order, `limit` stays
+`1000`, and `truncated` is sticky from any probe or the merge cut — so a `priority` or
+`age` predicate that drops the merged rows below the bound never clears a truncation the
+reads already observed. `returned` is the length of `items`; `truncated` is computed from
+the probes, never inferred from `returned == limit`.
+*Data rules:* rows, counts, totals and truncation are computed only over permitted,
+filtered rows. No `GET` route mutates and no write verb is added (`SPA-10`, `SPA-13`); the
+four POSTs are unchanged.
+*Non-goals:* no client control, no DOM and no bundle behaviour — the UI controls are
+`t-9285df73` and out of scope here.
+*Status:* `SPEC-READY` 2026-09-28 for t-0fa71043 (independent gate, six findings closed; Store method-shape is implementor latitude under SPA-07 and the `x-store-method` rule). The `SPEC-READY` of 2026-09-19 (§1) does not cover this requirement. Implementation is owed by the implementation task, not this change: the Store predicates, the route wiring and the evidence case (`the_needs_you_route_filters_by_board_kind_priority_and_age_over_http`, rank-1001 store-side counterexample included) are still to be written; the `SPA-63` rows below and in `docs/testing/compiled-rust-e2e-matrix.md` carry `none` until then.
+
 ## 4. Acceptance examples
 
 Given/When/Then in plain prose. Each heading names the requirement IDs it proves.
@@ -942,6 +1009,24 @@ are raised without any stored lane, *then* the listing answers exactly as before
 this change; *and when* `--lane` names no lane any row uses, *then* the listing is
 empty rather than an error.
 
+### A19 — filtering the queue (SPA-63)
+
+*Given* three boards where the principal may read two, holding open rows of several
+kinds, levels and ages — including 1000 new high-priority rows and one old `P2` row
+ranked past them — plus one board the principal may not read,
+*when* `GET /api/v1/needs-you` is read with no parameters,
+*then* the body is today's queue over the two readable boards in deck order with `limit`
+1000; *when* read with `?board=<readable>`, *then* every card names that board and
+nothing else; *when* read with `?board=<unreadable>`, `?board=<unknown>` or
+`?board=<retired>`, *then* each answers `404` with `{"error":"denied or not found"}`
+and the three bodies are byte-identical; *when* read with
+`?kind=decision&priority=P0&age=7`, *then* every card is a decision at `P0` raised at
+least seven days ago, still in deck order; *when* read with a `priority` the capped
+default buries — the old `P2` row past rank 1001 — *then* that row is still returned,
+because the predicates ran in the store before the cap; *and when* read with
+`?kind=bogus`, `?age=-1` or a repeated `age`, *then* the answer is `400` with the
+`Error` shape before any board is opened, and the boards are byte-identical afterwards.
+
 ### Categories deliberately not exercised here, and why
 
 - **Authentication and session handling.** Not applicable: kanban implements none and there is no
@@ -1115,15 +1200,16 @@ row that must write one.
 | `SPA-60` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the journey proves percent-encoded navigation generally — it follows the opaque id as `/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23` and the task page mounts. No route carries a tag yet (recon 2026-09-23: the Boards index lists no tags, the router names no tag parameter), so the rule is prospective and this case is its standing encoding proof, not a tag-URL assertion. |
 | `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
 | `SPA-62` | MUST | process | `attention_raise_stores_lane_and_list_matches_both_routes` | landed with `t-14e6feb7`, over the compiled binary: raises the three-route matrix above plus the no-stored-lane control, asserts the `--lane` listing returns exactly the three cards, asserts the stored value round-trips on show/JSON, and asserts an unused lane reads empty. |
+| `SPA-63` | MUST | http | `none` | no e2e coverage — to be written by `t-0fa71043`: `the_needs_you_route_filters_by_board_kind_priority_and_age_over_http` over the compiled binary on a real socket, holding the unfiltered default, each predicate, the store-side counterexample past rank 1001, the deck order under filters, the named-board `404` triple, the `400` syntax refusals including a repeated `age`, and the sticky `truncated` with `limit` 1000. contract: `docs/api/kanban-web.openapi.yaml` under `/api/v1/needs-you` |
 
-**Counts.** 62 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 47 `chrome`, 6
+**Counts.** 63 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 47 `chrome`, 7
 `http`, 5 `unit`, 4 `process`. By group: identity 3 (`SPA-01`..`SPA-03`), readiness 2
 (`SPA-04`..`SPA-05`), the JSON projection 8 (`SPA-06`..`SPA-13`), the Needs-you deck 21
 (`SPA-14`..`SPA-34`), the read pages 8 (`SPA-35`..`SPA-42`), decided/plans/subscriptions/sprints
 and deployments 5 (`SPA-43`..`SPA-47`), the live channel 2 (`SPA-48`..`SPA-49`), payload 1
 (`SPA-50`), what is retired 1 (`SPA-51`), the rendered result keeping ADR-046 6
 (`SPA-52`..`SPA-57`), a board that cannot be read 1 (`SPA-58`), tag namespaces 3
-(`SPA-59`..`SPA-61`), and the lane queue 1 (`SPA-62`).
+(`SPA-59`..`SPA-61`), the lane queue 1 (`SPA-62`), and Needs-you filtering 1 (`SPA-63`).
 
 **How the WEB figures below are counted.** A requirement *preserves* a `WEB-nn` when its
 `Source` line says so; `SPA-51` is excluded because it retires two WEB requirements rather than
@@ -1134,8 +1220,8 @@ table above, an existing Chrome test that observes the behaviour today: the four
 (proved at `unit` over the bundle's stylesheet since 2026-09-19). `SPA-22` and `SPA-31` joined
 the 38 on 2026-09-19 with `t-e978824a`.
 
-**Rows with no evidence yet: 2.** `SPA-02` and `SPA-50`, each naming the epic `e-9306a1d9` row
-that must write it. `SPA-02` is `none` because its remaining half is a host inventory rather
+**Rows with no evidence yet: 3.** `SPA-02` and `SPA-50`, each naming the epic `e-9306a1d9` row
+that must write it, and `SPA-63`, planned under `t-0fa71043`. `SPA-02` is `none` because its remaining half is a host inventory rather
 than a test. `SPA-22` and `SPA-31` left the list on 2026-09-19 with `t-e978824a`, which wrote
 the two real-board refusal cases (A6 and A7) and the rendered keys line. `SPA-51` left it the
 same day with `t-1f495a7f`: the case that asserted the scriptless list was REWRITTEN rather
@@ -1241,3 +1327,18 @@ absent from both the detail and the index).
   three-route matrix plus the no-stored-lane control. §8 names
   `attention_raise_stores_lane_and_list_matches_both_routes`, and
   `docs/testing/compiled-rust-e2e-matrix.md` carries the same row verbatim.
+- `2026-09-28` — `t-0fa71043` proposes `SPA-63` (Needs-you API filters: `board`, `kind`,
+  `priority` and `age` on `GET /api/v1/needs-you`) with §4 A19. Numbered `SPA-63`/`A19`
+  after the landed `SPA-62`/`A18` (the attention lane, `t-14e6feb7`). Corrected against the
+  `6673689` draft: `priority` and `age` narrow inside the `Store` query before the
+  per-board cap and its `+1` probe through the shared CLI/MCP `Store` path (ADR-048 §5) —
+  the 1000-new-plus-one-old-`P2` counterexample is in A19 — `kind` repeats as a union with
+  per-read probes and a per-board merge cut, the subset guarantee is over the uncapped
+  authorised rows, a repeated `age` is `400`, no board-name length bound is invented, and
+  `returned`/`truncated` are stated as computed. `docs/api/kanban-web.openapi.yaml`
+  carries the four parameters with `400`/`404` (`InvalidFilter`); this change adds the
+  `SPA-63` rows to §8 and `docs/testing/compiled-rust-e2e-matrix.md` with `none`
+  placeholders. No product code: the Store predicates, the route wiring and the e2e case
+  are owed by the implementation task, not this change. (`docs/api/README.md` V2/V14
+  query-parameter corrections from the reviewed draft are not applied here — owed as a
+  docs follow-up.)

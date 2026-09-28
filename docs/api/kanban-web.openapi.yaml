@@ -140,8 +140,93 @@ paths:
         Boards refused by the typed authorization guard are skipped. Zero
         permitted boards returns an empty 200 envelope; operational failures
         still fail the request.
-      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+
+        Four optional filters narrow the queue (SPA-63); with none present the
+        route answers exactly what it answers today. `kind`, `priority` (via
+        `model::priority_level`, `rust/model.rs:472`) and `age` narrow inside
+        the `Store` query before the per-board cap and its `+1` probe, through
+        the shared CLI/MCP `Store` query path (ADR-048 §5) — never as a
+        narrowing of capped rows in the projection, which would lose a filtered
+        row ranked past the cap. The filtered answer is therefore a subset of
+        the uncapped authorised rows, not of the capped default. `kind`
+        repeats as a union, one narrow read per named kind per board; the
+        per-board merge is cut to `1000` in deck order. `limit` stays `1000`
+        and `truncated` is sticky from any probe or the merge cut. A `board`
+        value naming an unknown, retired, ambiguous or unauthorized board is
+        `404` with `DeniedOrNotFound` for the whole request; a malformed
+        filter value — including a repeated `age` — is `400` with
+        `InvalidFilter` before any board is opened. Unrecognised query
+        parameters are ignored, so additive parameters keep this route on
+        `v1`. Proposed by `t-0fa71043` (`docs/specs/spa.md` SPA-63): specified
+        here, not yet served.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-63]
       x-store-method: Store::attention
+      parameters:
+        - name: board
+          in: query
+          required: false
+          description: |
+            Restrict the merged queue to the named boards. Repeatable:
+            `?board=ALPHA&board=BRAVO`; repeated values are deduplicated. Each
+            value is a registered board name, matched exactly and
+            case-sensitively; no length bound is placed on a value beyond
+            non-empty, because the registry publishes none. A value naming an
+            unknown, retired, ambiguous or unauthorized board answers `404`
+            with `DeniedOrNotFound` for the whole request — a named board is
+            never skipped the way an unreadable board is in the unfiltered
+            listing (SPA-08, SPA-63).
+          schema:
+            type: array
+            items: { type: string, minLength: 1 }
+            maxItems: 64
+          style: form
+          explode: true
+          example: [KANBAN]
+        - name: kind
+          in: query
+          required: false
+          description: |
+            Keep only rows whose `kind` equals any one of the named kinds, from
+            the closed `ATTENTION_KINDS` vocabulary (`rust/model.rs:933`):
+            `approval`, `blocking`, `complaint`, `decision`, `review`, `risk`.
+            Repeatable; the repeats are a union, read as one narrow store read
+            per named kind per board and merged in deck order. A value outside
+            the vocabulary is `400` (`InvalidFilter`).
+          schema:
+            type: array
+            items: { type: string, enum: [approval, blocking, complaint, decision, review, risk] }
+          style: form
+          explode: true
+          example: [decision]
+        - name: priority
+          in: query
+          required: false
+          description: |
+            Keep only rows whose durable `priority` maps to one of the named
+            levels via `model::priority_level` (`rust/model.rs:472`): `P0` is
+            `0..=2`, `P1` is `3..=5`, `P2` is `6..=9`. Repeatable; a row whose
+            priority maps to no level matches no level. Applied in the store
+            before the per-board cap, so a matching row ranked past the
+            unfiltered cap is still returned. A value outside
+            `P0`/`P1`/`P2` is `400` (`InvalidFilter`).
+          schema:
+            type: array
+            items: { type: string, enum: [P0, P1, P2] }
+          style: form
+          explode: true
+          example: [P0]
+        - name: age
+          in: query
+          required: false
+          description: |
+            Keep only rows raised at least this many whole days ago:
+            `now - createdAt >= age × 86_400_000`, where `now` is the server's
+            clock at the request and `createdAt` is epoch millis. `0` is no age
+            filtering. Applied in the store before the per-board cap, like
+            `priority`. Single: a repeated `age` is `400` (`InvalidFilter`).
+            Not an integer `0..=36500` is `400` (`InvalidFilter`).
+          schema: { type: integer, minimum: 0, maximum: 36500 }
+          example: 7
       responses:
         "200":
           description: The open queue, in the order the deck shows it.
@@ -156,7 +241,9 @@ paths:
                       items:
                         type: array
                         items: { $ref: "#/components/schemas/AttentionCard" }
+        "400": { $ref: "#/components/responses/InvalidFilter" }
         "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
         "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/ServerError" }
 
@@ -1420,6 +1507,19 @@ components:
         application/json; charset=utf-8:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "The search query is too long. Shorten it and try again." }
+    InvalidFilter:
+      description: |
+        A needs-you filter value was malformed (SPA-63): an empty `board`
+        value, more than 64 `board` values, a `kind` outside
+        `ATTENTION_KINDS` (`rust/model.rs:933`), a `priority` outside
+        `P0`/`P1`/`P2`, or an `age` that is not a single integer `0..=36500`
+        (a repeated `age` counts as malformed).
+        Refused before any board is opened. The sentence may echo the supplied
+        value, which came from the caller, and never board state.
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: 'unknown attention kind "bogus"' }
     WriteRecorded:
       description: |
         Recorded. The response is a redirect to the page that shows the result,
