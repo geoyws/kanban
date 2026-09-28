@@ -245,7 +245,7 @@ answer and the stored result fields from ACC-07. Redaction removes fields rather
 a guessable placeholder.
 
 **ACC-14 — Inherit tenancy and tag visibility without an ACC bypass.**
-Strength: MUST · Layer: http · Source: rollout brief; existing Store authorization boundary.
+Strength: MUST · Layer: http/process · Source: rollout brief; existing Store authorization boundary.
 Every ACC read and write is authorized as the containing attention row is authorized. A caller
 who cannot read the row receives the existing non-enumerating unauthorized/not-found behaviour
 and no check metadata; a caller who can read it gets the appropriate ACC-13 projection. ACC adds
@@ -527,6 +527,16 @@ resolve reuses the result with no echo. *When* the row has no check, the key is 
 the actor is neither `geoyws` nor the raiser, *then* the command is refused naming why and
 nothing changes.
 
+### A20 — search scores depend on permitted documents only (`ACC-14`)
+
+*Given* a principal with board read and write on untagged rows plants an anchor task carrying
+a unique token once in a long body, *when* they search the anchor token beside a prefix no
+visible document matches, *then* the anchor's served `lexicalScore` and `score` read some
+value; *when* a tag-denied document strongly matching that prefix is added, *then* the same
+query serves the anchor with byte-identical `lexicalScore` and `score`, and the denied row
+appears in neither receipt. On an unenforced board the same query is unaffected by design:
+every row is readable there, so the divisor is still taken over the whole match set.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -626,11 +636,11 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-10` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | page and projection sentinel sweep; reveal only post-answer |
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
-| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | always-redacted pre-answer show/list and mutation receipts landed; digest/HTTP and post-answer state remain planned |
-| `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
-| `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
-| `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
-| `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
+| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a) |
+| `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
+| `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
+| `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
 | `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
 | `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
 | `ACC-20` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one answer on a resolved row and on an open row, status/resolution unchanged; identical and different second answers refused with board and audit chain unchanged; reopen clears and the check answers again |
@@ -680,3 +690,18 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   answer, open or resolved) and ACC-21 (the CLI `attention check` verb and its teaching receipt)
   are appended at the end of the creation sequence with A19. ACC-09's web check-before-decision
   card is unchanged.
+- 2026-09-29 — ACC-14 search-score evidence landed (`t-e9c0127a`):
+  `search_scores_are_a_function_of_permitted_documents_only` plants an anchor task carrying a
+  unique token once in a long body as a principal with board read and write on untagged rows,
+  then adds a tag-denied document strongly matching a guessed prefix: the anchor's served
+  `lexicalScore` and `score` are byte-identical with and without the denied row, which itself
+  appears in neither receipt (A11). The landing fixed the leak as a bug; requirement wording
+  is unchanged. `lexical_scores` normalised every bm25 by the strongest match on the whole
+  board index, denied documents included, so a denied row moved a permitted hit's served
+  scores — a prefix oracle for denied text. The permitted candidate set is now decided before
+  any scoring; per-request tag-set memoization plus the event row joined into the document
+  query remove the per-event second SELECT. Event documents are authorized as the event they
+  index (same union the event tails filter on), since the task's tags alone handed a denied
+  row to any caller who could read the task. HTTP proofs are moot: the web serving retired
+  (`e-caeb1449`), so the evidence is CLI-process e2e. The full BM25 recompute over permitted
+  documents follows in the same row.
