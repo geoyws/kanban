@@ -42521,16 +42521,70 @@ fn hig_release_script_install_writes_no_activation_receipt_when_the_proof_fails(
 /// default witness is the kernel's: `readlink /proc/<pid>/exe`, on the hosts
 /// this installs to. So this one takes the seam away and puts a real process
 /// behind the proof - the very `kanban` executable retained inside the release
-/// - and lets the installer read the real link and the real 200 for it. Linux
-/// only: macOS has no /proc, which is why the seam exists at all.
-#[cfg(target_os = "linux")]
+/// - and lets the installer read the real link and the real 200 for it.
+///
+/// The package is a native one: `FAKE_RELEASE_IMAGE` is the compiled `kanban`
+/// binary itself, and `HIG_RELEASE_TARGET_RUNNER` is unset so the version
+/// probe executes the artifact the way production does. That only runs where
+/// the host kernel can execute the artifact, which is why this is gated to
+/// linux x86-64:
+///
+/// - on macOS there is no `/proc`, which is why the seam exists at all;
+/// - on linux arm64 an x86-64 release binary runs only under emulation
+///   (qemu binfmt), where `/proc/<pid>/exe` names the emulator rather than
+///   the release binary, so the receipt would measure the emulator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
     let harness = ReleaseGuardHarness::new("hig-release-serve-proc");
-    let release_id = release_id_from_package(&harness.package_dir);
+    // A genuinely executable release package: the compiled `kanban` binary
+    // already IS an ELF 64-bit x86-64 executable on this host, so it is
+    // packaged as-is. The platform gate reads a true header off those bytes,
+    // and with no runner the version probe executes them natively.
+    let native_package = harness.fixture.root.join("package-native");
+    let packaged = harness
+        .command()
+        .args([
+            "package",
+            "hax",
+            "--output",
+            native_package.to_str().unwrap(),
+        ])
+        .env("FAKE_RELEASE_IMAGE", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_UNAME_S", "Linux")
+        .env("FAKE_UNAME_M", "x86_64")
+        .env_remove("HIG_RELEASE_TARGET_RUNNER")
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "native packaging of the real binary failed: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let release_id = release_id_from_package(&native_package);
     harness
         .fixture
         .ok_json(&harness.fixture.main, &["init", "--name", "PROC", "--json"]);
+    // The hig leg refuses a package hax never activated, so the native
+    // package gets its own hax activation before either target is proved.
+    let native_hax_root = harness.fixture.root.join("install-hax-native");
+    let native_hax_bin = harness.fixture.root.join("bin-hax-native");
+    let hax_ready = harness
+        .install_command(
+            "hax",
+            &native_package,
+            &native_hax_root,
+            &native_hax_root,
+            &native_hax_bin,
+        )
+        .env_remove("HIG_RELEASE_TARGET_RUNNER")
+        .output()
+        .unwrap();
+    assert!(
+        hax_ready.status.success(),
+        "hax activation of the native package failed: {}",
+        String::from_utf8_lossy(&hax_ready.stderr)
+    );
     for target in ["hax", "hig"] {
         let install_root = harness.fixture.root.join(format!("proc-{target}"));
         let bin_dir = harness.fixture.root.join(format!("proc-bin-{target}"));
@@ -42540,7 +42594,17 @@ fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
             .join("kanban");
         // A first activation with no unit, so the release binary exists to be
         // run; the proved activation is the one after it.
-        let staged = harness.install(target, &install_root, &bin_dir);
+        let staged = harness
+            .install_command(
+                target,
+                &native_package,
+                &native_hax_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env_remove("HIG_RELEASE_TARGET_RUNNER")
+            .output()
+            .unwrap();
         assert!(
             staged.status.success(),
             "{target}: staging install failed: {}",
@@ -42569,8 +42633,13 @@ fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
             }
             if Instant::now() >= ready {
                 let _ = server.kill();
-                let _ = server.wait();
-                panic!("{target}: the retained release binary never served on {port}");
+                let server_stderr = match server.wait_with_output() {
+                    Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
+                    Err(e) => format!("<the server's output could not be collected: {e}>"),
+                };
+                panic!(
+                    "{target}: the retained release binary never served on {port}\nserver stderr: {server_stderr}"
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -42578,11 +42647,12 @@ fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
         let installed = harness
             .install_command(
                 target,
-                &harness.package_dir,
-                &harness.hax_install_root,
+                &native_package,
+                &native_hax_root,
                 &install_root,
                 &bin_dir,
             )
+            .env_remove("HIG_RELEASE_TARGET_RUNNER")
             .env("FAKE_SERVE_UNIT_PRESENT", "1")
             .env("FAKE_SERVE_MAIN_PID", pid.to_string())
             .env("FAKE_SERVE_PORT", port.to_string())
