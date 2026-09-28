@@ -258,6 +258,10 @@ hig itself over ssh, so no relay is needed and hig never needs to reach hax
 (a hig-shell scp from hax fails with `Connection closed`). The same two
 sentences now live in the script's `usage()` block.
 
+## Amendment 2026-09-28 (`e-caeb1449`, `t-fec3da9e`): the serve unit is gone
+
+The web view is retired: `kanban serve` no longer exists, and the installer manages no units, restarts nothing, probes no listener and records no `serve` receipt section. `serve_restart_and_prove`, `serve_restore_previous`, `serve_unit_listener`, `serve_prove_release`, `serve_deadline_seconds`, `serve_listener_json` and the `SERVE_*` variables are deleted from `scripts/hig-release.sh`; the `curl`/deadline/listener proofs and the FAKE_SERVE_* test harness went with them, along with the e2e tests named above that drove outcomes through a serving release. What stays true in this record: the receipt stays the commit, retention still runs past it, rollback still moves the links an install moves, and the provenance/manifest/binary guards are unchanged. The Consequences prose above that describes serve proofs is retained as history of the retired design, not as current behavior.
+
 ## References
 
 - `scripts/hig-release.sh`
