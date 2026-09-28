@@ -39,9 +39,16 @@ RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
     && rm -rf /tmp/bun.zip "/opt/bun-linux-${bun_arch}" \
     && bun --version
 
-# Last, so a different host uid rebuilds only this layer.
+# Last, so a different host uid rebuilds only this layer. A root caller
+# (uid 0, e.g. a host with no login user) cannot useradd uid 0, and needs no
+# passwd entry: root always resolves. The gate then runs as container root
+# and the receipt must say so.
 ARG GATE_UID=501
 ARG GATE_GID=20
-RUN (getent group "${GATE_GID}" >/dev/null || groupadd -g "${GATE_GID}" gate) \
-    && useradd -u "${GATE_UID}" -g "${GATE_GID}" -M -s /bin/bash gate \
-    && setpriv --reuid "${GATE_UID}" --regid "${GATE_GID}" --clear-groups id -un | grep -qx gate
+RUN if [ "${GATE_UID}" = 0 ]; then \
+        id -un | grep -qx root; \
+    else \
+        (getent group "${GATE_GID}" >/dev/null || groupadd -g "${GATE_GID}" gate) \
+        && useradd -u "${GATE_UID}" -g "${GATE_GID}" -M -s /bin/bash gate \
+        && setpriv --reuid "${GATE_UID}" --regid "${GATE_GID}" --clear-groups id -un | grep -qx gate; \
+    fi

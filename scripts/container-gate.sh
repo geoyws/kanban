@@ -100,6 +100,21 @@ candidate="$(git -C "$worktree" rev-parse HEAD)"
 
 uid="$(id -u)"
 gid="$(id -g)"
+# A root caller (uid 0, e.g. a host with no login user) can never pass a
+# managed-mode suite: the product denies uid 0 as a policy principal by
+# design (rust/lib.rs root_is_not_a_policy_principal), so the gate would go
+# red on policy, not on product. Run the inside as the image's `nobody`
+# (65534:65534, present in the Debian base) instead: the authz suites bind
+# whatever the process resolves for itself, so the measurement stays
+# self-consistent, and the receipt must name the inner user.
+inner_uid="$uid"
+inner_gid="$gid"
+cargo_dir="cargo"
+if [[ "$uid" == 0 ]]; then
+    inner_uid=65534
+    inner_gid=65534
+    cargo_dir="cargo-u0"
+fi
 state="${KANBAN_GATE_STATE:-$HOME/.cache/kanban-gate}"
 image="${KANBAN_GATE_IMAGE:-kanban-gate:1.95-chrome-u$uid}"
 if [[ -z "$name" ]]; then
@@ -109,7 +124,13 @@ if [[ -z "$name" ]]; then
 fi
 [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--name must be a container-safe name: $name"
 
-mkdir -p "$state/cargo" "$state/target-$name"
+mkdir -p "$state/$cargo_dir" "$state/target-$name"
+if [[ "$uid" == 0 ]]; then
+    # The bind mounts are checked against the HOST kernel: root-owned cache
+    # and target dirs would deny the inner nobody. The u0 cargo cache is
+    # created owned by nobody once; per-run target dirs are chowned fresh.
+    chown "$inner_uid:$inner_gid" "$state/$cargo_dir" "$state/target-$name"
+fi
 log="$state/$name.log"
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -169,9 +190,9 @@ run_container=(
     --security-opt seccomp=unconfined
     --mount "type=bind,src=$worktree,dst=/work,readonly"
     --mount "type=bind,src=$state/target-$name,dst=/gate-target"
-    --mount "type=bind,src=$state/cargo,dst=/gate-cargo"
+    --mount "type=bind,src=$state/$cargo_dir,dst=/gate-cargo"
     "$image"
-    bash -c "$inner" inner "$uid" "$gid" "$loop_target" "$loop_test" "${iterations:-0}"
+    bash -c "$inner" inner "$inner_uid" "$inner_gid" "$loop_target" "$loop_test" "${iterations:-0}"
 )
 
 gate_slot="$(realpath ~/.agents/skills 2>/dev/null)/../../medic/skills/gate-slot/bin/gate-slot"
@@ -187,6 +208,7 @@ fi
     printf 'container-gate: candidate %s\n' "$candidate"
     printf 'container-gate: worktree %s\n' "$worktree"
     printf 'container-gate: image %s %s\n' "$image" "$image_id"
+    printf 'container-gate: caller %s:%s inner %s:%s\n' "$uid" "$gid" "$inner_uid" "$inner_gid"
     printf 'container-gate: started %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } | tee "$log"
 
