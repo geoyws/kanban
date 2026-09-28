@@ -591,6 +591,42 @@ each row says `no e2e coverage` plainly.
 resolves, reopens and migrates through the existing attention machinery; the
 board schema stands at 34.
 
+## Requirements trace — docs/specs/watch.md WATCH-01..WATCH-12
+
+One row per requirement, in the `t-28dca81e` worktree at 2026-09-28: commit
+`edb07459d4bf1e36ffbb18cf621a7ddc15cfd1a7` (detached at
+`origin/kanban-geoyws-driver`). The specification is at `DRAFT — gate requested
+2026-09-28`; these rows land with it so the gate reviewer reads the trace rather than a
+promise of one. `Layer` uses the specification's own vocabulary, where `process` is a
+compiled-binary process-boundary exchange with no HTTP and no browser: the slice changes no
+served markup, so there is no browser surface to drive. `Existing test` is the test that
+observes the behaviour today; the new surface (`--lane`, `--note-kind`, the four envelope
+keys, the conformance readback) has no test yet because the implementation `t-fde5d91c`
+stays gated until the specification lands, so those rows say `none` and `no e2e coverage`
+plainly and name the row that must write them. Every other name was enumerated with
+`cargo test --locked --test e2e -- --list` and
+`cargo test --locked --test authz_bypass_matrix_e2e -- --list` on 2026-09-28 in this
+worktree.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `WATCH-01` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: `--lane` does not exist at the baseline. |
+| `WATCH-02` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
+| `WATCH-03` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
+| `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
+| `WATCH-05` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no note-kind predicate at the baseline. |
+| `WATCH-06` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: the four keys are not projected at the baseline. |
+| `WATCH-07` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with OQ-1 readback: A6's side-by-side is the evidence. |
+| `WATCH-08` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no new cursor fields exist yet to default. |
+| `WATCH-09` | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes` | additive stability on the shipped surface; `t-fde5d91c` re-runs both against envelopes carrying the four new keys. |
+| `WATCH-10` | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes` | the redaction half of that case; re-run with lane/type/priority-bearing events. |
+| `WATCH-11` | MUST | process | `watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats` | the heartbeat half; extended to lane/note-kind-skipped tails by `t-fde5d91c`. |
+| `WATCH-12` | MUST | process | `watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits`, `watch_follow_still_refuses_a_zero_limit` | limit-before/after-filtering and the at-least-1 refusal; re-run under steered predicates. |
+
+12 requirements: 12 MUST, no SHOULD or MAY. The steered stream is a repeatable lane and
+note-kind predicate bound to the opaque cursor, with an additive four-key envelope shared
+field-for-field with Ord; board schema stands at 34 and no migration rides this slice.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
