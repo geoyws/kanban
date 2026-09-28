@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-08
-**Amended:** 2026-09-11 (§5's undo copy: the receipt now offers a web Undo; see ADR-016's 2026-09-11 amendment)
+**Amended:** 2026-09-11 (§5's undo copy: the receipt now offers a web Undo; see ADR-016's 2026-09-11 amendment); 2026-09-28 (`t-750c2743`): a defer with a return trigger snoozes instead of resolving (§1a)
 He named the shape of the problem three times in one hour — "kanban needs to
 have multiple choice questions about what to do, not just approve or reject,
 with one additional choice being the free text choice that also allows for
@@ -132,6 +132,22 @@ oblivion.
 receipts, SHA256s, paths, the `RESOLVE-WHEN` line. The card is the top of the
 item and the body is folded beneath it (§6). Nothing in this ADR rewrites a
 body, and the Phase 4 backfill (§8) explicitly does not.
+
+### 1a. A defer with a return trigger snoozes the row (added 2026-09-28, `t-750c2743`)
+
+This amends "every choice resolves the row, `defer` included" above: a defer recorded with
+a return trigger leaves the row `open` instead of settling it. The trigger is one of
+`date:YYYY-MM-DD`, `task:<t-id>` or `event:<kind>`; §7's rule that a `defer` consequence
+names what brings the question back is now a stored field, not only prose. Storage is one
+nullable `return_trigger` column beside `decision` (schema `34` → `35`, existing rows
+`NULL`); a malformed trigger is refused naming the three forms. While snoozed the row is
+hidden from the default open queue and its counts but stays visible to
+`attention list --all` and to a direct show. The trigger is evaluated on read — `date:D`
+at the start of `D` (UTC), `task:T` when `T` is written after the deferral instant,
+`event:K` when an event of kind `K` is recorded after the deferral instant — so no sweep
+exists and a fired row simply reappears, still `open`, its recorded decision intact. A
+defer with no trigger resolves exactly as §1 says. The snooze writes
+`attention_updated`, not `attention_resolved`.
 
 ### 2. Storage: four columns on the attention row, schema 24 → 25
 
