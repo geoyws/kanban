@@ -30999,6 +30999,60 @@ fn hig_release_script_refuses_a_hig_install_when_the_activated_hax_release_is_no
     );
 }
 
+/// Split ownership (t-317647c9): an install root no service identity can
+/// traverse to is refused before anything is written, naming the blocking
+/// ancestor. The walk reads mode bits rather than effective access because
+/// the installer is usually root, for whom access() never fails. Roots
+/// under the child's $TMPDIR are scratch by convention and skip the walk,
+/// so the dark parent lives in a scratch dir of its own with the child's
+/// TMPDIR pointed elsewhere; both are restored and removed first, so
+/// assertions never run against a 700 directory left behind.
+#[test]
+fn hig_release_script_install_refuses_a_release_root_no_service_identity_can_traverse() {
+    let harness = ReleaseGuardHarness::new("hig-release-dark-root");
+    // Two scratch dirs: the child's TMPDIR must NOT contain the dark root,
+    // or the scratch exemption skips the very walk this test exercises.
+    let tmp_home =
+        std::env::temp_dir().join(format!("kanban-rust-e2e-dark-tmp-{}", std::process::id()));
+    let elsewhere = std::env::temp_dir().join(format!(
+        "kanban-rust-e2e-dark-elsewhere-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_home).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let dark = elsewhere.join("dark-parent");
+    fs::create_dir_all(&dark).unwrap();
+    fs::set_permissions(&dark, fs::Permissions::from_mode(0o700)).unwrap();
+    let install_root = dark.join("store");
+    let bin_dir = harness.fixture.root.join("dark-root-bin");
+    let mut command = harness.install_command(
+        "hax",
+        &harness.package_dir,
+        &harness.hax_install_root,
+        &install_root,
+        &bin_dir,
+    );
+    command.env("TMPDIR", &tmp_home);
+    let refused = command.output().unwrap();
+    fs::set_permissions(&dark, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(&tmp_home).unwrap();
+    fs::remove_dir_all(&elsewhere).unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "install under a 700 parent succeeded"
+    );
+    assert!(
+        stderr.contains("grants no other-traverse") && stderr.contains(dark.to_str().unwrap()),
+        "expected the dark ancestor to be named in a traversal refusal:\n{stderr}"
+    );
+    assert!(
+        !install_root.exists(),
+        "a refused install created {}",
+        install_root.display()
+    );
+}
+
 /// Packaging is not the only way a binary reaches a release store: a package
 /// directory can be handed to `install` by anyone. So the installer reads the
 /// header of every binary it is about to activate, and it reads it before the
@@ -32383,7 +32437,11 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
     for name in [
         "physical_dir",
         "ensure_managed_activation_receipt",
-        "atomic_symlink",
+        // The release-view gate and the traversability guard it calls: a
+        // remote copy that lost the 700-parent refusal would strand hig
+        // activations the local leg refuses (t-317647c9).
+        "ensure_safe_release_view",
+        "require_shared_release_root_traversable",
         "reject_carried_release_identity",
         "require_release_platform",
         // The version probe and the release-set membership check it calls:

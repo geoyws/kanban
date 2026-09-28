@@ -78,6 +78,10 @@ usage:
     hig-release.sh install hig --package DIR \
       --install-root /root/.local/share/kanban-releases \
       --hax-install-root /root/.local/share/kanban-releases
+  --install-root is required and has no default. The canonical split-ownership
+  root is /var/lib/kanban-releases (root-owned, service-traversed, t-317647c9):
+  prefer it for new stores. These spellings move together: usage here, the
+  refusal in require_shared_release_root_traversable, docs.
 EOF
   exit 64
 }
@@ -694,6 +698,32 @@ ensure_managed_activation_receipt() {
 # unless it has the shape this installer creates: releases/ and releases/<id>
 # real directories, current and bin/<name> absent or managed symlinks, the bin
 # dir a real directory. Called from a clean state so a refusal mutates nothing.
+# Split ownership (t-317647c9): an activation no service identity can
+# traverse to is stranded the moment a parent goes 700. The installer
+# usually runs as root, for whom access() never fails, so this reads mode
+# bits, not effective access. Roots under $TMPDIR are scratch by convention
+# and skip the walk; every other root must already grant other-traverse on
+# every existing ancestor. Directories the installer creates are chmod'd
+# 0755 at their creation sites, not here. This spelling of the canonical
+# root moves together with usage() above: /var/lib/kanban-releases.
+require_shared_release_root_traversable() {
+  local root="$1" tmp="${TMPDIR:-/tmp}" dir
+  # A trailing slash on TMPDIR would double the separator in the
+  # scratch match below and exempt nothing (macOS exports one).
+  tmp="${tmp%/}"
+  [[ -n "$tmp" ]] || tmp="/"
+  case "$root/" in
+    "$tmp/"*) return 0 ;;
+  esac
+  dir="$root"
+  while [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]]; do
+    if [[ -e "$dir" ]]; then
+      [[ -n "$(find "$dir" -maxdepth 0 -perm -o+x 2>/dev/null)" ]] ||
+        die "refusing to install under $root: $dir grants no other-traverse, so no service identity could reach activations; chmod o+x $dir or install under another root (canonical: /var/lib/kanban-releases)"
+    fi
+    dir="$(dirname "$dir")"
+  done
+}
 ensure_safe_release_view() {
   local install_root="$1"
   local bin_dir="$2"
@@ -713,6 +743,7 @@ ensure_safe_release_view() {
     [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
     [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
   fi
+  require_shared_release_root_traversable "$install_root"
   ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
   if [[ -e "$current" || -L "$current" ]]; then
     managed_symlink "$current" "$install_root" releases ||
@@ -1424,7 +1455,14 @@ install_release_tree() {
   local previous_current="" current_switched=0 release_created=0
   release_id="$(release_id_from_receipt "$receipt")"
   ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+  # What the installer creates it owns traversable: pre-existing ancestors
+  # were verified above, so only newly created directories need chmod.
+  local had_root=0 had_releases=0
+  [[ -e "$install_root" ]] && had_root=1
+  [[ -e "$install_root/releases" ]] && had_releases=1
   mkdir -p "$install_root/releases"
+  (( had_root == 1 )) || chmod 0755 "$install_root"
+  (( had_releases == 1 )) || chmod 0755 "$install_root/releases"
 
   release_path="$(release_dir "$install_root" "$release_id")"
   release_meta="$(release_receipt "$install_root" "$release_id")"
@@ -1962,6 +2000,32 @@ ensure_managed_activation_receipt() {
 # unless it has the shape this installer creates: releases/ and releases/<id>
 # real directories, current and bin/<name> absent or managed symlinks, the bin
 # dir a real directory. Called from a clean state so a refusal mutates nothing.
+# Split ownership (t-317647c9): an activation no service identity can
+# traverse to is stranded the moment a parent goes 700. The installer
+# usually runs as root, for whom access() never fails, so this reads mode
+# bits, not effective access. Roots under $TMPDIR are scratch by convention
+# and skip the walk; every other root must already grant other-traverse on
+# every existing ancestor. Directories the installer creates are chmod'd
+# 0755 at their creation sites, not here. This spelling of the canonical
+# root moves together with usage() above: /var/lib/kanban-releases.
+require_shared_release_root_traversable() {
+  local root="$1" tmp="${TMPDIR:-/tmp}" dir
+  # A trailing slash on TMPDIR would double the separator in the
+  # scratch match below and exempt nothing (macOS exports one).
+  tmp="${tmp%/}"
+  [[ -n "$tmp" ]] || tmp="/"
+  case "$root/" in
+    "$tmp/"*) return 0 ;;
+  esac
+  dir="$root"
+  while [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]]; do
+    if [[ -e "$dir" ]]; then
+      [[ -n "$(find "$dir" -maxdepth 0 -perm -o+x 2>/dev/null)" ]] ||
+        die "refusing to install under $root: $dir grants no other-traverse, so no service identity could reach activations; chmod o+x $dir or install under another root (canonical: /var/lib/kanban-releases)"
+    fi
+    dir="$(dirname "$dir")"
+  done
+}
 ensure_safe_release_view() {
   local install_root="$1"
   local bin_dir="$2"
@@ -1981,6 +2045,7 @@ ensure_safe_release_view() {
     [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
     [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
   fi
+  require_shared_release_root_traversable "$install_root"
   ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
   if [[ -e "$current" || -L "$current" ]]; then
     managed_symlink "$current" "$install_root" releases ||
@@ -2196,7 +2261,14 @@ done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @ts
 
 release_id="$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
 ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+# What the installer creates it owns traversable: pre-existing ancestors
+# were verified above, so only newly created directories need chmod.
+had_root=0; had_releases=0
+[[ -e "$install_root" ]] && had_root=1
+[[ -e "$install_root/releases" ]] && had_releases=1
 mkdir -p "$install_root/releases"
+(( had_root == 1 )) || chmod 0755 "$install_root"
+(( had_releases == 1 )) || chmod 0755 "$install_root/releases"
 release_path="$install_root/releases/$release_id"
 release_receipt="$install_root/releases/$release_id.receipt.json"
 previous_current=""
