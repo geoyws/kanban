@@ -11,6 +11,14 @@ supersede it by a later ADR.
 the behaviour and stays in force; this ADR only freezes the schema that
 behaviour already emits.
 **Superseded in part by:** [ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md) (2026-09-10) — the two receipts of §2 and §3 are at `formatVersion` 2 there. §1's `manifest.json` stays frozen exactly as written below, so no `releaseId` moves. See the addendum dated 2026-09-10 at the end of this document for which rows became history.
+**Addendum 2026-09-28:** §7's `a-f0ced14b` store-path holding ("the store
+paths stay") is HISTORY under owner verdict `a-b68921fe` (choice `split`,
+approve) on `t-317647c9`; the canonical roots are `/var/lib/kanban`
+(`kanban:kanban`, `0700`) and root-owned `/var/lib/kanban-releases`, the
+authorization-root code fix with Linux e2e comes before anything host-side,
+and production cutover is out of scope behind a separate George approval.
+See the addendum dated 2026-09-28 at the end of this document. The schema
+freeze is untouched.
 
 ## Context
 
@@ -563,6 +571,38 @@ nothing is backfilled, and a v1 activation receipt already in the store stays
 listable, prunable and rollback-able because the store's own readers never
 look at `formatVersion`.
 
+Addendum 2026-09-28 (owner verdict `a-b68921fe` on `t-317647c9`: choice
+`split`, approve — the release-root replan): §7's store-path holding is now
+HISTORY, kept as written above rather than edited, and the
+cut-over-in-one-step approach the security review rejected is explicitly
+SUPERSEDED. Nothing below moves any host, and nothing here authorises a
+cutover. The split, in order:
+
+1. The canonical authorization root, declared now and enforced in code
+   later: the writable runtime/data root is `/var/lib/kanban`, owned
+   `kanban:kanban`, mode `0700`; the immutable release store is
+   `/var/lib/kanban-releases`, root-owned. Writable data and immutable
+   releases are different roots with different owners — that separation is
+   the point of the split. Naming the roots changes no stored artifact:
+   the `formatVersion` 1 manifest freeze, §§2–6, retention keying and the
+   script itself are untouched, and no `releaseId` moves.
+2. The authorization-root fix lands in code FIRST, proven by Linux e2e,
+   before anything host-side. No host command beyond read-only inspection,
+   no SSH and no production touch happens before that proof. The follow-up
+   code task names its tests by test id in
+   `docs/testing/compiled-rust-e2e-matrix.md` (enumerated with
+   `cargo test --locked --test e2e -- --list` before landing, per that
+   file's convention); no coverage is claimed here. If that fix touches
+   specified product behaviour it carries its own `/quality spec` gate
+   under ADR-047; this addendum is planning, outside the `WEB`/`SPA`
+   rollout, and needs none.
+3. Production cutover is explicitly OUT OF SCOPE here. It returns to
+   George separately behind its own approval. Until that approval the live
+   store stays `/root/.local/share/kanban-releases` exactly as §7 records,
+   the script's mandatory `--install-root` convention is unchanged, and
+   [ADR-034](ADR-034-hig-release-packages-and-board-rule-transfer.md)'s
+   recorded invocation is unchanged.
+
 ## References
 
 - `scripts/hig-release.sh` — the whole release path; every citation above
@@ -575,3 +615,4 @@ look at `formatVersion`.
 - `tests/e2e.rs` — `hig_release_script_*`, including `hig_release_script_local_and_remote_install_guards_are_identical` and `hig_release_script_enumerates_exactly_the_executables_the_crate_declares`
 - `docs/testing/graphql-agent-loop-benchmark-2026-09-05.json:303` — the live store path in use
 - Kanban board: epic `e-c3c8a863`; task `t-66ca0c2d` (this ADR); decision `a-f0ced14b` (2026-09-06, the store paths stay)
+- Owner verdict `a-b68921fe` (2026-09-28, choice `split`, approve) on task `t-317647c9` — the replan this addendum records: canonical authz root `/var/lib/kanban` (`kanban:kanban`, `0700`) plus root-owned `/var/lib/kanban-releases`; authorization-root code fix with Linux e2e before anything host-side; production cutover out of scope behind a separate George approval
