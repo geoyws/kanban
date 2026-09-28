@@ -2981,6 +2981,15 @@ fn board_v32_result_shape_exists(connection: &Connection) -> Result<bool> {
     )?;
     Ok(triggers == 2)
 }
+
+fn board_v34_result_shape_exists(connection: &Connection) -> Result<bool> {
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('attention')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(columns.iter().any(|column| column == "lane"))
+}
+
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
     let mut current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > migrations.len() {
@@ -3013,7 +3022,12 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
         // instead of failing on a duplicate column.
         let board_v32_step = current + 1 == 32;
         let v32_stands = board_v32_step && board_v32_result_shape_exists(&transaction)?;
-        if !v31_rewind && !v32_stands {
+        // The v34 ALTER cannot re-run against a column that already stands,
+        // so a board rewound past its own physical v34 shape skips the step
+        // instead of failing on a duplicate column.
+        let board_v34_step = current + 1 == 34;
+        let v34_stands = board_v34_step && board_v34_result_shape_exists(&transaction)?;
+        if !v31_rewind && !v32_stands && !v34_stands {
             if v31_columns {
                 transaction.execute_batch(
                     "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
@@ -4579,6 +4593,50 @@ mod tests {
             .unwrap();
         assert!(matched.contains(&"a-old".to_owned()), "{matched:?}");
         assert!(matched.contains(&"a-new".to_owned()), "{matched:?}");
+    }
+
+    #[test]
+    fn v34_lane_column_rerun_after_a_rewind_skips_the_step() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..33]).expect("migrate through v33");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6)",
+                [],
+            )
+            .expect("insert a pre-lane row");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        // Rewinding one step re-runs V34 against a table that already has
+        // the column, so the shape guard must skip the ALTER instead of
+        // failing on a duplicate column name.
+        connection
+            .pragma_update(None, "user_version", 33)
+            .expect("rewind past v34");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v34 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-old'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lane, None);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,lane
+                 ) VALUES('a-new','decision','body','geoyws',2,'open',0,6,'driver-2')",
+                [],
+            )
+            .expect("insert a stored-lane row after the rerun");
+        let stored: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-new'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("driver-2"));
     }
 
     fn index_sql(connection: &Connection, name: &str) -> String {
