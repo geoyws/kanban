@@ -19237,10 +19237,14 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
             // v33 rebuilds the table, so definition and result columns stand
             // on their own lines now (v32's ALTERs had landed them on the
             // check_about line); a simulated v30 board strips all eight.
+            // v34's ALTER appends lane to the last column definition line, so
+            // the answered_at strip carries it: the simulated v30 board must
+            // not contain v34's column either, or the v34 rerun would meet a
+            // duplicate column instead of an empty slot.
             " check_about TEXT,\n",
             " check_answered TEXT,\n",
             " check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),\n",
-            " check_answered_at INTEGER,\n",
+            " check_answered_at INTEGER, lane TEXT,\n",
             " CHECK(\n   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL\n    AND check_explanation IS NULL AND check_about IS NULL)\n   OR\n   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL\n    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)\n ),\n",
         ] {
             let without = sql.replace(declaration, "");
