@@ -703,5 +703,11 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   query remove the per-event second SELECT. Event documents are authorized as the event they
   index (same union the event tails filter on), since the task's tags alone handed a denied
   row to any caller who could read the task. HTTP proofs are moot: the web serving retired
-  (`e-caeb1449`), so the evidence is CLI-process e2e. The full BM25 recompute over permitted
-  documents follows in the same row.
+  (`e-caeb1449`), so the evidence is CLI-process e2e. The recompute half: filtering only
+  the divisor proved insufficient on re-review (M1): FTS5's per-row bm25 folds whole-index
+  term frequencies, row count and average length into every strength, so under enforcement
+  FTS now decides only which rows match while `permitted_bm25_scores` recomputes the
+  strengths with N, df and avgdl over permitted rows only (same k1/b 1.2/0.75 and 8/2/4
+  title/body/tags weights); `search_scores_and_order_are_a_function_of_permitted_documents_only`
+  pins both hits' scores and their order. On unenforced boards the FTS5 strengths are kept
+  unchanged, so scores and order are exactly what the unfiltered code produced.
