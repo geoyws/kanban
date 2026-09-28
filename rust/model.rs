@@ -2905,7 +2905,7 @@ mod tests {
         for about in [
             "rust/store.rs",
             "store.rs",
-            "edge-cache",
+            "@@edge",
             "@_uat",
             "DEFAULT_TIER",
             "--rootless",

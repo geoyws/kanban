@@ -41059,7 +41059,7 @@ fn att_list_check_report_groups_worst_first_with_adr037_caps() {
     // (about, resolved rows, correct answers, kind).
     for (about, total, correct, kind) in [
         ("src/store.rs", 5, 1, None),
-        ("edge-cache", 4, 3, None),
+        ("@@edge", 4, 3, None),
         ("FAST_FLAG", 3, 3, Some("risk")),
         ("src/trunc.rs", 6, 5, None),
     ] {
@@ -41132,7 +41132,7 @@ fn att_list_check_report_groups_worst_first_with_adr037_caps() {
         stdout.as_ref(),
         "about answered correct missed miss-rate\n\
          src/store.rs 5 1 4 80\n\
-         edge-cache 4 3 1 25\n\
+         @@edge 4 3 1 25\n\
          src/trunc.rs 6 5 1 16\n\
          FAST_FLAG 3 3 0 0\n",
         "the report table: {stdout}"
@@ -41153,7 +41153,7 @@ fn att_list_check_report_groups_worst_first_with_adr037_caps() {
         report,
         json!([
             {"about": "src/store.rs", "answered": 5, "correct": 1, "missed": 4, "missRate": 80},
-            {"about": "edge-cache", "answered": 4, "correct": 3, "missed": 1, "missRate": 25},
+            {"about": "@@edge", "answered": 4, "correct": 3, "missed": 1, "missRate": 25},
             {"about": "src/trunc.rs", "answered": 6, "correct": 5, "missed": 1, "missRate": 16},
             {"about": "FAST_FLAG", "answered": 3, "correct": 3, "missed": 0, "missRate": 0},
         ])
@@ -41187,7 +41187,7 @@ fn att_list_check_report_groups_worst_first_with_adr037_caps() {
     );
     assert_eq!(two.as_array().unwrap().len(), 2);
     assert_eq!(two[0]["about"], "src/store.rs");
-    assert_eq!(two[1]["about"], "edge-cache");
+    assert_eq!(two[1]["about"], "@@edge");
 
     // The existing limit law refuses a negative or over-ceiling `--limit`.
     for limit in ["-1", "1000001"] {
@@ -41338,7 +41338,7 @@ fn att_list_check_report_fans_out_across_boards() {
         &fixture,
         &fixture.worktree,
         "Second board comprehension.",
-        "edge-cache",
+        "@@edge",
         None,
         "alpha",
     );
@@ -41369,7 +41369,7 @@ fn att_list_check_report_fans_out_across_boards() {
         merged,
         json!([
             {"about": "src/store.rs", "answered": 1, "correct": 0, "missed": 1, "missRate": 100},
-            {"about": "edge-cache", "answered": 1, "correct": 1, "missed": 0, "missRate": 0},
+            {"about": "@@edge", "answered": 1, "correct": 1, "missed": 0, "missRate": 0},
         ])
     );
     // A board selector beside `--all-boards` is refused, as the search
