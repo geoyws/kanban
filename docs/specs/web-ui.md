@@ -116,7 +116,7 @@ Strength keywords are BCP 14. `Layer` names the one layer that proves the requir
 A served invariant that is also observable in a browser is stated twice, once per layer, so that
 each requirement keeps exactly one layer and George's "both unit tests and e2e tests" holds for
 groups below are topical, so the numbering is not monotonic: WEB-56 .. WEB-59 were added by the
-3: 2026-09-17 gate review and sit in the group they belong to, WEB-71 was appended on
+2026-09-17 gate review and sit in the group they belong to, WEB-71 was appended on
 2026-09-28 for t-2845f881 in its own group at the end of the creation sequence, WEB-72 was
 appended the same day for t-1319fcb8 in the Responsiveness group it belongs to, and WEB-73 was appended on
 2026-09-28 for t-b2662161 in the Read pages group it belongs to (WEB-60 is
@@ -853,7 +853,7 @@ at 60 px, and the note field is still at 716–785 — inside the viewport and a
 816. Without the restore the same scenario reports both positions at 0 and the note at
 1130–1199, off the screen.
 
-4: **A21 — the default is one latest per lane (WEB-71).**
+**A21 — the default is one latest per lane (WEB-71).**
 *Given* boards `px` (lanes `driver` with three sitreps, `driver-2` with two) and `atmux` (lane
 `driver` with one),
 *when* `GET /api/v1/lanes` with no query is read over HTTP,
@@ -924,7 +924,45 @@ the copy. It does not touch:
 Because no interface or stored shape moves, there is no migration, no compatibility window and
 no ownership transfer to record.
 
- @both
+**WEB-73 delta (2026-09-28, SPEC-READY).** The paragraphs above cover WEB-01..WEB-59, for which the
+stored deployment shape never moved. WEB-73 moves no stored shape either — legacy rows keep
+their absolute-path `repo`, so there is no migration and no compatibility window — and answers
+the contract lines for that reading only; everything else above stands:
+
+- **Caller contract:** `deploy start --repo` sends `owner/name`. An absolute-path `--repo`
+  is refused before any row is stored. The exact refusal sentence is owned by the
+  implementation change, not pinned here; A26 proves the refusal and the empty ledger.
+- **Read contract:** `/deployments` and `/deployment/<board>/<id>` keep their routes,
+  columns, order and truncation (t-1b970747); only the repository identity's text changes
+  per WEB-73.
+
+**WEB-71 delta (2026-09-28, DRAFT).** The paragraphs above cover WEB-01..WEB-59, for which no
+OpenAPI document existed. WEB-71 moves one JSON surface and answers the contract lines for
+that move only; everything else above stands:
+
+- **Interface version or schema:** `GET /api/v1/lanes` under the pinned OpenAPI 3.0.3 contract
+  (`docs/api/kanban-web.openapi.yaml:2`), staying `v1`: the history parameters and the
+  `nextCursor` field are additive, and additive fields do not bump the path version. Draft
+  against `getLanes` (same file `:546`-`:577`):
+  `parameters: [{name: board, in: query, required: false, description: lane history is
+  addressed by board and lane together; absent board/lane answers the one-latest default},
+  {name: lane, in: query, required: false}, {name: cursor, in: query, required: false,
+  description: opaque server-minted page token; absent starts at the newest}]`;
+  `LaneSummary` gains `nextCursor: {type: string, nullable: true}` (null when the trail is
+  exhausted; absent-or-null on the default listing); `400` reuses the one `{"error"}` shape
+  naming `cursor`; `404` reuses `{"error":"denied or not found"}` for an unknown or unreadable
+  lane. The `.yaml` edit itself lands with the implementation (the file is SPA-trace-owned;
+  this draft is what it implements — owed trace for main to apply), parsed through the existing
+  `query_value` path.
+- **Data invariants:** sitrep order stays `created_at DESC, id DESC`; groups stay
+  most-recently-active first; `truncated` stays computed by the `limit + 1` over-fetch, never
+  inferred. A cursor denotes a position in that lane's trail and carries no authority.
+- **Migration:** none stored. Clients reading the full `updates` arrays of the old default get
+  one latest per group instead; history they never had is new capability, not a moved field.
+- **Compatibility:** default shape is unchanged (`items`, `returned`, `limit`, `truncated`,
+  `board`, `lane`, `updates`); only the per-lane tail shrinks and `nextCursor` appears.
+- **Ownership:** sitrep rows stay the board's (SPA-08, the store guard); the cursor mint is the
+  route's, opaque to the caller.
 
 ## 6. Quality and security
 
@@ -1111,7 +1149,7 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-57 | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | chrome | M2 |
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
-6: | WEB-73 | `repository_column_names_an_unknown_identity_in_real_chrome` (A26) | chrome | M3 |
+| WEB-73 | `repository_column_names_an_unknown_identity_in_real_chrome` (A26) | chrome | M3 |
 | WEB-71 | `the_lanes_default_serves_one_latest_sitrep_per_lane_over_http` (A21), `lane_history_pages_newest_first_behind_an_opaque_cursor_over_http` (A22), `lane_history_refuses_a_stale_or_malformed_cursor_over_http` (A23), `lane_history_withholds_a_board_the_caller_may_not_read_over_http` (A24) | http | M5 |
 
 Counts: 61 requirements — 59 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
