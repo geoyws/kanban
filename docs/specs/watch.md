@@ -18,9 +18,9 @@
   reinstated, and the open questions in §7.
 - **Decider (wording of this document):** slice row `t-28dca81e` under epic `e-c0852fe7`, approved
   on owner verdict `a-e240ed2d` (choice `watch`, outcome `approve`) — the approval ADR-047 §7
-  requires for a slice outside the `WEB`/`SPA` rollout. (These rows were taken from the
-  delegating contract, not read directly: this worktree has no KB route — no `hosts.tsv` beside
-  `skills/kb/scripts/`, so `skills/kb/scripts/kb-board` refuses to route. See OQ-1 in §7.)
+  requires for a slice outside the `WEB`/`SPA` rollout. (Read directly from the kb board:
+  attention `a-e240ed2d`, kind `approval`, choice `watch` — Approve WATCH slice and promote draft —
+  resolved by geoyws 2026-09-28: `WATCH slice approved; t-28dca81e promoted; t-fde5d91c proceeds once docs/specs/watch.md is SPEC-READY`.)
 - **Sources:**
   - Slice row `t-28dca81e` — the scope under approval: `watch --lane` cursor binding, note-kind
     steer, envelope `lane`/`type`/`priority`, and shared kb/Ord conformance against Ord
@@ -53,12 +53,12 @@
     (`rust/model.rs:492`), `type` (`rust/model.rs:486-487`), `priority` (`rust/model.rs:497`)
     and its operator-facing projection `priority_level` (`rust/model.rs:472-479`: 0-2 `P0`,
     3-5 `P1`, 6-9 `P2`); the stored event row (`rust/model.rs:713-724`).
-  - The existing evidence this slice preserves: ten `watch_*` cases in `tests/e2e.rs` plus
+  - The existing evidence this slice preserves: nine `watch_*` cases plus one `the_watch_*` case in `tests/e2e.rs` plus
     `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` in
     `tests/authz_bypass_matrix_e2e.rs` — every name enumerated with
     `cargo test --locked --test e2e -- --list` and
     `cargo test --locked --test authz_bypass_matrix_e2e -- --list` on 2026-09-28 in this
-    worktree — and the coverage note at `docs/testing/compiled-rust-e2e-matrix.md:625-633`.
+    worktree — and the coverage note at `docs/testing/compiled-rust-e2e-matrix.md:630-638`.
   - Ord `t-49703f52` (read-only reference, unread from this worktree — no `acies` CLI and no
     `ACIES_*` environment here) via the `/ord` skill's `.result` envelope convention; the row-field
     shapes (`task list`/`task show` rows carrying the task's lane, type and priority,
@@ -119,7 +119,7 @@ named lanes. Values within the lane family are ORed; the family is ANDed with ev
 predicate family (--kind, --note-kind, --relation, --prior-status, --current-status, --tag).
 Matching is literal against the task row's lane; a lane that matches nothing yields an empty
 stream, not an error.`
-`Permissions: none — watch is read-only on both scopes.`
+`Permissions: the caller's board/tag read scopes gate the stream — revoking authority stops a live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1041); watch itself grants nothing and writes nothing.`
 `Failure behaviour: none beyond WATCH-04 on registry scope.`
 `Data rules: the predicate selects from stored rows; it writes nothing, archives nothing, and
 survives no restart beyond the persisted opaque cursor that carries it (WATCH-02).`
@@ -229,8 +229,8 @@ limit bounds the filtered result set, never the raw scan.`
 ## 4. Acceptance examples
 
 Concurrency needs no example: watch writes nothing, two streams share no mutable state, and
-one scope per stream (§2) keeps two consumers independent. Unauthorized access needs none
-beyond the refusals: watch is read-only at every scope, so there is no write to be refused.
+one scope per stream (§2) keeps two consumers independent. Unauthorized access is read-authority gating rather
+than a write refusal: per-poll authority re-read stops a revoked live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1041).
 
 ### A1 (WATCH-01, WATCH-02)
 
@@ -352,6 +352,14 @@ rows carrying kind and lane) are assumptions A6 must confirm.
 - **Security:** fail-closed refusals for unknown note kinds, registry-scope lane/note-kind use,
   mismatched cursors and malformed/future cursors (WATCH-02, WATCH-04, WATCH-05); refusals write
   nothing (ADR-008). No new capability is granted: watch stays read-only.
+- **Security — ASVS applicability:** OWASP ASVS **5.0.0** is selected as verification guidance,
+  not a certification claim. **V5.1** applies to fail-closed validation of the new predicates
+  (WATCH-02, WATCH-04, WATCH-05); **V8.3.1** applies because the board/tag read scopes gating
+  each stream are enforced by the trusted Store per poll, not by stream parameters (WATCH-03,
+  §4); **V14.2.6** applies because envelopes disclose only the minimum data — secrets redacted
+  recursively (WATCH-10) and the scope echo carrying only the caller's own predicates (WATCH-03).
+  Authentication, session-management and cryptography chapters add no WATCH-specific contract
+  because this slice inherits the existing identity, creates no secret, credential or session mechanism.
 - **Operability:** one scope per stream (non-goal, §2); sparse filtering before `--limit`
   (WATCH-12); the `advanced` heartbeat keeps sparse follow streams moving (WATCH-11).
 - **Performance:** observations, not budgets — the 250ms poll (`rust/watch.rs:15`), the 16 KiB
@@ -382,18 +390,18 @@ enumerated with `cargo test --locked --test e2e -- --list` and
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| WATCH-01 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: `--lane` does not exist at the baseline. |
-| WATCH-02 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
-| WATCH-03 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
-| WATCH-04 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
-| WATCH-05 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no note-kind predicate at the baseline. |
-| WATCH-06 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: the four keys are not projected at the baseline. |
-| WATCH-07 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with OQ-1 readback: A6's side-by-side is the evidence. |
-| WATCH-08 | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no new cursor fields exist yet to default. |
-| WATCH-09 | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes` | additive stability on the shipped surface; `t-fde5d91c` re-runs both against envelopes carrying the four new keys. |
-| WATCH-10 | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes` | the redaction half of that case; re-run with lane/type/priority-bearing events. |
-| WATCH-11 | MUST | process | `watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats` | the heartbeat half; extended to lane/note-kind-skipped tails by `t-fde5d91c`. |
-| WATCH-12 | MUST | process | `watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits`, `watch_follow_still_refuses_a_zero_limit` | limit-before/after-filtering and the at-least-1 refusal; re-run under steered predicates. |
+| `WATCH-01` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: `--lane` does not exist at the baseline. |
+| `WATCH-02` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
+| `WATCH-03` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
+| `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
+| `WATCH-05` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no note-kind predicate at the baseline. |
+| `WATCH-06` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: the four keys are not projected at the baseline. |
+| `WATCH-07` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with OQ-1 readback: A6's side-by-side is the evidence. |
+| `WATCH-08` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no new cursor fields exist yet to default. |
+| `WATCH-09` | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes` | additive stability on the shipped surface; `t-fde5d91c` re-runs both against envelopes carrying the four new keys. |
+| `WATCH-10` | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes` | the redaction half of that case; re-run with lane/type/priority-bearing events. |
+| `WATCH-11` | MUST | process | `watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats` | the heartbeat half; extended to lane/note-kind-skipped tails by `t-fde5d91c`. |
+| `WATCH-12` | MUST | process | `watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits`, `watch_follow_still_refuses_a_zero_limit` | limit-before/after-filtering and the at-least-1 refusal; re-run under steered predicates. |
 
 Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run):
 `watch_replays_resumes_and_respects_selector_boundaries`,
