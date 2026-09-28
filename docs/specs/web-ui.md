@@ -2,15 +2,23 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-59` and are stable across wording
-  refinements (WEB-56..59 were added by the 2026-09-17 SPEC-READY review; numbering is by
-  creation, grouping is by topic).
+- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-59` plus `WEB-73`, and are stable
+  across wording refinements (WEB-56..59 were added by the 2026-09-17 SPEC-READY review;
+  WEB-60 is reserved for the t-b412670a `/all` fix, WEB-61..WEB-70 for the t-97878627 makeover,
+  WEB-71..WEB-72 are sibling deltas landing with main, so this delta takes the next free ID —
+  WEB-73 was appended 2026-09-28 for t-b2662161; numbering is by creation, grouping is by
+  topic).
 - **Baseline:** 2026-09-17 at commit `56e6b24` on branch `docs/t-b349fa14-spec`. Every "today"
   claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-17 (independent gate by a reviewer applying the SDD §1
   exit criteria; OQ-2 and OQ-4 in §7 gated ADR-046's acceptance — both closed 2026-09-20 in
   attention a-e02c9116 — not this specification's testability). Product readiness is not
   claimed by this stamp.
+- **Delta status (2026-09-28):** `SPEC-READY` for `WEB-73` (repository column names an unknown
+  identity for path-valued legacy rows, t-b2662161; owner verdict a-2ff30418, choice `unknown`,
+  outcome approve). The stamp covers `WEB-73` only: the 2026-09-17 `SPEC-READY` above still
+  covers `WEB-01`..`WEB-59`. The implementation change owes the real-Chrome test by test id
+  (A26, matrix row M3); product readiness is not claimed by this stamp.
 - **Owner (product scope):** George. He alone resolves scope, colour, wording and whether a
   declined option is reinstated.
 - **Decider (wording of this document and of ADR-046):** codex@driver.
@@ -62,6 +70,8 @@ plus the shared shell, its navigation drawer, the inline stylesheet and the inli
 - No new write verb. The browser's writes stay exactly decide, undo, plan-open and subscription
   pause/resume (ADR-016:82, allowlist at `rust/serve.rs:453`-`rust/serve.rs:459`).
 - No new route, and no change to any HTTP status, form field, header or WebSocket frame.
+- No page-layout change on `/deployments`: columns, order and truncation stay as t-1b970747
+  owns them; WEB-73 changes only what the repository identity reads.
 - No Tailwind, no Node toolchain, no build step (§7 records the decision and its owner).
 - No external asset: no webfont, no image host, no CDN. The stylesheet and script stay inline in
   the served document (`rust/serve.rs:3729`, `rust/serve.rs:3742`).
@@ -84,7 +94,8 @@ A served invariant that is also observable in a browser is stated twice, once pe
 each requirement keeps exactly one layer and George's "both unit tests and e2e tests" holds for
 every invariant that has both. IDs are assigned in order of creation and never reused, while the
 groups below are topical, so the numbering is not monotonic: WEB-56 .. WEB-59 were added by the
-2026-09-17 gate review and sit in the group they belong to.
+2026-09-17 gate review and sit in the group they belong to, and WEB-73 was appended on
+2026-09-28 for t-b2662161 in the Read pages group it belongs to.
 
 ### Hero and type
 
@@ -463,6 +474,10 @@ On `/boards` and `/deployments`, every `th` and `td` computes a total border wid
 `0px`, that `1px` is the row separator in `--surface0`, and every numeric cell computes
 `text-align: right` with the `--mono` family.
 
+**WEB-73** — the repository column names an unknown identity instead of leaking a worktree path. [`SPEC-READY` 2026-09-28 for t-b2662161; independent gate, see §1 delta status.]
+Strength: MUST · Layer: chrome · Source: t-b2662161; owner verdict a-2ff30418 (choice `unknown`, outcome approve); measured 2026-09-25 (absolute worktree paths in the column).
+A deployment row whose stored `repo` is an absolute path (it begins with `/`) is a path-valued legacy row (`rust/model.rs:2241`; required but unshaped at `rust/lib.rs:6853`). On `/deployments`, no rendered repository identity is an absolute path: the Repository column cell of a path-valued legacy row reads exactly `repository unknown - legacy absolute path` with the board sub-line unchanged (`web/src/pages/deployments.tsx:188`-`:191`), and the in-progress and recent-failure sentences name the same unknown identity rather than the stored path. The attempt-detail page keeps the audit trail: its Repository row renders the stored value verbatim (`web/src/pages/deployment.tsx:39`). A new `deploy start` whose `--repo` is an absolute path is refused before any row is stored; new callers send `owner/name`. Columns, order and truncation are unchanged (t-1b970747).
+
 ### Responsiveness
 
 **WEB-44** — nothing overflows sideways, anywhere.
@@ -772,6 +787,11 @@ at 60 px, and the note field is still at 716–785 — inside the viewport and a
 816. Without the restore the same scenario reports both positions at 0 and the note at
 1130–1199, off the screen.
 
+**A26 — a legacy worktree path reads as an unknown repository, and the detail keeps the path (WEB-73).**
+*Given* a board with one path-valued legacy attempt whose stored `repo` is an absolute worktree path and one ordinary attempt whose `repo` is `owner/name`,
+*when* `/deployments` is loaded in real Chrome and the legacy attempt's `/deployment/<board>/<id>` page is read,
+*then* the legacy row's Repository cell reads exactly `repository unknown - legacy absolute path` with its board sub-line, no repository identity rendered anywhere on `/deployments` begins with `/`, the ordinary row still reads its `owner/name`, and the detail page's Repository row reads the stored absolute path verbatim; *and when* a new `deploy start --repo /tmp/abs-worktree` is attempted, *then* it is refused and no row is stored.
+
 **Categories deliberately not exercised here.** Unauthenticated access, session handling and
 CSRF-token design are the edge's and are already proven where they live: kanban implements no
 authentication (ADR-016:49), the actor header is trusted only from the edge
@@ -801,6 +821,18 @@ the copy. It does not touch:
 
 Because no interface or stored shape moves, there is no migration, no compatibility window and
 no ownership transfer to record.
+
+**WEB-73 delta (2026-09-28, SPEC-READY).** The paragraphs above cover WEB-01..WEB-59, for which the
+stored deployment shape never moved. WEB-73 moves no stored shape either — legacy rows keep
+their absolute-path `repo`, so there is no migration and no compatibility window — and answers
+the contract lines for that reading only; everything else above stands:
+
+- **Caller contract:** `deploy start --repo` sends `owner/name`. An absolute-path `--repo`
+  is refused before any row is stored. The exact refusal sentence is owned by the
+  implementation change, not pinned here; A26 proves the refusal and the empty ledger.
+- **Read contract:** `/deployments` and `/deployment/<board>/<id>` keep their routes,
+  columns, order and truncation (t-1b970747); only the repository identity's text changes
+  per WEB-73.
 
 ## 6. Quality and security
 
@@ -965,11 +997,14 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-57 | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | chrome | M2 |
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
+| WEB-73 | `repository_column_names_an_unknown_identity_in_real_chrome` (A26) | chrome | M3 |
 
-Counts: 59 requirements — 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
-`unit`, 28 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
+Counts: 60 requirements — 58 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
+`unit`, 29 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
 WEB-40 moved from `unit` to `chrome` with `t-bf255880` wave 1, when every page
-that lists rows became the bundle's.
+that lists rows became the bundle's. WEB-73 skips WEB-60 (reserved for the t-b412670a `/all`
+fix), WEB-61..WEB-70 (reserved for the t-97878627 makeover) and WEB-71..WEB-72 (sibling
+deltas landing with main); its real-Chrome test is owed by test id at implementation (A26).
 
 ## Appendix A — the design plan, verbatim
 

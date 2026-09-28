@@ -236,14 +236,14 @@ asserting real database state plus tenancy isolation` — or the superseding dat
 One row per mandatory requirement; a `MAY` gets a row only if it is actually tested. The section
 is updated in the same change as the specification delta it traces.
 
-## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-59
+## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-59 plus WEB-73
 
 One row per requirement, on branch `docs/t-5e88b314-release` at 2026-09-17:
-commit `b98e81e` plus the WEB-38 HTTP test written the same day. `Layer` uses
+commit `b98e81e` plus the WEB-38 HTTP test written the same day. WEB-73 was appended 2026-09-28 for t-b2662161; its real-Chrome test is owed by the implementation change and is not enumerated here. `Layer` uses
 the specification's own vocabulary: `unit` is a `#[test]` in `rust/serve.rs`'s
 `mod tests` reading served bytes, `chrome` is a compiled-binary test driving
 real Chrome in `tests/e2e.rs`, `http` is a compiled-binary HTTP exchange with
-no browser. Every test named here exists in that build, enumerated with
+no browser. Every test named here except WEB-73's owed test exists in that build, enumerated with
 `cargo test --locked --lib serve:: -- --list` and
 `cargo test --locked --test e2e -- --list`. The narrative rows above carry what
 each test measures; this table carries only the mapping.
@@ -309,11 +309,12 @@ each test measures; this table carries only the mapping.
 | WEB-57 | MUST | chrome | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | |
 | WEB-58 | MUST | unit | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` | shipped test, green against the rewritten stylesheet **Deleted 2026-09-19 by `t-bf255880` wave 2** with the `CSS` constant it read. The bundle's stylesheet is swept by the WEB-01/04/06/08/09/10 unit proofs, which read `bundle_stylesheet()` since wave 2; deck rules ship in a page that always ran its script, so the scoping clause is vacuous. |
 | WEB-59 | MUST | chrome | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | |
+| WEB-73 | MUST | none | `none` | no e2e coverage yet — the t-b2662161 implementation change owes `repository_column_names_an_unknown_identity_in_real_chrome` (spec A26) |
 
-59 requirements: 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY — WEB-47's MAY
+60 requirements: 58 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY — WEB-47's MAY
 became a MUST on 2026-09-18. By layer,
-30 `unit`, 28 `chrome` and 1 `http` — every requirement maps to an existing
-test at the layer §3 assigns it. WEB-40 moved from `unit` to `chrome` with
+30 `unit`, 28 `chrome`, 1 `http` and 1 `none` (WEB-73, owed) — every requirement except WEB-73 maps to an existing
+test at the layer §3 assigns it; WEB-73's real-Chrome test is owed by the implementation change. WEB-40 moved from `unit` to `chrome` with
 `t-bf255880` wave 1.
 
 ## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-63
