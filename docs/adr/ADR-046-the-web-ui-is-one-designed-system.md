@@ -1,6 +1,6 @@
 # ADR-046: The web UI is one designed system: the question is the hero, surfaces not boxes, one motion
 
-**Status:** Accepted (2026-09-20, George, attention a-e02c9116)
+**Status:** Superseded by [ADR-053](ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`); was Accepted 2026-09-20, George, attention a-e02c9116
 **Date:** 2026-09-17
 **Deciders:** codex@driver wrote this; George owns it. He commissioned the revamp in four
 sentences on 2026-09-17 — "revamp the design philosophy please for the web"; "use SDD to do the

@@ -54,7 +54,7 @@ values must never be copied into the plaintext board database.
   agent having to know which external file to search.
 - Context cost stays bounded by carrying an always-complete table of contents
   and fetching full long rules only on demand.
-- Rules gain an auditable lifecycle and a human-readable served surface.
+- Rules gain an auditable lifecycle.
 - Operators must still maintain dotfiles for long-form, encrypted and
   cross-machine knowledge; project rules complement that store rather than
   replacing it.
@@ -73,4 +73,4 @@ escaped served HTML. Unit tests remain a separate layer.
 - [ADR-005](ADR-005-kanban-owns-work-state-atmux-consumes-it.md)
 - [ADR-007](ADR-007-global-project-addressing.md)
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)
-- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md)
+- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md) (the served surface — retired: [ADR-053](ADR-053-the-web-view-is-retired.md))

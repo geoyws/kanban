@@ -1,4 +1,6 @@
 # Specification: the operator UI is one embedded TypeScript application (slice SPA)
+> **Withdrawn by [ADR-053](../adr/ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`):** the operator UI is retired — the embedded SPA, its JSON projection and every HTTP route are deleted with no replacement UI. This specification is retained as history, not as an obligation; requirement IDs stay stable so existing matrix rows remain traceable.
+
 
 ## 1. Identity and baseline
 

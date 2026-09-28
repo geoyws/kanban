@@ -53,7 +53,8 @@ argued here.
    commands, one per project
    ([ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md) Context). That
    measurement — operator decisions queueing behind the cost of looking at them —
-   is the business reason the product has a web surface.
+   was the business reason the product had a web surface (retired:
+   [ADR-053](adr/ADR-053-the-web-view-is-retired.md)).
 
 ## Outcomes
 
@@ -68,8 +69,8 @@ document invents no number for them.
   Unmeasured; the ownership rule is
   [ADR-005](adr/ADR-005-kanban-owns-work-state-atmux-consumes-it.md).
 - **Operator decisions stop queueing.** The 2026-08-24 baseline above (75 open,
-  oldest 65h, thirteen commands to see them) is the measured starting point in
-  [ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md); no later
+  oldest 65h, thirteen commands to see them) is the measured starting point recorded in
+  [ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md) (superseded by ADR-053); no later
   re-measurement of that queue exists, so no improvement figure is claimed here.
 - **The decision surface is cheap enough to open.** Measured 2026-09-19: on a
   seeded three-board fixture the landing payload is **517 888 B** total, against
@@ -90,8 +91,8 @@ the product owner and the authority for every boundary below. Agent harnesses
 are consumers of the ledger, not stakeholders with requirements of their own.
 There is no user population, no adoption target, no revenue outcome and no
 service-level commitment, because the product has none
-([ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md): "For a
-single-operator tool that is the intended authority";
+([ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md) (superseded by ADR-053; the
+single-operator premise stands): "For a single-operator tool that is the intended authority";
 [ADR-047](adr/ADR-047-kanban-adopts-specification-driven-development.md) §9).
 
 ## Business boundaries
@@ -148,7 +149,7 @@ arbitrary SQL for agents, cross-host replication, replacing Git — are
 - [ADR-005](adr/ADR-005-kanban-owns-work-state-atmux-consumes-it.md) — the
   ownership boundary: Kanban owns work state, atmux consumes it.
 - [ADR-016](adr/ADR-016-kanban-serves-its-own-read-only-ui.md) — the measured
-  approvals bottleneck that justifies the web surface.
+  approvals bottleneck that justified the web surface (superseded by ADR-053; retained as the measurement record).
 - [ADR-047](adr/ADR-047-kanban-adopts-specification-driven-development.md) —
   SDD adoption; the singleton rule for this file and the refusal to invent
   commitments.

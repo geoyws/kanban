@@ -1,4 +1,6 @@
 # Specification: the Kanban web UI is one designed system (slice WEB)
+> **Withdrawn by [ADR-053](../adr/ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`):** the web view is retired — `serve`, `web/`, `/live` and every HTTP route are deleted with no replacement UI. This specification is retained as history, not as an obligation; requirement IDs stay stable so existing matrix rows remain traceable.
+
 
 ## 1. Identity and baseline
 

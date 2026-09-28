@@ -53,8 +53,7 @@ An update retains the current tags unless a targeting flag is supplied. Target
 changes preserve the previous tags in the registry audit trail.
 
 Claim, context and accepted-handoff injection filters global summaries using
-the addressed board name, then appends that board's project rules. The web view
-does the same and shows canonical board tags beside each applicable global rule.
+the addressed board name, then appends that board's project rules.
 The registry remains the only storage location; targeted rules are not copied
 into project databases.
 

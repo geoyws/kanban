@@ -183,86 +183,6 @@ pub struct Subscription {
     pub paused_by: Option<String>,
 }
 
-/// Where one subscription has actually got to, derived and never stored.
-///
-/// There is no cursor column and there must not be one: `start_event_seq` is
-/// where a subscription began, and progress is the state of its
-/// `subscription_deliveries` rows. This is that state summarised for a
-/// reader — the highest acked seq plus how much is queued, retrying or
-/// dead-lettered.
-///
-/// `Copy` on purpose: the operator page looks one of these up per rendered
-/// row, and a lookup that allocates is a lookup that shows up in a page
-/// serving thirteen boards.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubscriptionPosition {
-    /// The highest `acked` delivery seq, or `None` when nothing has been
-    /// acked yet — which is not the same fact as "acked through seq 0".
-    pub acked_through_seq: Option<i64>,
-    pub pending: i64,
-    pub leased: i64,
-    pub retry_wait: i64,
-    pub dead_letter: i64,
-}
-
-/// One code a dead-lettered delivery was refused with, and how many of this
-/// subscription's dead letters carry it.
-///
-/// The code is the adapter's own classification, stored on the delivery row
-/// as `last_error_code`: `opencode_endpoint_unreachable` tells an operator to
-/// check a port, `kimi_frame_oversized` tells them to check a payload, and a
-/// count alone tells them to guess. Not `Copy` and deliberately owned — a
-/// code is text out of the ledger, and the alternative is a reader holding a
-/// borrow of the whole projection while it renders.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeadLetterCode {
-    pub code: String,
-    pub deliveries: i64,
-}
-
-/// Every subscription's position on one board, against that board's head.
-///
-/// The head travels with the positions because the two are only meaningful
-/// together: "acked through seq 8" says nothing until you know whether the
-/// board is at seq 8 or seq 800, and reading them apart invites a page that
-/// pairs one board's head with another board's acks.
-///
-/// The dead-letter codes travel with them for the same reason: `dead_letter`
-/// is how many refusals are waiting and the codes are what refused, and a
-/// reader that has one without the other either reports a count nobody can
-/// act on or an attribution that does not add up.
-#[derive(Debug, Clone, Default)]
-pub struct SubscriptionPositions {
-    pub head_event_seq: i64,
-    pub by_subscription: std::collections::BTreeMap<String, SubscriptionPosition>,
-    /// Only subscriptions with dead letters appear here, each with its codes
-    /// ordered by how many deliveries carry them and then by code, so equal
-    /// counts keep one order across reads.
-    pub dead_letters: std::collections::BTreeMap<String, Vec<DeadLetterCode>>,
-}
-
-impl SubscriptionPositions {
-    /// A subscription with no delivery rows has a real position — nothing
-    /// acked, nothing queued — rather than a missing one, so this never
-    /// returns an absence the caller has to interpret.
-    pub fn position(&self, subscription_id: &str) -> SubscriptionPosition {
-        self.by_subscription
-            .get(subscription_id)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// The codes behind one subscription's dead letters, empty when it has
-    /// none — same contract as `position`: no absence to interpret.
-    pub fn dead_letter_codes(&self, subscription_id: &str) -> &[DeadLetterCode] {
-        self.dead_letters
-            .get(subscription_id)
-            .map_or(&[], Vec::as_slice)
-    }
-}
-
 /// A due delivery candidate selected from the durable dispatcher queue.
 ///
 /// The nested subscription carries the immutable consumer/action capability
@@ -1738,6 +1658,7 @@ pub struct AttentionAnswer<'a> {
 impl<'a> AttentionAnswer<'a> {
     /// The custom answer, which every item offers and which always carries a
     /// verdict and a note.
+    #[cfg(test)]
     pub fn custom(outcome: &'a str, note: &'a str) -> Self {
         Self {
             choice: Some(CUSTOM_CHOICE),

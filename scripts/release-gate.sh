@@ -5,38 +5,29 @@
 # `docs/testing/compiled-rust-e2e-matrix.md` names it rather than restating
 # its steps.
 #
-# The order is cheapest-failure-first, so a typo in the web tree is not paid
-# for with a forty-minute browser suite:
+# The order is cheapest-failure-first:
 #
-#   1. `web/gate.sh` -- the bundle's own three steps (`tsc --noEmit`,
-#      `biome check`, `web/check-reproducible.sh`). The Rust half below
-#      embeds the committed `web/dist` bytes, so proving those bytes first
-#      is the cheapest way to fail (ADR-048).
-#   2. `cargo fmt --all -- --check` -- no compilation at all.
-#   3. `cargo clippy --locked --all-targets -- -D warnings` -- one build of
+#   1. `cargo fmt --all -- --check` -- no compilation at all.
+#   2. `cargo clippy --locked --all-targets -- -D warnings` -- one build of
 #      everything, including the test targets, with warnings fatal. A
 #      compile error in any integration target surfaces here rather than
 #      forty minutes into the browser suite.
-#   4. `cargo test --locked --lib` -- the in-process logic and the drift
+#   3. `cargo test --locked --lib` -- the in-process logic and the drift
 #      guards, plus the two fixed-descriptor remap tests, which are
 #      `#[ignore]`d and must be run serially and in isolation (they rebind
 #      fixed file descriptors, so a parallel test in the same process can
 #      lose its own).
-#   5. `bash skills/kb/tests/kb-wrapper-tests.sh` -- the pinned public
+#   4. `bash skills/kb/tests/kb-wrapper-tests.sh` -- the pinned public
 #      package's own wrapper tests, run out of the `skills/kb` submodule
 #      (ADR-036). The submodule is initialized path-specifically, never
 #      recursively, because that is the only initialization AGENTS.md
 #      admits and `rust/lib.rs` `include_str!`s `skills/kb/SKILL.md`.
-#   6. Every integration target, one at a time, each with
+#   5. Every integration target, one at a time, each with
 #      `-- --test-threads=1`, ending with `e2e`.
 #
 # Why the integration targets are serialized rather than run as one
-# `cargo test --all-targets`: `tests/e2e.rs` drives a REAL Chrome against a
-# real compiled `kanban serve`. Two of those at once contend for the same
-# browser cache, the same ephemeral ports and the whole machine's CPU, and
-# what that produces is a flaky failure that reads like a product bug. So
-# the browser suite never runs concurrently with another cargo command:
-# one target at a time, single-threaded inside the target, `e2e` last.
+# `cargo test --all-targets`: one target at a time, single-threaded inside
+# the target, `e2e` last.
 # Serialized is the answer to "too slow", and so is "make it faster".
 # Sampling is not: there is no `--only`, no `--skip`, no quick mode, and
 # nothing here reads an environment variable that turns a step off.
@@ -80,8 +71,6 @@ run() {
         exit 1
     fi
 }
-
-run 'web bundle gate' ./web/gate.sh
 
 run 'cargo fmt' cargo fmt --all -- --check
 

@@ -11,13 +11,14 @@ working on. It gives humans and compatible agent harnesses one durable place to
 discover work, coordinate atomic ownership, report progress, preserve evidence,
 and transfer work to a replacement agent when context or tokens run low.
 
-The operator's own view of that state is a single-page application. `kb.geoy.ws`
-is a React and TypeScript client that the product ships as part of the one
-executable, and it reads the board through a browser-facing JSON projection of
-the same work state the CLI and the agents use. The decision to build it that
-way is [ADR-048](adr/ADR-048-the-operator-ui-is-a-typescript-spa-embedded-in-the-binary.md)
-and its contracts are [the SPA specification](specs/spa.md); what belongs here
-is only what the operator gets: one application, one work state beneath it.
+The operator reads that state through the CLI, the generated MCP surface, and `kb watch` /
+`kb events`. The former single-page operator application — a React and TypeScript client
+shipped inside the one executable, reading the board through a browser-facing JSON projection —
+is retired ([ADR-053](adr/ADR-053-the-web-view-is-retired.md)); its decision
+[ADR-048](adr/ADR-048-the-operator-ui-is-a-typescript-spa-embedded-in-the-binary.md) and its
+contracts [the SPA specification](specs/spa.md) are withdrawn and retained as history. What
+belongs here is only what the operator gets now: the CLI, the harness surfaces, and one work
+state beneath them.
 
 ## Goals
 
@@ -33,8 +34,8 @@ is only what the operator gets: one application, one work state beneath it.
    this portable work-state engine.
 8. Expose a cursor-native `kb watch` process over the append-only ledgers,
    with additive protocol-v1 event payloads and fail-closed cursor semantics,
-   while keeping `kb events` as the newest-first snapshot reader and `/live`
-   as compatibility invalidation for the served UI.
+   while keeping `kb events` as the newest-first snapshot reader. (`/live` was compatibility
+   invalidation for the served UI and retired with it: ADR-053.)
 9. Persist board-local declarative subscriptions with immutable identity,
    fail-closed predicates, bounded consumer policy, and secret references only;
    execute them only through the separate capability-gated compiled dispatcher,
@@ -48,12 +49,10 @@ is only what the operator gets: one application, one work state beneath it.
 - Arbitrary SQL access for agents.
 - Cross-host replication in the first release.
 - Replacing Git, source documentation, or external customer issue systems.
-- A no-script fallback for the operator UI. Today every decision form posts
-  without JavaScript and the page degrades cleanly; once the UI is one mounted
-  application it does not, and no equivalent is planned. George decided the
-  single-page shape on 2026-09-17 and accepted that loss with it, so it is a
-  chosen consequence rather than something a later reader should discover as a
-  regression.
+- A no-script fallback for the operator UI (moot: the UI itself is retired — [ADR-053](adr/ADR-053-the-web-view-is-retired.md) — and this row is retained as the record of the accepted cost). When it lived, every decision form posted
+  without JavaScript and the page degraded cleanly; once the UI became one mounted
+  application it did not, and no equivalent was planned. George decided the
+  single-page shape on 2026-09-17 and accepted that loss with it.
 
 ## Primary workflows
 
@@ -116,8 +115,7 @@ working through it.
 - Search every durable work-knowledge source without requiring the caller to
   know its project first.
 - Fuse exact identifier/text retrieval, SQLite full-text ranking, and private
-  local semantic similarity through one implementation shared by CLI, MCP, and
-  the served UI.
+  local semantic similarity through one implementation shared by CLI and MCP.
 - Stream append-only board and registry ledger changes through `kb watch` with
   one scope per invocation, opaque cursor resume, additive protocol-v1
   payloads, a `--task` subject selector, repeatable `--kind`, `--relation`,
@@ -243,9 +241,9 @@ working through it.
   row is still outside done or cancelled, close must additionally require a
   named carry-to sprint and a non-empty carry note, and the carry and close
   must commit atomically.
-- Project the current sprint in the dashboard, the attached sprint in task
-  context only when the task is attached, and read-only `/sprints`,
-  `/sprints/BOARD`, and `/sprint/BOARD/ID` web views.
+- Project the current sprint in the dashboard and the attached sprint in task
+  context only when the task is attached. (The read-only `/sprints`, `/sprints/BOARD`,
+  and `/sprint/BOARD/ID` web views retired with the served UI: ADR-053.)
 - Scope a rule to a sprint as `SPRINT:sp-ID` with exactly one board selector
   and optional intersecting subsystem tags; setting and clearing that scope are
   mutually exclusive. Claim, handoff acceptance, and task context must evaluate
@@ -258,6 +256,10 @@ working through it.
   automatic rollover, and automatic sprint archival.
 
 ### The decision room
+
+> **Withdrawn by [ADR-053](adr/ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`):** this
+> section specified the retired served UI. It is retained as the record of what the deck was,
+> not as an obligation on any live surface.
 
 - Render the open attention items on the served "Needs you" page as a deck of
   decision cards showing one card at a time, in the order they are decided: the
@@ -312,13 +314,14 @@ working through it.
   [ADR-046](adr/ADR-046-the-web-ui-is-one-designed-system.md): the question is
   the only serif and the largest thing on the page, one motion, a colour means
   an outcome, nothing is boxed, and the deck and the full queue are one client
-  wearing that system. ADR-046 is Accepted (2026-09-20, George, attention a-e02c9116): he
-  reviewed the responsive deck on phone and Mac after sending the first version back in
-  a-dd7be9ba.
-- Requirements trace: `docs/specs/web-ui.md` §3 states WEB-01..WEB-59 with a
-  strength and one evidence layer each, §8 names the test per requirement, and
-  [the compiled Rust E2E matrix](testing/compiled-rust-e2e-matrix.md) maps each
-  one to the test that exists.
+  wearing that system. ADR-046 was Accepted (2026-09-20, George, attention a-e02c9116) and is
+  now Superseded by ADR-053: he reviewed the responsive deck on phone and Mac after sending
+  the first version back in a-dd7be9ba.
+- Requirements trace: `docs/specs/web-ui.md` §3 stated WEB-01..WEB-59 with a
+  strength and one evidence layer each, §8 named the test per requirement, and
+  [the compiled Rust E2E matrix](testing/compiled-rust-e2e-matrix.md) mapped each
+  one to the test that existed. (Specification and matrix rows withdrawn, retained as
+  history: ADR-053.)
 
 ### P0 — first usable slice
 
@@ -344,7 +347,7 @@ working through it.
   explicit atomic reconcile mode for stopped-writer cutover refreshes.
 - Compatibility adapter followed by the verified removal of duplicate atmux
   Kanban storage and repository code.
-- Operator-oriented terminal or web board over the same APIs.
+- Operator-oriented terminal board over the same APIs.
 - Search/filter by project, worktree, status, priority, assignee, and recency.
 - Safe project/worktree detach and rename operations.
 - Backup, restore, integrity-check, and retention commands.
@@ -432,11 +435,11 @@ A handoff is valid only when:
    capability-gated dispatcher, the Codex queue compiled-process
    adapter-contract coverage, and the separately named HAX live smoke receipt
    for installed Codex support.
-8. **Decision room:** decision cards with authored choices, one-click
+8. **Decision room** (retired with the served UI: ADR-053): decision cards with authored choices, one-click
    settlement with reply and undo, keyboard answering, hover previews, and
    markdown across the served views.
 9. **Sprint release boundaries:** typed sprint rows, sprint-scoped claims and
-   handoff acceptance, the served-version close gate, sprint web projections,
+   handoff acceptance, the served-version close gate,
    sprint-scoped rules, and first-class sprint search.
 
 ## Current delivery status

@@ -1,6 +1,6 @@
 # ADR-048: The operator UI is a TypeScript SPA, built at build time and embedded in the binary
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-053](ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`)
 **Date:** 2026-09-17 (recorded 2026-09-19)
 **Deciders:** George decided the shape on 2026-09-17, after two rounds of measurement and one
 reversal of his own (the React Native / App Store branch he raised and withdrew the same day).

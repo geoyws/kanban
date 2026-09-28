@@ -498,7 +498,7 @@ is refused rather than resolved, because the values disagree and nothing in the
 receipt would say which one was used.
 
 A selector applies only to a command that resolves one board. `doctor`,
-`dashboard`, `backup`, `restore`, `audit verify`, `serve`, `schema`, `mcp` and
+`dashboard`, `backup`, `restore`, `audit verify`, `schema`, `mcp` and
 the `workspace` and `rule` subcommands address the registry instead, so they
 refuse a selector by name rather than accepting and discarding it:
 `doctor --db PATH` used to answer `healthy: true` about every registered board,
@@ -670,7 +670,7 @@ Directories Kanban creates are `0700` from creation. Kanban never re-permissions
 a directory it did not create, so pointing `--db` at a shared path leaves that
 path alone ([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
 When the CLI runs as root inside a data directory owned by somebody else — the
-shape on hax, where `kb` over ssh is root while `kanban serve` runs as the
+shape on hax, where `kb` over ssh is root while the data directory is owned by the
 `kanban` user — every file it creates or opens there, the `-wal` and `-shm`
 beside a board included, is given that directory's owner, so a root command
 cannot leave the service unable to open its own data.
@@ -729,8 +729,7 @@ filter it. `doctor` reports source/document/FTS parity plus cache freshness and
 fails when any document lacks a current embedding.
 
 The same command description generates the MCP `search` and `search_rebuild`
-tools. The served UI exposes cross-board search at `/search`; both surfaces call
-the same Rust retrieval implementation as the CLI. See
+tools, which call the same Rust retrieval implementation as the CLI. See
 [ADR-023](docs/adr/ADR-023-sqlite-native-hybrid-rag-search.md) and the
 [evaluation contract](docs/testing/rag-search-evaluation.md).
 
@@ -857,7 +856,7 @@ kb deploy start --repo geoyws/kanban --commit "$FULL_SHA" \
 
 kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
   --result succeeded --phase verification --served-commit "$FULL_SHA" \
-  --receipt "live release endpoint and served bundle matched" --as codex@driver --json
+  --receipt "live release endpoint matched" --as codex@driver --json
 
 kb deploy current --json
 kb deploy list --status failed --json
@@ -867,8 +866,7 @@ kb deploy show "$DEPLOYMENT_ID" --json
 Success is deliberately strict: it requires a live verification receipt and a
 served commit exactly equal to the requested full 40-character commit. A retry
 is a new attempt linked with `--retry-of`; an idempotent caller supplies
-`--operation-id`. See ADR-030. The cross-board live matrix is at
-`https://kb.geoy.ws/deployments`.
+`--operation-id`. See ADR-030.
 
 ### Recovering an artifact whose build commit is unknown
 
@@ -937,117 +935,9 @@ The decryption key is the **only** copy — `keys/kanban-backup-age.key` in the
 git-crypt'd dotfiles, which is where it must live, because it has to survive the
 loss of the machine the backups are taken from.
 
-## The web view
+## Subscriptions and dispatcher delivery
 
-```bash
-kanban serve --port 14200                     # loopback only; no --bind flag exists
-kanban serve --socket /run/kanban/kanban.sock # proxy-only socket, mode 0660
-```
-
-Exactly one listener: both flags together, or neither, is a usage error and
-exits 64 rather than 1, so a supervisor can tell a bad unit file from a
-listener worth restarting. A `--socket` path is created mode `0660` owned by
-the serving uid and its primary group — add nginx's `www-data` to that group
-and nothing else on the box can connect. The path must be absolute, and one
-already holding anything other than a stale socket of this uid's, or whose
-parent directory is a symlink, is refused rather than replaced.
-
-Eleven server-rendered views over every registered board: open attention items
-across all of them by priority then age, recent decisions with an undo, the
-dashboard projection, draft plans with the work each holds back, the verified
-deployment matrix and attempt detail, `/lanes` lane sitreps, `/subscriptions`
-delivery state, cross-board cited search, one board's rows, and one task in
-full. Every read page is rows: the title first, one sentence of meta beneath
-it, one pill for a status, the priority as plain mono text with P0 in red, and
-tables carrying no border but the row hairline.
-Every read goes through the same `Store` methods the CLI calls, so there is no
-second implementation to keep in step.
-
-The Plans page can open an existing draft epic as `geoyws`, moving it to `todo` and
-releasing its child work for claims. It requires a same-origin POST and refuses
-any row that is not currently a draft epic.
-
-`/subscriptions` says in words what each subscription watches, where it
-delivers, and where it has actually got to: the start anchor, the highest acked
-seq, the distance to that board's event head, and the pending, retrying and
-dead-lettered counts, with dead-lettered flagged as needing a person. A
-configured `secretRef` renders as the fact that a secret is configured, never
-as its value. Pause and resume are same-origin POSTs through the same audited
-Store operations as `kb subscription pause`/`resume`, and repeating one is a
-no-op that still lands on the page. Whether paused rows are listed is
-`?show=all` in the URL and nothing is stored: no cursor, no preference row.
-Cursor presentation means showing a cursor's meaning — a cursor held in a
-browser would be a claim the server must trust, and a stale one silently skips
-rows (`docs/ui-pubsub-consumption-seams.md`).
-
-The **Needs you** page is the deliberately narrow exception to the read-only
-surface: it serves the open items as a deck showing one decision card at a
-time, and one click or one digit settles the current one as `geoyws`.
-Same-origin checks, strict bounded form decoding and the Store's
-duplicate-resolution refusal guard the write. With no script the same page is a
-plain list of every card, each with a form that still posts.
-
-A card reads top to bottom in the order it is decided in
-([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)
-§5): the eyebrow naming who asked, where and when in one sentence, the question
-as the headline — the page's only serif and the largest thing on it — the
-context, then the recommended choice first, marked `recommended`, leading on
-its own outcome-coloured fill and the first interactive element in the card,
-with each choice's consequence beneath its button, then the card's one reply
-field, then the operator's own answer with its four-value outcome picker folded
-until it is asked for, then the body folded under `show the full item`, then
-the meta line. The reply field sits with the choices, above the rule that
-starts the operator's own answer, because it serves both: whatever is written
-in it rides with whichever choice is clicked, and the own answer is that same
-field plus a verdict. `1`–`4` answer the current card in the order it lists
-them, so `1` is always the recommendation; `s` sends the card to the back of
-the deck and records nothing; `u` undoes the decision just made; `c` opens the
-operator's own answer. The digits stay inert while a reply is being typed and
-on a card whose own verdict is already picked. A row whose raiser authored no
-card is the same card with the `approve`/`reject` default pair, its first body
-line as the question and nothing marked recommended.
-
-One click posts `decision=<key>`, carrying `reply=<text>` as that decision's
-note when the field has words in it; the free-text answer posts
-`decision=custom&outcome=<verdict>&reply=<text>` and is refused without both
-by the page and by the composer that writes the trail. Nothing navigates: the
-card leaves the deck, the next one becomes current, and a one-line receipt
-naming the choice — and saying the reply is recorded when one rode with it —
-lands in the session history carrying its outcome as a coloured left rule plus
-the `kanban attention reopen <id>` that undoes it; the count of what is left
-drops and the receipt survives the live refresh — a reload on a 133-item list
-would throw the reader back to the top of it. A key the row no longer carries
-is refused by name rather than mapped onto whatever now sits in that position,
-so a card left open in a tab is safe to click. Every other route remains
-read-only: the browser can resolve an attention item, open a draft plan, and
-pause or resume a subscription, and nothing else, enforced by the source
-mutator allowlist and byte-for-byte process-boundary tests.
-
-The page says what happened in two channels and no others: one live line
-carrying only the connection's own words — `connecting`, `live`,
-`reconnecting`, `sending` — and one log region holding the toasts, where a
-change stays at least 20 seconds, holds while the pointer or focus is on it,
-dismisses on a click or `Esc`, and at most three are on screen at once, newest
-first. A refusal — the board's own sentence, or the composer's when an answer
-arrives with only one of its two halves — renders inline beside what it refused
-and is tied to the focused control with `aria-describedby`, not announced as an
-alert. The whole look is one designed system:
-[docs/specs/web-ui.md](docs/specs/web-ui.md) states it as WEB-01..WEB-59 with
-the test that proves each one, and
-[ADR-046](docs/adr/ADR-046-the-web-ui-is-one-designed-system.md) is the
-decision behind it, Proposed until George has reviewed screenshots of the deck
-on the phone and the Mac.
-
-`/live` is a WebSocket notification channel. It sends only revision notices and
-heartbeats; the browser fetches the canonical server-rendered page after a board
-changes. It never sends board content, cookies, credentials or lease tokens, and
-it defers a refresh while a reply is being typed. The compatibility socket
-stays on `/live`; the canonical long-running subscription is `kb watch`, which
-reads the append-only ledgers directly and leaves `kb events` as the newest-
-first snapshot view. `kb watch` uses the additive protocol-v1 envelope and the
-same fail-closed cursor rules described in ADR-031.
-
-Durable delivery intent is managed separately from the live process:
+Durable delivery intent is managed separately:
 
 ```bash
 kb subscription add --project NAME --id sub-codex-queue \
@@ -1168,23 +1058,6 @@ adapter cleanly, and a crash after adapter success but before acknowledgement
 is recovered after lease expiry. Delivery is therefore at-least-once, with
 immutable identity `(subscriptionID,eventID)` as the idempotency key rather
 than an exactly-once promise.
-
-Kanban implements no authentication: it binds `127.0.0.1`, or a `0660` Unix
-socket, and trusts the edge.
-The persisted target edge is nginx `auth_request` backed by the shared Google
-SSO at `https://kb.geoy.ws`; only `geoyws@gmail.com` is allowed, and the
-`.geoy.ws` session cookie is shared with Paste, Snip and Docs. When the web
-surface runs in opt-in actor-header mode, nginx must strip any client-supplied
-copy and set `X-Auth-Request-Email` from a successful `auth_request`; Kanban
-uses that normalized value as the audit actor and still requires same-origin.
-That `--actor-header` mode may be enabled only while nothing but the edge can
-reach the server: loopback, or a socket, which is strictly more local than
-loopback rather than a widening of it. The `kanban-serve.service` keeps the
-process up. There is
-deliberately no
-`--bind` flag — any value other than loopback publishes an unauthenticated
-surface.
-Reasoning: `docs/adr/ADR-016-*`.
 
 ## Short names
 
@@ -1484,7 +1357,7 @@ cargo build --release --locked
 ```
 
 `scripts/release-gate.sh` is the mechanical gate — one command, so the
-documented gate and the enforced gate cannot drift. It runs `web/gate.sh`,
+documented gate and the enforced gate cannot drift. It runs
 `cargo fmt --all -- --check`,
 `cargo clippy --locked --all-targets -- -D warnings`,
 `cargo test --locked --lib` (including the two ignored fixed-descriptor
@@ -1504,11 +1377,6 @@ specification, tests, code and trace row land in one change — see
 [`AGENTS.md`](AGENTS.md) §"Specification before implementation", the
 conventions in [`docs/specs/README.md`](docs/specs/README.md), and
 [ADR-047](docs/adr/ADR-047-kanban-adopts-specification-driven-development.md).
-
-`web/gate.sh` typechecks and lints the operator UI's TypeScript and proves
-the committed `web/dist` bundle is byte-for-byte reproducible from the frozen
-lockfile (`web/check-reproducible.sh`); `cargo build` only embeds those
-committed bytes, so the release build needs no Node on the host (ADR-048).
 
 `cargo test` runs unit tests for the pure logic (flag validation, the
 nearest-match hint, the alias tables, context trimming) alongside the E2E

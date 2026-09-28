@@ -8,9 +8,9 @@
 - Do not add Bun, Node, npm, pnpm, Yarn, or Corepack runtime dependencies.
 - Every release gate must spawn the compiled binary across real process
   boundaries; in-process domain tests do not count as E2E evidence.
-- The gate is one command: `scripts/release-gate.sh`. It is the web gate,
-  `fmt`, `clippy`, the unit suite, the `skills/kb` wrapper tests and every
-  integration target serialized with `-- --test-threads=1`, `e2e` last. Run
+- The gate is one command: `scripts/release-gate.sh`. It is `fmt`, `clippy`,
+  the unit suite, the `skills/kb` wrapper tests and every integration target
+  serialized with `-- --test-threads=1`, `e2e` last. Run
   it rather than a hand-assembled list, and never a bare
   `cargo test --all-targets`: the browser suite must not run concurrently
   with another cargo command. `KANBAN_CHROME` names the browser on a host

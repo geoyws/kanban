@@ -5,7 +5,6 @@ mod audit;
 mod authz;
 #[allow(dead_code)]
 mod broker;
-mod bundle;
 #[allow(dead_code)]
 mod claude_print_adapter;
 #[allow(dead_code)]
@@ -29,11 +28,9 @@ mod model;
 mod opencode_adapter;
 #[allow(dead_code)]
 mod policy;
-mod projection;
 mod registry;
 mod routing;
 mod search;
-mod serve;
 mod store;
 mod watch;
 mod zcode_notify_adapter;
@@ -82,7 +79,6 @@ Usage:
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
-  kanban serve (--port N | --socket PATH) [--actor-header NAME]
   kanban events [--task ID | --rule ID | --registry] [--kind KIND]
              [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
@@ -296,7 +292,7 @@ Usage:
   kanban mcp
 
 Global options (accepted by every board command; a command that addresses the
-registry instead — doctor, dashboard, backup, restore, audit verify, serve,
+registry instead — doctor, dashboard, backup, restore, audit verify,
 schema, mcp, workspace, rule — refuses the ones it would discard):
   --project NAME     address a registered project by name, from any directory
   --workspace PATH   use the project containing PATH instead of the cwd
@@ -523,16 +519,16 @@ pub(crate) fn repeatable(command: &str, sub: Option<&str>, flag: &str) -> bool {
 
 /// Commands that are processes rather than operations.
 ///
-/// `mcp` and `serve` block until killed. That makes them meaningless as tool
+/// `mcp` and `watch` block until killed. That makes them meaningless as tool
 /// calls — the MCP layer spawns the binary and reads its result, so a tool that
 /// never returns hangs the caller — and impossible to exercise the way the
 /// read-only guard exercises everything else, which runs each operation and
 /// compares the board before and after.
 ///
-/// This was a bare `!= "mcp"` inside the tool builder until `serve` arrived and
-/// the filter named only the first of two. It is a set with a guard now,
-/// because the next one will be the same mistake.
-pub(crate) const LONG_RUNNING: [&str; 3] = ["mcp", "serve", "watch"];
+/// This was a bare `!= "mcp"` inside the tool builder until a second
+/// long-running command arrived and the filter named only the first of two.
+/// It is a set with a guard now, because the next one will be the same mistake.
+pub(crate) const LONG_RUNNING: [&str; 2] = ["mcp", "watch"];
 
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
@@ -676,12 +672,6 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         None,
         &["db", "project", "workspace"],
         "replaces the whole data root from the snapshot named by --from",
-    ),
-    (
-        "serve",
-        None,
-        &["db", "project", "workspace"],
-        "serves every registered board",
     ),
     (
         "schema",
@@ -928,13 +918,6 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("search-rebuild", None, &["as", "all-boards"], &[], false),
-    (
-        "serve",
-        None,
-        &["port", "socket", "actor-header"],
-        &[],
-        true,
-    ),
     ("backup", None, &["output", "keep"], &[], false),
     (
         "archive",
@@ -2092,13 +2075,6 @@ impl Args {
             .and_then(|v| v.last())
             .map(String::as_str)
     }
-    fn single(&self, name: &str) -> Result<Option<&str>> {
-        match self.flags.get(name) {
-            None => Ok(None),
-            Some(values) if values.len() == 1 => Ok(values.first().map(String::as_str)),
-            Some(_) => bail!("--{name} may be given at most once"),
-        }
-    }
     fn many(&self, name: &str) -> Vec<String> {
         self.flags.get(name).cloned().unwrap_or_default()
     }
@@ -2311,34 +2287,6 @@ impl Args {
             );
         }
         Ok(rows)
-    }
-
-    /// The TCP port `serve` listens on, bounded to the real range.
-    ///
-    /// A port outside 1-65535 cannot be bound, and 0 asks the kernel to choose
-    /// one — which for a server nginx reaches by number means listening
-    /// somewhere nobody can find. Both are refused here rather than turning
-    /// into an opaque bind failure, or worse a server that starts and is
-    /// unreachable. Privileged ports are allowed: this binds loopback and the
-    /// operator may have reason to.
-    ///
-    /// Absent is `None` rather than a default port. `serve` takes either a
-    /// port or a `--socket` path, so a default here would have quietly won
-    /// every argument about which listener was meant.
-    fn port(&self) -> Result<Option<u16>> {
-        let Some(value) = self.optional_integer("port")? else {
-            return Ok(None);
-        };
-        u16::try_from(value)
-            .ok()
-            .filter(|port| *port != 0)
-            .map(Some)
-            .with_context(|| {
-                format!(
-                    "--port must be between 1 and 65535, got {value}: port 0 asks the \
-                     kernel to pick one, and nginx reaches this server by number"
-                )
-            })
     }
 
     /// Fail on an argument this command was never going to read.
@@ -5199,14 +5147,7 @@ pub fn entrypoint() -> ! {
             if json_requested() && !STDOUT_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = print(&json!({ "error": message }), true);
             }
-            // 1 for everything a retry might fix; `sysexits.h` 64 for a
-            // command line that will still be wrong on the next attempt.
-            // Only `serve`'s listener selection raises that today, and it
-            // raises it by type rather than by message so no future rewording
-            // can silently drop the distinction.
-            if error.downcast_ref::<serve::ListenerUsage>().is_some() {
-                std::process::exit(serve::EXIT_USAGE)
-            }
+            // 1 for everything a retry might fix.
             std::process::exit(1)
         }
     }
@@ -6448,27 +6389,6 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             bail!("Kanban integrity check failed");
         }
         return Ok(());
-    }
-    if command == "serve" {
-        // Exactly one listener. A default port alongside `--socket` would
-        // have picked loopback for an operator who asked for a socket, and
-        // accepting both would bind one and silently ignore the other -- so
-        // both and neither are refused with the shape, not with a bind error
-        // twenty lines later.
-        let actor_header = args.single("actor-header")?.map(str::to_owned);
-        let socket = args.single("socket")?.map(PathBuf::from);
-        return match (args.port()?, socket) {
-            (Some(_), Some(_)) => Err(serve::ListenerUsage::error(
-                "serve takes --port N or --socket PATH, not both: two listeners is not an \
-                 address nginx can be pointed at",
-            )),
-            (None, None) => Err(serve::ListenerUsage::error(
-                "serve needs a listener: --port N for loopback, or --socket PATH for a \
-                 proxy-only Unix socket",
-            )),
-            (Some(port), None) => serve::serve(port, actor_header),
-            (None, Some(path)) => serve::serve_unix(&path, actor_header),
-        };
     }
     if command == "watch" {
         return watch::run(&args);
@@ -8180,21 +8100,14 @@ fn run_access(args: &Args, sub: Option<&str>) -> Result<()> {
     }
 }
 
-/// The version banner, on two lines.
-///
-/// The first line is the program: its version and the two schema versions it
-/// speaks. The second is the operator UI bundle it carries, by the
-/// fingerprint `build.rs` derived from the embedded bytes — the half of the
-/// release proof that `readlink /proc/<pid>/exe` cannot give (SPA-03). A
-/// deploy receipt records the same number as `bundleSha256`, and the install
-/// asks the installed binary for this line to prove the two agree.
+/// The version banner: the program, its version and the two schema versions
+/// it speaks, on one line.
 fn version_string() -> String {
     format!(
-        "kanban {} (board schema {}; registry schema {})\nbundle {}",
+        "kanban {} (board schema {}; registry schema {})",
         env!("CARGO_PKG_VERSION"),
         db::BOARD_SCHEMA_VERSION,
         db::REGISTRY_SCHEMA_VERSION,
-        bundle::SHA256
     )
 }
 
@@ -8368,27 +8281,6 @@ mod tests {
                 "a flag value is parsed by `{pattern}`, which reports no flag name"
             );
         }
-    }
-
-    #[test]
-    fn actor_header_is_single_valued_at_startup() {
-        assert_eq!(
-            args(&["serve", "--actor-header", "X-Kanban-Actor"])
-                .single("actor-header")
-                .unwrap(),
-            Some("X-Kanban-Actor")
-        );
-        assert!(
-            args(&[
-                "serve",
-                "--actor-header",
-                "X-Kanban-Actor",
-                "--actor-header",
-                "X-Other"
-            ])
-            .single("actor-header")
-            .is_err()
-        );
     }
 
     #[test]
@@ -8589,7 +8481,6 @@ mod tests {
             // Withheld from `tools/list`, and withheld here for the same
             // reason: an unbounded follow inside a write scope is not an item.
             ("watch", "names no such operation watch"),
-            ("serve", "names no such operation serve"),
             // Addresses the registry or the data root, so its write would
             // land outside the batch's transaction.
             ("doctor", "rather than addressing one board's rows"),

@@ -23,9 +23,6 @@
 #   - --security-opt seccomp=unconfined: Chromium's user-namespace sandbox
 #     answers "No usable sandbox" under Docker's default profile. The browser
 #     still runs WITH its sandbox, because tests disable it only for uid 0.
-#   - --tmpfs .../web/node_modules with exec: the worktree is read-only and
-#     `bun install` must write somewhere executable; Docker tmpfs is noexec by
-#     default.
 #   - --init: reaps the orphans the process-boundary tests leave behind.
 #
 # Host-wide limit: the run is wrapped in medic's `gate-slot` (medic ADR-004),
@@ -112,7 +109,7 @@ if [[ -z "$name" ]]; then
 fi
 [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--name must be a container-safe name: $name"
 
-mkdir -p "$state/cargo" "$state/target-$name" "$worktree/web/node_modules"
+mkdir -p "$state/cargo" "$state/target-$name"
 log="$state/$name.log"
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -136,7 +133,6 @@ as_gate() {
 }
 mkdir -p /tmp/gate-home
 chown "$uid:$gid" /tmp/gate-home
-(cd /work/web && as_gate bun install)
 cd /work
 if [[ -z "$loop_target" ]]; then
     as_gate bash scripts/release-gate.sh
@@ -174,7 +170,6 @@ run_container=(
     --mount "type=bind,src=$worktree,dst=/work,readonly"
     --mount "type=bind,src=$state/target-$name,dst=/gate-target"
     --mount "type=bind,src=$state/cargo,dst=/gate-cargo"
-    --tmpfs "/work/web/node_modules:uid=$uid,gid=$gid,mode=0755,exec,size=2g"
     "$image"
     bash -c "$inner" inner "$uid" "$gid" "$loop_target" "$loop_test" "${iterations:-0}"
 )

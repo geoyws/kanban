@@ -1,6 +1,6 @@
 # ADR-016: Kanban serves its own UI, read-only first, behind an edge it does not implement
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-053](ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`)
 **Date:** 2026-08-24
 **Amended:** 2026-09-11 (decisions room: recent decisions, web undo, previews, markdown);
 2026-09-19 (ADR-048: the UI becomes a bundled SPA; §"Needs you is live" projection-swap wording

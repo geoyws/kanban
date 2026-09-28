@@ -3832,99 +3832,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Every subscription's derived position on this board — including which
-    /// codes its dead letters were refused with — from one grouped query over
-    /// the delivery rows, plus one read of the event head.
-    ///
-    /// Deliberately not per-subscription. The operator page renders a row per
-    /// subscription across every registered board, so a position query taking
-    /// a subscription id would sit inside that loop and turn one page into one
-    /// query per subscription per board. Two statements answer the whole set
-    /// however many subscriptions the board carries.
-    ///
-    /// `max(CASE WHEN status='acked' ...)` is the whole cursor: the ledger
-    /// already owns "what have I seen" as `seq`, and there is no cursor column
-    /// to read or to keep in step (`docs/ui-pubsub-consumption-seams.md`).
-    ///
-    /// The extra `GROUP BY` term is what makes the codes trustworthy rather
-    /// than merely present. Grouping by subscription *and* dead-letter code
-    /// splits each subscription into one row per code plus a null-code row
-    /// carrying everything that is not dead-lettered, and the counts are
-    /// summed back per subscription here. A second statement would have been
-    /// simpler to read and wrong: the dispatcher can dead-letter a delivery
-    /// between two statements, and the page would then print an attribution
-    /// whose parts do not add up to the total it printed beside them. One
-    /// statement is one snapshot.
-    pub fn subscription_positions(&self) -> Result<SubscriptionPositions> {
-        self.authz.check_read(&[])?;
-        let head_event_seq =
-            self.connection
-                .query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
-                    row.get(0)
-                })?;
-        let mut statement = self.connection.prepare(
-            "SELECT subscription_id,\
-                    CASE WHEN status='dead_letter' THEN last_error_code END AS dead_letter_code,\
-                    max(CASE WHEN status='acked' THEN event_seq END) AS acked_through_seq,\
-                    sum(status='pending') AS pending,\
-                    sum(status='leased') AS leased,\
-                    sum(status='retry_wait') AS retry_wait,\
-                    sum(status='dead_letter') AS dead_letter \
-             FROM subscription_deliveries GROUP BY subscription_id,dead_letter_code",
-        )?;
-        let mut by_subscription: BTreeMap<String, SubscriptionPosition> = BTreeMap::new();
-        let mut dead_letters: BTreeMap<String, Vec<DeadLetterCode>> = BTreeMap::new();
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>("subscription_id")?,
-                // A dead-lettered delivery cannot have a null code — the
-                // table's own CHECK says so — so a null here is a row that is
-                // not dead-lettered, never an unattributed refusal.
-                row.get::<_, Option<String>>("dead_letter_code")?,
-                SubscriptionPosition {
-                    acked_through_seq: row.get("acked_through_seq")?,
-                    pending: row.get("pending")?,
-                    leased: row.get("leased")?,
-                    retry_wait: row.get("retry_wait")?,
-                    dead_letter: row.get("dead_letter")?,
-                },
-            ))
-        })?;
-        for row in rows {
-            let (subscription_id, dead_letter_code, group) = row?;
-            if let Some(code) = dead_letter_code {
-                dead_letters
-                    .entry(subscription_id.clone())
-                    .or_default()
-                    .push(DeadLetterCode {
-                        code,
-                        deliveries: group.dead_letter,
-                    });
-            }
-            let position = by_subscription.entry(subscription_id).or_default();
-            // `None` sorts below every `Some`, so this is the highest acked
-            // seq across the groups and not an accident of row order.
-            position.acked_through_seq = position.acked_through_seq.max(group.acked_through_seq);
-            position.pending += group.pending;
-            position.leased += group.leased;
-            position.retry_wait += group.retry_wait;
-            position.dead_letter += group.dead_letter;
-        }
-        for codes in dead_letters.values_mut() {
-            codes.sort_by(|left, right| {
-                right
-                    .deliveries
-                    .cmp(&left.deliveries)
-                    .then_with(|| left.code.cmp(&right.code))
-            });
-        }
-        Ok(SubscriptionPositions {
-            head_event_seq,
-            by_subscription,
-            dead_letters,
-        })
-    }
-
     fn set_subscription_paused(
         &mut self,
         id: &str,
@@ -4535,18 +4442,6 @@ impl Store {
         Ok(expired as usize)
     }
 
-    /// Recorded ledger events, newest first. The `events` table is the audit
-    /// trail for lease seizures and destructive removals, so it needs a reader.
-    pub fn events(
-        &self,
-        task: Option<&str>,
-        kind: Option<&str>,
-        limit: i64,
-        include_archived: bool,
-    ) -> Result<Vec<Event>> {
-        self.events_with_bounds(task, kind, None, None, limit, include_archived)
-    }
-
     pub fn events_with_bounds(
         &self,
         task: Option<&str>,
@@ -4601,53 +4496,6 @@ impl Store {
         self.visible_events(rows)
     }
 
-    /// Where this board's ledger currently ends.
-    ///
-    /// Board scope only, because what leaves this function is a sequence
-    /// number and not row content — the same reasoning [`Store::events_since`]
-    /// states for its own scope, minus the rows. It discloses that the board
-    /// has had `n` events, which board read already tells a caller.
-    ///
-    /// A live consumer needs this to START at the head: a connection that
-    /// began at zero would replay the whole trail at an operator who just
-    /// reconnected, and one whose position sat ahead of the head — a board
-    /// restored from a backup — would stall silently, which is missing
-    /// information that reads as absence of information.
-    pub fn event_head_seq(&self) -> Result<i64> {
-        self.authz.check_read(&[])?;
-        self.connection
-            .query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
-                row.get(0)
-            })
-            .map_err(Into::into)
-    }
-
-    /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
-    ///
-    /// Deliberately board-wide: watch reads this as the tail that lets a cursor
-    /// move past rows its filtered scan rejected, so it has to see the rows
-    /// that do not match. It used to take a `task` parameter the SQL never
-    /// bound, so a caller could pass a selector and silently receive board-wide
-    /// rows anyway; the parameter is removed rather than honoured, because a
-    /// task-scoped board tail would stall the cursor behind other tasks'
-    /// traffic. Subject-scoped reads belong in `events_since_filtered`.
-    ///
-    /// This reasoning is about the board tail only. The registry twin,
-    /// `Registry::rule_events_since`, does bind its selector, so a
-    /// `--rule R --follow` watch has exactly the rule-scoped tail argued
-    /// against here. That asymmetry is deliberate and pre-existing: rule trails
-    /// are sparse enough that a stalled cursor costs little, and narrowing a
-    /// tail is always safe. Do not "fix" the registry to match this one.
-    ///
-    /// Authorization: board scope only, and deliberately so. This is the one
-    /// event read whose PURPOSE is to see rows the caller's filter rejected,
-    /// so per-row filtering here would stall the cursor behind another task's
-    /// traffic and re-scan the same window forever. Its only caller —
-    /// `watch::poll_once` — takes `.last().seq` from it and nothing else, so
-    /// what leaves this function is a sequence number, not row content. The
-    /// rows a watcher is actually HANDED come from `events_since_filtered`,
-    /// which filters per row. A caller that returned these rows to a consumer
-    /// would be a new leak, and would need the filter that this one skips.
     pub fn events_since(
         &self,
         kind: Option<&str>,
@@ -6677,62 +6525,6 @@ impl Store {
         Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
     }
 
-    /// The newest resolved attention rows, decided-first — the web's Recent
-    /// decisions view.
-    ///
-    /// `attention(Some("resolved"), …)` orders by priority then raised time,
-    /// which is the right order for a queue and the wrong end for "what was
-    /// decided lately": a board with more resolved rows than the caller's
-    /// bound would hand back its oldest decisions. This is the one read that
-    /// orders by `resolved_at DESC`.
-    ///
-    /// A row whose tags this caller may not read is not in the answer, on the
-    /// same all-of-tag test a named read is refused with: a decision that was
-    /// taken about a row this caller may not see is still about that row. The
-    /// bound is the READABLE rows', for the reason [`Store::attention`] gives
-    /// — the decisions room over-fetches per board and merges, and a denied
-    /// row spending a scan slot would drop a readable decision off the end.
-    pub fn recent_resolved_attention(&self, limit: i64) -> Result<Vec<Attention>> {
-        self.authz.check_read(&[])?;
-        let enforcing = self.authz.is_enforcing();
-        let sql = format!(
-            "SELECT * FROM attention WHERE status='resolved' AND archived=0 \
-             ORDER BY resolved_at DESC,id ASC{}",
-            if enforcing { "" } else { " LIMIT ?" }
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let bound: &[&dyn rusqlite::ToSql] = if enforcing { &[] } else { &[&limit] };
-        let mut rows = statement
-            .query_map(bound, attention_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        attach_attention_tags(&self.connection, &mut rows)?;
-        if enforcing {
-            rows.retain(|row| self.authz.permits_read(&row.tags));
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-        for row in &mut rows {
-            redact_attention_check(row);
-        }
-        Ok(rows)
-    }
-
-    /// Group resolved answered checks by `about`, worst first (ACC-18/ACC-19).
-    ///
-    /// The one grouping both surfaces share, so the CLI report and the
-    /// `/decided` block cannot disagree about which subject is worst: the
-    /// CLI feeds it the resolved rows its filters selected, and the decided
-    /// projection feeds it the page's own already-read items — no new Store
-    /// read on either side beyond the rows each surface already holds.
-    ///
-    /// Only resolved rows carrying a native check with a recorded answer
-    /// contribute; rows without a check and rows without an answer are
-    /// skipped, never fabricated into a group. Each group's miss rate is
-    /// `missed * 100 / answered`, a whole-percent integer truncated toward
-    /// zero, and groups sort worst first — miss rate descending, then missed
-    /// descending, then `about` ascending. The key is `about` alone: no
-    /// raiser, actor, answer-key, explanation or choice-label column exists,
-    /// so the report is never a leaderboard and never scores raisers.
     pub fn aggregate_check_report<'a>(
         items: impl IntoIterator<Item = &'a Attention>,
     ) -> Vec<CheckReportGroup> {
@@ -7155,28 +6947,6 @@ impl Store {
         )
     }
 
-    /// Settle an item from the trusted web edge.
-    ///
-    /// The edge identity is the audit actor, and the web route is the only
-    /// caller that may opt into this broader authorization model.
-    pub(crate) fn resolve_attention_from_trusted_edge(
-        &mut self,
-        id: &str,
-        actor: &str,
-        answer: &AttentionAnswer<'_>,
-        check_answered: Option<&str>,
-    ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(
-            id,
-            actor,
-            actor,
-            answer,
-            check_answered,
-            None,
-            true,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn resolve_attention_with_authorization(
         &mut self,
@@ -7437,27 +7207,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Record the one answer to a row's check without settling it — the web
-    /// card's write (ACC-11), through the same `record_check_answer` law the
-    /// CLI's `--check-answered` resolve uses, so no second answer behaviour
-    /// can exist. The row's status is unchanged: an open row stays open and a
-    /// later resolve finds the recorded answer and asks nothing twice
-    /// (ACC-06); a resolved row stays history with its result now recorded
-    /// (ACC-20).
-    pub(crate) fn answer_attention_check_from_trusted_edge(
-        &mut self,
-        id: &str,
-        actor: &str,
-        key: &str,
-    ) -> Result<Attention> {
-        self.answer_check_with_authorization(id, actor, actor, key, true)
-    }
-
-    /// Record the one answer to a row's check from the CLI (`attention
-    /// check`, ACC-21): the web route's operation under the resolve verb's
-    /// authorization — only the operator or the row's raiser may answer.
-    /// The receipt is the post-answer projection, carrying the correct key
-    /// and the explanation beside the recorded result (ACC-13).
     pub fn answer_attention_check(
         &mut self,
         id: &str,
@@ -10822,7 +10571,7 @@ mod tests {
             "a denied row spent a slot of this caller's page"
         );
         let decided = store
-            .recent_resolved_attention(100)
+            .attention(Some("resolved"), None, None, None, None, 100, false)
             .expect("recent decisions");
         assert_eq!(
             decided
@@ -10837,7 +10586,7 @@ mod tests {
         // its place in the scan.
         assert_eq!(
             store
-                .recent_resolved_attention(1)
+                .attention(Some("resolved"), None, None, None, None, 1, false)
                 .expect("the bounded scan")
                 .iter()
                 .map(|row| row.body.as_str())
@@ -10904,7 +10653,7 @@ mod tests {
         );
         assert_eq!(
             relaxed
-                .recent_resolved_attention(100)
+                .attention(Some("resolved"), None, None, None, None, 100, false)
                 .expect("recent decisions")
                 .len(),
             2,
@@ -10912,7 +10661,7 @@ mod tests {
         );
         assert_eq!(
             relaxed
-                .recent_resolved_attention(1)
+                .attention(Some("resolved"), None, None, None, None, 1, false)
                 .expect("the bounded scan")
                 .iter()
                 .map(|row| row.id.as_str())
@@ -11143,7 +10892,7 @@ mod tests {
         // The subject ids each envelope names, per event kind.
         let subjects = |store: &Store, kind: &str| -> Vec<String> {
             store
-                .events(Some("t-visible"), Some(kind), 100, true)
+                .events_with_bounds(Some("t-visible"), Some(kind), None, None, 100, true)
                 .unwrap_or_else(|error| panic!("events {kind}: {error}"))
                 .iter()
                 .filter_map(|event| {
@@ -11186,7 +10935,7 @@ mod tests {
         // an envelope's body, tags and choices name the row as surely as its
         // id does.
         let tail = store
-            .events(Some("t-visible"), None, 100, true)
+            .events_with_bounds(Some("t-visible"), None, None, None, 100, true)
             .expect("the task's whole tail")
             .iter()
             .map(|event| event.payload.to_string())
@@ -11668,7 +11417,9 @@ mod tests {
             .expect("read active events");
         assert_eq!(board_event_seqs(&active), vec![4, 3, 2, 1]);
 
-        let all = store.events(None, None, 10, true).expect("read all events");
+        let all = store
+            .events_with_bounds(None, None, None, None, 10, true)
+            .expect("read all events");
         assert_eq!(board_event_seqs(&all), vec![5, 4, 3, 2, 1]);
     }
 
@@ -11693,101 +11444,6 @@ mod tests {
             .expect_err("reversed bounds must be rejected")
             .to_string();
         assert_eq!(reversed, "--after must not be later than --before");
-    }
-
-    #[test]
-    fn trusted_edge_resolution_records_the_edge_actor_without_changing_cli_rules() {
-        let mut store = test_store("trusted-edge-resolution");
-        store.initialize("TRUSTED", "geoyws").unwrap();
-        insert_task(&store, "t-web");
-        insert_task(&store, "t-cli");
-        insert_task(&store, "t-forbidden");
-
-        let web_attention = store
-            .raise_attention(
-                "Resolve from the trusted edge.",
-                "decision",
-                "geoyws",
-                Some("t-web"),
-                0,
-                &[],
-                &DecisionCard::default(),
-                None,
-                None,
-            )
-            .expect("raise web attention");
-        let cli_attention = store
-            .raise_attention(
-                "CLI still owns this one.",
-                "decision",
-                "ifca-sso",
-                Some("t-cli"),
-                0,
-                &[],
-                &DecisionCard::default(),
-                None,
-                None,
-            )
-            .expect("raise cli attention");
-        let forbidden_attention = store
-            .raise_attention(
-                "Geo still owns this other one.",
-                "decision",
-                "geoyws",
-                Some("t-forbidden"),
-                0,
-                &[],
-                &DecisionCard::default(),
-                None,
-                None,
-            )
-            .expect("raise forbidden attention");
-
-        let resolved = store
-            .resolve_attention_from_trusted_edge(
-                &web_attention.id,
-                "ifca-sso",
-                &AttentionAnswer::custom("other", "done"),
-                None,
-            )
-            .expect("trusted edge resolution");
-        assert_eq!(resolved.resolved_by.as_deref(), Some("ifca-sso"));
-
-        let resolved_events = store
-            .events(Some("t-web"), Some("attention_resolved"), 10, true)
-            .expect("read resolved web event");
-        assert_eq!(resolved_events.len(), 1);
-        assert_eq!(resolved_events[0].actor.as_deref(), Some("ifca-sso"));
-
-        let cli_resolved = store
-            .resolve_attention(
-                &cli_attention.id,
-                "ifca-sso",
-                &AttentionAnswer::custom("other", "done"),
-                None,
-            )
-            .expect("ordinary cli resolution");
-        assert_eq!(cli_resolved.resolved_by.as_deref(), Some("ifca-sso"));
-
-        let cli_events = store
-            .events(Some("t-cli"), Some("attention_resolved"), 10, true)
-            .expect("read resolved cli event");
-        assert_eq!(cli_events.len(), 1);
-        assert_eq!(cli_events[0].actor.as_deref(), Some("ifca-sso"));
-
-        let forbidden = store
-            .resolve_attention(
-                &forbidden_attention.id,
-                "ifca-sso",
-                &AttentionAnswer::custom("other", "not allowed"),
-                None,
-            )
-            .expect_err("CLI resolve must still reject a non-geoyws, non-raiser actor")
-            .to_string();
-        assert!(
-            forbidden.contains("only geoyws or that same raiser may resolve"),
-            "{forbidden}"
-        );
     }
 
     #[test]
@@ -12458,96 +12114,6 @@ mod tests {
             .into_iter()
             .map(|event| event.event_hash.expect("board event hash is required"))
             .collect()
-    }
-
-    #[test]
-    fn subscriptions_are_normalized_audited_and_secret_values_never_enter_events() {
-        let mut store = subscription_store("subscriptions-lifecycle");
-        let mut input = subscription_input("sub-unit");
-        input.relations.push("parent:t-parent".into());
-        input.kinds = vec!["subscription_resumed".into(), "checkpoint_added".into()];
-        input.tags.push("pubsub".into());
-        let added = store.add_subscription(input).unwrap();
-        assert_eq!(added.protocol_version, SUBSCRIPTION_PROTOCOL_VERSION);
-        assert_eq!(added.relations, vec!["parent:t-parent"]);
-        assert_eq!(
-            added.kinds,
-            vec!["checkpoint_added", "subscription_resumed"]
-        );
-        assert_eq!(added.tags, vec!["pubsub"]);
-        assert_eq!(added.secret_ref.as_deref(), Some("codex_queue_token"));
-        assert_eq!(
-            store.subscriptions(None, None, false).unwrap(),
-            vec![added.clone()]
-        );
-        assert_eq!(
-            store
-                .subscriptions(Some("active"), Some("codex.queue"), true)
-                .unwrap(),
-            vec![added.clone()]
-        );
-        assert!(store.subscriptions(Some("unknown"), None, true).is_err());
-        assert!(store.subscriptions(None, Some("../../bad"), true).is_err());
-
-        let add_event = store
-            .events(None, Some("subscription_added"), 1, true)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(added.start_event_seq, add_event.seq);
-        assert_eq!(
-            store
-                .require_subscription("sub-unit")
-                .unwrap()
-                .start_event_seq,
-            add_event.seq
-        );
-        let encoded = add_event.payload.to_string();
-        assert!(!encoded.contains("secretRef"), "{encoded}");
-        assert!(!encoded.contains("codex_queue_token"), "{encoded}");
-        assert_eq!(add_event.payload["_semanticV1"], Value::Null);
-
-        let mut unfiltered_store = subscription_store("subscriptions-lifecycle-unfiltered");
-        let mut unfiltered_input = subscription_input("sub-open");
-        unfiltered_input.subject_task_id = None;
-        unfiltered_input.relations.clear();
-        unfiltered_input.kinds.clear();
-        unfiltered_input.prior_statuses.clear();
-        unfiltered_input.current_statuses.clear();
-        unfiltered_input.tags.clear();
-        unfiltered_input.secret_ref = None;
-        let unfiltered = unfiltered_store.add_subscription(unfiltered_input).unwrap();
-        assert_eq!(
-            unfiltered_store
-                .require_subscription("sub-open")
-                .unwrap()
-                .start_event_seq,
-            unfiltered.start_event_seq
-        );
-        assert_eq!(unfiltered_store.materialize_subscriptions().unwrap(), 0);
-        assert!(delivery_event_ids(&unfiltered_store, "sub-open").is_empty());
-
-        let paused = store.pause_subscription("sub-unit", "test@driver").unwrap();
-        assert_eq!(paused.status, "paused");
-        assert!(store.subscriptions(None, None, false).unwrap().is_empty());
-        assert_eq!(store.subscriptions(None, None, true).unwrap().len(), 1);
-        let paused_again = store.pause_subscription("sub-unit", "test@driver").unwrap();
-        assert_eq!(paused_again, paused);
-        assert_eq!(
-            store
-                .events(None, Some("subscription_paused"), 10, true)
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let resumed = store
-            .resume_subscription("sub-unit", "test@driver")
-            .unwrap();
-        assert_eq!(resumed.status, "active");
-        assert!(resumed.paused_at.is_none());
-        assert!(resumed.paused_by.is_none());
-        assert!(store.audit().unwrap().healthy);
     }
 
     #[test]
@@ -13381,294 +12947,6 @@ mod tests {
                 .next_due_subscription_delivery(due_at + 4)
                 .unwrap()
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn subscription_positions_answer_every_row_from_one_grouped_query() {
-        let mut store = subscription_store("subscriptions-positions");
-        let mut ids = Vec::new();
-        for (id, max_retries) in [
-            ("sub-position-acked", 1),
-            ("sub-position-retry", 3),
-            ("sub-position-dead", 0),
-            ("sub-position-leased", 1),
-        ] {
-            let mut input = delivery_subscription_input(id);
-            input.max_retries = max_retries;
-            ids.push(store.add_subscription(input).unwrap().id);
-        }
-        for created_at in [20, 30] {
-            crate::audit::append_board_event(
-                &store.connection,
-                Some("t-subject"),
-                "checkpoint_added",
-                "test",
-                "{}",
-                created_at,
-            )
-            .unwrap();
-        }
-        // Added after those events, so its anchor is past them: a
-        // subscription with no delivery rows at all.
-        let idle = store
-            .add_subscription(delivery_subscription_input("sub-position-idle"))
-            .unwrap()
-            .id;
-        store.materialize_subscriptions().unwrap();
-
-        let mut first_event = std::collections::BTreeMap::new();
-        for id in &ids {
-            let event_ids = delivery_event_ids(&store, id);
-            assert_eq!(event_ids.len(), 2, "{id} should have both events queued");
-            first_event.insert(id.clone(), event_ids[0].clone());
-        }
-        let acked_seq = {
-            let event = &first_event["sub-position-acked"];
-            let due_at = delivery_row(&store, "sub-position-acked", event)
-                .next_attempt_at
-                .unwrap();
-            let claimed = store
-                .claim_subscription_delivery("sub-position-acked", event, due_at, 5_000)
-                .unwrap()
-                .unwrap();
-            assert!(
-                store
-                    .finalize_subscription_delivery_success(
-                        "sub-position-acked",
-                        event,
-                        &claimed.lease_token,
-                        due_at + 1,
-                    )
-                    .unwrap()
-            );
-            claimed.event_seq
-        };
-        for id in ["sub-position-retry", "sub-position-dead"] {
-            let event = &first_event[id];
-            let due_at = delivery_row(&store, id, event).next_attempt_at.unwrap();
-            let claimed = store
-                .claim_subscription_delivery(id, event, due_at, 5_000)
-                .unwrap()
-                .unwrap();
-            assert!(
-                store
-                    .finalize_subscription_delivery_failure(
-                        id,
-                        event,
-                        &claimed.lease_token,
-                        due_at + 1,
-                        false,
-                        "consumer_refused",
-                    )
-                    .unwrap()
-            );
-        }
-        {
-            let event = &first_event["sub-position-leased"];
-            let due_at = delivery_row(&store, "sub-position-leased", event)
-                .next_attempt_at
-                .unwrap();
-            store
-                .claim_subscription_delivery("sub-position-leased", event, due_at, 5_000)
-                .unwrap()
-                .unwrap();
-        }
-
-        let positions = store.subscription_positions().unwrap();
-        assert_eq!(positions.head_event_seq, board_event_count(&store));
-        assert_eq!(
-            positions.position("sub-position-acked"),
-            SubscriptionPosition {
-                acked_through_seq: Some(acked_seq),
-                pending: 1,
-                leased: 0,
-                retry_wait: 0,
-                dead_letter: 0,
-            }
-        );
-        assert_eq!(
-            positions.position("sub-position-retry"),
-            SubscriptionPosition {
-                acked_through_seq: None,
-                pending: 1,
-                leased: 0,
-                retry_wait: 1,
-                dead_letter: 0,
-            }
-        );
-        assert_eq!(
-            positions.position("sub-position-dead"),
-            SubscriptionPosition {
-                acked_through_seq: None,
-                pending: 1,
-                leased: 0,
-                retry_wait: 0,
-                dead_letter: 1,
-            }
-        );
-        assert_eq!(
-            positions.position("sub-position-leased"),
-            SubscriptionPosition {
-                acked_through_seq: None,
-                pending: 1,
-                leased: 1,
-                retry_wait: 0,
-                dead_letter: 0,
-            }
-        );
-        // No delivery rows is a real position, not a missing one.
-        assert!(!positions.by_subscription.contains_key(&idle));
-        assert_eq!(
-            positions.position(&idle),
-            SubscriptionPosition::default(),
-            "a subscription with nothing queued has a position, not an absence"
-        );
-        assert_eq!(positions.by_subscription.len(), ids.len());
-
-        // Not N+1, and provably so: the projection is one grouped statement
-        // over the delivery rows plus one head read, and it takes no
-        // subscription id — there is no shape in which a caller could put it
-        // inside a per-row loop and still get an answer. A reviewer can read
-        // that off the two statements below; this asserts it stays true.
-        const SOURCE: &str = include_str!("store.rs");
-        let body = SOURCE
-            .split_once("pub fn subscription_positions(")
-            .expect("the projection is defined in this file")
-            .1
-            .split_once("\n    fn ")
-            .expect("the next private method ends the body")
-            .0;
-        assert_eq!(body.matches("SELECT").count(), 2, "{body}");
-        assert_eq!(
-            body.matches("FROM subscription_deliveries").count(),
-            1,
-            "{body}"
-        );
-        assert_eq!(
-            body.matches("GROUP BY subscription_id").count(),
-            1,
-            "{body}"
-        );
-        assert!(!body.contains("WHERE subscription_id"), "{body}");
-    }
-
-    #[test]
-    fn dead_letters_are_attributed_to_their_codes_and_retries_are_not() {
-        let mut store = subscription_store("subscriptions-dead-letter-codes");
-        let mut dead_input = delivery_subscription_input("sub-codes-dead");
-        dead_input.max_retries = 0;
-        let dead = store.add_subscription(dead_input).unwrap().id;
-        let mut retry_input = delivery_subscription_input("sub-codes-retry");
-        retry_input.max_retries = 3;
-        let retry = store.add_subscription(retry_input).unwrap().id;
-        for created_at in [20, 30, 40] {
-            crate::audit::append_board_event(
-                &store.connection,
-                Some("t-subject"),
-                "checkpoint_added",
-                "test",
-                "{}",
-                created_at,
-            )
-            .unwrap();
-        }
-        store.materialize_subscriptions().unwrap();
-
-        // Two refusals of one kind and one of another, so the projection has
-        // to both group them and rank them.
-        let events = delivery_event_ids(&store, &dead);
-        for (event, code) in events.iter().zip([
-            "opencode_endpoint_unreachable",
-            "kimi_frame_oversized",
-            "opencode_endpoint_unreachable",
-        ]) {
-            let due_at = delivery_row(&store, &dead, event).next_attempt_at.unwrap();
-            let claimed = store
-                .claim_subscription_delivery(&dead, event, due_at, 5_000)
-                .unwrap()
-                .unwrap();
-            assert!(
-                store
-                    .finalize_subscription_delivery_failure(
-                        &dead,
-                        event,
-                        &claimed.lease_token,
-                        due_at + 1,
-                        false,
-                        code,
-                    )
-                    .unwrap()
-            );
-        }
-        // A retry carries a `last_error_code` too, and it is not a dead
-        // letter: attributing it would report a delivery that is still
-        // going to happen as one that has stopped.
-        let retry_event = &delivery_event_ids(&store, &retry)[0];
-        let due_at = delivery_row(&store, &retry, retry_event)
-            .next_attempt_at
-            .unwrap();
-        let claimed = store
-            .claim_subscription_delivery(&retry, retry_event, due_at, 5_000)
-            .unwrap()
-            .unwrap();
-        assert!(
-            store
-                .finalize_subscription_delivery_failure(
-                    &retry,
-                    retry_event,
-                    &claimed.lease_token,
-                    due_at + 1,
-                    true,
-                    "opencode_deadline_exceeded",
-                )
-                .unwrap()
-        );
-
-        let positions = store.subscription_positions().unwrap();
-        assert_eq!(
-            positions.position(&dead),
-            SubscriptionPosition {
-                acked_through_seq: None,
-                pending: 0,
-                leased: 0,
-                retry_wait: 0,
-                dead_letter: 3,
-            }
-        );
-        // Ranked by how many deliveries carry each code, and the counts add
-        // up to the total beside them.
-        assert_eq!(
-            positions.dead_letter_codes(&dead),
-            [
-                DeadLetterCode {
-                    code: "opencode_endpoint_unreachable".to_owned(),
-                    deliveries: 2,
-                },
-                DeadLetterCode {
-                    code: "kimi_frame_oversized".to_owned(),
-                    deliveries: 1,
-                },
-            ]
-        );
-        assert_eq!(
-            positions
-                .dead_letter_codes(&dead)
-                .iter()
-                .map(|code| code.deliveries)
-                .sum::<i64>(),
-            positions.position(&dead).dead_letter
-        );
-        assert_eq!(positions.position(&retry).retry_wait, 1);
-        assert_eq!(positions.position(&retry).dead_letter, 0);
-        assert!(
-            positions.dead_letter_codes(&retry).is_empty(),
-            "a retrying delivery is not a dead letter: {:?}",
-            positions.dead_letters
-        );
-        assert!(
-            positions.dead_letter_codes("sub-not-here").is_empty(),
-            "an unknown subscription has no codes, not a missing answer"
         );
     }
 
@@ -14552,7 +13830,7 @@ mod tests {
             })
             .unwrap();
         let event = store
-            .events(Some("t-semantic"), Some("task_added"), 1, false)
+            .events_with_bounds(Some("t-semantic"), Some("task_added"), None, None, 1, false)
             .unwrap()
             .pop()
             .unwrap();
@@ -14594,7 +13872,7 @@ mod tests {
             .move_task("t-move", "done", "test", json!({}), false)
             .unwrap();
         let event = store
-            .events(Some("t-move"), Some("task_moved"), 1, false)
+            .events_with_bounds(Some("t-move"), Some("task_moved"), None, None, 1, false)
             .unwrap()
             .pop()
             .unwrap();
@@ -14936,7 +14214,7 @@ mod tests {
                 })
                 .unwrap();
             let event = store
-                .events(Some(id), Some("checkpoint_added"), 1, false)
+                .events_with_bounds(Some(id), Some("checkpoint_added"), None, None, 1, false)
                 .unwrap()
                 .pop()
                 .unwrap();
@@ -17012,10 +16290,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        // The web card's write path records the one answer while the row is
+        // The CLI check answer records the one answer while the row is
         // open, through the same Store operation the route calls (ACC-11).
         let answered = store
-            .answer_attention_check_from_trusted_edge(&raised.id, OPERATOR_ACTOR, "store")
+            .answer_attention_check(&raised.id, OPERATOR_ACTOR, "store")
             .unwrap();
         assert_eq!(
             answered.check.as_ref().unwrap().answered.as_deref(),
@@ -17027,7 +16305,7 @@ mod tests {
         assert_eq!(answered.status, "open");
         // A second answer through the same operation is refused unchanged.
         let again = store
-            .answer_attention_check_from_trusted_edge(&raised.id, OPERATOR_ACTOR, "client")
+            .answer_attention_check(&raised.id, OPERATOR_ACTOR, "client")
             .unwrap_err()
             .to_string();
         assert!(again.contains("exactly one answer"), "{again}");

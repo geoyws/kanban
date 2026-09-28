@@ -82,14 +82,12 @@ the serialized context payload. The receipt reports returned results, used
 characters, searched and missing boards, model identity and truncation. Cache
 freshness is reported by `doctor`.
 
-### One command contract, three surfaces
+### One command contract, two surfaces
 
 - CLI: `kb search QUERY`, with source/status/tag/lane/time filters and explicit
   `--all-boards` cross-project scope.
 - MCP: generated from the same command table and marked read-only. The explicit
   rebuild operation is a separate write tool.
-- Web: one keyboard-friendly search form and a server-rendered results page.
-  The handler calls the same retrieval function and never receives a lease.
 
 `--all-boards` is explicit and cannot be combined with `--project`, `--workspace`
 or `--db`. It opens only present registered boards. Missing boards are named in
@@ -153,5 +151,5 @@ Two corrections:
 - [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md)
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)
 - [ADR-010](ADR-010-adapters-generated-from-the-command-surface.md)
-- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md)
+- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md) (the served results page — retired: [ADR-053](ADR-053-the-web-view-is-retired.md))
 - [ADR-021](ADR-021-settled-history-leaves-operational-indexes.md)

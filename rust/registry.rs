@@ -4101,20 +4101,6 @@ impl Registry {
             .collect())
     }
 
-    pub fn applicable_rules(
-        &self,
-        board_name: Option<&str>,
-        task_tags: Option<&HashSet<String>>,
-        task_sprint: Option<&str>,
-        include_archived: bool,
-    ) -> Result<Vec<Rule>> {
-        Ok(self
-            .rules(include_archived)?
-            .into_iter()
-            .filter(|rule| rule_tags_apply(&rule.tags, board_name, task_tags, task_sprint))
-            .collect())
-    }
-
     pub fn rules_targeting_board(
         &self,
         board_name: Option<&str>,
