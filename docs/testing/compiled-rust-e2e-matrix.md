@@ -78,6 +78,13 @@ with `KANBAN_CHROME` pointed at Playwright Chromium: 17 steps green in
 44m10s, of which the `e2e` target is 2338s of 415 serialized cases. That
 is the number to make smaller by making it faster, not by cutting it up.
 
+Addendum 2026-09-29 (t-2b6a496e): the estate norm moved on 2026-09-28
+(migration epic e-0ea4e50b; placement in dotfiles/infra-root, never here):
+Unum and geoyws gates run on the estate test host inside the Linux gate
+image. First green there: commit `ee8d062`, 17 steps, `e2e` 319/0
+(image `kanban-gate:1.95-chrome-u0`, inner user `nobody`). The 2026-09-20
+`@@mbp` measurement above stays as history.
+
 The two fixed-descriptor remap unit tests are isolated unit evidence, not
 compiled-process E2E; they are `#[ignore]`d and are run serially and in
 isolation by the gate:

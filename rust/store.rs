@@ -15910,7 +15910,7 @@ mod tests {
             ("a-small.rs", 2, 1),
             ("a-tie.rs", 2, 1),
             ("b-tie.rs", 2, 1),
-            ("@@hax", 4, 3),
+            ("edge-cache", 4, 3),
             ("src/trunc.rs", 6, 5),
             ("FAST_FLAG", 3, 3),
         ] {
@@ -16009,7 +16009,7 @@ mod tests {
                 ("a-small.rs", 2, 1, 1, 50),
                 ("a-tie.rs", 2, 1, 1, 50),
                 ("b-tie.rs", 2, 1, 1, 50),
-                ("@@hax", 4, 3, 1, 25),
+                ("edge-cache", 4, 3, 1, 25),
                 // 1/6 misses at 16.66…%, pinning truncation toward zero.
                 ("src/trunc.rs", 6, 5, 1, 16),
                 ("FAST_FLAG", 3, 3, 0, 0),

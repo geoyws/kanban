@@ -927,3 +927,12 @@ receipt text rather than `--observed`.
 - [ADR-043: Artifact-identity attempts state an unknown build commit](ADR-043-artifact-identity-attempts-state-an-unknown-build-commit.md) — §3's typed identity kinds, the two `ARTIFACT_IDENTITY_KINDS` a bundle sha256 is not
 - `tests/e2e.rs:31954` — the local/remote twin test that keeps the validator edit in both copies
 - Kanban board: epic `e-6cd91fd9`; task `t-51d5505e` (this ADR); decision `a-4741a3c3` (2026-09-10, choice `mbp-path`) on `t-491ebb8e`; rule `r-7af4dd57` (install targets, not build hosts)
+
+Addendum 2026-09-29 (t-2b6a496e): the `@@mbp` norm stated above (§51 and
+measurements) is superseded for Unum and geoyws estates by George's
+2026-09-28 migration (kanban epic `e-0ea4e50b`; binding placement in
+dotfiles `AGENTS.md` and infra-root ADR-005): their gates, e2e and test
+suites run on the estate test host inside the Linux gate image, and
+`@_bdt`/`@_bd` dev tiers are served from there per lane. IFCA dev tiers
+still validate on `@@mbp`. The `@@mbp` statements above stay as history;
+host placement lives in dotfiles/infra-root, never in this repository.

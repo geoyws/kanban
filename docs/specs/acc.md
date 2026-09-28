@@ -478,7 +478,7 @@ lock behind a new answer and raiser update is restored.
 ### A17 — miss-rate report from the CLI (`ACC-18`)
 
 *Given* a board holding resolved checks across three subjects — `src/store.rs` with 5 answered
-and 4 missed, `@@hax` with 4 answered and 1 missed, `FAST_FLAG` with 3 answered and none
+and 4 missed, `edge-cache` with 4 answered and 1 missed, `FAST_FLAG` with 3 answered and none
 missed — *when* `kb att list --check-report` runs, *then* three groups print worst first with
 miss rates 80, 25 and 0, and `--json` returns the same three objects with exactly the keys
 `about`, `answered`, `correct`, `missed` and `missRate` and no raiser, actor, answer-key,
