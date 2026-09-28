@@ -497,8 +497,9 @@ The age view is a deck presentation of the same open queue — the same rows, re
 first — reached as a view switch on the deck; it adds no route, no projection and no count. A
 card with no age, a relative-only age, or an age view in newest-first order fails this
 requirement.
-*Non-goals:* no client control, no DOM and no bundle behaviour — the UI controls are
-`t-9285df73` and out of scope here.
+*Non-goals:* the view-switch control itself — view switching is `t-9285df73`'s and out of scope
+here; SPA-66 pins what the age view shows and its oldest-first order, with its chrome evidence running once that control exists.
+*Status:* `SPEC-READY` 2026-09-28 for `t-750c2743` (independent review: one blocker plus three notes, all closed in this change). The `SPEC-READY` of 2026-09-19 (§1) does not cover SPA-64..SPA-66.
 
 ### The read pages
 
@@ -1281,7 +1282,7 @@ row that must write one.
 | `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
 | `SPA-62` | MUST | process | `attention_raise_stores_lane_and_list_matches_both_routes` | landed with `t-14e6feb7`, over the compiled binary: raises the three-route matrix above plus the no-stored-lane control, asserts the `--lane` listing returns exactly the three cards, asserts the stored value round-trips on show/JSON, and asserts an unused lane reads empty. |
 | `SPA-63` | MUST | http | `none` | no e2e coverage — to be written by `t-0fa71043`: `the_needs_you_route_filters_by_board_kind_priority_and_age_over_http` over the compiled binary on a real socket, holding the unfiltered default, each predicate, the store-side counterexample past rank 1001, the deck order under filters, the named-board `404` triple, the `400` syntax refusals including a repeated `age`, and the sticky `truncated` with `limit` 1000. contract: `docs/api/kanban-web.openapi.yaml` under `/api/v1/needs-you` |
-| `SPA-64` | MUST | process | `none` | no e2e coverage — to be written by `t-750c2743`: over the compiled binary, a defer with each of the three trigger forms hides the row from the default open queue while `--all` still names it, each trigger fires on read, a triggerless defer still resolves, and a malformed trigger is refused naming the three forms. |
+| `SPA-64` | MUST | process | `none` | no e2e coverage — to be written by `t-750c2743`: over the compiled binary, a defer with each of the three trigger forms hides the row from the default open queue while `--all` still names it, each trigger fires on read, a triggerless defer still resolves, `http`-layer holds, same task: the row reads as absent from `GET /api/v1/needs-you` (`getNeedsYou`) and every count it feeds, the projection carries `returnTrigger` additively (`null` on rows that never snoozed, projection stays `v1`); contract: `docs/api/kanban-web.openapi.yaml` under `/api/v1/needs-you` plus `Attention.returnTrigger`. |
 | `SPA-65` | MUST | process | `none` | no e2e coverage — to be written by `t-750c2743`: one `transact` batch of `attention_resolve` items settles every named row, and a batch naming one unresolvable row settles none and names the failed index. |
 | `SPA-66` | MUST | chrome | `none` | no e2e coverage — to be written by `t-750c2743`: the mounted deck's age view names each open card's whole-day age beside its raised date and orders oldest first. |
 
@@ -1431,4 +1432,4 @@ absent from both the detail and the index).
   (schema `34` → `35`, the next migration number `V35` — contingent on no earlier `V35` landing first — ADR-042 amended §1a), superseded questions resolve in one
   `transact` batch of `attention_resolve` items, and the queue gains an age view. A20
   proves all three. §8 names `none` for each, owned by `t-750c2743`, and
-  `docs/testing/compiled-rust-e2e-matrix.md` carries the same rows verbatim.
+  `docs/testing/compiled-rust-e2e-matrix.md` carries the same rows verbatim. `docs/api/kanban-web.openapi.yaml` carries `Attention.returnTrigger` (additive, stays `v1`) and the `getNeedsYou` snooze exclusion under `/api/v1/needs-you`, per §7 OQ-3.

@@ -159,7 +159,12 @@ paths:
         parameters are ignored, so additive parameters keep this route on
         `v1`. Proposed by `t-0fa71043` (`docs/specs/spa.md` SPA-63): specified
         here, not yet served.
-      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-63]
+        Snoozed rows read as absent (SPA-64): a deferred row with an unfired
+        return trigger is excluded from this route and from every count it
+        feeds, exactly as from the default open queue; a fired trigger returns
+        the row still `open`. Proposed by `t-750c2743` (`docs/specs/spa.md`
+        SPA-64): specified here, not yet served.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-63, SPA-64]
       x-store-method: Store::attention
       parameters:
         - name: board
@@ -1803,6 +1808,10 @@ components:
           type: string
           nullable: true
           description: The lane `attention raise --lane` named (SPA-62); `null` on rows raised without one, as every pre-v34 row is. Additive — the projection stays `v1`.
+        returnTrigger:
+          type: string
+          nullable: true
+          description: The `--return-trigger` the deferral named (SPA-64); `null` on rows that never snoozed, as every pre-v35 row is. Additive — the projection stays `v1`.
         createdAt: { $ref: "#/components/schemas/EpochMillis" }
         status: { type: string }
         priority: { type: integer }
