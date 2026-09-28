@@ -16,8 +16,16 @@
 - **Status (delta 2026-09-24):** owner-authorised scope change on board task `t-1aa9f553`
   (George, 2026-09-24, chose "Ledger + skills"): ACC-06, ACC-15 and ACC-17 superseded in place,
   ACC-20 and ACC-21 appended. Drafted with the implementation on branch
-  `wt/t-1aa9f553-ledger` from base `f7cc09f`; the independent `/quality spec` review of this
-  delta is pending, and readiness authorises neither rollout nor release.
+  `wt/t-1aa9f553-ledger` from base `f7cc09f`.
+- **Status (delta review 2026-09-29):** `SPEC-READY` for the 2026-09-24 delta (independent review
+  by the `t-0382c937` lane against the SDD §1 exit criteria, no findings). Baseline, owner and
+  source explicit; IDs stable with strengths; behaviours observable with permissions
+  (ACC-21 actor rule) and named refusals; A19 covers ACC-06/20/21 happy, invalid and
+  unauthorized paths beside A6; CLI grammar and JSON receipt keys enumerated; verification
+  mapped to existing tests (`attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`,
+  `answered_check_locks_definition_and_a_later_resolve_reuses_it`); no open questions, the
+  owner decided every scope point. Specification readiness authorises neither implementation,
+  rollout nor release.
 - **Owner (product scope):** George.
 - **Decider (wording of this document):** George.
 - **Sources:**
