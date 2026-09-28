@@ -2,12 +2,12 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-59` plus `WEB-73`, and are stable
-  across wording refinements (WEB-56..59 were added by the 2026-09-17 SPEC-READY review;
-  WEB-60 is reserved for the t-b412670a `/all` fix, WEB-61..WEB-70 for the t-97878627 makeover,
-  WEB-71..WEB-72 are sibling deltas landing with main, so this delta takes the next free ID —
-  WEB-73 was appended 2026-09-28 for t-b2662161; numbering is by creation, grouping is by
-  topic).
+- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-59` plus `WEB-71` and `WEB-73`,
+  and are stable across wording refinements (WEB-56..59 were added by the 2026-09-17
+  SPEC-READY review; WEB-60 is reserved for the t-b412670a `/all` fix, WEB-61..WEB-70 for
+  the t-97878627 makeover, WEB-72 is the sibling delta landing with main (t-1319fcb8) —
+  WEB-71 was appended 2026-09-28 for t-2845f881 and WEB-73 was appended 2026-09-28 for
+  t-b2662161; numbering is by creation, grouping is by topic).
 - **Baseline:** 2026-09-17 at commit `56e6b24` on branch `docs/t-b349fa14-spec`. Every "today"
   claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-17 (independent gate by a reviewer applying the SDD §1
@@ -19,6 +19,7 @@
   outcome approve). The stamp covers `WEB-73` only: the 2026-09-17 `SPEC-READY` above still
   covers `WEB-01`..`WEB-59`. The implementation change owes the real-Chrome test by test id
   (A26, matrix row M3); product readiness is not claimed by this stamp.
+- **Delta status (2026-09-28):** `SPEC-READY` for `WEB-71` (lanes latest-per-lane plus bounded per-lane history, t-2845f881), stamped 2026-09-28 by an independent reviewer applying the SDD §1 exit criteria (re-keyed from `WEB-60` to avoid the t-b412670a `/all` collision; `WEB-60` stays reserved for that fix, `WEB-61`..`WEB-70` for the t-97878627 makeover). The stamp covers `WEB-71` only: the 2026-09-17 `SPEC-READY` above still covers `WEB-01`..`WEB-59`. The implementation change owes the `M5` matrix row, the OpenAPI delta, and the `A21`..`A24` tests. OQ-5 stays OPEN by design — it gates the served history-bound value and the archived-rows sentence, not this delta's testability. Product readiness is not claimed by this stamp.
 - **Owner (product scope):** George. He alone resolves scope, colour, wording and whether a
   declined option is reinstated.
 - **Decider (wording of this document and of ADR-046):** codex@driver.
@@ -40,6 +41,24 @@
     `rust/serve.rs:445`-`rust/serve.rs:464` (the four POST verbs), `rust/serve.rs:1590`
     (`needs_you`), `rust/serve.rs:1827` (`decision_card`), `rust/serve.rs:3725` (`shell`),
     `rust/serve.rs:3747` (`JS`), `rust/serve.rs:4799` (`CSS`).
+  - t-2845f881 (2026-09-28) — "Lanes API latest sitrep per lane, history cursor-paged": today
+    `GET /api/v1/lanes` answers 764,956 bytes, every sitrep of every lane. Default becomes one
+    latest per lane; history per lane becomes bounded and cursor-paged (ADR-037). Lane page
+    layout is t-5236f3db and is out of scope.
+  - `rust/projection.rs:254`-`rust/projection.rs:272` (`LaneSummary`, `LaneUpdate`),
+    `rust/projection.rs:518`-`rust/projection.rs:535` (`lanes()` over
+    `lane_groups(LANE_UPDATE_ROWS)`), `rust/serve.rs:105`-`rust/serve.rs:106` (`LANE_UPDATE_ROWS
+    = 200`), `rust/serve.rs:1886`-`rust/serve.rs:1919` (`lane_groups`: per-board `limit + 1`
+    scan, `(board, lane)` grouping, most-recently-active first, unreadable boards skipped),
+    `rust/store.rs:6364`-`rust/store.rs:6403` (`Store::sitreps`, `created_at DESC, id DESC`),
+    `rust/store.rs:2603` (`CURRENT_SITREPS_PER_LANE = 10`), `rust/serve.rs:479`,
+    `rust/serve.rs:549`-`rust/serve.rs:551` (named JSON denial: `404`
+    `{"error":"denied or not found"}`), `rust/serve.rs:1028`-`rust/serve.rs:1032`
+    (`query_value`), `docs/api/kanban-web.openapi.yaml:2` (OpenAPI pinned to 3.0.3),
+    `docs/api/kanban-web.openapi.yaml:546`-`docs/api/kanban-web.openapi.yaml:577` (`getLanes`),
+    `docs/api/README.md:151`-`docs/api/README.md:178` (the `ListEnvelope` shape and its two
+    rules), `docs/api/README.md:216`-`docs/api/README.md:222` (lanes tenancy: skip, never
+    enumerate).
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 names the rows this slice adds
   to it; this specification does not restate the matrix.
 
@@ -79,6 +98,10 @@ plus the shared shell, its navigation drawer, the inline stylesheet and the inli
   folded body, meta.
 - No performance, latency, availability or payload-size commitment. §6 records one measurement as
   an observation, not a budget.
+- WEB-71 carve-out (2026-09-28, t-2845f881): the payload of `GET /api/v1/lanes` may gain
+  query parameters on its existing path and refusal cases in the existing `{"error"}`
+  shapes — neither is a new route — while the rendered `/lanes` page layout stays out of scope
+  entirely (t-5236f3db owns it; this delta is payload-only).
 
 ## 3. Requirements
 
@@ -92,10 +115,12 @@ Strength keywords are BCP 14. `Layer` names the one layer that proves the requir
 
 A served invariant that is also observable in a browser is stated twice, once per layer, so that
 each requirement keeps exactly one layer and George's "both unit tests and e2e tests" holds for
-every invariant that has both. IDs are assigned in order of creation and never reused, while the
 groups below are topical, so the numbering is not monotonic: WEB-56 .. WEB-59 were added by the
-2026-09-17 gate review and sit in the group they belong to, and WEB-73 was appended on
-2026-09-28 for t-b2662161 in the Read pages group it belongs to.
+3: 2026-09-17 gate review and sit in the group they belong to, WEB-71 was appended on
+2026-09-28 for t-2845f881 in its own group at the end of the creation sequence, WEB-72 was
+appended the same day for t-1319fcb8 in the Responsiveness group it belongs to, and WEB-73 was appended on
+2026-09-28 for t-b2662161 in the Read pages group it belongs to (WEB-60 is
+reserved for the t-b412670a /all fix, WEB-61..WEB-70 for the t-97878627 makeover).
 
 ### Hero and type
 
@@ -579,6 +604,47 @@ and never change the connection line's text; and the `role=log` region never gai
 Strength: MUST · Layer: chrome · Source: WCAG 2.2 SC 4.1.2; plan §Principles 1.
 The current card's accessible name, read from the accessibility tree, equals its question text.
 
+### Lanes payload
+
+**WEB-71** — the lanes listing serves one latest per lane, with bounded per-lane history behind
+a cursor. [`SPEC-READY` 2026-09-28 for t-2845f881; independent gate, see §1 delta status.]
+Strength: MUST · Layer: http · Source: t-2845f881 (today `GET /api/v1/lanes` answers 764,956
+bytes, every sitrep of every lane); ADR-037 (bounded history, computed truncation).
+`GET /api/v1/lanes` with no history parameter answers one `LaneSummary` per readable
+`(board, lane)` group, groups most-recently-active first, and each group's `updates` carries
+exactly that lane's newest sitrep — the head of the `Store::sitreps` order (`created_at DESC,
+id DESC`) — with its `bodyHtml` typeset by the server's one markdown renderer. The per-board
+scan feeding the grouping is unchanged (`LANE_UPDATE_ROWS`, envelope `limit: 200`,
+`truncated` computed by the `limit + 1` over-fetch); only the per-lane tail is trimmed to one.
+History is per lane and finite: `GET /api/v1/lanes?board=<name>&lane=<name>` answers the same
+envelope holding exactly that lane's group, `updates` newest-first, at most one named history
+bound per page, `truncated` computed by the same over-fetch discipline, and the group's
+`nextCursor` carrying an opaque server-minted cursor for the following page, or `null` when the
+trail is exhausted — so every trail terminates in a `null`-cursor page after a finite number of
+pages, each holding at most the bound. A history request with no `cursor` starts at the
+newest. The bound's VALUE is not fixed here (§7 OQ-5): it is one named server bound, reported
+as the envelope's `limit`, and tests read that field rather than a hardcoded number. History
+reads the lane's full trail including archived rows (the existing `Store::sitreps`
+`include_archived` parameter; archiving hides a row from the default read but never deletes
+it) — proposed; if George declines, history keeps the default's exclusion and this sentence is
+superseded.
+`Permissions:` the default listing skips a board the caller may not read (indistinguishable
+from a board with no sitreps, per the lanes tenancy rule); a history request naming a lane on
+such a board, or on no board at all, is refused exactly as a named unreadable row: `404`
+`{"error":"denied or not found"}`.
+`Failure behaviour:` a malformed `cursor`, or one naming no sitrep on that board (stale,
+rewound or foreign — including a cursor minted for a different lane), is refused `400`
+`{"error":"…"}` naming `cursor` in the ADR-008 form, with no silent re-anchor and no partial
+page. A cursor denotes a position in that lane's trail: any cursor whose sitrep is absent from
+that lane's trail — deleted, restored-over, rewound, or minted for another lane — is invalid
+and refused rather than re-anchored to the nearest surviving row. Re-presenting a valid cursor
+returns the identical page. Method and content-type rules are unchanged (`GET`-only,
+`application/json; charset=utf-8`).
+`Data rules:` this route deletes nothing; a cursor denotes a position in that lane's trail and
+carries no authority.
+`Quality constraints:` every served update still carries server-typeset `bodyHtml` (no second
+renderer in the client); only the rows of the page served are typeset.
+
 ### Security and quality
 
 **WEB-54** — the document reaches no third party.
@@ -787,6 +853,42 @@ at 60 px, and the note field is still at 716–785 — inside the viewport and a
 816. Without the restore the same scenario reports both positions at 0 and the note at
 1130–1199, off the screen.
 
+4: **A21 — the default is one latest per lane (WEB-71).**
+*Given* boards `px` (lanes `driver` with three sitreps, `driver-2` with two) and `atmux` (lane
+`driver` with one),
+*when* `GET /api/v1/lanes` with no query is read over HTTP,
+*then* every `LaneSummary.updates` has length exactly 1, each id equals that lane's head from
+`sitrep list --json`, group order is most-recently-active first, the envelope still reports the
+per-board scan bound with computed `truncated`, and the body is a fraction of the 764,956-byte
+all-sitreps observation.
+
+**A22 — history pages newest-first behind the cursor (WEB-71).**
+*Given* a lane holding more sitreps than two history pages,
+*when* its history is requested with no `cursor`,
+*then* `updates` are newest-first, their count equals the envelope's own `limit`, and
+`nextCursor` is non-null; *when* that cursor is followed, *then* the next page is disjoint and
+contiguous with the first, still newest-first; *when* cursors are followed to exhaustion, *then*
+the final page carries `nextCursor: null`; *and when* any cursor is presented twice, *then* the
+identical page answers both times.
+
+**A23 — stale and malformed cursors fail closed (WEB-71).**
+*Given* the lane of A22,
+*when* its history is requested with a malformed `cursor`, with a cursor minted for a different
+lane, or with a cursor naming a sitrep id on no board,
+*then* each answers `400` with the one `{"error"}` shape naming `cursor`, serves no rows, and
+writes nothing; a cursor left behind by a board restore answers the same unknown-id refusal
+rather than a re-anchored page.
+
+**A24 — tenancy: skip in the listing, refuse by name (WEB-71).**
+*Given* two registered boards, one of which the caller may not read, each with a lane holding
+sitreps,
+*when* the default listing is read, *then* no group names the unreadable board;
+*when* history names that board's lane, *then* it answers `404 {"error":"denied or not found"}`
+byte-identical to the history answer for a lane on no board at all.
+
+*(Acceptance IDs A17..A20 are skipped: A17 is reserved for the t-b412670a /all fix and
+A18..A20 for the t-97878627 makeover.)*
+
 **A26 — a legacy worktree path reads as an unknown repository, and the detail keeps the path (WEB-73).**
 *Given* a board with one path-valued legacy attempt whose stored `repo` is an absolute worktree path and one ordinary attempt whose `repo` is `owner/name`,
 *when* `/deployments` is loaded in real Chrome and the legacy attempt's `/deployment/<board>/<id>` page is read,
@@ -822,17 +924,7 @@ the copy. It does not touch:
 Because no interface or stored shape moves, there is no migration, no compatibility window and
 no ownership transfer to record.
 
-**WEB-73 delta (2026-09-28, SPEC-READY).** The paragraphs above cover WEB-01..WEB-59, for which the
-stored deployment shape never moved. WEB-73 moves no stored shape either — legacy rows keep
-their absolute-path `repo`, so there is no migration and no compatibility window — and answers
-the contract lines for that reading only; everything else above stands:
-
-- **Caller contract:** `deploy start --repo` sends `owner/name`. An absolute-path `--repo`
-  is refused before any row is stored. The exact refusal sentence is owned by the
-  implementation change, not pinned here; A26 proves the refusal and the empty ledger.
-- **Read contract:** `/deployments` and `/deployment/<board>/<id>` keep their routes,
-  columns, order and truncation (t-1b970747); only the repository identity's text changes
-  per WEB-73.
+ @both
 
 ## 6. Quality and security
 
@@ -881,10 +973,17 @@ applicability below is by chapter theme.
 script measured 26,213 and 52,211 bytes at the baseline; that is an observation recorded for
 future comparison, not a budget, and only George may make it one.
 
+**Observation for WEB-71, not a requirement.** Per the t-2845f881 brief (2026-09-28),
+`GET /api/v1/lanes` answers 764,956 bytes — every sitrep of every lane. This is recorded so a
+later reader can see what the one-latest default shrinks, exactly as the stylesheet/script
+figures above are recorded. It is **not** a budget, implies no target, and only George may make
+it one; the history page bound is likewise his number (§7 OQ-5), not a commitment invented here.
+
 ## 7. Open questions
 
-*All four questions are closed (OQ-1 resolved, OQ-2 closed by acceptance, OQ-3 declined, OQ-4
-resolved); the entries below are history.*
+*OQ-1..OQ-4 are closed; the entries below are history. OQ-5 is open and belongs to the
+WEB-71 delta. (No OQ-6: the WEB-60/WEB-61..WEB-70 reservations live in §1, not in an open
+question.)*
 
 **OQ-1 — `--overlay`'s hex versus the plan's own AA claim.** *Status:* **RESOLVED**
 2026-09-17 by codex@driver under George's standing instruction "use SDD to do the UI/UX using
@@ -921,6 +1020,16 @@ Proposed until George reviewed the responsive deck on phone and Mac: he sent the
 back as squished on iPad/phone in a-dd7be9ba (2026-09-18), the responsive fix t-534f29f6
 followed, and he accepted the re-ask in a-e02c9116 (choice `accept`, outcome approve).
 
+**OQ-5 — the per-lane history page bound, and whether history includes archived rows.**
+*Status:* **OPEN**. *Owner:* George. *Gate:* implementation, not the spec gate: WEB-71 requires
+one named server bound reported as the envelope's `limit` with `truncated` computed by
+over-fetch, and A22 reads that field rather than a hardcoded number, so no invented figure
+blocks testability — but the served number itself is George's call (per-lane analogue of
+`LANE_UPDATE_ROWS = 200` and `CURRENT_SITREPS_PER_LANE = 10`, neither of which this delta
+changes). Until he rules, no figure appears here. Likewise the archived-rows sentence in
+WEB-71 is proposed: if George declines, history keeps the default's exclusion and that
+sentence is superseded — an implementation-gate decision, not a spec-gate blocker.
+
 ## 8. Verification
 
 Planned test names are proposals; names ending `_in_real_chrome` are compiled-binary real-Chrome
@@ -935,6 +1044,11 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 - **M3** — "Web navigation, read pages, responsiveness and accessibility (spec WEB, real
   Chrome)".
 - **M4** — "Web destinations answer without a script (spec WEB, HTTP)".
+- **M5** — "Lanes latest-plus-history (spec WEB, HTTP)". Planned for the WEB-71 delta; the row
+  lands in `docs/testing/compiled-rust-e2e-matrix.md` with the implementation, not with this
+  delta (owed trace for main to apply). Planned test names below are proposals: this writer ran
+  no build and no `cargo test -- --list` in the isolated clone (main integrates), so main
+  enumerates the real names before landing or the row is a lie.
 
 | Requirement | Planned test | Layer | Matrix row |
 | --- | --- | --- | --- |
@@ -997,14 +1111,16 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-57 | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | chrome | M2 |
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
-| WEB-73 | `repository_column_names_an_unknown_identity_in_real_chrome` (A26) | chrome | M3 |
+6: | WEB-73 | `repository_column_names_an_unknown_identity_in_real_chrome` (A26) | chrome | M3 |
+| WEB-71 | `the_lanes_default_serves_one_latest_sitrep_per_lane_over_http` (A21), `lane_history_pages_newest_first_behind_an_opaque_cursor_over_http` (A22), `lane_history_refuses_a_stale_or_malformed_cursor_over_http` (A23), `lane_history_withholds_a_board_the_caller_may_not_read_over_http` (A24) | http | M5 |
 
-Counts: 60 requirements — 58 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
-`unit`, 29 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
+Counts: 61 requirements — 59 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
+`unit`, 29 `chrome`, 2 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
 WEB-40 moved from `unit` to `chrome` with `t-bf255880` wave 1, when every page
 that lists rows became the bundle's. WEB-73 skips WEB-60 (reserved for the t-b412670a `/all`
 fix), WEB-61..WEB-70 (reserved for the t-97878627 makeover) and WEB-71..WEB-72 (sibling
-deltas landing with main); its real-Chrome test is owed by test id at implementation (A26).
+deltas landing with main); WEB-71 skips WEB-60 and WEB-61..WEB-70 with WEB-72 next;
+their tests are owed by test id at implementation (A26 chrome, A21..A24 http).
 
 ## Appendix A — the design plan, verbatim
 
