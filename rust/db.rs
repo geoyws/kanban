@@ -2259,6 +2259,18 @@ const BOARD_V34: &str = r#"
 ALTER TABLE attention ADD COLUMN lane TEXT;
 "#;
 
+/// What brings a snoozed card back (SPA-64): one nullable `return_trigger` on
+/// `attention`, forward-only, no backfill — existing rows `NULL`, because no
+/// row snoozed before this column existed.
+///
+/// A plain `ALTER TABLE` on the `BOARD_V34` precedent: no CHECK names the
+/// column and no trigger reads it. The grammar is the store's
+/// (`model::parse_return_trigger`), and the read-side firing test is the
+/// store's open-queue filter.
+const BOARD_V35: &str = r#"
+ALTER TABLE attention ADD COLUMN return_trigger TEXT;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
@@ -2560,7 +2572,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 34;
+pub const BOARD_SCHEMA_VERSION: usize = 35;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2982,12 +2994,20 @@ fn board_v32_result_shape_exists(connection: &Connection) -> Result<bool> {
     Ok(triggers == 2)
 }
 
-fn board_v34_result_shape_exists(connection: &Connection) -> Result<bool> {
+fn attention_has_column(connection: &Connection, name: &str) -> Result<bool> {
     let columns: Vec<String> = connection
         .prepare("SELECT name FROM pragma_table_info('attention')")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(columns.iter().any(|column| column == "lane"))
+    Ok(columns.iter().any(|column| column == name))
+}
+
+fn board_v34_result_shape_exists(connection: &Connection) -> Result<bool> {
+    attention_has_column(connection, "lane")
+}
+
+fn board_v35_result_shape_exists(connection: &Connection) -> Result<bool> {
+    attention_has_column(connection, "return_trigger")
 }
 
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
@@ -3027,7 +3047,10 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
         // instead of failing on a duplicate column.
         let board_v34_step = current + 1 == 34;
         let v34_stands = board_v34_step && board_v34_result_shape_exists(&transaction)?;
-        if !v31_rewind && !v32_stands && !v34_stands {
+        // The v35 ALTER, for the same reason and by the same guard.
+        let board_v35_step = current + 1 == 35;
+        let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
+        if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
             if v31_columns {
                 transaction.execute_batch(
                     "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
@@ -3113,7 +3136,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34,
+    BOARD_V34, BOARD_V35,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4637,6 +4660,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored.as_deref(), Some("driver-2"));
+    }
+
+    #[test]
+    fn v35_return_trigger_is_null_on_old_rows_and_a_rewound_rerun_skips_the_step() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..34]).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), 34);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,decision
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6,NULL)",
+                [],
+            )
+            .expect("insert a pre-snooze row");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v35");
+        assert_eq!(schema_version(&connection).unwrap(), 35);
+        assert_eq!(BOARD_SCHEMA_VERSION, 35);
+        let trigger = |connection: &Connection, id: &str| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT return_trigger FROM attention WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            trigger(&connection, "a-old"),
+            None,
+            "no backfill: a row older than v35 never snoozed"
+        );
+        // A rewound board re-runs V35 against a column that already stands;
+        // the shape guard must skip the ALTER, not fail on a duplicate.
+        connection
+            .execute(
+                "UPDATE attention SET return_trigger='date:2031-01-01' WHERE id='a-old'",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 34)
+            .expect("rewind past v35");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v35 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), 35);
+        assert_eq!(
+            trigger(&connection, "a-old").as_deref(),
+            Some("date:2031-01-01"),
+            "the rerun must keep what the column already holds"
+        );
     }
 
     fn index_sql(connection: &Connection, name: &str) -> String {

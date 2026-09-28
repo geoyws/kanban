@@ -950,6 +950,85 @@ pub const ATTENTION_STATUSES: [&str; 2] = ["open", "resolved"];
 /// label is what geoyws reads; this is what a lane branches on.
 pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"];
 
+/// The three forms a snoozing defer may name as the thing that brings the
+/// card back (SPA-64), quoted whole by every refusal of a malformed one.
+pub const RETURN_TRIGGER_FORMS: &str = "date:YYYY-MM-DD, task:<t-id> or event:<kind>";
+
+/// What brings a snoozed card back, parsed from `--return-trigger`.
+///
+/// Evaluated on read, never by sweep: `Date` fires at the start of that day
+/// in UTC, `Task` when that task is written after the deferral instant,
+/// `Event` when an event of that kind is recorded after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnTrigger<'a> {
+    Date(&'a str),
+    Task(&'a str),
+    Event(&'a str),
+}
+
+/// Parse one `--return-trigger` value, refusing anything that is not one of
+/// [`RETURN_TRIGGER_FORMS`] with a sentence naming all three.
+///
+/// Shape only: whether a named task or event kind exists on the board is the
+/// store's question, asked against the board the trigger will be read on.
+pub fn parse_return_trigger(value: &str) -> Result<ReturnTrigger<'_>> {
+    let refuse = || {
+        anyhow::anyhow!(
+            "--return-trigger {value:?} is not a return trigger; a trigger is one of {RETURN_TRIGGER_FORMS}"
+        )
+    };
+    let (form, argument) = value.split_once(':').ok_or_else(refuse)?;
+    let plain = |text: &str| {
+        !text.is_empty()
+            && !text
+                .chars()
+                .any(|character| character.is_whitespace() || character == ':')
+    };
+    match form {
+        "date" if calendar_date(argument) => Ok(ReturnTrigger::Date(argument)),
+        "task" if plain(argument) => Ok(ReturnTrigger::Task(argument)),
+        "event"
+            if plain(argument)
+                && argument
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            Ok(ReturnTrigger::Event(argument))
+        }
+        _ => Err(refuse()),
+    }
+}
+
+/// Whether `text` is a real `YYYY-MM-DD` calendar day: four-digit year, and
+/// a month and day that exist in it (so `2026-02-30` is refused rather than
+/// silently normalised to March by SQLite's date arithmetic).
+fn calendar_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let slice = &bytes[range];
+        slice
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(slice).ok()?.parse().ok())
+            .flatten()
+    };
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year >= 1 && (1..=days).contains(&day)
+}
+
 /// The statuses a sprint row may hold (ADR-045 §1).
 ///
 /// A closed set beside [`ATTENTION_STATUSES`] for the same reason: the
@@ -1780,6 +1859,10 @@ pub struct Attention {
     /// was raised without one — as every pre-v34 row was. A `None` row still
     /// reads through the raiser-suffix and task-lane routes.
     pub lane: Option<String>,
+    /// The `--return-trigger` a snoozing defer named (SPA-64), or `None` on
+    /// a row that never snoozed — as every pre-v35 row is. While it has not
+    /// fired, the open queue and every count it feeds read the row as absent.
+    pub return_trigger: Option<String>,
     pub created_at: i64,
     pub status: String,
     pub priority: i64,
@@ -3909,5 +3992,58 @@ mod tests {
                  {API_ID}) and --observed named no identity for it"
             )
         );
+    }
+
+    /// SPA-64: the three trigger forms parse, and every malformed value —
+    /// including a date the calendar does not have — is refused with a
+    /// sentence naming all three forms.
+    #[test]
+    fn a_return_trigger_is_one_of_three_forms_and_a_malformed_one_names_them() {
+        assert_eq!(
+            parse_return_trigger("date:2028-02-29").unwrap(),
+            ReturnTrigger::Date("2028-02-29"),
+            "2028 is a leap year"
+        );
+        assert_eq!(
+            parse_return_trigger("date:2000-02-29").unwrap(),
+            ReturnTrigger::Date("2000-02-29"),
+            "a year divisible by 400 is a leap year"
+        );
+        assert_eq!(
+            parse_return_trigger("task:t-1a2b3c4d").unwrap(),
+            ReturnTrigger::Task("t-1a2b3c4d")
+        );
+        assert_eq!(
+            parse_return_trigger("event:task_moved").unwrap(),
+            ReturnTrigger::Event("task_moved")
+        );
+        for malformed in [
+            "",
+            "2026-10-01",
+            "date:",
+            "date:2026-02-29",
+            "date:1900-02-29",
+            "date:2026-13-01",
+            "date:2026-04-31",
+            "date:2026-00-10",
+            "date:2026-1-01",
+            "date:26-10-01",
+            "date:2026-10-01T00:00",
+            "task:",
+            "task:t 1",
+            "event:",
+            "event:Task-Moved",
+            "week:2026-W40",
+            "Date:2026-10-01",
+        ] {
+            let refusal = format!(
+                "{:#}",
+                parse_return_trigger(malformed).expect_err(malformed)
+            );
+            assert!(
+                refusal.contains("date:YYYY-MM-DD, task:<t-id> or event:<kind>"),
+                "{malformed:?} must be refused naming the three forms: {refusal}"
+            );
+        }
     }
 }

@@ -1399,6 +1399,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         check: attention_check(row)?,
         raised_by: row.get("raised_by")?,
         lane: row.get("lane")?,
+        return_trigger: row.get("return_trigger")?,
         created_at: row.get("created_at")?,
         status: row.get("status")?,
         priority: row.get("priority")?,
@@ -2098,6 +2099,55 @@ fn owner_clause(text: &str) -> Option<&str> {
     Some(text[start..end].trim())
 }
 
+/// The open-queue half of SPA-64, as one SQL predicate over `attention`: a
+/// row is visible unless it is open, carries a return trigger, and that
+/// trigger has not fired. The one placeholder is the reader's clock, in epoch
+/// milliseconds.
+///
+/// The deferral instant is the recorded decision's own `at`, and the snooze
+/// event is stamped with that same instant, so the snooze never fires itself
+/// through a `task:` or `event:` trigger naming its own task or kind: both
+/// fire only on a write strictly after it. `date:D` fires at `00:00` UTC on
+/// `D`. A stored value in none of the three forms reads as fired rather than
+/// hiding a card forever; the write path never stores one.
+const SNOOZE_VISIBLE: &str = "(return_trigger IS NULL OR status<>'open' OR CASE \
+     WHEN substr(return_trigger,1,5)='date:' \
+       THEN CAST(strftime('%s',substr(return_trigger,6)) AS INTEGER)*1000 <= ? \
+     WHEN substr(return_trigger,1,5)='task:' \
+       THEN EXISTS(SELECT 1 FROM events e WHERE e.task_id=substr(attention.return_trigger,6) \
+            AND e.created_at > json_extract(attention.decision,'$.at')) \
+     WHEN substr(return_trigger,1,6)='event:' \
+       THEN EXISTS(SELECT 1 FROM events e WHERE e.kind=substr(attention.return_trigger,7) \
+            AND e.created_at > json_extract(attention.decision,'$.at')) \
+     ELSE 1 END)";
+
+/// A `--return-trigger` checked against the board it will be read on: the
+/// grammar first (a malformed value is refused naming the three forms), then
+/// that a named task exists and a named event kind is one this board can
+/// record — either would otherwise hide the card for good.
+fn board_return_trigger(connection: &Connection, value: &str) -> Result<String> {
+    match parse_return_trigger(value)? {
+        ReturnTrigger::Date(_) => {}
+        ReturnTrigger::Task(id) => {
+            if get_task(connection, id)?.is_none() {
+                bail!(
+                    "--return-trigger {value} names task {id}, which is not on this board; \
+                     a card waiting on it would never return"
+                );
+            }
+        }
+        ReturnTrigger::Event(kind) => {
+            if !BOARD_EVENT_KINDS.contains(&kind) && !board_event_kind_exists(connection, kind)? {
+                bail!(
+                    "--return-trigger {value} names event kind {kind}, which this board never \
+                     records; a card waiting on it would never return"
+                );
+            }
+        }
+    }
+    Ok(value.to_owned())
+}
+
 /// Whether this task is already asking the operator for something.
 ///
 /// The in-transaction twin of [`Store::open_attentions`], holding the same
@@ -2168,6 +2218,20 @@ pub(crate) fn event(
     actor: Option<&str>,
     payload: Value,
 ) -> Result<()> {
+    event_stamped(connection, task_id, kind, actor, payload, now_ms())
+}
+
+/// [`event`] at a caller-chosen instant, for a write whose row records the
+/// same instant its envelope must carry — the snooze, whose deferral instant
+/// is what its return trigger is measured after.
+fn event_stamped(
+    connection: &Connection,
+    task_id: Option<&str>,
+    kind: &str,
+    actor: Option<&str>,
+    mut payload: Value,
+    at: i64,
+) -> Result<()> {
     let status = task_id
         .map(|id| {
             connection
@@ -2178,15 +2242,13 @@ pub(crate) fn event(
         })
         .transpose()?
         .flatten();
-    event_with_status(
-        connection,
-        task_id,
-        kind,
-        actor,
-        payload,
-        status.as_deref(),
-        status.as_deref(),
-    )
+    payload["_semanticV1"] = match task_id {
+        Some(task_id) => {
+            semantic_snapshot(connection, task_id, status.as_deref(), status.as_deref())?
+        }
+        None => Value::Null,
+    };
+    event_at(connection, task_id, kind, actor, payload, at)
 }
 
 fn semantic_snapshot(
@@ -6787,6 +6849,14 @@ impl Store {
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !include_archived {
             clauses.push("archived=0");
+            // SPA-64: a snoozed row reads as absent until its return trigger
+            // fires, and the trigger is evaluated HERE, on read, never by a
+            // sweep — so the default queue, every count taken through this
+            // filter and the `+1` probes all agree, and the bound applies to
+            // the rows that are really there. `--all` is the one listing that
+            // still names a snoozed row, beside the direct show.
+            clauses.push(SNOOZE_VISIBLE);
+            values.push(Box::new(now_ms()));
         }
         if let Some(status) = status {
             clauses.push("status=?");
@@ -7045,7 +7115,44 @@ impl Store {
         answer: &AttentionAnswer<'_>,
         check_answered: Option<&str>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, answer, check_answered, false)
+        self.resolve_attention_with_authorization(
+            id,
+            actor,
+            actor,
+            answer,
+            check_answered,
+            None,
+            false,
+        )
+    }
+
+    /// Answer an item with a defer that names what brings it back (SPA-64):
+    /// the row stays `open` with its decision recorded and the trigger beside
+    /// it, and reads as absent from the open queue and its counts until the
+    /// trigger fires on a later read.
+    ///
+    /// Everything else is [`Store::resolve_attention`]'s — the same actor
+    /// rule, the same composer, the same refusals — plus two of its own: a
+    /// malformed trigger is refused naming the three forms, and a trigger on
+    /// an answer whose outcome is not `defer` is refused rather than
+    /// silently dropped.
+    pub fn defer_attention(
+        &mut self,
+        id: &str,
+        actor: &str,
+        answer: &AttentionAnswer<'_>,
+        check_answered: Option<&str>,
+        return_trigger: &str,
+    ) -> Result<Attention> {
+        self.resolve_attention_with_authorization(
+            id,
+            actor,
+            actor,
+            answer,
+            check_answered,
+            Some(return_trigger),
+            false,
+        )
     }
 
     /// Settle an item from the trusted web edge.
@@ -7059,9 +7166,18 @@ impl Store {
         answer: &AttentionAnswer<'_>,
         check_answered: Option<&str>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, answer, check_answered, true)
+        self.resolve_attention_with_authorization(
+            id,
+            actor,
+            actor,
+            answer,
+            check_answered,
+            None,
+            true,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_attention_with_authorization(
         &mut self,
         id: &str,
@@ -7069,6 +7185,7 @@ impl Store {
         audit_actor: &str,
         answer: &AttentionAnswer<'_>,
         check_answered: Option<&str>,
+        return_trigger: Option<&str>,
         trusted_edge: bool,
     ) -> Result<Attention> {
         let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
@@ -7100,6 +7217,11 @@ impl Store {
                 existing.raised_by
             );
         }
+        // After the actor rule, so a caller who may not answer this row does
+        // not learn which trigger forms the board accepts.
+        let return_trigger = return_trigger
+            .map(|value| board_return_trigger(&transaction, value))
+            .transpose()?;
         let now = now_ms();
         // ACC-06 (amended 2026-09-24, t-1aa9f553): a checked row settles with
         // or without its answer. A supplied answer is validated and recorded
@@ -7143,15 +7265,70 @@ impl Store {
         // (ADR-042 §3). `existing.choices` is the served card, so a row that
         // authored none is answered through the default pair.
         let (decision, mut resolution) = answer.decide(id, &existing.choices, &audit_actor, now)?;
+        let check_result = match recorded {
+            Some((key, correct)) => json!({
+                "answered": key,
+                "correct": correct,
+                "answeredAt": now,
+            }),
+            None => check_result_json(existing.check.as_ref()),
+        };
+        if let Some(trigger) = return_trigger {
+            if decision.outcome != "defer" {
+                bail!(
+                    "attention {id}: --return-trigger snoozes a defer, and choice {} records {}; \
+                     pick a defer (or --choice {CUSTOM_CHOICE} --outcome defer) or drop \
+                     --return-trigger",
+                    decision.choice,
+                    decision.outcome
+                );
+            }
+            // Open, with the decision recorded and the trigger beside it: the
+            // return is not a resolution, so nothing under `resolved_*` moves
+            // and a reopened row keeps the reopen that made it open.
+            transaction.execute(
+                "UPDATE attention SET decision=?,return_trigger=? WHERE id=?",
+                params![serde_json::to_string(&decision)?, trigger, id],
+            )?;
+            // Stamped at the decision's own instant, so the trigger — which
+            // fires only on a write strictly after it — never fires on the
+            // snooze's own envelope.
+            event_stamped(
+                &transaction,
+                existing.task_id.as_deref(),
+                "attention_updated",
+                Some(&audit_actor),
+                json!({
+                    "attentionID": id,
+                    "changed": ["decision", "returnTrigger"],
+                    "tags": old_tags,
+                    "decision": decision,
+                    "returnTrigger": trigger,
+                    "previousDecision": existing.decision,
+                    "previousReturnTrigger": existing.return_trigger,
+                    "checkResult": check_result,
+                }),
+                now,
+            )?;
+            let mut result =
+                transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
+            transaction.commit()?;
+            attach_attention_tags(&self.connection, std::slice::from_mut(&mut result))?;
+            redact_attention_check(&mut result);
+            return Ok(result);
+        }
         // The human line that agrees with the stored fields (ACC-07).
         if let Some(echo) = check_echo {
             resolution.push('\n');
             resolution.push_str(&echo);
         }
         let decision_json = serde_json::to_string(&decision)?;
+        // Settling clears any trigger: a settled row is not snoozed, and the
+        // envelope below keeps the one it had.
         transaction.execute(
             "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=?,\
-             decision=?,reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
+             decision=?,reopened_at=NULL,reopened_by=NULL,reopen_note=NULL,return_trigger=NULL \
+             WHERE id=?",
             params![now, audit_actor, resolution, decision_json, id],
         )?;
         // `tags` is the row's tag set AT SETTLEMENT, under the same key the
@@ -7180,14 +7357,8 @@ impl Store {
                 "reopenedAt": existing.reopened_at,
                 "reopenedBy": existing.reopened_by,
                 "reopenNote": existing.reopen_note,
-                "checkResult": match recorded {
-                    Some((key, correct)) => json!({
-                        "answered": key,
-                        "correct": correct,
-                        "answeredAt": now,
-                    }),
-                    None => check_result_json(existing.check.as_ref()),
-                },
+                "previousReturnTrigger": existing.return_trigger,
+                "checkResult": check_result,
             }),
         )?;
         let result =
@@ -10749,6 +10920,108 @@ mod tests {
             [secret_resolved.as_str()],
             "the direct estate's own scan bound changed"
         );
+    }
+
+    /// SPA-64 under managed enforcement: the snooze predicate and the tag
+    /// test compose. The most urgent row is a readable snooze and the next a
+    /// tag-denied row, so a bound spent on either would hand back nothing;
+    /// the one-row read, the open count and the `--all` listing each answer
+    /// only readable, unsnoozed rows (`--all` adds the readable snooze and
+    /// never the denied row). The direct estate counts the denied row and
+    /// still not the snooze.
+    #[test]
+    fn managed_open_queue_hides_a_snooze_and_a_tag_denied_row_before_the_bound() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-6464-4646-8646-646464646464";
+        let dir = std::env::temp_dir().join(format!("kanban-snooze-authz-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        let (snoozed, readable) = {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            let mut raise = |body: &str, priority: i64, tag: &str| -> String {
+                seed.raise_attention(
+                    body,
+                    "decision",
+                    "seed",
+                    None,
+                    priority,
+                    &[tag.to_owned()],
+                    &DecisionCard::default(),
+                    None,
+                    None,
+                )
+                .expect("raise")
+                .id
+            };
+            let snoozed = raise("the snoozed question", 0, "visible");
+            raise("the secret question", 1, "secret");
+            let readable = raise("the readable question", 2, "visible");
+            let row = seed
+                .defer_attention(
+                    &snoozed,
+                    "geoyws",
+                    &AttentionAnswer::custom("defer", "later"),
+                    None,
+                    "date:2999-01-01",
+                )
+                .expect("snooze");
+            assert_eq!(row.status, "open");
+            assert_eq!(row.return_trigger.as_deref(), Some("date:2999-01-01"));
+            (snoozed, readable)
+        };
+
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(
+                Enforcement::Managed,
+                authority([
+                    (
+                        ScopeTuple::Board {
+                            board_id: board.to_owned(),
+                        },
+                        Capability::Read,
+                    ),
+                    (
+                        ScopeTuple::BoardTag {
+                            board_id: board.to_owned(),
+                            tag: "visible".to_owned(),
+                        },
+                        Capability::Read,
+                    ),
+                ]),
+                board.to_owned(),
+            ),
+        )
+        .expect("open under partial tag authority");
+        let ids = |rows: Vec<Attention>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store
+                .attention(Some("open"), None, None, None, None, 1, false)
+                .expect("one-row read")),
+            std::slice::from_ref(&readable),
+            "the bound was spent on a snoozed or tag-denied row"
+        );
+        assert_eq!(store.count_open_attention().expect("count"), 1);
+        assert_eq!(
+            ids(store
+                .attention(Some("open"), None, None, None, None, 10, true)
+                .expect("--all read")),
+            [snoozed.clone(), readable.clone()],
+            "--all names the readable snooze and never the denied row"
+        );
+
+        let direct = Store::open(&path).expect("direct estate");
+        assert_eq!(
+            direct.count_open_attention().expect("direct count"),
+            2,
+            "the direct estate counts the secret row and still not the snooze"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The same finding one surface further along again: the EVENT TAIL of a

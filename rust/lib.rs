@@ -229,9 +229,12 @@ Usage:
              [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
              [--check-explain TEXT --check-about SUBJECT]
   kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--check-answered KEY]
-             [--json]
+             [--return-trigger date:YYYY-MM-DD|task:ID|event:KIND] [--json]
   kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
-             --note TEXT [--json]
+             --note TEXT [--return-trigger date:YYYY-MM-DD|task:ID|event:KIND] [--json]
+             (--return-trigger on a defer snoozes the card instead of settling it: it
+             stays open with its decision, out of the open queue and its counts until
+             the trigger fires on read; attention list --all and show still name it)
   kanban attention check ID --as ACTOR --key KEY [--json]
              (answer the row's comprehension check once, open or resolved;
              prints the verdict, the correct key and label, and why)
@@ -1377,7 +1380,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("resolve"),
-        &["as", "note", "choice", "outcome", "check-answered"],
+        &[
+            "as",
+            "note",
+            "choice",
+            "outcome",
+            "check-answered",
+            "return-trigger",
+        ],
         &["id"],
         false,
     ),
@@ -4374,7 +4384,7 @@ const TASK_GATED_FIELDS: [(&str, &str); 3] = [
 ];
 
 /// The keys of one `attention list` row, exactly as a caller sees them.
-const ATTENTION_FIELDS: [&str; 23] = [
+const ATTENTION_FIELDS: [&str; 24] = [
     "id",
     "taskID",
     "kind",
@@ -4385,6 +4395,7 @@ const ATTENTION_FIELDS: [&str; 23] = [
     "check",
     "raisedBy",
     "lane",
+    "returnTrigger",
     "createdAt",
     "status",
     "priority",
@@ -7515,19 +7526,18 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "attention" && sub == Some("resolve") {
         let id = rest.first().context("attention id is required")?;
-        return print(
-            &store.resolve_attention(
-                id,
-                args.require("as")?,
-                &AttentionAnswer {
-                    choice: args.one("choice"),
-                    outcome: args.one("outcome"),
-                    note: args.one("note"),
-                },
-                args.one("check-answered"),
-            )?,
-            args.has("json"),
-        );
+        let actor = args.require("as")?;
+        let answer = AttentionAnswer {
+            choice: args.one("choice"),
+            outcome: args.one("outcome"),
+            note: args.one("note"),
+        };
+        let check_answered = args.one("check-answered");
+        let row = match args.one("return-trigger") {
+            Some(trigger) => store.defer_attention(id, actor, &answer, check_answered, trigger)?,
+            None => store.resolve_attention(id, actor, &answer, check_answered)?,
+        };
+        return print(&row, args.has("json"));
     }
     if command == "attention" && sub == Some("check") {
         let id = rest.first().context("attention id is required")?;
@@ -9857,6 +9867,7 @@ mod tests {
             }),
             raised_by: "worker@driver-2".into(),
             lane: None,
+            return_trigger: None,
             created_at: 1,
             status: "open".into(),
             priority: 0,

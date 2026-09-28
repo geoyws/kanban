@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 34);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 34);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 34);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 35);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 35);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 35);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -18475,7 +18475,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        34
+        35
     );
 }
 
@@ -19237,14 +19237,15 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
             // v33 rebuilds the table, so definition and result columns stand
             // on their own lines now (v32's ALTERs had landed them on the
             // check_about line); a simulated v30 board strips all eight.
-            // v34's ALTER appends lane to the last column definition line, so
-            // the answered_at strip carries it: the simulated v30 board must
-            // not contain v34's column either, or the v34 rerun would meet a
-            // duplicate column instead of an empty slot.
+            // v34's and v35's ALTERs append lane and return_trigger to the
+            // last column definition line, so the answered_at strip carries
+            // both: the simulated v30 board must not contain either column,
+            // or the v34/v35 reruns would meet a duplicate column instead of
+            // an empty slot.
             " check_about TEXT,\n",
             " check_answered TEXT,\n",
             " check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),\n",
-            " check_answered_at INTEGER, lane TEXT,\n",
+            " check_answered_at INTEGER, lane TEXT, return_trigger TEXT,\n",
             " CHECK(\n   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL\n    AND check_explanation IS NULL AND check_about IS NULL)\n   OR\n   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL\n    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)\n ),\n",
         ] {
             let without = sql.replace(declaration, "");
@@ -19275,7 +19276,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        34
+        35
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -20641,7 +20642,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        34
+        35
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -21559,6 +21560,544 @@ fn attention_raise_stores_lane_and_list_matches_both_routes() {
     let mut control_expected = vec![control_raiser, control_task];
     control_expected.sort();
     assert_eq!(control_ids, control_expected);
+}
+
+/// Today and tomorrow as UTC calendar days, read off SQLite's own clock — the
+/// same `date` arithmetic the store's firing predicate uses — so a test that
+/// straddles midnight asks both sides of the same clock.
+fn utc_today_and_tomorrow() -> (String, String) {
+    Connection::open_in_memory()
+        .unwrap()
+        .query_row("SELECT date('now'), date('now','+1 day')", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+}
+
+/// The ids `attention list <extra> --json` returns, sorted.
+fn attention_ids(fixture: &Fixture, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["attention", "list", "--limit", "500"];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    let mut ids: Vec<String> = fixture
+        .ok_json(&fixture.main, &args)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// This board's `openAttention` as `dashboard --json` counts it.
+fn dashboard_open_attention(fixture: &Fixture, board: &str) -> i64 {
+    fixture
+        .ok_json(&fixture.main, &["dashboard", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == board)
+        .unwrap_or_else(|| panic!("the dashboard lists no {board}"))["openAttention"]
+        .as_i64()
+        .unwrap()
+}
+
+#[test]
+fn a_defer_with_a_return_trigger_snoozes_the_card_until_the_trigger_fires_on_read() {
+    // SPA-64 (A20), over the compiled binary, every call a fresh process
+    // against the same board file: a defer naming a return trigger leaves
+    // the row open with its decision, hides it from the default queue and
+    // its counts while `--all` and show still name it, and each of the three
+    // forms brings it back on read — no sweep runs anywhere in this test.
+    let fixture = Fixture::new("stale-queue-snooze");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STALE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "The work a card waits on",
+            "--id",
+            "t-wait",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Unrelated work", "--id", "t-other", "--json"],
+    );
+    let raise = |body: &str| -> String {
+        raise_carded(&fixture, body, "claude@driver", &CARD)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let by_date = raise("Snoozed until tomorrow.");
+    let by_today = raise("Snoozed until a day that has already begun.");
+    let by_task = raise("Snoozed until t-wait is written.");
+    let by_event = raise("Snoozed until a card is updated.");
+    let triggerless = raise("Deferred with no trigger.");
+    let never = raise("Never snoozed.");
+    let (today, tomorrow) = utc_today_and_tomorrow();
+    let defer = |id: &str, trigger: &str| -> Value {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "resolve",
+                id,
+                "--as",
+                "geoyws",
+                "--choice",
+                "keep-parked",
+                "--return-trigger",
+                trigger,
+                "--json",
+            ],
+        )
+    };
+
+    // The receipt: still open, the defer decision recorded, the trigger
+    // beside it, and nothing under resolved_* — the snooze is not a
+    // resolution.
+    let date_trigger = format!("date:{tomorrow}");
+    let snoozed = defer(&by_date, &date_trigger);
+    assert_eq!(snoozed["status"], "open", "{snoozed}");
+    assert_eq!(snoozed["returnTrigger"], date_trigger.as_str(), "{snoozed}");
+    assert_eq!(snoozed["decision"]["choice"], "keep-parked", "{snoozed}");
+    assert_eq!(snoozed["decision"]["outcome"], "defer", "{snoozed}");
+    assert_eq!(snoozed["decision"]["by"], "geoyws", "{snoozed}");
+    assert!(snoozed["resolvedAt"].is_null(), "{snoozed}");
+    assert!(snoozed["resolvedBy"].is_null(), "{snoozed}");
+    assert!(snoozed["resolution"].is_null(), "{snoozed}");
+
+    // `date:D` fires at the start of D in UTC, so a day already begun has
+    // fired by the time anyone reads it.
+    let fired_today = defer(&by_today, &format!("date:{today}"));
+    assert_eq!(fired_today["status"], "open");
+    // `task:` and `event:` fire only on a write strictly after the deferral:
+    // the snooze's own `attention_updated` envelope must not fire an
+    // `event:attention_updated` trigger.
+    defer(&by_task, "task:t-wait");
+    defer(&by_event, "event:attention_updated");
+
+    // A defer with no trigger resolves exactly as ADR-042 §1 says.
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &triggerless,
+            "--as",
+            "geoyws",
+            "--choice",
+            "keep-parked",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["status"], "resolved", "{resolved}");
+    assert_eq!(resolved["decision"]["outcome"], "defer", "{resolved}");
+    assert!(resolved["returnTrigger"].is_null(), "{resolved}");
+
+    // The default open queue, the unfiltered default listing and the
+    // dashboard count all read the three unfired rows as absent; the fired
+    // `date:today` row and the never-snoozed row are there.
+    let mut visible_open = vec![by_today.clone(), never.clone()];
+    visible_open.sort();
+    assert_eq!(
+        attention_ids(&fixture, &["--status", "open"]),
+        visible_open,
+        "the default open queue must hide exactly the unfired snoozes"
+    );
+    let mut visible_all_statuses = vec![by_today.clone(), never.clone(), triggerless.clone()];
+    visible_all_statuses.sort();
+    assert_eq!(attention_ids(&fixture, &[]), visible_all_statuses);
+    assert_eq!(
+        dashboard_open_attention(&fixture, "STALE"),
+        2,
+        "a snoozed row leaked into the open count"
+    );
+    // `--all` still names every snoozed row, each with its trigger.
+    let everything = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--all", "--limit", "500", "--json"],
+    );
+    let trigger_of = |id: &str| -> Value {
+        everything
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("--all does not name {id}: {everything}"))["returnTrigger"]
+            .clone()
+    };
+    assert_eq!(trigger_of(&by_date), json!(date_trigger));
+    assert_eq!(trigger_of(&by_task), json!("task:t-wait"));
+    assert_eq!(trigger_of(&by_event), json!("event:attention_updated"));
+    assert_eq!(
+        trigger_of(&never),
+        Value::Null,
+        "a row that never snoozed carries a null trigger, not an absent key"
+    );
+    // So does a direct show.
+    let shown = fixture.ok_json(&fixture.main, &["attention", "show", &by_date, "--json"]);
+    assert_eq!(shown["returnTrigger"], date_trigger.as_str());
+    assert_eq!(shown["status"], "open");
+
+    // A write to some other task fires nothing.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "update", "t-other", "--as", "geoyws", "--title", "Renamed", "--json",
+        ],
+    );
+    assert!(!attention_ids(&fixture, &["--status", "open"]).contains(&by_task));
+    // A write to t-wait fires `task:t-wait` on the next read.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "update", "t-wait", "--as", "geoyws", "--title", "Written", "--json",
+        ],
+    );
+    let open = attention_ids(&fixture, &["--status", "open"]);
+    assert!(
+        open.contains(&by_task),
+        "task:t-wait did not fire: {open:?}"
+    );
+    assert!(
+        !open.contains(&by_event),
+        "a task write is not an attention_updated event: {open:?}"
+    );
+    // An `attention_updated` recorded after the deferral fires the event
+    // trigger; `never` is corrected, which records exactly that kind.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            &never,
+            "--as",
+            "claude@driver",
+            "--body",
+            "Corrected.",
+            "--json",
+        ],
+    );
+    let open = attention_ids(&fixture, &["--status", "open"]);
+    assert!(
+        open.contains(&by_event),
+        "event:attention_updated did not fire: {open:?}"
+    );
+    assert!(
+        !open.contains(&by_date),
+        "tomorrow has not arrived: {open:?}"
+    );
+    assert_eq!(dashboard_open_attention(&fixture, "STALE"), 4);
+
+    // The date arriving: the stored day is moved to one already begun, which
+    // is what reading it tomorrow would see. It returns still open, its
+    // defer decision intact — the return is not a resolution.
+    let board = board_path_for_project(&fixture, &fixture.main, "STALE");
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE attention SET return_trigger=? WHERE id=?",
+            params![format!("date:{today}"), by_date],
+        )
+        .unwrap();
+    let queue = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    let returned = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == by_date.as_str())
+        .unwrap_or_else(|| panic!("the arrived date did not bring the card back: {queue}"));
+    assert_eq!(returned["status"], "open");
+    assert_eq!(returned["decision"]["choice"], "keep-parked");
+    assert_eq!(returned["decision"]["outcome"], "defer");
+    assert!(returned["resolvedAt"].is_null());
+    assert_eq!(dashboard_open_attention(&fixture, "STALE"), 5);
+
+    // A returned card settles like any other, and settling clears the
+    // trigger so the row is history rather than a snooze.
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &by_date,
+            "--as",
+            "geoyws",
+            "--choice",
+            "assign-and-login",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert!(settled["returnTrigger"].is_null(), "{settled}");
+}
+
+#[test]
+fn a_malformed_or_misapplied_return_trigger_is_refused_and_writes_nothing() {
+    // SPA-64 refusals (A20): the malformed trigger names the three forms; a
+    // trigger on a non-defer answer, on a task not on this board, or from an
+    // actor who may not answer the row is refused; each refusal leaves every
+    // row and the audit chain exactly as it was, and the corrected retry
+    // lands.
+    let fixture = Fixture::new("stale-queue-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STALE-REFUSE", "--json"]);
+    let id = raise_carded(&fixture, "A card to snooze.", "claude@driver", &CARD)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = attention_and_chain(&fixture);
+    let resolve = |actor: &str, choice: &[&str], trigger: &str| -> String {
+        let mut args = vec!["resolve", id.as_str(), "--as", actor];
+        args.extend_from_slice(choice);
+        args.extend_from_slice(&["--return-trigger", trigger]);
+        attention_refusal(&fixture, &args)
+    };
+    for malformed in [
+        "tomorrow",
+        "date:2026-02-30",
+        "date:2026-10-1",
+        "week:40",
+        "task:",
+        "",
+    ] {
+        let refusal = resolve("geoyws", &["--choice", "keep-parked"], malformed);
+        assert!(
+            refusal.contains("date:YYYY-MM-DD, task:<t-id> or event:<kind>"),
+            "{malformed:?}: {refusal}"
+        );
+        assert_eq!(attention_and_chain(&fixture), before, "{malformed:?} wrote");
+    }
+    let refusal = resolve(
+        "geoyws",
+        &["--choice", "assign-and-login"],
+        "date:2031-01-01",
+    );
+    assert!(
+        refusal.contains("--return-trigger snoozes a defer")
+            && refusal.contains("assign-and-login records approve"),
+        "{refusal}"
+    );
+    assert_eq!(attention_and_chain(&fixture), before);
+    let refusal = resolve(
+        "geoyws",
+        &["--choice", "custom", "--outcome", "reject", "--note", "no"],
+        "date:2031-01-01",
+    );
+    assert!(refusal.contains("custom records reject"), "{refusal}");
+    let refusal = resolve("geoyws", &["--choice", "keep-parked"], "task:t-nowhere");
+    assert!(
+        refusal.contains("names task t-nowhere, which is not on this board"),
+        "{refusal}"
+    );
+    let refusal = resolve("geoyws", &["--choice", "keep-parked"], "event:no_such_kind");
+    assert!(
+        refusal.contains("names event kind no_such_kind, which this board never records"),
+        "{refusal}"
+    );
+    // Only George or the raiser may answer the row, snooze included.
+    let refusal = resolve(
+        "someone@lane-9",
+        &["--choice", "keep-parked"],
+        "date:2031-01-01",
+    );
+    assert!(
+        refusal.contains("only geoyws or that same raiser may resolve it"),
+        "{refusal}"
+    );
+    assert_eq!(attention_and_chain(&fixture), before);
+
+    // The retry with a well-formed trigger, through the custom defer form,
+    // by the raiser.
+    let snoozed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "claude@driver",
+            "--choice",
+            "custom",
+            "--outcome",
+            "defer",
+            "--note",
+            "after the pin lands",
+            "--return-trigger",
+            "date:2031-01-01",
+            "--json",
+        ],
+    );
+    assert_eq!(snoozed["status"], "open");
+    assert_eq!(snoozed["decision"]["choice"], "custom");
+    assert_eq!(snoozed["decision"]["outcome"], "defer");
+    assert_eq!(snoozed["decision"]["note"], "after the pin lands");
+    assert_eq!(snoozed["returnTrigger"], "date:2031-01-01");
+    assert!(attention_ids(&fixture, &["--status", "open"]).is_empty());
+    // The snooze is on the ledger, stamped at the decision's own instant.
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_updated", "--json"],
+    );
+    let envelope = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["payload"]["attentionID"] == id.as_str())
+        .unwrap_or_else(|| panic!("no snooze envelope: {events}"));
+    assert_eq!(envelope["payload"]["returnTrigger"], "date:2031-01-01");
+    assert_eq!(envelope["payload"]["decision"]["outcome"], "defer");
+    assert_eq!(
+        envelope["createdAt"], snoozed["decision"]["at"],
+        "the snooze envelope must carry the deferral instant"
+    );
+}
+
+#[test]
+fn superseded_questions_settle_in_one_transact_batch_or_not_at_all() {
+    // SPA-65 (A20): five superseded rows settle as one `transact` of five
+    // `attention_resolve` items; a batch naming one already-resolved row, a
+    // stale key or a row its actor may not resolve settles none of them,
+    // names the failed index and the row, and leaves the audit chain where
+    // it was; the corrected retry lands whole.
+    let fixture = Fixture::new("stale-queue-batch");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STALE-BATCH", "--json"]);
+    let raise = |body: String| -> String {
+        raise_carded(&fixture, &body, "claude@driver", &CARD)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let superseded: Vec<String> = (0..5)
+        .map(|index| raise(format!("Superseded question {index}.")))
+        .collect();
+    let item = |id: &str, actor: &str, choice: &str| -> Value {
+        json!({ "name": "attention_resolve", "arguments": {
+            "id": id, "as": actor, "choice": choice,
+            "note": "Decided elsewhere; superseded.",
+        }})
+    };
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &superseded
+            .iter()
+            .map(|id| item(id, "geoyws", "drop-receipt"))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let batch_id = envelope["batchId"].as_str().unwrap().to_owned();
+    let rows = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--all", "--limit", "500", "--json"],
+    );
+    for id in &superseded {
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["status"], "resolved", "{row}");
+        assert_eq!(row["resolvedBy"], "geoyws", "{row}");
+        assert_eq!(row["decision"]["choice"], "drop-receipt", "{row}");
+        assert_eq!(row["decision"]["by"], "geoyws", "{row}");
+        assert_eq!(row["decision"]["note"], "Decided elsewhere; superseded.");
+    }
+    let stamped = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_resolved", "--json"],
+    );
+    assert_eq!(
+        stamped
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["payload"]["batchId"] == batch_id.as_str())
+            .count(),
+        5,
+        "each settled row carries the one batch id: {stamped}"
+    );
+    assert_eq!(dashboard_open_attention(&fixture, "STALE-BATCH"), 0);
+
+    // Three fresh rows; every refused batch below must leave all three open.
+    let fresh: Vec<String> = (0..3)
+        .map(|index| raise(format!("Fresh question {index}.")))
+        .collect();
+    let open_before = attention_ids(&fixture, &["--status", "open"]);
+    assert_eq!(open_before.len(), 3);
+    let chain_before = board_audit(&fixture);
+    for (label, failed_index, bad_item, expected) in [
+        (
+            "an already-resolved row",
+            1,
+            item(&superseded[2], "geoyws", "drop-receipt"),
+            format!("attention {} was already resolved by geoyws", superseded[2]),
+        ),
+        (
+            "a stale key",
+            2,
+            item(&fresh[2], "geoyws", "no-such-key"),
+            format!("attention {} has no choice no-such-key", fresh[2]),
+        ),
+        (
+            "an actor who may not resolve the row",
+            2,
+            item(&fresh[2], "someone@lane-9", "drop-receipt"),
+            format!("attention {} was raised by claude@driver", fresh[2]),
+        ),
+    ] {
+        let mut items = vec![
+            item(&fresh[0], "geoyws", "drop-receipt"),
+            item(&fresh[1], "claude@driver", "keep-parked"),
+            item(&fresh[2], "geoyws", "drop-receipt"),
+        ];
+        items.insert(failed_index, bad_item);
+        items.truncate(3);
+        let envelope = transact_results(&fixture, &fixture.main, &items);
+        assert_eq!(envelope["ok"], false, "{label}: {envelope}");
+        assert_eq!(envelope["failedIndex"], failed_index, "{label}: {envelope}");
+        assert_eq!(envelope["rolledBack"], true, "{label}: {envelope}");
+        let error = envelope["results"][failed_index]["error"].as_str().unwrap();
+        assert!(error.contains(&expected), "{label}: {error}");
+        assert_eq!(
+            attention_ids(&fixture, &["--status", "open"]),
+            open_before,
+            "{label}: a refused batch settled some of its rows"
+        );
+        assert_eq!(
+            dashboard_open_attention(&fixture, "STALE-BATCH"),
+            3,
+            "{label}"
+        );
+        let chain_after = board_audit(&fixture);
+        assert_eq!(chain_after["lastSeq"], chain_before["lastSeq"], "{label}");
+        assert_eq!(chain_after["head"], chain_before["head"], "{label}");
+    }
+
+    // The retry without the bad item lands whole, per-item actors intact.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            item(&fresh[0], "geoyws", "drop-receipt"),
+            item(&fresh[1], "claude@driver", "keep-parked"),
+            item(&fresh[2], "geoyws", "assign-and-login"),
+        ],
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert!(attention_ids(&fixture, &["--status", "open"]).is_empty());
+    let settled = fixture.ok_json(&fixture.main, &["attention", "show", &fresh[1], "--json"]);
+    assert_eq!(settled["resolvedBy"], "claude@driver");
+    assert_eq!(settled["decision"]["outcome"], "defer");
 }
 
 #[test]
@@ -57334,7 +57873,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 34, "the board did not migrate forward");
+    assert_eq!(migrated, 35, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -57366,7 +57905,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 34);
+    assert_eq!(again, 35);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any

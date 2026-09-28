@@ -405,9 +405,9 @@ measures rather than re-pointed at the new one (SPA-51).
 | `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
 | `SPA-62` | MUST | process | `attention_raise_stores_lane_and_list_matches_both_routes` | landed with `t-14e6feb7`, over the compiled binary: raises the three-route matrix above plus the no-stored-lane control, asserts the `--lane` listing returns exactly the three cards, asserts the stored value round-trips on show/JSON, and asserts an unused lane reads empty. |
 | `SPA-63` | MUST | http | `none` | no e2e coverage — to be written by `t-0fa71043`: `the_needs_you_route_filters_by_board_kind_priority_and_age_over_http` over the compiled binary on a real socket, holding the unfiltered default, each predicate, the store-side counterexample past rank 1001, the deck order under filters, the named-board `404` triple, the `400` syntax refusals including a repeated `age`, and the sticky `truncated` with `limit` 1000. contract: `docs/api/kanban-web.openapi.yaml` under `/api/v1/needs-you` |
-| `SPA-64` | MUST | process | `none` | no e2e coverage — to be written by `t-750c2743`: over the compiled binary, a defer with each of the three trigger forms hides the row from the default open queue while `--all` still names it, each trigger fires on read, a triggerless defer still resolves, `http`-layer holds, same task: the row reads as absent from `GET /api/v1/needs-you` (`getNeedsYou`) and every count it feeds, the projection carries `returnTrigger` additively (`null` on rows that never snoozed, projection stays `v1`); contract: `docs/api/kanban-web.openapi.yaml` under `/api/v1/needs-you` plus `Attention.returnTrigger`. |
-| `SPA-65` | MUST | process | `none` | no e2e coverage — to be written by `t-750c2743`: one `transact` batch of `attention_resolve` items settles every named row, and a batch naming one unresolvable row settles none and names the failed index. |
-| `SPA-66` | MUST | chrome | `none` | no e2e coverage — to be written by `t-750c2743`: the mounted deck's age view names each open card's whole-day age beside its raised date and orders oldest first. |
+| `SPA-64` | MUST | process | `a_defer_with_a_return_trigger_snoozes_the_card_until_the_trigger_fires_on_read`, `a_malformed_or_misapplied_return_trigger_is_refused_and_writes_nothing` | landed with `t-750c2743`, CLI only (the web view and its routes are retired by `e-caeb1449`, so no `http` hold is written): over the compiled binary, a defer with each of the three trigger forms (`date:`, `task:`, `event:`) leaves the row `open` with its defer decision and hides it from `attention list --status open`, the unfiltered default listing and `dashboard` `openAttention` while `--all` and `show` still name it with its trigger; each trigger fires on read (`date:` today fires at UTC start of day, the stored date arriving returns the card with its decision intact, a write to the named task, a later `attention_updated`; a write to another task and the snooze's own envelope fire nothing); a triggerless defer still resolves; malformed triggers are refused naming the three forms, and a non-defer answer, an unknown task or event kind, or an actor who is neither `geoyws` nor the raiser is refused, each leaving rows and audit chain unchanged, and the corrected retry lands. |
+| `SPA-65` | MUST | process | `superseded_questions_settle_in_one_transact_batch_or_not_at_all` | landed with `t-750c2743`, over the compiled binary: one `transact` of five `attention_resolve` items settles all five `resolved` with George's decisions, each `attention_resolved` envelope carrying the one `batchId`; a batch naming an already-resolved row, a stale key, or a row its actor may not resolve settles none of its rows (the item before the refusal included), reports `rolledBack` with that `failedIndex` and an error naming the row, leaves the open count and the audit chain head unchanged, and the corrected retry lands whole with per-item actors intact. |
+| `SPA-66` | MUST | chrome | `none` | superseded by `e-caeb1449` (web view retired 2026-09-28): the deck age view will not be built and no evidence will be written. Requirement text retained as history. |
 
 66 requirements: 66 MUST, no SHOULD and no MAY. By layer, 48 `chrome`, 7
 `http`, 5 `unit` and 6 `process`. A requirement *preserves* a `WEB-nn` when
@@ -417,8 +417,8 @@ preserve at least one `WEB-nn` (SPA-10, SPA-13, SPA-14..SPA-47 and
 SPA-52..SPA-57) and 38 of those also name an existing Chrome test here. The
 four that do not are SPA-10, SPA-13 and SPA-57, proved at `unit`/`http`, and
 SPA-56, proved at `unit` over the bundle's own stylesheet since 2026-09-19.
-Six rows carry no evidence yet — SPA-02 and SPA-50, each naming the epic
-`e-9306a1d9` row that must write it, SPA-63, planned under `t-0fa71043`, and SPA-64, SPA-65 and SPA-66, each naming `t-750c2743`. Two left that list on 2026-09-19 with
+Three rows carry no evidence yet — SPA-02 and SPA-50, each naming the epic
+`e-9306a1d9` row that must write it, SPA-63, planned under `t-0fa71043`. SPA-66 names no evidence because it will write none: superseded by `e-caeb1449` (web view retired). SPA-64 and SPA-65 left that list on 2026-09-28 with `t-750c2743`. Two left that list on 2026-09-19 with
 `t-e978824a`, which wrote the two real-board refusal cases and the rendered
 keys line: SPA-22 and SPA-31. SPA-51 left it the same day with `t-1f495a7f`.
 Four left it with `t-992e40aa`,
@@ -589,7 +589,7 @@ each row says `no e2e coverage` plainly.
 
 7 requirements: 7 MUST, no SHOULD or MAY. The sixth kind raises, lists, shows,
 resolves, reopens and migrates through the existing attention machinery; the
-board schema stands at 34.
+board schema stands at 35.
 
 ## Requirements trace — docs/specs/watch.md WATCH-01..WATCH-12
 
@@ -625,7 +625,7 @@ worktree.
 
 12 requirements: 12 MUST, no SHOULD or MAY. The steered stream is a repeatable lane and
 note-kind predicate bound to the opaque cursor, with an additive four-key envelope shared
-field-for-field with Ord; board schema stands at 34 and no migration rides this slice.
+field-for-field with Ord; board schema stands at 35 and no migration rides this slice.
 
 ## Watch coverage note
 

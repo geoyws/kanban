@@ -592,6 +592,7 @@ mod tests {
             check: None,
             raised_by: "codex@driver".to_owned(),
             lane: None,
+            return_trigger: None,
             created_at: 3,
             status: "open".to_owned(),
             priority,
