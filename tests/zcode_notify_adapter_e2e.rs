@@ -164,12 +164,22 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
+        // Best-effort delivery: the adapter may refuse (unknown flag, wrong
+        // action) or die before reading stdin, closing the pipe first. Only
+        // BrokenPipe is tolerated, and the verdict below never comes from
+        // this write: exit code, stderr and the capture file still fail a
+        // genuinely broken adapter, which is what makes this a race fix and
+        // not a loosened assertion. (t-cdc77b3e: 4/6 gate runs flaked here.)
+        match child
             .stdin
             .as_mut()
             .unwrap()
             .write_all(&serde_json::to_vec(request).unwrap())
-            .unwrap();
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write request to adapter stdin: {error}"),
+        }
         child.wait_with_output().unwrap()
     }
 }
