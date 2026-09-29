@@ -40768,7 +40768,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 35, "the board did not migrate forward");
+    assert_eq!(migrated, 36, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -40800,7 +40800,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 35);
+    assert_eq!(again, 36);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any

@@ -2451,9 +2451,7 @@ CREATE TABLE attention (
  check_about TEXT,
  check_answered TEXT,
  check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),
- check_answered_at INTEGER,
- lane TEXT,
- return_trigger TEXT,
+ check_answered_at INTEGER, lane TEXT, return_trigger TEXT,
  CHECK(
    (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
     AND check_explanation IS NULL AND check_about IS NULL)
