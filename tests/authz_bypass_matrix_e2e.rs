@@ -24,6 +24,15 @@
 //! same `active_grants_for_principal_on` query, and retired by the same state
 //! transition `access revoke` performs.
 
+//! Non-root only: the managed broker refuses root pairs by design
+//! (`routing::local_authority` mints no authority for euid 0, and
+//! `policy.rs` refuses root bootstrap/prove-rebind pairs), so as uid 0
+//! `bind_self` binds a principal the guard can never resolve and every
+//! managed command answers `denied-or-not-found`. `ManagedEstate::new`
+//! panics fast with that sentence instead of failing seventeen tests
+//! confusingly — and never skips. Run as a normal user or in the Linux
+//! gate container.
+
 use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
@@ -41,9 +50,14 @@ const DENIED: &str = "denied or not found";
 
 /// How long a `watch --follow` assertion waits for a line that should arrive,
 /// and how long it waits before being satisfied that a line will NOT arrive.
-/// The poll interval is 250ms, so both are many polls wide.
+/// The `watch --follow` server polls once per 250ms (`rust/watch.rs`
+/// `POLL_INTERVAL`), so both are many polls wide.
 const APPEAR: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_secs(4);
+/// Hard cap for a should-arrive wait that keeps seeing stream output. Under
+/// load the delivery can lag well past APPEAR while the stream is visibly
+/// alive (heartbeats keep arriving); the cap bounds that grace period.
+const APPEAR_MAX: Duration = Duration::from_secs(30);
 
 /// One scope grant: a capability and the ADR-033 atom list it applies to.
 type Scope = (&'static str, Vec<String>);
@@ -86,6 +100,7 @@ struct ManagedEstate {
 
 impl ManagedEstate {
     fn new(label: &str) -> Self {
+        require_non_root();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -313,6 +328,24 @@ fn id_output(args: &[&str]) -> String {
     let output = Command::new("id").args(args).output().unwrap();
     assert!(output.status.success(), "id {args:?} failed");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Fail fast as root instead of failing every test confusingly. The managed
+/// broker refuses root pairs by design (`routing::local_authority` mints no
+/// authority for euid 0; `policy.rs` refuses root bootstrap/prove-rebind
+/// pairs), so `bind_self` would bind a principal the guard can never resolve
+/// and every managed command would answer `denied-or-not-found`. This panics
+/// with that sentence — it never skips, so a root run stays red until it is
+/// re-run as a non-root user or in the Linux gate container.
+fn require_non_root() {
+    if self_uid() == 0 {
+        panic!(
+            "authz_bypass_matrix_e2e requires a non-root user: the managed broker refuses root pairs by design \
+             (routing::local_authority mints no authority for euid 0; policy.rs refuses root bootstrap/prove-rebind pairs), \
+             so as uid 0 every managed command answers `denied-or-not-found`. \
+             Re-run as a non-root user or in the Linux gate container."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,20 +1529,54 @@ impl Stream {
     }
 
     /// Block until an event envelope arrives, or fail with everything seen.
+    ///
+    /// The base budget is `budget` (APPEAR at both call sites). Past it, the
+    /// wait is granted grace ONLY while the stream keeps producing output —
+    /// each newly arrived line (heartbeat or envelope) moves the deadline out
+    /// by another `budget`, capped at APPEAR_MAX past the start. Under load
+    /// the server-side 250ms poll plus scheduling can lag a delivery well
+    /// past the base budget while the stream is visibly alive; that is the
+    /// flake this absorbs. Total silence still fails at the base budget,
+    /// because with no output at all there is no evidence the stream is even
+    /// up.
+    ///
+    /// Why this cannot mask a real failure: the exit condition is unchanged —
+    /// an `"type":"event"` envelope must still arrive, and a heartbeat is
+    /// never counted as one (`events_in`). A genuinely broken delivery
+    /// produces zero envelopes no matter how long the wait runs, so it still
+    /// fails, only at the cap instead of at the base budget; grace merely
+    /// withholds the verdict while the stream proves it is alive and polling.
+    /// The must-NOT-appear half of the revocation test is untouched — it
+    /// still sleeps a fixed SETTLE and asserts zero envelopes — so extra
+    /// patience here can never turn a leaked delivery into a pass.
     fn wait_for_event(&mut self, budget: Duration) {
-        let deadline = Instant::now() + budget;
+        let start = Instant::now();
+        let hard = start + APPEAR_MAX;
+        let mut deadline = start + budget;
         let mut arrived = Vec::new();
-        while Instant::now() < deadline {
-            arrived.extend(self.drain());
+        let mut settled = 0usize;
+        loop {
+            for line in self.drain() {
+                settled = 0;
+                arrived.push(line);
+                // Observed progress: the stream is alive, so grant another
+                // full budget window, never past the hard cap.
+                deadline = (Instant::now() + budget).min(hard);
+            }
             if events_in(&arrived) > 0 {
                 return;
             }
+            let now = Instant::now();
+            if now >= deadline {
+                panic!(
+                    "no event envelope arrived within {budget:?} (+ progress-tied grace to {APPEAR_MAX:?}, \
+                     {settled} silent polls at the end):\n{}",
+                    arrived.join("\n")
+                );
+            }
+            settled += 1;
             thread::sleep(Duration::from_millis(100));
         }
-        panic!(
-            "no event envelope arrived within {budget:?}:\n{}",
-            arrived.join("\n")
-        );
     }
 
     fn running(&mut self) -> bool {

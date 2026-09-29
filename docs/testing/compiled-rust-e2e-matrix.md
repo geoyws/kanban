@@ -28,6 +28,14 @@ invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 compiled-process evidence. The gate as a whole is a
 unit/integration/process gate, not compiled-process E2E.
 
+**`authz_bypass_matrix_e2e` runs as non-root only.** The managed broker
+refuses root pairs by design (`rust/routing.rs` `local_authority` mints no
+authority for euid 0; `rust/policy.rs` refuses root bootstrap/prove-rebind
+pairs), so as uid 0 every managed command in that target answers
+`denied-or-not-found`. The suite fails fast with that sentence instead of
+failing test by test, and it never skips: run it as a normal user or in the
+Linux gate container.
+
 **Serialization is a rule, not a preference.** Each target runs as its own
 `cargo test --locked --test TARGET -- --test-threads=1`, and no cargo
 command runs concurrently with another. Some cases drive a real Chrome
