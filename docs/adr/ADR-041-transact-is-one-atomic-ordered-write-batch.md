@@ -596,3 +596,99 @@ Phase 3, MCP:
   `t-77e00737`; Phase 3 `t-ffab5763`; geoyws's ruling `e-321f6350` note 118
   (2026-09-07)
 - Measured at commit `58129a6` on `kanban-geoyws-driver`
+
+---
+
+## Amendment 2026-09-29 (slice BA): the CLI read batch, reads riding `transact`, one mail notice per envelope
+
+**Status of the amendment:** proposal, carried by slice BA
+(`docs/specs/batch.md`, task `t-ebb79c13`, child of epic `e-cf7e5aaa`). Nothing
+above is rewritten: the `transact` decision, the frozen read-only MCP `batch`,
+and every numbered acceptance case stand unchanged. What follows extends them.
+
+### What George ordered and what exists
+
+George, 2026-09-29 (epic `e-cf7e5aaa`): "`we need a way for our kb commands to
+accept multiple commands at one time and multiple replies... this way we can save
+on round trips.`" The epic records five gaps against the tree at
+`origin/kanban-geoyws-driver`: the MCP `batch` carries 32 reads per request with
+per-item results and the 12-read loop precedent (26,110.698 ms p50 to 423.932 ms
+p50), `transact` is atomic on both surfaces with `$ref` back-references — but the
+CLI has no read batch, `kb-board` transfers `--body-file` and not `--items-file`,
+reads cannot ride `transact` from any lane's point of view, skills do not batch,
+and outbox decision 5 (`e-ea261014`) wants the mail notice once per batch.
+
+### The extension, in one paragraph
+
+`kanban batch --items JSON_ARRAY | --items-file PATH` is the CLI twin of the MCP
+`batch`: the exact item shape (`{"name", "arguments"}`, `BATCH_LIMIT` 32,
+per-item `{index, ok, result|error}`, independent failures, reads only, nested
+and write refusals naming the fix). Reads are confirmed as `transact` items that
+observe the batch's uncommitted writes (this ADR's §5, now measured from the
+compiled surface and not only from Probe B). The outbox mail notice appears once
+per batch envelope, never per item. `kb-board` delivers `--items-file` across
+machines the way it delivers `--body-file`.
+
+### Alternatives considered and why they lost
+
+- **A shell loop over one-shots (no new surface).** Keeps the tree smallest and
+  was measured: 4 ssh one-shots at ~1.43 s against ~0.39 s collapsed
+  (`@@mbp` to `hax`, 6 runs each, `/usr/bin/time -p`). The loop pays one round
+  trip per operation (~357 ms apiece on this link) with no ceiling on how many a
+  lane chains, no shared refusal vocabulary, and no envelope for the mail notice
+  to sit on. It is the status quo, and the measurement is the argument against it.
+- **`transact`-only (reads ride the write batch, no CLI `batch`).** Tempting:
+  `transact` already accepts read items (probe (a1) 2026-09-29) and one process
+  answers them. But a pure-read loop through `transact` opens a write transaction
+  (`BEGIN IMMEDIATE`) it never needs, takes the write lock against every other
+  writer for the whole list, mints a `batchId` that will never appear in the
+  ledger (a rolled-back batch appends nothing, and a read-only batch always
+  "lands" vacuously), and answers `rolledBack`/`failedIndex` fields that mean
+  nothing for reads. Semantics the caller must then unlearn are worse than a
+  second command with first-command simplicity. Reads that decide inside a write
+  sequence still ride `transact` (slice BA `BA-06`); reads alone ride `batch`.
+
+### Measured numbers (2026-09-29, throwaway probes, writers' raw outputs kept)
+
+Link arms from `@@mbp` (`geoywsMBP.local`, M3 Max) to the board home (`hax`),
+fresh `ssh -o BatchMode=yes` per call, release `kb` on `hax`, 6 runs each:
+4 one-shots (`task show t-ebb79c13`) at 1.41–1.46 s per loop (mean ~1.43 s,
+~357 ms per round trip); one collapsed call answering the same 4 reads
+(`transact --items-file`, 4 `task_show`) at 0.38–0.40 s (mean ~0.39 s) —
+~3.7× at 4 reads, growing with N. The four collapsed answers were
+byte-identical to the single call (`json.dumps(sort_keys=True)` equal, all four).
+Local arms on the same machine (debug build, throwaway board, load ~12.4):
+4 one-shots at ~0.09 s against one collapsed call at ~0.038 s. Inside one
+persistent MCP session there is deliberately no local win (40.5 ms singles vs
+43.0 ms batch per 4-read loop): the MCP batch spawns the binary per entry and
+its value is the round-trip collapse, which is why the one-process CLI batch
+exists beside it.
+
+Probe (a): `transact` of one `task_show` answered `ok: true` (reads accepted);
+`claim` at index 0 then `task_show` at index 1 answered the claim back
+(`agentID` and `claimedAt` equal, before commit) — §5's sentence holds on the
+compiled surface. Rollback with a read/write mix: good `note` then bad-lease
+`checkpoint` answered `failedIndex: 1`, `rolledBack: true`, notes unchanged.
+SQLite semantics cited directly (`sqlite3 3.54.0`): one session under
+`BEGIN IMMEDIATE` sees its own uncommitted `INSERT` (count 2), a second
+connection sees the pre-batch snapshot (count 1), `ROLLBACK` returns 1 — the
+same-connection visibility the lent-board path relies on and the isolation that
+makes the rollback clean.
+
+Uncertainties, stated not smoothed: debug build on the local arms (release
+shrinks the constant, not which side wins); elevated load (~12.4) on the shared
+machine; 6 runs, not the 20 the release gate wants — the p50-over-20 link
+measurement is owned by `t-cdcfd429`, and the §6 table of slice BA is its
+acceptance baseline, not its replacement.
+
+### Consequences of the amendment
+
+- Slice BA (`BA-01`..`BA-12`) specifies the CLI batch, the transfer, the
+  read-in-transact confirmation, and the once-per-envelope mail placement; its
+  `OB-14`-blocked requirement (`BA-08`) places the notice without redefining it.
+- Phase rows: `t-034b6a11` implements (draft until BA is SPEC-READY),
+  `t-f52e9016` teaches batching in the skills, `t-cdcfd429` owns the release
+  gate and the p50-over-20 link numbers.
+- This ADR's acceptance list gains no new numbered case here; slice BA's §8
+  planned table (12 rows, all `process`, all `no e2e coverage`) is the draft the
+  matrix takes when it lands.
