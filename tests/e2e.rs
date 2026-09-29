@@ -42658,3 +42658,168 @@ fn successful_claim_stores_the_caller_string_verbatim() {
     assert_eq!(shown["assignee"], "claude@driver-2");
     assert_eq!(shown["status"], "in_progress");
 }
+
+/// One board named `name` in its own fixture, and a `deploy start` against it
+/// (docs/specs/deploy.md §4 `START`).
+fn deploy_tier_board(test: &str, name: &str) -> Fixture {
+    let fixture = Fixture::new(&format!("deploy-{test}-{}", name.to_lowercase()));
+    fixture.ok_json(&fixture.main, &["init", "--name", name, "--json"]);
+    fixture
+}
+
+fn deploy_tier_start(fixture: &Fixture, tier: &str, host: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "deploy",
+        "start",
+        "--repo",
+        "geoyws/example",
+        "--commit",
+        "1111111111111111111111111111111111111111",
+        "--tier",
+        tier,
+        "--environment",
+        "env",
+        "--host",
+        host,
+        "--url",
+        "https://x",
+        "--as",
+        "e2e",
+    ];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    fixture.run(&fixture.main, &args)
+}
+
+fn deploy_tier_accepted(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "deploy start was refused: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn deploy_tier_attempt_count(fixture: &Fixture) -> usize {
+    fixture
+        .ok_json(&fixture.main, &["deploy", "list", "--all", "--json"])
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// DEPLOY-05, DEPLOY-07, DEPLOY-08: a Unum or geoyws board records the dev
+/// tiers on `hax`; a replay still returns before the pairing check; the board
+/// schema does not move.
+#[test]
+fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
+    for board in ["kanban", "acies", "unum", "unum-web"] {
+        let fixture = deploy_tier_board("hax-ok", board);
+        for tier in ["@_bdt", "@_bd"] {
+            let started = deploy_tier_accepted(&deploy_tier_start(&fixture, tier, "hax", &[]));
+            let attempt = &started;
+            assert_eq!(attempt["host"], "hax", "{board} {tier}: {started}");
+            assert_eq!(attempt["tier"], tier, "{board} {tier}: {started}");
+        }
+    }
+
+    let fixture = deploy_tier_board("hax-ok", "kanban");
+    let first = deploy_tier_accepted(&deploy_tier_start(
+        &fixture,
+        "@_bdt",
+        "hax",
+        &["--operation-id", "op-1"],
+    ));
+    let again = deploy_tier_accepted(&deploy_tier_start(
+        &fixture,
+        "@_bdt",
+        "hax",
+        &["--operation-id", "op-1"],
+    ));
+    assert_eq!(again["idempotentReplay"], true, "{again}");
+    assert_eq!(again["id"], first["id"]);
+    assert_eq!(deploy_tier_attempt_count(&fixture), 1);
+
+    let board = board_path_for_project(&fixture, &fixture.main, "kanban");
+    let schema = Connection::open(board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(
+        schema, 36,
+        "a dev-tier attempt on hax moved the board schema"
+    );
+}
+
+/// DEPLOY-06: an IFCA board, and a board no estate claims, keep the dev tiers
+/// off `hax`, in exactly the words the slice states, and write nothing.
+#[test]
+fn deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards() {
+    for (board, why) in [
+        ("px", "is in estate ifca"),
+        ("prjx-root", "is in estate ifca"),
+        ("TIERHOST", "maps to no estate"),
+    ] {
+        let fixture = deploy_tier_board("hax-no", board);
+        for tier in ["@_bdt", "@_bd"] {
+            assert_eq!(
+                refusal_object(&deploy_tier_start(&fixture, tier, "hax", &[])),
+                format!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {board} {why}, so deploy it from geoywsMBP (or geoywsMBA)"
+                )
+            );
+        }
+        assert_eq!(
+            deploy_tier_attempt_count(&fixture),
+            0,
+            "a refused dev-tier start on hax wrote an attempt for {board}"
+        );
+    }
+    // Byte-exact host: another spelling of hax is an ordinary Hetzner host.
+    let fixture = deploy_tier_board("hax-no", "kanban");
+    assert_eq!(
+        refusal_object(&deploy_tier_start(&fixture, "@_bdt", "HAX", &[])),
+        "tier @_bdt is an MBP tier (canonical row \"@_bdt -> geoywsMBP\"), but host is HAX; deploy it from geoywsMBP (or geoywsMBA)"
+    );
+}
+
+/// DEPLOY-02, DEPLOY-03: every other pairing refusal is byte-identical to the
+/// baseline, for a board the hax exception would otherwise favour.
+#[test]
+fn deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words() {
+    let fixture = deploy_tier_board("same-words", "kanban");
+    for tier in ["@_bdt", "@_bd"] {
+        assert_eq!(
+            refusal_object(&deploy_tier_start(&fixture, tier, "hig", &[])),
+            format!(
+                "tier {tier} is an MBP tier (canonical row \"{tier} -> geoywsMBP\"), but host is hig; deploy it from geoywsMBP (or geoywsMBA)"
+            )
+        );
+    }
+    for host in ["geoywsMBP", "geoywsMBA"] {
+        assert_eq!(
+            refusal_object(&deploy_tier_start(&fixture, "@_p", host, &[])),
+            format!(
+                "tier @_p is a Hetzner tier (canonical row \"@_p -> Hetzner host\"), but host is {host}; deploy it from a Hetzner host (e.g. hax or hig)"
+            )
+        );
+    }
+    assert_eq!(deploy_tier_attempt_count(&fixture), 0);
+}
+
+/// DEPLOY-01, DEPLOY-04: an IFCA board still records the dev tiers on the MBP
+/// and the Hetzner tiers on hax.
+#[test]
+fn deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board() {
+    let fixture = deploy_tier_board("ifca-pairs", "px");
+    for (tier, host) in [
+        ("@_bdt", "geoywsMBP"),
+        ("@_bd", "geoywsMBA"),
+        ("@_p", "hax"),
+        ("@_uat", "hig"),
+    ] {
+        let started = deploy_tier_accepted(&deploy_tier_start(&fixture, tier, host, &[]));
+        assert_eq!(started["host"], host, "{tier} {host}");
+    }
+    assert_eq!(deploy_tier_attempt_count(&fixture), 4);
+}

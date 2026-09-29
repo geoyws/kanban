@@ -471,25 +471,28 @@ served markup, so there is no browser surface to drive.
 
 ## Requirements trace — `docs/specs/deploy.md` DEPLOY-01..DEPLOY-08
 
-The DEPLOY slice is `SPEC-READY` on 2026-09-30 on branch `kanban-geoyws-driver` at commit `863667d`;
-the implementation row is `t-1220f80f`. `Layer` uses the specification's vocabulary: `process`
-is a compiled-binary process-boundary exchange in `tests/e2e.rs`. The one existing name was
-enumerated with `cargo test --test e2e -- --list` at the baseline; every other row is planned,
-carries `none` / `none` and says `no e2e coverage` plainly until the implementation enumerates
-its real name. All 8 requirements are `MUST`; the slice has no browser surface.
+The DEPLOY slice is `SPEC-READY` on 2026-09-30 (commit `93103f8`) and implemented by row
+`t-1220f80f` on branch `wt/t-c720eb6b-deploy`. `Layer` uses the specification's vocabulary:
+`process` is a compiled-binary process-boundary exchange in `tests/e2e.rs`. All 8 requirements
+are `MUST` and all 8 are proved at `process`; every name was enumerated with
+`cargo test --test e2e -- --list`. Two of the four new tests
+(`deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` and
+`deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards`) fail on the baseline and
+pass with the change; the other two pin the pairings the change must not move. The slice has no
+browser surface.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `DEPLOY-01` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_bdt` on `geoywsMBP` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` as planned `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` |
-| `DEPLOY-02` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words`, owed by `t-1220f80f` (the existing test checks substrings only) |
-| `DEPLOY-03` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words`, owed by `t-1220f80f` (the existing test checks substrings only) |
-| `DEPLOY-04` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_p` on `hax` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` as planned `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` |
-| `DEPLOY-05` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards`, owed by `t-1220f80f` |
-| `DEPLOY-06` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards`, owed by `t-1220f80f` |
-| `DEPLOY-07` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards`, owed by `t-1220f80f` |
-| `DEPLOY-08` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards`, owed by `t-1220f80f` |
+| `DEPLOY-01` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_bdt` on `geoywsMBP` and `@_bd` on `geoywsMBA`; `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` covers an unmapped board |
+| `DEPLOY-02` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_bdt` and `@_bd` on `hig` for board `kanban` get the baseline MBP-tier sentence, compared byte-for-byte; nothing is written |
+| `DEPLOY-03` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_p` on `geoywsMBP` and `geoywsMBA` get the baseline Hetzner-tier sentence, compared byte-for-byte |
+| `DEPLOY-04` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_p` on `hax` and `@_uat` on `hig`; the existing test covers an unmapped board |
+| `DEPLOY-05` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | boards `kanban`, `acies`, `unum` and `unum-web` record `@_bdt` and `@_bd` on `hax` |
+| `DEPLOY-06` | MUST | process | `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards` | boards `px`, `prjx-root` (estate ifca) and `TIERHOST` (no estate) are refused on `hax` in the two exact sentences and write no attempt; `HAX` is not `hax` |
+| `DEPLOY-07` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | a repeated `--operation-id op-1` returns the same attempt with `idempotentReplay: true` and one attempt row |
+| `DEPLOY-08` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | after the `hax` attempts the board file reads `PRAGMA user_version` 36 |
 
-8 requirements: 8 MUST, 2 proved at `process` by an existing test, 6 planned.
+8 requirements: 8 MUST, 8 proved at `process`.
 
 ## Watch coverage note
 

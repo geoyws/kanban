@@ -1868,8 +1868,8 @@ pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verifica
 /// ("Deployment tiers" section): `@_bdt` and `@_bd` are MBP tiers, hosted on
 /// `geoywsMBP` (or the thin client `geoywsMBA`); `@_bst`, `@_bs`, `@_s`,
 /// `@_uat` and `@_p` are Hetzner tiers. Every other canonical tier is Hetzner
-/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table — no other
-/// pairing is hard-coded anywhere.
+/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table, apart from
+/// the one exception [`DEV_TIER_HAX_HOST`] names.
 pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
 
 /// The only hostnames that are MBP. Everything else is treated as a Hetzner
@@ -1877,6 +1877,17 @@ pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
 /// host (`@_bdt` on `hig`, measured in the field) is refused, while a Hetzner
 /// tier on `geoywsMBP` is refused as the mirror image.
 pub const MBP_HOSTS: [&str; 2] = ["geoywsMBP", "geoywsMBA"];
+
+/// The one Hetzner host where the MBP tiers may also run, and only for boards
+/// in [`DEV_TIER_HAX_ESTATES`] (George, 2026-09-28: "`@_bdt` and `@_bd` run on
+/// `@@hax` for the Unum and geoyws estates"; docs/specs/deploy.md DEPLOY-05).
+/// Compared byte-exact: an alias or another spelling is not this host.
+pub const DEV_TIER_HAX_HOST: &str = "hax";
+
+/// The board estates whose MBP-tier attempts may record host
+/// [`DEV_TIER_HAX_HOST`]. IFCA boards and boards no estate claims keep the
+/// MBP hosts only (DEPLOY-06).
+pub const DEV_TIER_HAX_ESTATES: [&str; 2] = ["unum", "geoyws"];
 
 /// A full Git commit: 40 lowercase hexadecimal characters, and nothing
 /// shorter.

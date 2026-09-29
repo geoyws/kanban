@@ -259,3 +259,6 @@ exist. The matrix section carries the same mapping.
   unreachable `(unnamed)` case is marked defensive; A6 reads the board file's `user_version`;
   DEPLOY-08 reads the row's CHECK phrase against the measured schema; A2 and the `START`
   abbreviation are literal. No requirement changed.
+- `2026-09-30` — implemented by `t-1220f80f`: `DEV_TIER_HAX_HOST` and `DEV_TIER_HAX_ESTATES` in
+  `rust/model.rs`, the exception in `require_deploy_tier_host` (`rust/store.rs`), four new
+  process tests now named in the matrix, and the ADR-030 amendment. No requirement changed.

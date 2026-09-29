@@ -9979,10 +9979,26 @@ impl Store {
     /// so this guards only new records; a replay of one already written is
     /// returned before it is reached. Only [`MBP_TIERS`] on a non-MBP host and
     /// non-MBP tiers on an [`MBP_HOSTS`] host are refused, because every other
-    /// host is Hetzner by exclusion (see the constants in `model.rs`).
-    fn require_deploy_tier_host(tier: &str, host: &str) -> Result<()> {
+    /// host is Hetzner by exclusion (see the constants in `model.rs`) — with
+    /// one exception: an MBP tier on [`DEV_TIER_HAX_HOST`] is accepted for a
+    /// board whose estate is in [`DEV_TIER_HAX_ESTATES`], and refused by name
+    /// for any other board (docs/specs/deploy.md DEPLOY-05, DEPLOY-06). The
+    /// estate comes from the board's registered name, never from the caller.
+    fn require_deploy_tier_host(tier: &str, host: &str, board: Option<&str>) -> Result<()> {
         let mbp_tier = MBP_TIERS.contains(&tier);
         let mbp_host = MBP_HOSTS.contains(&host);
+        if mbp_tier && host == DEV_TIER_HAX_HOST {
+            let name = board.unwrap_or("(unnamed)");
+            return match board.and_then(estate_for_board) {
+                Some(estate) if DEV_TIER_HAX_ESTATES.contains(&estate) => Ok(()),
+                Some(estate) => bail!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {name} is in estate {estate}, so deploy it from geoywsMBP (or geoywsMBA)"
+                ),
+                None => bail!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {name} maps to no estate, so deploy it from geoywsMBP (or geoywsMBA)"
+                ),
+            };
+        }
         if mbp_tier && !mbp_host {
             bail!(
                 "tier {tier} is an MBP tier (canonical row \"{tier} -> geoywsMBP\"), but host is {host}; deploy it from geoywsMBP (or geoywsMBA)"
@@ -10107,7 +10123,12 @@ impl Store {
                 });
             }
         }
-        Self::require_deploy_tier_host(&input.tier, &host)?;
+        let board_name: Option<String> = transaction
+            .query_row("SELECT value FROM board_meta WHERE key='name'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Self::require_deploy_tier_host(&input.tier, &host, board_name.as_deref())?;
         let id = format!("d-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let capability_token = Uuid::new_v4().to_string();
         let now = now_ms();
