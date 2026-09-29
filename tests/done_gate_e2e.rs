@@ -1530,6 +1530,7 @@ fn a17_done_gate_checkpoint_done_is_gated() {
 
     // No verdict: the done checkpoint is refused with sentence 1 and writes
     // nothing — row, lease, checkpoints and events unchanged.
+    let checkpoints_before = estate.show("t-x")["checkpoints"].as_array().unwrap().len();
     let before = estate.snapshot("t-x");
     let refused = estate.checkpoint_state("t-x", &lease, EXEC, H1, "done");
     assert!(!refused.status.success(), "gated done checkpoint succeeded");
@@ -1540,13 +1541,40 @@ fn a17_done_gate_checkpoint_done_is_gated() {
         "refusal wording differs byte-for-byte"
     );
     estate.assert_unchanged("t-x", &before);
+    assert_eq!(
+        estate.show("t-x")["checkpoints"].as_array().unwrap().len(),
+        checkpoints_before,
+        "refused done checkpoint wrote a checkpoint row"
+    );
     assert_eq!(estate.show("t-x")["status"], "in_progress");
 
-    // Positive: a foreign-actor verdict covering the head lets the same
-    // checkpoint through, closing the row.
+    // The gate judges the head the checkpoint records: with only the H1
+    // verdict present, a done checkpoint recording fresh H2 is stale
+    // (sentence 2) and lands nothing — including no checkpoint row.
     let aid = estate.resolved_attention("t-x");
     estate.verdict_ok("t-x", REVIEWER, &[H1], &[&aid], PLANNER);
-    let done = estate.checkpoint_state("t-x", &lease, EXEC, H1, "done");
+    let stale_before = estate.snapshot("t-x");
+    let stale_count = estate.show("t-x")["checkpoints"].as_array().unwrap().len();
+    let stale = estate.checkpoint_state("t-x", &lease, EXEC, H2, "done");
+    assert!(!stale.status.success(), "stale done checkpoint succeeded");
+    let stale_value: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(
+        stale_value["error"].as_str().unwrap(),
+        s2_stale("t-x", H1, H2),
+        "refusal wording differs byte-for-byte"
+    );
+    estate.assert_unchanged("t-x", &stale_before);
+    assert_eq!(
+        estate.show("t-x")["checkpoints"].as_array().unwrap().len(),
+        stale_count,
+        "refused stale checkpoint wrote a checkpoint row"
+    );
+    assert_eq!(estate.show("t-x")["status"], "in_progress");
+
+    // Positive: a fresh foreign-actor verdict at H2 lets the same
+    // checkpoint through, closing the row.
+    estate.verdict_ok("t-x", REVIEWER, &[H2], &[&aid], PLANNER);
+    let done = estate.checkpoint_state("t-x", &lease, EXEC, H2, "done");
     assert!(
         done.status.success(),
         "verdict-covered done checkpoint refused\nstdout: {}\nstderr: {}",
