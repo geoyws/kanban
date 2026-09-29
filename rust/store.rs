@@ -122,6 +122,104 @@ fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse user text shaped like a credential, before it reaches any INSERT.
+///
+/// Estate triage (kb t-d65fa53a) showed 85 of 104 `generic-api-key` findings
+/// are hashes, ids and template lines, so broad secret rules would
+/// false-refuse legitimate board writes. Only two high-signal shapes are
+/// checked, both with near-zero legitimate board use:
+/// - AWS access key IDs: `AKIA` followed by 16 uppercase ASCII alphanumerics.
+/// - PEM private-key headers: `-----BEGIN [RSA |OPENSSH |EC |DSA ]PRIVATE KEY-----`.
+///
+/// Fail-closed: every caller runs this after authorization and before the
+/// first `INSERT`/`UPDATE`, under the write lock where the path already holds
+/// one, so a refusal writes nothing. The refusal names the shape and the
+/// label, so the caller reads the exit status and the fix in one message.
+fn reject_secret_shaped_text(value: &str, label: &str) -> Result<()> {
+    if contains_aws_access_key_id(value) {
+        bail!(
+            "refusing {label}: text looks like an AWS access key ID (AKIA...); credentials do not belong on the board"
+        );
+    }
+    if contains_pem_private_key_header(value) {
+        bail!(
+            "refusing {label}: text looks like a PEM private key header; credentials do not belong on the board"
+        );
+    }
+    Ok(())
+}
+
+/// `AKIA` followed by 16 uppercase ASCII alphanumerics, anywhere in the text.
+/// A longer uppercase run still contains the shape at its start and is
+/// refused; hashes and UUIDs never match because neither carries the `AKIA`
+/// prefix in uppercase.
+fn contains_aws_access_key_id(value: &str) -> bool {
+    const PREFIX: &[u8] = b"AKIA";
+    const SUFFIX_LEN: usize = 16;
+    let bytes = value.as_bytes();
+    bytes.windows(PREFIX.len() + SUFFIX_LEN).any(|window| {
+        window.starts_with(PREFIX)
+            && window[PREFIX.len()..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() && !byte.is_ascii_lowercase())
+    })
+}
+
+/// One of the five literal PEM private-key headers, anywhere in the text.
+fn contains_pem_private_key_header(value: &str) -> bool {
+    const HEADERS: [&str; 5] = [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN DSA PRIVATE KEY-----",
+    ];
+    HEADERS.iter().any(|header| value.contains(header))
+}
+
+/// Every DecisionCard prose field the attention row stores verbatim: the
+/// question, the context, and each choice's label and consequence. Choice
+/// keys and outcomes are machine grammar, not prose, and stay unchecked.
+fn reject_card_text(card: &DecisionCard) -> Result<()> {
+    if let Some(question) = &card.question {
+        reject_secret_shaped_text(question, "attention question")?;
+    }
+    if let Some(context) = &card.context {
+        reject_secret_shaped_text(context, "attention context")?;
+    }
+    for choice in &card.choices {
+        reject_secret_shaped_text(
+            &choice.label,
+            &format!("attention choice {} label", choice.key),
+        )?;
+        reject_secret_shaped_text(
+            &choice.consequence,
+            &format!("attention choice {} consequence", choice.key),
+        )?;
+    }
+    Ok(())
+}
+
+/// Every comprehension-check definition field the attention row stores
+/// verbatim. The choice keys are machine grammar and stay unchecked.
+fn reject_check_text(check: &AttentionCheck) -> Result<()> {
+    reject_secret_shaped_text(&check.question, "attention check question")?;
+    for choice in &check.choices {
+        reject_secret_shaped_text(
+            &choice.label,
+            &format!("attention check choice {} label", choice.key),
+        )?;
+    }
+    if let Some(answer) = &check.answer {
+        reject_secret_shaped_text(answer, "attention check answer")?;
+    }
+    if let Some(explanation) = &check.explanation {
+        reject_secret_shaped_text(explanation, "attention check explanation")?;
+    }
+    reject_secret_shaped_text(&check.about, "attention check about")?;
+    Ok(())
+}
+
 fn subscription_identifier(value: &str, label: &str, max: usize) -> Result<String> {
     let value = nonempty(value, label)?;
     if value.len() > max
@@ -5322,6 +5420,12 @@ impl Store {
         // A new row has no old tag set; the resulting set is what the caller
         // asked for. Under the mutation lock.
         self.authz.check_write(&[], &input.tags)?;
+        // Credential-shaped prose never reaches the row: refused under the
+        // lock, after authorization, before the first INSERT.
+        reject_secret_shaped_text(&title, "task title")?;
+        if let Some(body) = &input.body {
+            reject_secret_shaped_text(body, "task body")?;
+        }
         // A removed id is never reused: its surviving linked rows would
         // re-parent under the new row's tags. Refused before the INSERT, so
         // a live id answers `already exists` instead of the raw UNIQUE
@@ -5936,6 +6040,14 @@ impl Store {
         let previous_stale = current.stale_minutes;
         let previous_driver = current.driver_only;
         let previous_priority = current.priority;
+        // Only newly supplied prose is checked: a row that already carries
+        // secret-shaped text (written before the guard) must stay updatable.
+        if let Some(title) = &input.title {
+            reject_secret_shaped_text(title, "task title")?;
+        }
+        if let Some(Some(body)) = &input.body {
+            reject_secret_shaped_text(body, "task body")?;
+        }
         let title = input.title.unwrap_or(current.title);
         let body = input.body.unwrap_or(current.body);
         let assignee = input.assignee.unwrap_or(current.assignee);
@@ -6342,6 +6454,7 @@ impl Store {
         if task.archived {
             bail!("task {id} is archived history and cannot be changed");
         }
+        reject_secret_shaped_text(body, "note body")?;
         let now = now_ms();
         transaction.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
@@ -6418,6 +6531,18 @@ impl Store {
             )?;
         } else {
             require_no_blocking_gates(&transaction, &input.task_id, GateCaller::Holder)?;
+        }
+        // Checkpoints carry lane state including pasted commands, so their
+        // prose trio is guarded like the handoff's. `state` is validated
+        // grammar above, not prose, and stays unchecked.
+        reject_secret_shaped_text(&input.summary, "checkpoint summary")?;
+        reject_secret_shaped_text(&input.intent, "checkpoint intent")?;
+        reject_secret_shaped_text(&input.next_action, "checkpoint next action")?;
+        for blocker in &input.blockers {
+            reject_secret_shaped_text(blocker, "checkpoint blocker")?;
+        }
+        for validation in &input.validations {
+            reject_secret_shaped_text(validation, "checkpoint validation")?;
         }
         transaction.execute(
             "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -6758,6 +6883,7 @@ impl Store {
                 bail!("task {id} is archived history and cannot be changed");
             }
         }
+        reject_secret_shaped_text(&body, "sitrep body")?;
         let now = now_ms();
         let id = format!("sr-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
@@ -6917,6 +7043,13 @@ impl Store {
             if task.archived {
                 bail!("task {id} is archived history and cannot be changed");
             }
+        }
+        // Credential-shaped prose never reaches the row: body, card and check
+        // definition, under the lock, after the attach check, before INSERT.
+        reject_secret_shaped_text(&body, "attention body")?;
+        reject_card_text(card)?;
+        if let Some(check) = check {
+            reject_check_text(check)?;
         }
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -7403,6 +7536,18 @@ impl Store {
             );
         }
         let check = check.map(AttentionCheckInput::parse).transpose()?.flatten();
+        // Only newly supplied prose is checked: the merged card below carries
+        // stored text that predates the guard, so checking it would wedge
+        // rows written before the guard existed.
+        if let Some(value) = body {
+            reject_secret_shaped_text(value, "attention body")?;
+        }
+        if let Some(card) = card {
+            reject_card_text(card)?;
+        }
+        if let Some(check) = &check {
+            reject_check_text(check)?;
+        }
         // The column, not the served row: a row that authored no choices is
         // served as the default pair, and merging that pair in would turn a
         // never-authored row into an authored one on a body-only update.
@@ -7603,8 +7748,12 @@ impl Store {
                 existing.raised_by
             );
         }
-        // After the actor rule, so a caller who may not answer this row does
-        // not learn which trigger forms the board accepts.
+        // The custom note is free prose, so shape-check it after the actor
+        // rule, before the composer turns it into resolution text.
+        if let Some(note) = answer.note {
+            reject_secret_shaped_text(note, "attention resolution note")?;
+        }
+
         let return_trigger = return_trigger
             .map(|value| board_return_trigger(&transaction, value))
             .transpose()?;
@@ -7766,6 +7915,7 @@ impl Store {
         // not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
+        reject_secret_shaped_text(&note, "reopen note")?;
         let existing = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
@@ -8023,6 +8173,12 @@ impl Store {
         let transaction = self.begin_write()?;
         // Handoffs carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
+        for blocker in &input.blockers {
+            reject_secret_shaped_text(blocker, "handoff blocker")?;
+        }
+        for validation in &input.validations {
+            reject_secret_shaped_text(validation, "handoff validation")?;
+        }
         let now = now_ms();
         let prior_status = input
             .task_id
@@ -8065,6 +8221,11 @@ impl Store {
         let summary = nonempty(&input.summary, "summary")?.to_owned();
         let intent = nonempty(&input.intent, "intent")?.to_owned();
         let next = nonempty(&input.next_action, "next action")?.to_owned();
+        // Credential-shaped prose never reaches either row: refused under the
+        // lock, after authorization, before the checkpoint/handoff INSERTs.
+        reject_secret_shaped_text(&summary, "handoff summary")?;
+        reject_secret_shaped_text(&intent, "handoff intent")?;
+        reject_secret_shaped_text(&next, "handoff next action")?;
         let blockers = serde_json::to_string(&input.blockers)?;
         let validations = serde_json::to_string(&input.validations)?;
         // A task handoff closes the task with a checkpoint, so a successor
@@ -8348,6 +8509,7 @@ impl Store {
         let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
+        reject_secret_shaped_text(&note, "retire note")?;
         let existing = absent_as_denied(
             transaction
                 .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
