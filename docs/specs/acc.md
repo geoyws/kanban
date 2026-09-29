@@ -571,6 +571,48 @@ keeps its plain `not found` message and authorized attaches work as before.
 *event's own snapshot, so the tails and the index agree instead of the
 *index dropping what the tails serve.
 
+### A23 — a removed task's linked rows stay tag-gated on every surface (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* the owner posts a sitrep `--task`, creates a handoff, raises an
+untagged attention row and starts a deployment `--task` on a `secret` task
+and then removes the task, *then* the caller sees none of them in any
+listing, in search, in a lane-filtered sitrep listing, on the deployment
+listing or in a `watch --follow` stream, and `handoff retire`, `handoff
+accept`, `attention show`, `deploy show` and `deploy finish` answer exactly
+as for a never-created id — the same exit code and byte-identical stderr
+carrying the generic denial, with nothing recorded — while genuinely
+taskless rows (a lanewide sitrep, a session handoff, a taskless deployment,
+an untagged attention row) stay readable to the same caller and the owner
+still sees every row. *When* no enforcement applies, *then* an unknown id
+keeps its plain `not found` message. The board schema moves `35` → `36`:
+the four links become plain `TEXT` with no foreign key, so a removal keeps
+the orphaned id and every read path gates it on the task's last-known
+removal tags. Rows already nulled by an older removal recover their link
+from their creation event — but only when that event's task has a
+`task_removed` record and no live row — so session handoffs, lanewide
+sitreps and taskless deployments stay NULL. Accepting an orphaned handoff is
+an acknowledgement that mints no lease, and the archive sweep files orphaned
+handoffs and events away once they are old. A deployment naming a task with
+neither a live row nor a removal record hides just that row instead of
+failing the listing, and `doctor` reports it under `orphanedTaskLinks`.
+
+### A24 — a removed task's id is never reused (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* the owner posts a sitrep on a `secret` task and then removes
+the task, *then* `task add --id` naming the removed id is refused exactly
+like `task add --id` naming a live `secret` id — the same exit code and
+byte-identical stderr carrying the generic denial, with nothing recorded —
+and the caller sees the surviving sitrep on no listing, while the owner
+still reads it. *When* no enforcement applies, *then* re-adding a removed id
+answers `task X was removed and its id cannot be reused`, and re-adding a
+live id answers `task X already exists`, replacing the raw `UNIQUE
+constraint failed`. Removed ids stay unreusable on every board, managed or
+not, through `task add` and through import, because the rows that outlive a
+removal keep the orphaned id and would otherwise re-parent under the new
+row's tags.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -671,7 +713,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -779,3 +821,60 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   HTTP route halves of the pre-serve fix are moot with serve retired, and a
   removed task with no removal record still fails closed with the stale-entry
   tag.
+
+- 2026-09-29 — ACC-14 removed-task-link evidence landed (`t-2cffbe08` port of
+  `983265c`, CLI paths only): `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`
+  seeds a sitrep, a handoff, an untagged attention row and a deployment attempt
+  on a `secret` task plus genuinely taskless control rows, then removes the
+  task: a caller holding only board read and write sees no trace of the
+  orphaned rows in any listing, in search, in a lane-filtered sitrep listing
+  (the stand-in for the retired `/api/v1/lanes` surface), on the deployment
+  listing or in a `watch --follow` stream, and `handoff retire`, `handoff
+  accept`, `attention show`, `deploy show` and `deploy finish` answer
+  byte-identically to a never-created id — while every control row stays
+  readable and the owner still sees every row (A23). The landing fixed the
+  leak as a bug; requirement wording is unchanged apart from the new A23. The
+  four links were `ON DELETE SET NULL`, so removing the task rewrote each
+  row's `task_id` to NULL and every gate read the orphaned row as board
+  scope. The board schema moves `35` → `36`: the links are plain `TEXT` with
+  no foreign key — the `subscriptions.subject_task_id` precedent — so a
+  removal keeps the id and the listings, the index (`document_row_tags`
+  through the sibling cache's removal union), the handoff transitions and the
+  deployment gates resolve it through the task's last-known removal tags,
+  failing closed with no record. Rows already nulled by an older removal
+  recover their link from their creation event when that event's task has a
+  `task_removed` record and no live row; session handoffs, lanewide sitreps
+  and taskless deployments stay NULL.
+
+- 2026-09-29 — ACC-14 orphan follow-throughs landed (`t-2cffbe08` port of
+  `b8ec141`, CLI paths only): accepting a handoff orphaned by removal is an
+  acknowledgement that mints no lease (the accept receipt falls back to board
+  scope rule summaries through `task_row_exists`, exactly like a session
+  acknowledgement), and the archive sweep files orphaned handoffs and events
+  away once they are old; a deployment naming a task with neither a live row
+  nor a removal record hides just that row, and `doctor` reports it under
+  `orphanedTaskLinks` — pinned by
+  `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`,
+  `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`,
+  `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`,
+  `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`
+  and `schema_36_backfills_pre_v36_nulled_links_from_creation_events` (A23).
+
+- 2026-09-29 — ACC-14 id-reuse evidence landed (`t-2cffbe08` port of `776e77e`,
+  CLI paths only):
+  `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids` removes
+  a `secret` task carrying a sitrep and probes the freed id beside a live
+  `secret` id as a caller holding board read and untagged write: both `task
+  add --id` attempts answer the one generic denial with the same exit code
+  and byte-identical stderr and record nothing, the sitrep reaches no
+  listing, and the owner still reads it (A24).
+  `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`
+  pins the unenforced halves: a live id answers `task X already exists` and
+  a removed id answers `task X was removed and its id cannot be reused`. The
+  landing fixed the leak as a bug and added the A24 wording: `task add`
+  refused a live id with the raw `UNIQUE constraint failed` — an existence
+  oracle — while a removed id could be recreated, re-parenting every
+  surviving linked row under the new row's tags. `refuse_reused_task_id` now
+  refuses any id naming a live row, a `task_removed` record or any event
+  history — read-gated under enforcement so a caller who cannot read the
+  id's tags gets the generic denial — on `task add` and on import alike.

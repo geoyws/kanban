@@ -712,6 +712,52 @@ fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str
     absent_as_denied(get_task(connection, id)?, "task", id, authz)
 }
 
+/// The last-known tag evidence for a task row that no longer exists: the
+/// union of the `_semanticV1.tags` snapshots frozen into EVERY
+/// `task_removed` event naming the id, or `None` when no removal record names
+/// it at all.
+///
+/// `remove_task` writes its `task_removed` event before the DELETE, so each
+/// removal snapshot holds the tag set the task carried at that removal. The
+/// union over all of them — rather than the latest alone — is what keeps a
+/// removed-and-recreated-and-removed-untagged task from laundering its
+/// secret-era history: a tag present at ANY removal still gates every one of
+/// the task's surviving rows. `Some(vec![])` means the task was removed while
+/// carrying no tag, which authorizes exactly like a live untagged task;
+/// `None` (no removal record: a partial restore, a hand edit) fails closed
+/// at the caller.
+pub(crate) fn removed_task_tag_union(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<Vec<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq ASC",
+    )?;
+    let payloads = statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let found = !payloads.is_empty();
+    let mut union = Vec::new();
+    for payload in &payloads {
+        // Fail closed: an unreadable removal record is an error, never
+        // an untagged task.
+        let value: Value = serde_json::from_str(payload).with_context(|| {
+            format!("task {id} carries a task_removed payload that is not JSON")
+        })?;
+        if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
+            union.extend(
+                frozen
+                    .iter()
+                    .filter_map(|tag| tag.as_str())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    union.sort();
+    union.dedup();
+    Ok(found.then_some(union))
+}
+
 /// A per-search-request cache of tag sets and row-existence answers
 /// (`t-e9c0127a`). Authorizing every indexed document on every request used to
 /// cost, per event document, a primary-key SELECT of the full payload, a JSON
@@ -800,35 +846,211 @@ impl SearchTagCache {
         if let Some(cached) = self.removed_task_tags.get(id) {
             return Ok(cached.clone());
         }
-        let mut statement = connection.prepare(
-            "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq ASC",
-        )?;
-        let payloads = statement
-            .query_map([id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let found = !payloads.is_empty();
-        let mut union = Vec::new();
-        for payload in &payloads {
-            // Fail closed: an unreadable removal record is an error, never
-            // an untagged task.
-            let value: Value = serde_json::from_str(payload).with_context(|| {
-                format!("task {id} carries a task_removed payload that is not JSON")
-            })?;
-            if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
-                union.extend(
-                    frozen
-                        .iter()
-                        .filter_map(|tag| tag.as_str())
-                        .map(str::to_owned),
-                );
-            }
-        }
-        union.sort();
-        union.dedup();
-        let answer = found.then_some(union);
+        let answer = removed_task_tag_union(connection, id)?;
         self.removed_task_tags.insert(id.to_owned(), answer.clone());
         Ok(answer)
     }
+}
+
+/// The tags an ABSENT task id authorizes against (ACC-14): a deleted row
+/// carries no live tags, so the id gates on its last-known removal union,
+/// and fails closed — the generic denial under enforcement — when no removal
+/// record names it at all. Outside enforcement the guard cannot deny, so the
+/// empty set authorizes exactly like a live untagged row and the caller's
+/// existing plain message stays.
+fn absent_task_tags_or_denied(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Vec<String>> {
+    match removed_task_tag_union(connection, id)? {
+        Some(tags) => Ok(tags),
+        None if authz.is_enforcing() => Err(crate::authz::DeniedOrNotFound.into()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The tags a row LINKED to a task authorizes against when the task itself
+/// may already be gone (ACC-14): a live id gates on its live `task_tags`,
+/// while an id whose row is gone gates on its last-known removal union
+/// through [`absent_task_tags_or_denied`] — failing closed under enforcement
+/// when no removal record names it, and authorizing like an untagged row
+/// outside enforcement where the guard cannot deny.
+///
+/// Since `BOARD_V36` the sitrep, handoff, deployment and attention links are
+/// plain `TEXT` with no `ON DELETE SET NULL`, so a removed task's rows keep
+/// the orphaned id and reach this helper's second branch; before that
+/// migration the FK nulled the link and these rows wrongly read as board
+/// scope.
+fn removed_aware_linked_task_tags(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Vec<String>> {
+    if get_task(connection, id)?.is_some() {
+        return task_tags(connection, id);
+    }
+    absent_task_tags_or_denied(connection, id, authz)
+}
+
+/// Whether a listing row linked to `task_id` stays visible (ACC-14): rows
+/// naming no task keep board scope, rows naming a live task read as their
+/// writers left them, and rows naming a removed task gate on the task's
+/// last-known removal union — hidden from a caller who cannot read it, and
+/// hidden from everyone when no removal record names it at all. Outside
+/// enforcement nothing can be denied and every row stays visible.
+fn task_linked_row_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    task_id: Option<&str>,
+) -> Result<bool> {
+    if !authz.is_enforcing() {
+        return Ok(true);
+    }
+    let Some(task_id) = task_id else {
+        return Ok(true);
+    };
+    if get_task(connection, task_id)?.is_some() {
+        return Ok(true);
+    }
+    match removed_task_tag_union(connection, task_id)? {
+        Some(tags) => Ok(authz.permits_read(&tags)),
+        None => Ok(false),
+    }
+}
+
+/// A task filter on a listing (ACC-14): under managed enforcement an unknown
+/// or removed task filters exactly like a denied one — the listing proceeds
+/// and each row passes [`task_linked_row_visible`], which withholds every
+/// row linked to a task the caller cannot read — so the two are
+/// indistinguishable. Outside enforcement the guard cannot deny, so the
+/// plain `not found` stays.
+fn require_task_filter(connection: &Connection, id: &str, authz: &AuthzContext) -> Result<()> {
+    if get_task(connection, id)?.is_some() {
+        return Ok(());
+    }
+    if authz.is_enforcing() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("task {id} not found"))
+}
+
+/// A write to a row linked to `task_id` (ACC-14): a row naming no task, or a
+/// task whose row is still live, keeps whatever gate the caller already ran,
+/// while a row orphaned by a removal (BOARD_V36) additionally requires write
+/// on the task's last-known removal tags — otherwise an untagged orphaned row
+/// reads as board scope and any board writer could rewrite or settle a
+/// removed secret task's rows. Fails closed under enforcement when no removal
+/// record names the id, through [`absent_task_tags_or_denied`]; outside
+/// enforcement the guard cannot deny and nothing is added.
+fn check_orphaned_link_write(
+    connection: &Connection,
+    task_id: Option<&str>,
+    authz: &AuthzContext,
+) -> Result<()> {
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
+    if get_task(connection, task_id)?.is_some() {
+        return Ok(());
+    }
+    let tags = absent_task_tags_or_denied(connection, task_id, authz)?;
+    authz.check_write(&tags, &tags)
+}
+
+/// Refuse a task id that names a live row or any prior use of the id (ACC-14):
+/// removed ids are never reused, because the sitrep, handoff, deployment and
+/// attention rows that outlive a removal keep the orphaned id and would
+/// otherwise re-parent under the new row's tags.
+///
+/// A live id answers `task {id} already exists`; an id with a `task_removed`
+/// record — or any event history at all — answers `task {id} was removed and
+/// its id cannot be reused`, replacing the raw `UNIQUE constraint failed`.
+/// Under enforcement both answers are read-gated first, so a caller who
+/// cannot read the id's tags (the live tags, or the removal union for a
+/// removed id) gets the generic denial exactly like a never-created id,
+/// while a caller who can read keeps the plain message. Outside enforcement
+/// the guard cannot deny and the plain message stays.
+pub(crate) fn refuse_reused_task_id(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<()> {
+    if get_task(connection, id)?.is_some() {
+        if authz.is_enforcing() {
+            authz.check_read(&task_tags(connection, id)?)?;
+        }
+        bail!("task {id} already exists");
+    }
+    match removed_task_tag_union(connection, id)? {
+        Some(union) => {
+            if authz.is_enforcing() {
+                authz.check_read(&union)?;
+            }
+            bail!("task {id} was removed and its id cannot be reused");
+        }
+        None => {
+            let used: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE task_id=?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !used {
+                return Ok(());
+            }
+            if authz.is_enforcing() {
+                return Err(crate::authz::DeniedOrNotFound.into());
+            }
+            bail!("task {id} was removed and its id cannot be reused");
+        }
+    }
+}
+
+/// The `_semanticV1` snapshot for an event naming a task that no longer
+/// exists (ACC-14): the union of the task's `task_removed` snapshots as
+/// `tags` — the same last-known evidence every read path gates the orphaned
+/// link on — with empty relations, since the live rows a traversal would
+/// read are gone.
+///
+/// The subject keeps the removed row's own `type`, read from the `task`
+/// object `remove_task` freezes into its `task_removed` payload, so watches
+/// filtering on the subject see the same shape the task's live events
+/// carried; a removal record without one (hand-restored history) falls back
+/// to `task`. The statuses are the event's own, as in
+/// [`semantic_snapshot`].
+///
+/// Fail-closed: with no removal record naming the id there is nothing
+/// truthful to freeze, so snapshotting is an error — never an untagged
+/// snapshot that would read as board scope. Every post-`BOARD_V36` removal
+/// writes its `task_removed` record before the DELETE, so reachable rows
+/// always carry one.
+fn removed_task_snapshot(
+    connection: &Connection,
+    id: &str,
+    prior_status: Option<&str>,
+    current_status: Option<&str>,
+) -> Result<Value> {
+    let tags = removed_task_tag_union(connection, id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "task {id} was removed without a removal record; refusing to snapshot its tags"
+        )
+    })?;
+    let task_type: Option<String> = connection
+        .query_row(
+            "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq DESC LIMIT 1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .and_then(|value| value.pointer("/task/type").and_then(Value::as_str).map(str::to_owned));
+    Ok(json!({
+        "subject": { "type": task_type.as_deref().unwrap_or("task"), "id": id },
+        "tags": tags,
+        "relations": [],
+        "priorStatus": prior_status,
+        "currentStatus": current_status,
+    }))
 }
 
 /// The tags one EVENT exposes, which is more than the tags its row carries
@@ -1044,8 +1266,15 @@ fn board_tag_universe(connection: &Connection) -> Result<Vec<String>> {
 /// Takes the connection so a write path can read it inside its own
 /// `BEGIN IMMEDIATE`, which is what keeps a concurrent retag from slipping
 /// between the check and the write. Read live from `task_tags`, never from
-/// anything the immutable attempt row froze at deploy time.
-fn deployment_subject_tags_on(connection: &Connection, deployment_id: &str) -> Result<Vec<String>> {
+/// anything the immutable attempt row froze at deploy time. Takes the
+/// caller's authorization context so a removed task's attempts — which keep
+/// the orphaned id since `BOARD_V36` — gate on their last-known removal
+/// tags rather than the empty set a taskless deployment authorizes against.
+fn deployment_subject_tags_on(
+    connection: &Connection,
+    deployment_id: &str,
+    authz: &AuthzContext,
+) -> Result<Vec<String>> {
     let task_id: Option<String> = connection
         .query_row(
             "SELECT task_id FROM deployments WHERE id=?",
@@ -1055,7 +1284,13 @@ fn deployment_subject_tags_on(connection: &Connection, deployment_id: &str) -> R
         .optional()?
         .flatten();
     match task_id.as_deref() {
-        Some(task_id) => task_tags(connection, task_id),
+        Some(task_id) => {
+            if get_task(connection, task_id)?.is_some() {
+                task_tags(connection, task_id)
+            } else {
+                absent_task_tags_or_denied(connection, task_id, authz)
+            }
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -2505,9 +2740,18 @@ fn event_stamped(
         .transpose()?
         .flatten();
     payload["_semanticV1"] = match task_id {
-        Some(task_id) => {
-            semantic_snapshot(connection, task_id, status.as_deref(), status.as_deref())?
-        }
+        Some(task_id) => match get_task(connection, task_id)? {
+            Some(_) => {
+                semantic_snapshot(connection, task_id, status.as_deref(), status.as_deref())?
+            }
+            // The row is gone but its linked rows outlive it (BOARD_V36), so
+            // a mutation touching one still audits against the same
+            // last-known evidence the read paths gate on — rather than
+            // failing the write outright.
+            None => {
+                removed_task_snapshot(connection, task_id, status.as_deref(), status.as_deref())?
+            }
+        },
         None => Value::Null,
     };
     event_at(connection, task_id, kind, actor, payload, at)
@@ -2570,8 +2814,14 @@ fn event_with_status(
     current_status: Option<&str>,
 ) -> Result<()> {
     if let Some(task_id) = task_id {
-        payload["_semanticV1"] =
-            semantic_snapshot(connection, task_id, prior_status, current_status)?;
+        payload["_semanticV1"] = match get_task(connection, task_id)? {
+            Some(_) => semantic_snapshot(connection, task_id, prior_status, current_status)?,
+            // The row is gone but its linked rows outlive it (BOARD_V36), so
+            // a mutation touching one still audits against the same
+            // last-known evidence the read paths gate on — rather than
+            // failing the write outright.
+            None => removed_task_snapshot(connection, task_id, prior_status, current_status)?,
+        };
     } else {
         payload["_semanticV1"] = Value::Null;
     }
@@ -4983,6 +5233,12 @@ impl Store {
         self.authz.check_read(&[])
     }
 
+    /// This store's authorization context, for the import path's id-reuse
+    /// refusal — the only other writer that takes caller-chosen task ids.
+    pub(crate) fn authz(&self) -> &AuthzContext {
+        &self.authz
+    }
+
     /// Whether this board has ever recorded an event of this kind. A kind is
     /// vocabulary, not a row, so board scope is the whole check.
     pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
@@ -5066,6 +5322,11 @@ impl Store {
         // A new row has no old tag set; the resulting set is what the caller
         // asked for. Under the mutation lock.
         self.authz.check_write(&[], &input.tags)?;
+        // A removed id is never reused: its surviving linked rows would
+        // re-parent under the new row's tags. Refused before the INSERT, so
+        // a live id answers `already exists` instead of the raw UNIQUE
+        // failure, read-gated under enforcement like every other by-id path.
+        refuse_reused_task_id(&transaction, &id, &self.authz)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
             let parent = require_task(&transaction, parent)?;
@@ -6558,7 +6819,7 @@ impl Store {
     ) -> Result<Vec<Sitrep>> {
         self.authz.check_read(&[])?;
         if let Some(id) = task {
-            require_task(&self.connection, id)?;
+            require_task_filter(&self.connection, id, &self.authz)?;
         }
         let mut clauses = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -6578,16 +6839,40 @@ impl Store {
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
         };
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows: a `LIMIT` bound in SQL runs
+        // before the tag test, so a denied row would consume a slot and the
+        // page would come back short. Outside enforcement nothing can be
+        // denied, so the direct estate keeps the SQL bound.
+        let enforcing = self.authz.is_enforcing();
+        if !enforcing {
+            values.push(Box::new(limit));
+        }
         let sql = format!(
-            "SELECT * FROM sitreps{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?"
+            "SELECT * FROM sitreps{where_clause} ORDER BY created_at DESC, id DESC{}",
+            if enforcing { "" } else { " LIMIT ?" }
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let mut rows = statement
             .query_map(params_from_iter(refs), sitrep_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // Rows orphaned by a task removal keep the id (BOARD_V36) and stay
+        // gated on its last-known removal tags; every other row reads as
+        // its writers left it.
+        if enforcing {
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if task_linked_row_visible(&self.connection, &self.authz, row.task_id.as_deref())? {
+                    visible.push(row);
+                }
+            }
+            rows = visible;
+            // A negative bound is SQLite's "no bound", and stays one here.
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6710,7 +6995,7 @@ impl Store {
         }
         self.authz.check_read(&[])?;
         if let Some(id) = task {
-            require_task(&self.connection, id)?;
+            require_task_filter(&self.connection, id, &self.authz)?;
         }
         let (where_clause, mut values) =
             self.attention_filter(status, kind, task, tag, lane, include_archived)?;
@@ -6742,7 +7027,13 @@ impl Store {
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
         if enforcing {
-            rows.retain(|row| self.authz.permits_read(&row.tags));
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if self.attention_row_visible(&row)? {
+                    visible.push(row);
+                }
+            }
+            rows = visible;
             // A negative bound is SQLite's "no bound", and stays one here.
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         }
@@ -6751,19 +7042,48 @@ impl Store {
         }
         Ok(rows)
     }
+
+    /// Whether one attention row stays visible: its own tags first, then the
+    /// task it names. A row orphaned by a removal (BOARD_V36) stays gated on
+    /// its last-known removal tags, so a secret task's untagged rows do not
+    /// surface as board scope once the task is gone.
+    fn attention_row_visible(&self, row: &Attention) -> Result<bool> {
+        if !self.authz.is_enforcing() {
+            return Ok(true);
+        }
+        if !self.authz.permits_read(&row.tags) {
+            return Ok(false);
+        }
+        task_linked_row_visible(&self.connection, &self.authz, row.task_id.as_deref())
+    }
     /// Read one attention row through the safe broad projection.
     ///
     /// No authoritative principal-to-raisedBy binding reaches the Store, so a
     /// caller-supplied actor string cannot unlock answer material (ACC-13).
     pub fn show_attention(&self, id: &str) -> Result<Attention> {
         self.authz.check_read(&[])?;
-        let mut item = self
-            .connection
-            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+        let mut item = absent_as_denied(
+            self.connection
+                .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+                .optional()?,
+            "attention",
+            id,
+            &self.authz,
+        )?;
         let tags = attention_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
+        // A row orphaned by a removal keeps the id (BOARD_V36): gate it on
+        // the task's last-known removal tags as well, so a secret task's
+        // untagged rows do not surface as board scope once the task is gone.
+        if let Some(task_id) = item.task_id.as_deref()
+            && get_task(&self.connection, task_id)?.is_none()
+        {
+            self.authz.check_read(&absent_task_tags_or_denied(
+                &self.connection,
+                task_id,
+                &self.authz,
+            )?)?;
+        }
         item.tags = tags;
         redact_attention_check(&mut item);
         Ok(item)
@@ -6804,8 +7124,13 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
-        rows.retain(|row| self.authz.permits_read(&row.tags));
-        Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self.attention_row_visible(&row)? {
+                visible.push(row);
+            }
+        }
+        Ok(i64::try_from(visible.len()).unwrap_or(i64::MAX))
     }
 
     pub fn aggregate_check_report<'a>(
@@ -7049,6 +7374,10 @@ impl Store {
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
+        // A row orphaned by a removal keeps the id (BOARD_V36): gate the
+        // rewrite on the task's last-known removal tags as well, so a secret
+        // task's untagged rows are not rewritable as board scope.
+        check_orphaned_link_write(&transaction, existing.task_id.as_deref(), &self.authz)?;
         if existing.status != "open" {
             bail!("attention {id} is resolved history; its card cannot be rewritten");
         }
@@ -7252,6 +7581,10 @@ impl Store {
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
+        // A row orphaned by a removal keeps the id (BOARD_V36): gate the
+        // settlement on the task's last-known removal tags as well, so a
+        // secret task's untagged rows are not settleable as board scope.
+        check_orphaned_link_write(&transaction, existing.task_id.as_deref(), &self.authz)?;
         // Resolving twice would overwrite who settled it and when, which is
         // the part of the record worth keeping.
         if existing.status != "open" {
@@ -7437,6 +7770,10 @@ impl Store {
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
+        // A row orphaned by a removal keeps the id (BOARD_V36): gate the
+        // reopen on the task's last-known removal tags as well, so a secret
+        // task's untagged rows are not reopenable as board scope.
+        check_orphaned_link_write(&transaction, existing.task_id.as_deref(), &self.authz)?;
         if existing.status != "resolved" {
             bail!("attention {id} is already open; there is no resolution to reopen");
         }
@@ -7518,6 +7855,10 @@ impl Store {
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
+        // A row orphaned by a removal keeps the id (BOARD_V36): gate the
+        // answer on the task's last-known removal tags as well, so a secret
+        // task's untagged rows are not answerable as board scope.
+        check_orphaned_link_write(&transaction, existing.task_id.as_deref(), &self.authz)?;
         if !trusted_edge
             && authorization_actor != OPERATOR_ACTOR
             && authorization_actor != existing.raised_by
@@ -7575,36 +7916,82 @@ impl Store {
         }
         self.authz.check_read(&[])?;
         if let Some(id) = task {
-            require_task(&self.connection, id)?;
+            require_task_filter(&self.connection, id, &self.authz)?;
         }
         let (where_clause, mut values) = handoff_filter(task, status, to_agent, include_archived);
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows — see `sitreps` — so the
+        // direct estate keeps the SQL bound and enforcement over-fetches.
+        let enforcing = self.authz.is_enforcing();
+        if !enforcing {
+            values.push(Box::new(limit));
+        }
         let sql = format!(
-            "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC LIMIT ?"
+            "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC{}",
+            if enforcing { "" } else { " LIMIT ?" }
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let mut rows = statement
             .query_map(params_from_iter(refs), handoff_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // Rows orphaned by a task removal keep the id (BOARD_V36) and stay
+        // gated on its last-known removal tags; every other row reads as
+        // its writers left it.
+        if enforcing {
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if task_linked_row_visible(&self.connection, &self.authz, row.task_id.as_deref())? {
+                    visible.push(row);
+                }
+            }
+            rows = visible;
+            // A negative bound is SQLite's "no bound", and stays one here.
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        Ok(rows)
     }
 
     /// How many handoffs nobody has accepted or cancelled: the dashboard's
     /// number, counted rather than fetched, so a board past the listing's
     /// page still reports what it holds. Same filter as
-    /// `handoffs(None, Some("pending"), None, …)`.
+    /// `handoffs(None, Some("pending"), None, …)` — including its visibility
+    /// gate: a raw `COUNT(*)` would report pending handoffs the caller may
+    /// not list, turning the dashboard number into an existence oracle for
+    /// hidden rows. Only the linked ids are read, never the full rows, and
+    /// outside enforcement the guard cannot deny so the SQL count stays.
     pub fn count_pending_handoffs(&self) -> Result<i64> {
         self.authz.check_read(&[])?;
         let (where_clause, values) = handoff_filter(None, Some("pending"), None, false);
+        if !self.authz.is_enforcing() {
+            let refs = values.iter().map(|value| value.as_ref());
+            return self
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM handoffs{where_clause}"),
+                    params_from_iter(refs),
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
         let refs = values.iter().map(|value| value.as_ref());
-        self.connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM handoffs{where_clause}"),
-                params_from_iter(refs),
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT task_id FROM handoffs{where_clause}"))?;
+        let task_ids = statement
+            .query_map(params_from_iter(refs), |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut count = 0i64;
+        for task_id in task_ids {
+            if task_linked_row_visible(&self.connection, &self.authz, task_id.as_deref())? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn create_handoff(&mut self, input: HandoffInput) -> Result<Handoff> {
@@ -7756,13 +8143,23 @@ impl Store {
             })
             .optional()?;
         if let Some(Some(task_id)) = subject {
-            let tags = task_tags(&transaction, &task_id)?;
+            // A removed task's handoffs keep the orphaned id (BOARD_V36), so
+            // gate on its last-known removal tags rather than the empty live
+            // set — otherwise the row reads as a session handoff.
+            let tags = removed_aware_linked_task_tags(&transaction, &task_id, &self.authz)?;
             self.authz.check_write(&tags, &tags)?;
         }
-        let handoff = transaction
-            .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
-            .optional()?
-            .with_context(|| format!("handoff {id} not found"))?;
+        // An unknown id answers the generic denial under enforcement rather
+        // than `not found`, so a handoff on a denied task and a never-created
+        // id are indistinguishable.
+        let handoff = absent_as_denied(
+            transaction
+                .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
+                .optional()?,
+            "handoff",
+            id,
+            &self.authz,
+        )?;
         if handoff.status == "retired" {
             bail!(
                 "handoff {id} was retired by {} at {} (epoch ms); a retired handoff is closed history, not work to accept",
@@ -7804,7 +8201,32 @@ impl Store {
             transaction.commit()?;
             return Ok((updated, None));
         };
-        let task = require_task(&transaction, &task_id)?;
+        // A removed task's handoffs keep the orphaned id (BOARD_V36), so a
+        // missing row is accepted as an acknowledgement exactly like the
+        // session branch above: there is no claimable task left to lease and
+        // leaving the handoff pending would rediscover it on every lane
+        // resume. The event keeps the orphaned id, so it is emitted through
+        // the removed-task snapshot fallback rather than as a session event.
+        let task = match get_task(&transaction, &task_id)? {
+            Some(task) => task,
+            None => {
+                transaction.execute("UPDATE handoffs SET status='accepted',accepted_at=?,accepted_by=?,accepted_session=? WHERE id=? AND status='pending'",params![now,agent,session,id])?;
+                event(
+                    &transaction,
+                    Some(&task_id),
+                    "handoff_accepted",
+                    Some(&agent),
+                    json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                )?;
+                let updated = transaction.query_row(
+                    "SELECT * FROM handoffs WHERE id=?",
+                    [id],
+                    handoff_row,
+                )?;
+                transaction.commit()?;
+                return Ok((updated, None));
+            }
+        };
         // Once work has been blocked or settled, accepting an older brief is
         // acknowledgement rather than ownership transfer. There is no
         // claimable task to protect, and leaving the handoff pending forever
@@ -7926,10 +8348,24 @@ impl Store {
         let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
-        let existing = transaction
-            .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
-            .optional()?
-            .with_context(|| format!("handoff {id} not found"))?;
+        let existing = absent_as_denied(
+            transaction
+                .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
+                .optional()?,
+            "handoff",
+            id,
+            &self.authz,
+        )?;
+        if let Some(task_id) = existing.task_id.as_deref() {
+            // A removed task's handoffs keep the orphaned id (BOARD_V36), so
+            // gate on its last-known removal tags — otherwise the row reads
+            // as a session handoff. A live link keeps the existing
+            // board-scope gate above.
+            if get_task(&transaction, task_id)?.is_none() {
+                let tags = absent_task_tags_or_denied(&transaction, task_id, &self.authz)?;
+                self.authz.check_write(&tags, &tags)?;
+            }
+        }
         if existing.status == "retired" {
             bail!(
                 "handoff {id} is already retired by {}",
@@ -8430,6 +8866,47 @@ impl Store {
         crate::db::foreign_key_violations(&self.connection)
     }
 
+    /// Links naming a task that is neither live nor removed, as `doctor`
+    /// reports them. Since `BOARD_V36` the sitrep, handoff, deployment and
+    /// attention links carry no foreign key, so `foreign_key_check` has
+    /// nothing to say about them — yet a non-null `task_id` with no `tasks`
+    /// row and no `task_removed` record is corruption all the same: a partial
+    /// restore, an adopted snapshot or a hand edit can leave one behind, and
+    /// no writer path creates one. Board scope, in the `foreign_key_check`
+    /// shape: the descriptions name tables and row ids, which is diagnostic
+    /// rather than row content, and a caller with no board read gets none of
+    /// it. A removed task's rows are not orphans — their id has a removal
+    /// record — and taskless rows are not orphans either: they name no task.
+    pub fn orphaned_task_links(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
+        let mut out = Vec::new();
+        for table in ["sitreps", "handoffs", "deployments", "attention"] {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT id,task_id FROM {table} WHERE task_id IS NOT NULL \
+                 AND task_id NOT IN (SELECT id FROM tasks) \
+                 AND NOT EXISTS (SELECT 1 FROM events WHERE kind='task_removed' AND task_id={table}.task_id) \
+                 ORDER BY id"
+            ))?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, task_id) = row?;
+                out.push(format!(
+                    "{table} row {id} references missing task {task_id}"
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the task row is still there, through no authorization: the
+    /// accept receipt uses it to fall back to board-scope rule summaries for
+    /// an orphaned handoff, exactly like a session acknowledgement.
+    pub(crate) fn task_row_exists(&self, id: &str) -> Result<bool> {
+        Ok(get_task(&self.connection, id)?.is_some())
+    }
+
     /// Tasks stamped after the moment they are read.
     ///
     /// Leases expire by comparing stamps, so a record from the future is not a
@@ -8650,11 +9127,14 @@ impl Store {
     /// caller may have no authority over.
     pub fn require_deployment(&self, id: &str) -> Result<DeploymentAttempt> {
         self.authz.check_read(&[])?;
-        let attempt = self
-            .connection
-            .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
-            .optional()?
-            .with_context(|| format!("deployment {id} not found"))?;
+        let attempt = absent_as_denied(
+            self.connection
+                .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
+                .optional()?,
+            "deployment",
+            id,
+            &self.authz,
+        )?;
         self.authz
             .check_read(&self.deployment_subject_tags(&attempt)?)?;
         Ok(attempt)
@@ -8666,19 +9146,27 @@ impl Store {
     /// Read live from `task_tags` rather than from anything stored on the
     /// deployment row: the attempt is immutable and its task can be retagged
     /// after the fact, so a copy taken at deploy time would authorize against
-    /// a tag set that no longer exists.
+    /// a tag set that no longer exists. A removed task's attempts keep the
+    /// orphaned id (BOARD_V36), so a missing row falls back to its
+    /// last-known removal tags rather than the empty set a taskless
+    /// deployment authorizes against.
     fn deployment_subject_tags(&self, attempt: &DeploymentAttempt) -> Result<Vec<String>> {
         if !self.authz.is_enforcing() {
             return Ok(Vec::new());
         }
         match attempt.task_id.as_deref() {
-            Some(task_id) => task_tags(&self.connection, task_id),
+            Some(task_id) => removed_aware_linked_task_tags(&self.connection, task_id, &self.authz),
             None => Ok(Vec::new()),
         }
     }
 
     /// Keep only the attempts this caller may see, by each attempt's subject
     /// task. Filtered rather than refused: this is an enumeration.
+    ///
+    /// A row whose subject has neither a live task nor a removal record hides
+    /// just that row (fail closed): a partial restore or hand edit can leave
+    /// such a link behind, and one corrupt row must not deny the whole
+    /// listing.
     fn visible_deployments(
         &self,
         attempts: Vec<DeploymentAttempt>,
@@ -8689,10 +9177,18 @@ impl Store {
         }
         let mut out = Vec::with_capacity(attempts.len());
         for attempt in attempts {
-            if self
-                .authz
-                .permits_read(&self.deployment_subject_tags(&attempt)?)
-            {
+            let tags = match self.deployment_subject_tags(&attempt) {
+                Ok(tags) => tags,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::authz::DeniedOrNotFound>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if self.authz.permits_read(&tags) {
                 out.push(attempt);
             }
         }
@@ -8725,8 +9221,19 @@ impl Store {
             sql.push_str(" AND tier=?");
             values.push(Box::new(value.to_owned()));
         }
-        sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows: a `LIMIT` bound in SQL runs
+        // before the tag test, so a denied row would consume a slot and the
+        // page would come back short. Outside enforcement nothing can be
+        // denied, so the direct estate keeps the SQL bound.
+        let enforcing = self.authz.is_enforcing();
+        if !enforcing {
+            values.push(Box::new(limit));
+        }
+        sql.push_str(" ORDER BY created_at DESC,id DESC");
+        if !enforcing {
+            sql.push_str(" LIMIT ?");
+        }
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
             .query_map(
@@ -8734,7 +9241,13 @@ impl Store {
                 deployment_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.visible_deployments(rows)
+        drop(statement);
+        let mut visible = self.visible_deployments(rows)?;
+        if enforcing {
+            // A negative bound is SQLite's "no bound", and stays one here.
+            visible.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        Ok(visible)
     }
 
     /// The newest succeeded attempt per (repo, tier, environment) — the
@@ -8790,16 +9303,20 @@ impl Store {
         }
         let transaction = self.begin_write()?;
         self.authz.check_write(&[], &[])?;
-        let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
+        let subject_tags = deployment_subject_tags_on(&transaction, &input.id, &self.authz)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
-        let current: (String, String, String, String, Option<String>, Option<String>, Option<String>) = transaction
-            .query_row(
-                "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts,sprint_id,target_version FROM deployments WHERE id=?",
-                [&input.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-            )
-            .optional()?
-            .with_context(|| format!("deployment {} not found", input.id))?;
+        let current: (String, String, String, String, Option<String>, Option<String>, Option<String>) = absent_as_denied(
+            transaction
+                .query_row(
+                    "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts,sprint_id,target_version FROM deployments WHERE id=?",
+                    [&input.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )
+                .optional()?,
+            "deployment",
+            &input.id,
+            &self.authz,
+        )?;
         let (
             status,
             token,
@@ -8918,17 +9435,21 @@ impl Store {
         let note = nonempty(note, "abandon note")?.to_owned();
         let transaction = self.begin_write()?;
         self.authz.check_write(&[], &[])?;
-        let subject_tags = deployment_subject_tags_on(&transaction, id)?;
+        let subject_tags = deployment_subject_tags_on(&transaction, id, &self.authz)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
         let (status, capability, task_id, updated_at): (String, String, Option<String>, i64) =
-            transaction
-                .query_row(
-                    "SELECT status,capability_token,task_id,updated_at FROM deployments WHERE id=?",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?
-                .with_context(|| format!("deployment {id} not found"))?;
+            absent_as_denied(
+                transaction
+                    .query_row(
+                        "SELECT status,capability_token,task_id,updated_at FROM deployments WHERE id=?",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?,
+                "deployment",
+                id,
+                &self.authz,
+            )?;
         if status != "started" {
             bail!("deployment {id} is already {status}");
         }
@@ -9193,7 +9714,7 @@ impl Store {
             "planned" => bail!("sprint {id} is planned, not current; start it before closing it"),
             _ => {}
         }
-        let proof_tags = deployment_subject_tags_on(&transaction, deployment_id)?;
+        let proof_tags = deployment_subject_tags_on(&transaction, deployment_id, &self.authz)?;
         self.authz.check_write(&proof_tags, &proof_tags)?;
         let proof = transaction
             .query_row(
@@ -9625,9 +10146,11 @@ impl Store {
         let handoffs = transaction.execute(
             "UPDATE handoffs SET archived=1 WHERE archived=0 AND status<>'pending' AND ( \
                task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
-               (task_id IS NULL AND COALESCE(accepted_at,created_at)<=?) \
+               (task_id IS NULL AND COALESCE(accepted_at,created_at)<=?) OR \
+               (task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks) \
+                AND COALESCE(accepted_at,created_at)<=?) \
              )",
-            [cutoff_at],
+            params![cutoff_at, cutoff_at],
         )? as i64;
         let attention = transaction.execute(
             "UPDATE attention SET archived=1 WHERE archived=0 AND status='resolved' AND ( \
@@ -9657,9 +10180,11 @@ impl Store {
         let events = transaction.execute(
             "UPDATE events SET archived=1 WHERE archived=0 AND ( \
                task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
-               (task_id IS NULL AND created_at<=?) \
+               (task_id IS NULL AND created_at<=?) OR \
+               (task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks) \
+                AND created_at<=?) \
              )",
-            [cutoff_at],
+            params![cutoff_at, cutoff_at],
         )? as i64;
 
         let report = ArchiveReport {
@@ -16136,6 +16661,82 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), "denied or not found");
         }
+    }
+
+    /// One corrupt deployment link must not fail the whole listing (ACC-14):
+    /// a deployment naming a task with neither a live row nor a removal
+    /// record — a partial restore, an adopted snapshot, a hand edit — hides
+    /// just that row under enforcement, while `doctor` reports it through
+    /// `orphaned_task_links` and the direct estate keeps it visible.
+    #[test]
+    fn managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-3333-4333-8333-333333333333";
+        let dir = std::env::temp_dir().join(format!("kanban-orphan-deploy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at)
+                       VALUES('d-healthy',NULL,'kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-healthy',1,1);
+                     INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at)
+                       VALUES('d-orphan','t-vanished','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-orphan',2,2);",
+                )
+                .expect("seed the deployments");
+        }
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Write,
+                ),
+            ])
+        };
+        let managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under board authority");
+        let listed = managed
+            .deployments(None, None, false, 100)
+            .expect("one corrupt row must not fail the listing");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|attempt| attempt.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d-healthy"],
+            "the listing served or dropped the wrong rows: {:?}",
+            listed.iter().map(|attempt| &attempt.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            managed.orphaned_task_links().expect("doctor check"),
+            vec!["deployments row d-orphan references missing task t-vanished".to_owned()],
+            "doctor did not report the dangling task link"
+        );
+        let direct = Store::open(&path).expect("open the direct estate");
+        assert_eq!(
+            direct
+                .deployments(None, None, false, 100)
+                .expect("direct listing")
+                .len(),
+            2,
+            "the direct estate hid a row it must keep visible"
+        );
     }
     fn native_check(question: &str, answer: &str, explanation: &str) -> AttentionCheck {
         AttentionCheck::parse(

@@ -1940,3 +1940,952 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
     // broken write path.
     estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
 }
+
+/// ACC-14, removed-task links (A23): removing a `secret` task keeps its
+/// sitrep, handoff, untagged attention row and deployment attempt linked to
+/// the orphaned id, and every one of them stays gated on the task's
+/// last-known removal tags — on every listing, on the event tail, on search,
+/// on lane-filtered sitrep listings (the stand-in for the retired
+/// `/api/v1/lanes` surface), on the deployment listing, in a `watch --follow`
+/// stream, and on `handoff retire`, `handoff accept`, `attention show`,
+/// `deploy show` and `deploy finish` — while a removed id and a
+/// never-created id answer byte-identically everywhere.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The owner seeds rows on a `secret` task carrying a marker
+/// no other row carries, plus genuinely taskless control rows (a lanewide
+/// sitrep, a session handoff, a taskless deployment, an untagged attention
+/// row) carrying a second marker, then removes the task; principal P holds
+/// board read and write but no `secret` scope. P sees no trace of the
+/// orphaned rows anywhere yet still reads every control row — the denials
+/// come from the guard gating the orphaned id, not from missing rows —
+/// while the owner still sees every row once enforcement is lifted.
+#[test]
+fn removed_task_links_stay_tag_gated_on_every_listing_search_and_lane() {
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    let estate = ManagedEstate::new("acc14-removed-task-links");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the removed secret task",
+            "--id",
+            "t-gone-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // Genuinely taskless controls: board scope before and after the removal.
+    estate.ok_json(
+        &work_a,
+        &[
+            "sitrep",
+            "post",
+            "lanewide control qxkcontrol body",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/gone-links",
+            "--branch",
+            "main",
+            "--head",
+            HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    );
+    let session_handoff = estate.ok_json(
+        &work_a,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "seed",
+            "--to",
+            "watcher",
+            "--summary",
+            "session control qxkcontrol summary",
+            "--intent",
+            "session control intent",
+            "--next-action",
+            "session control next",
+            "--reason",
+            "manual",
+            "--repo",
+            "/tmp/gone-links",
+            "--branch",
+            "main",
+            "--head",
+            HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let free_attention = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "free control qxkcontrol question",
+            "--kind",
+            "decision",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let free_attempt = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            HEAD,
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The secret task's rows, each carrying the marker no other row carries.
+    estate.ok_json(
+        &work_a,
+        &[
+            "sitrep",
+            "post",
+            "gone secret sitrep zxqpayroll body",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/gone-links",
+            "--branch",
+            "main",
+            "--head",
+            HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            "t-gone-secret",
+            "--json",
+        ],
+    );
+    let token = estate.ok_json(
+        &work_a,
+        &["claim", "t-gone-secret", "--as", "seed", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "handoff",
+            "create",
+            "t-gone-secret",
+            "--lease",
+            &token,
+            "--as",
+            "seed",
+            "--summary",
+            "gone secret handoff zxqpayroll summary",
+            "--intent",
+            "gone secret handoff intent",
+            "--next-action",
+            "gone secret handoff next",
+            "--repo",
+            "/tmp/gone-links",
+            "--branch",
+            "main",
+            "--head",
+            HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    );
+    let attention_id = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "gone secret attention zxqpayroll question",
+            "--kind",
+            "decision",
+            "--as",
+            "seed",
+            "--task",
+            "t-gone-secret",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attempt_id = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            HEAD,
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            "t-gone-secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret_handoff = estate
+        .ok_json(
+            &work_a,
+            &["handoff", "list", "--task", "t-gone-secret", "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "pending")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok(
+        &work_a,
+        &["task", "remove", "t-gone-secret", "--as", "seed"],
+    );
+    estate.bind_self(
+        "p-gone-rows",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The `--task` listings succeed for the removed id and the unknown id
+    //    alike and hand over nothing: the removed filter withholds exactly
+    //    what the unknown filter cannot match.
+    for (base, what) in [
+        (&["sitrep", "list", "--task"][..], "sitrep list --task"),
+        (&["handoff", "list", "--task"][..], "handoff list --task"),
+        (
+            &["attention", "list", "--task"][..],
+            "attention list --task",
+        ),
+    ] {
+        let mut removed_args = base.to_vec();
+        removed_args.extend_from_slice(&["t-gone-secret", "--json"]);
+        let mut unknown_args = base.to_vec();
+        unknown_args.extend_from_slice(&["t-never-created", "--json"]);
+        let removed = estate.run(&work_a, &removed_args);
+        let unknown = estate.run(&work_a, &unknown_args);
+        assert!(
+            removed.status.success(),
+            "{what} with a removed id should succeed: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert!(
+            unknown.status.success(),
+            "{what} with an unknown id should succeed: {}",
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        assert_eq!(
+            removed.stdout, unknown.stdout,
+            "{what} output differs between a removed id and an unknown id"
+        );
+        let rows: Value = serde_json::from_slice(&removed.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            0,
+            "{what} with the removed id handed over a row the caller may not read: {rows}"
+        );
+    }
+    // 2. The unfiltered listings, the event tail, search and the deployment
+    //    listing carry no trace of the removed task's rows — neither their
+    //    markers nor the orphaned id (event envelopes carry the id even where
+    //    their payloads carry no row text).
+    for (args, what) in [
+        (&["sitrep", "list", "--json"][..], "sitrep list"),
+        (&["handoff", "list", "--json"][..], "handoff list"),
+        (&["attention", "list", "--json"][..], "attention list"),
+        (&["deploy", "list", "--json"][..], "deploy list"),
+        (&["events", "--json"][..], "events"),
+        (&["search", "zxqpayroll", "--json"][..], "search"),
+    ] {
+        let listed = estate.run(&work_a, args);
+        assert!(
+            listed.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+        // The search receipt echoes the query itself, so absence is pinned
+        // on the rows' content markers and the orphaned id, never on the
+        // query string.
+        assert!(
+            !body.contains("gone secret"),
+            "{what} served a row on the removed denied task: {body}"
+        );
+        assert!(
+            !body.contains("t-gone-secret"),
+            "{what} served the removed task's id: {body}"
+        );
+    }
+    // 3. The lane-filtered sitrep listing — the stand-in for the retired
+    //    `/api/v1/lanes` surface — still serves the lanewide control while
+    //    withholding the removed task's sitrep.
+    let lane = estate.ok(&work_a, &["sitrep", "list", "--lane", "driver-1", "--json"]);
+    assert!(
+        lane.contains("lanewide control qxkcontrol body"),
+        "the lane listing lost the board-scope control row: {lane}"
+    );
+    assert!(
+        !lane.contains("gone secret") && !lane.contains("t-gone-secret"),
+        "the lane listing served the removed task's sitrep: {lane}"
+    );
+    // 4. The live tail withholds the removed rows too. The stream replays
+    //    from cursor 0, so history is offered to the filter; heartbeats prove
+    //    the stream stayed alive while it stayed quiet about the removed task.
+    {
+        let mut stream = Stream::start(
+            estate
+                .command(&work_a)
+                .args(["watch", "--follow", "--json"]),
+        );
+        thread::sleep(SETTLE);
+        let quiet = stream.drain();
+        // Event envelopes carry the task id even where their payloads carry
+        // no row text, so both the markers and the orphaned id must be absent.
+        assert!(
+            !quiet.join("\n").contains("zxqpayroll"),
+            "watch --follow handed over a removed task's rows:\n{}",
+            quiet.join("\n")
+        );
+        assert!(
+            !quiet.join("\n").contains("t-gone-secret"),
+            "watch --follow served the removed task's id:\n{}",
+            quiet.join("\n")
+        );
+        assert!(
+            stream.running(),
+            "the watch process exited instead of withholding the rows"
+        );
+        assert!(
+            !quiet.is_empty(),
+            "the stream produced nothing at all, so nothing was measured"
+        );
+    }
+    // 5. Every by-id surface answers the removed row exactly like a
+    //    never-created id — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and records nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a removed id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a removed id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a removed id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &[
+            "handoff",
+            "retire",
+            &secret_handoff,
+            "--as",
+            "seed",
+            "--note",
+            "gone probe",
+        ],
+        &[
+            "handoff",
+            "retire",
+            "h-never-created",
+            "--as",
+            "seed",
+            "--note",
+            "gone probe",
+        ],
+        "handoff retire",
+    );
+    assert_by_id_identical(
+        &["handoff", "accept", &secret_handoff, "--as", "seed"],
+        &["handoff", "accept", "h-never-created", "--as", "seed"],
+        "handoff accept",
+    );
+    assert_by_id_identical(
+        &["attention", "show", &attention_id, "--json"],
+        &["attention", "show", "a-never-raised", "--json"],
+        "attention show",
+    );
+    assert_by_id_identical(
+        &["deploy", "show", &attempt_id, "--json"],
+        &["deploy", "show", "d-never-started", "--json"],
+        "deploy show",
+    );
+    assert_by_id_identical(
+        &[
+            "deploy",
+            "finish",
+            &attempt_id,
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "gone probe",
+            "--as",
+            "seed",
+        ],
+        &[
+            "deploy",
+            "finish",
+            "d-never-started",
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "gone probe",
+            "--as",
+            "seed",
+        ],
+        "deploy finish",
+    );
+    // 6. The negative control: every genuinely taskless row stays readable
+    //    to the same caller, so the withholds above came from the guard
+    //    gating the orphaned id and not from missing rows.
+    for (args, marker, what) in [
+        (
+            &["sitrep", "list", "--json"][..],
+            "lanewide control qxkcontrol body",
+            "lanewide sitrep",
+        ),
+        (
+            &["handoff", "list", "--json"][..],
+            "session control qxkcontrol summary",
+            "session handoff",
+        ),
+        (
+            &["attention", "list", "--json"][..],
+            "free control qxkcontrol question",
+            "untagged attention row",
+        ),
+    ] {
+        let visible = estate.ok(&work_a, args);
+        assert!(
+            visible.contains(marker),
+            "the caller lost the {what} control row it may read: {visible}"
+        );
+    }
+    let deployments = estate.ok(&work_a, &["deploy", "list", "--json"]);
+    assert!(
+        deployments.contains(&free_attempt),
+        "the caller lost the taskless deployment it may read: {deployments}"
+    );
+    let free_shown = estate.ok_json(&work_a, &["attention", "show", &free_attention, "--json"]);
+    assert_eq!(free_shown["id"], serde_json::json!(free_attention));
+    // 7. The owner still sees every row, so the denials above came from the
+    //    guard and not from missing rows — and the refused writes recorded
+    //    nothing.
+    estate.enforce("direct");
+    // A `--task` filter naming a removed id cannot run even unenforced —
+    // there is no row left to filter on — so the owner reads the unfiltered
+    // listings, where the orphaned rows still carry their markers and id.
+    for (args, marker, what) in [
+        (
+            &["sitrep", "list", "--json"][..],
+            "gone secret sitrep zxqpayroll body",
+            "sitrep list",
+        ),
+        (
+            &["handoff", "list", "--json"][..],
+            "gone secret handoff zxqpayroll summary",
+            "handoff list",
+        ),
+        (
+            &["attention", "list", "--json"][..],
+            "gone secret attention zxqpayroll question",
+            "attention list",
+        ),
+        (
+            &["deploy", "list", "--json"][..],
+            attempt_id.as_str(),
+            "deploy list",
+        ),
+    ] {
+        let owned = estate.ok(&work_a, args);
+        assert!(
+            owned.contains(marker),
+            "the owner lost {what} on the removed task: {owned}"
+        );
+    }
+    let owned_search = estate.ok(&work_a, &["search", "zxqpayroll", "--json"]);
+    assert!(
+        owned_search.contains("zxqpayroll"),
+        "the owner lost the removed task's rows in search: {owned_search}"
+    );
+    let owned_attempt = estate.ok_json(&work_a, &["deploy", "show", &attempt_id, "--json"]);
+    assert_eq!(
+        owned_attempt["taskID"].as_str(),
+        Some("t-gone-secret"),
+        "the removed attempt lost its task link: {owned_attempt}"
+    );
+    let handoffs = estate.ok_json(&work_a, &["handoff", "list", "--json"]);
+    assert!(
+        handoffs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == secret_handoff && row["status"] == "pending"),
+        "a refused retire or accept moved a row: {handoffs}"
+    );
+    assert!(
+        handoffs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == session_handoff),
+        "the session control handoff went missing: {handoffs}"
+    );
+}
+
+/// ACC-14 id-reuse contract (A24), at the layer `process`: a removed task's
+/// id is never reusable, and probing one answers exactly like probing a live
+/// denied id.
+///
+/// The fixture tags two tasks `secret`, posts a sitrep carrying a unique
+/// token on `t-sec`, and removes `t-sec`. The caller holds board read and
+/// untagged write only — the `task add --id` precondition. Re-adding `t-sec`
+/// and re-adding the still-live `t-sec-live` then answer with the same exit
+/// code and byte-identical stderr carrying the one generic denial, and the
+/// caller sees the sitrep on no listing. Granting the same principal `secret`
+/// read shows the row survived: gating, not deletion.
+#[test]
+fn removed_task_ids_are_never_reused_and_probe_like_live_denied_ids() {
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    let estate = ManagedEstate::new("acc14-id-reuse");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    for (id, title) in [
+        ("t-sec", "the reuse secret task"),
+        ("t-sec-live", "the live secret task"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", "secret", "--as", "seed", "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "sitrep",
+            "post",
+            "quorumidreuse body on the removed secret task",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/id-reuse-probe",
+            "--branch",
+            "main",
+            "--head",
+            HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            "t-sec",
+            "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-sec", "--as", "seed"]);
+
+    estate.bind_self(
+        "p-id-reuse",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+
+    let removed = estate.run(
+        &work_a,
+        &[
+            "task", "add", "probe", "--id", "t-sec", "--as", "probe", "--json",
+        ],
+    );
+    let live = estate.run(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "probe",
+            "--id",
+            "t-sec-live",
+            "--as",
+            "probe",
+            "--json",
+        ],
+    );
+    for (output, what) in [
+        (&removed, "re-adding a removed secret id"),
+        (&live, "re-adding a live secret id"),
+    ] {
+        assert!(
+            !output.status.success(),
+            "{what} succeeded but must be refused\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    assert_eq!(
+        removed.status.code(),
+        live.status.code(),
+        "re-adding a removed id exits differently from re-adding a live denied one"
+    );
+    assert_eq!(
+        removed.stderr, live.stderr,
+        "re-adding a removed id answers differently from re-adding a live denied one"
+    );
+    assert!(
+        String::from_utf8_lossy(&removed.stderr).contains(DENIED),
+        "re-add refusal is not the generic denial: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    for args in [
+        vec!["sitrep", "list", "--json"],
+        vec!["sitrep", "list", "--task", "t-sec", "--json"],
+    ] {
+        let listing = estate.ok(&work_a, &args);
+        assert!(
+            !listing.contains("quorumidreuse"),
+            "`kanban {args:?}` handed over a removed task's sitrep after a refused re-add: {listing}"
+        );
+    }
+
+    estate.grant(
+        "p-id-reuse",
+        &[
+            tag_scope("read", &estate.id_a, "secret"),
+            tag_scope("write", &estate.id_a, "secret"),
+        ],
+    );
+    let owner = estate.ok(&work_a, &["sitrep", "list", "--task", "t-sec", "--json"]);
+    assert!(
+        owner.contains("quorumidreuse"),
+        "the refused re-add destroyed the row it must only gate: {owner}"
+    );
+}
+
+/// ACC-14 id-reuse contract (A24) where no guard can deny: re-adding a
+/// removed id and re-adding a live id are plain, stable refusals — never the
+/// raw `UNIQUE constraint failed`, never the generic denial.
+#[test]
+fn reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny() {
+    let estate = ManagedEstate::new("acc14-id-reuse-direct");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &[
+            "task", "add", "live", "--id", "t-live", "--as", "seed", "--json",
+        ],
+    );
+    let live = estate.run(
+        &work_a,
+        &[
+            "task", "add", "again", "--id", "t-live", "--as", "seed", "--json",
+        ],
+    );
+    assert!(
+        !live.status.success(),
+        "re-adding a live id succeeded but must be refused"
+    );
+    let live_stderr = String::from_utf8_lossy(&live.stderr).into_owned();
+    assert!(
+        live_stderr.contains("task t-live already exists"),
+        "re-adding a live id lost its plain refusal: {live_stderr}"
+    );
+    assert!(
+        !live_stderr.contains(DENIED),
+        "re-adding a live id answers a denial where no guard can deny: {live_stderr}"
+    );
+    assert!(
+        !live_stderr.contains("UNIQUE constraint failed"),
+        "re-adding a live id leaks the raw constraint: {live_stderr}"
+    );
+
+    estate.ok_json(
+        &work_a,
+        &[
+            "task", "add", "gone", "--id", "t-gone", "--as", "seed", "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-gone", "--as", "seed"]);
+    let gone = estate.run(
+        &work_a,
+        &[
+            "task", "add", "again", "--id", "t-gone", "--as", "seed", "--json",
+        ],
+    );
+    assert!(
+        !gone.status.success(),
+        "re-adding a removed id succeeded but must be refused"
+    );
+    let gone_stderr = String::from_utf8_lossy(&gone.stderr).into_owned();
+    assert!(
+        gone_stderr.contains("task t-gone was removed and its id cannot be reused"),
+        "re-adding a removed id lost its plain refusal: {gone_stderr}"
+    );
+    assert!(
+        !gone_stderr.contains(DENIED),
+        "re-adding a removed id answers a denial where no guard can deny: {gone_stderr}"
+    );
+}
+
+/// ACC-14 orphaned-handoff follow-through (A23), at the layer `process`: a
+/// pending handoff on a removed `secret` task stays deniable to a tag-less
+/// caller — `handoff accept` answers exactly like a never-created id — yet
+/// the secret holder can still accept it as a lease-free acknowledgement
+/// that the archive sweep files away, and `doctor` stays healthy throughout
+/// because rows with a removal record are not orphans.
+#[test]
+fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
+    let estate = ManagedEstate::new("acc14-accept-orphan");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the doomed secret task",
+            "--id",
+            "t-orphan-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let token = estate.ok_json(
+        &work_a,
+        &["claim", "t-orphan-secret", "--as", "seed", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let handoff_id = estate.ok_json(
+        &work_a,
+        &[
+            "handoff",
+            "create",
+            "t-orphan-secret",
+            "--lease",
+            &token,
+            "--as",
+            "seed",
+            "--summary",
+            "orphaned acknowledgement summary",
+            "--intent",
+            "orphaned intent",
+            "--next-action",
+            "orphaned next",
+            "--reason",
+            "manual",
+            "--repo",
+            "/tmp/accept-orphan",
+            "--branch",
+            "main",
+            "--head",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok(
+        &work_a,
+        &["task", "remove", "t-orphan-secret", "--as", "seed"],
+    );
+    estate.bind_self(
+        "p-orphan",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // The tag-less caller is denied the orphan exactly like a never-created
+    // handoff, and sees no trace of it on any listing.
+    let denied = estate.run(&work_a, &["handoff", "accept", &handoff_id, "--as", "seed"]);
+    let unknown = estate.run(
+        &work_a,
+        &["handoff", "accept", "h-never-created", "--as", "seed"],
+    );
+    assert!(
+        !denied.status.success(),
+        "accepting a removed task's handoff succeeded but must be refused"
+    );
+    assert_eq!(
+        denied.status.code(),
+        unknown.status.code(),
+        "the orphan accept exits differently from an unknown id"
+    );
+    assert_eq!(
+        denied.stderr, unknown.stderr,
+        "the orphan accept answers differently from an unknown id"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains(DENIED),
+        "the orphan accept is not the generic denial: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let listed = estate.ok(&work_a, &["handoff", "list", "--json"]);
+    assert!(
+        !listed.contains(&handoff_id),
+        "the caller reads an orphaned handoff it may not read: {listed}"
+    );
+    let filtered = estate.ok(
+        &work_a,
+        &["handoff", "list", "--task", "t-orphan-secret", "--json"],
+    );
+    assert_eq!(
+        filtered.trim(),
+        "[]",
+        "the removed-task filter handed over a row the caller may not read: {filtered}"
+    );
+    // The secret holder accepts the orphan as an acknowledgement: no lease
+    // is minted on the missing task.
+    estate.grant(
+        "p-orphan",
+        &[
+            tag_scope("read", &estate.id_a, "secret"),
+            tag_scope("write", &estate.id_a, "secret"),
+        ],
+    );
+    let accepted = estate.ok_json(
+        &work_a,
+        &["handoff", "accept", &handoff_id, "--as", "seed", "--json"],
+    );
+    assert_eq!(accepted["handoff"]["status"], "accepted");
+    assert_eq!(
+        accepted["handoff"]["acceptedBy"],
+        serde_json::json!("seed"),
+        "the acknowledgement lost its acceptor: {accepted}"
+    );
+    assert_eq!(
+        accepted["claim"],
+        Value::Null,
+        "accepting a removed task minted a lease on a missing task: {accepted}"
+    );
+    let claims: i64 = Connection::open(&estate.board_a)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_claims", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(claims, 0, "accepting a removed task left a lease behind");
+    // Once old, the archive sweep files the orphaned acknowledgement away.
+    Connection::open(&estate.board_a)
+        .unwrap()
+        .execute(
+            "UPDATE handoffs SET created_at=1,accepted_at=1 WHERE id=?",
+            [&handoff_id],
+        )
+        .unwrap();
+    let swept = estate.ok_json(
+        &work_a,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        swept["handoffs"], 1,
+        "the sweep left the orphan pending: {swept}"
+    );
+    assert_eq!(
+        estate.ok_json(&work_a, &["handoff", "list", "--json"]),
+        serde_json::json!([])
+    );
+    let all = estate.ok_json(&work_a, &["handoff", "list", "--all", "--json"]);
+    assert_eq!(all[0]["id"], serde_json::json!(handoff_id));
+    assert_eq!(all[0]["archived"], true);
+    // And the board is still consistent: rows with a removal record behind
+    // them are linked rows, not orphans, so doctor stays healthy.
+    estate.enforce("direct");
+    let doctor = estate.ok_json(&work_a, &["doctor", "--json"]);
+    assert_eq!(doctor["healthy"], true, "{doctor}");
+    assert_eq!(
+        doctor["projects"][0]["orphanedTaskLinks"],
+        serde_json::json!([])
+    );
+}

@@ -2271,6 +2271,353 @@ const BOARD_V35: &str = r#"
 ALTER TABLE attention ADD COLUMN return_trigger TEXT;
 "#;
 
+/// Keep a removed task's link on its sitreps, handoffs, deployments and
+/// attention rows (ACC-14): `task_id` becomes plain `TEXT` with no foreign
+/// key, so removing the task leaves the id in place instead of nulling it.
+///
+/// Design (a) from the finding — keep the link — rather than (b) a second
+/// id-recording column, because every read path resolves an orphaned id
+/// through the `task_removed` tag union (`task_linked_row_visible`,
+/// `document_row_tags`, the deployment subject gates): with the id kept,
+/// those branches finally run for these four tables, exactly as they already
+/// do for `subscriptions.subject_task_id`, which carries no FK and is the
+/// precedent. `ON DELETE NO ACTION` was not an option — it would refuse the
+/// removal — and `SET NULL` is the leak: a nulled row reads as board scope.
+///
+/// Nothing relies on the dropped FK action. `remove_task` names blocking
+/// children itself (the `parent_id` FK stays), the row writers validate the
+/// task before linking, and `doctor` reports dangling task links on these
+/// four tables through the new `orphaned_task_links` check rather than
+/// `foreign_key_check`, which has one fewer FK to check. `NULL` once again
+/// means only what the writers put there: a session handoff, a lanewide
+/// sitrep, a taskless deployment, an untagged attention row — each board
+/// scope, as before.
+///
+/// SQLite cannot drop a FK in place, so each table is rebuilt on the
+/// `BOARD_V33` precedent: drop the attached triggers, rename aside, recreate
+/// byte-identical apart from the `task_id` column (the v35 `attention` shape
+/// keeps its `lane` and `return_trigger` columns), copy every row back naming
+/// every column, drop the old table, recreate indexes and triggers.
+/// `search_source_rows` and `search_deployment_event_rows` resolve by name
+/// and are left alone under `PRAGMA legacy_alter_table`, as is
+/// `attention_tags.attention_id`, which keeps pointing at the name `attention`
+/// takes back. Rows already nulled by an older removal recover their link
+/// from their creation event — each one records the row id against the task —
+/// but only when that event's task has a `task_removed` record and no live
+/// row, so session handoffs, lanewide sitreps and taskless deployments stay
+/// NULL.
+const BOARD_V36: &str = r#"
+DROP TRIGGER search_sitreps_ai;
+DROP TRIGGER search_sitreps_au;
+DROP TRIGGER search_sitreps_ad;
+DROP TRIGGER search_handoffs_ai;
+DROP TRIGGER search_handoffs_au;
+DROP TRIGGER search_handoffs_ad;
+DROP TRIGGER search_deployments_au;
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+DROP TRIGGER attention_check_result_insert_all_or_none;
+DROP TRIGGER attention_check_result_update_all_or_none;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE sitreps RENAME TO sitreps_v35;
+CREATE TABLE sitreps (
+ id TEXT PRIMARY KEY NOT NULL,
+ lane TEXT NOT NULL,
+ task_id TEXT,
+ author TEXT NOT NULL,
+ body TEXT NOT NULL,
+ worktree TEXT,
+ branch TEXT,
+ head_sha TEXT,
+ root_head TEXT,
+ dirty_summary TEXT,
+ archived INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO sitreps(
+ id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at
+)
+SELECT id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at
+FROM sitreps_v35;
+DROP TABLE sitreps_v35;
+ALTER TABLE handoffs RENAME TO handoffs_v35;
+CREATE TABLE handoffs (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ checkpoint_seq INTEGER REFERENCES checkpoints(seq) ON DELETE SET NULL,
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled','retired')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT,root_head TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ retired_at INTEGER,
+ retired_by TEXT,
+ retire_note TEXT
+) STRICT;
+INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority,retired_at,retired_by,retire_note)
+ SELECT id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority,retired_at,retired_by,retire_note FROM handoffs_v35;
+DROP TABLE handoffs_v35;
+ALTER TABLE deployments RENAME TO deployments_v35;
+CREATE TABLE deployments (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ repo TEXT NOT NULL,
+ identity_mode TEXT NOT NULL DEFAULT 'git' CHECK(identity_mode IN ('git','artifact')),
+ commit_sha TEXT NOT NULL CHECK(
+   (identity_mode='git' AND length(commit_sha)=40 AND commit_sha NOT GLOB '*[^0-9a-f]*')
+   OR
+   (identity_mode='artifact' AND commit_sha='unknown')
+ ),
+ deployer_checkout TEXT CHECK(deployer_checkout IS NULL OR (length(deployer_checkout)=40 AND deployer_checkout NOT GLOB '*[^0-9a-f]*')),
+ expected_artifacts TEXT CHECK(expected_artifacts IS NULL OR (json_valid(expected_artifacts)
+   AND json_type(expected_artifacts)='array' AND json_array_length(expected_artifacts)>=1)),
+ observed_artifacts TEXT CHECK(observed_artifacts IS NULL OR (json_valid(observed_artifacts)
+   AND json_type(observed_artifacts)='array' AND json_array_length(observed_artifacts)>=1)),
+ branch TEXT,
+ tier TEXT NOT NULL CHECK(tier IN ('@_bdt','@_bd','@_bst','@_bs','@_s','@_uat','@_p')),
+ environment TEXT NOT NULL,
+ host TEXT NOT NULL,
+ url TEXT NOT NULL,
+ mechanism TEXT,
+ operation_id TEXT UNIQUE,
+ retry_of TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+ status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','abandoned')),
+ phase TEXT CHECK(phase IS NULL OR phase IN ('build','publish','start','verification')),
+ actor TEXT NOT NULL,
+ lane TEXT,
+ capability_token TEXT NOT NULL UNIQUE,
+ receipt TEXT,
+ artifact_uri TEXT,
+ served_commit TEXT CHECK(served_commit IS NULL OR (length(served_commit)=40 AND served_commit NOT GLOB '*[^0-9a-f]*')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ completed_at INTEGER,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ archived_at INTEGER,
+ sprint_id TEXT REFERENCES sprints(id),
+ target_version TEXT,
+ served_version TEXT,
+ CHECK(identity_mode='git' OR served_commit IS NULL),
+ CHECK(
+   (status='started' AND completed_at IS NULL)
+   OR
+   (status<>'started' AND completed_at IS NOT NULL)
+ ),
+ CHECK(status<>'succeeded' OR (phase='verification' AND receipt IS NOT NULL AND length(trim(receipt))>0 AND (
+   (identity_mode='git' AND served_commit=commit_sha)
+   OR
+   (identity_mode='artifact' AND observed_artifacts IS NOT NULL)
+ )))
+) STRICT;
+INSERT INTO deployments(
+ id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,observed_artifacts,
+ branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,phase,actor,lane,
+ capability_token,receipt,artifact_uri,served_commit,created_at,updated_at,completed_at,
+ archived,archived_at,sprint_id,target_version,served_version
+)
+SELECT id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,observed_artifacts,
+ branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,phase,actor,lane,
+ capability_token,receipt,artifact_uri,served_commit,created_at,updated_at,completed_at,
+ archived,archived_at,sprint_id,target_version,served_version
+FROM deployments_v35;
+DROP TABLE deployments_v35;
+ALTER TABLE attention RENAME TO attention_v35;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
+ body TEXT NOT NULL, raised_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),
+ check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'
+   AND json_array_length(check_choices) BETWEEN 2 AND 4)),
+ check_answer TEXT,
+ check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),
+ check_about TEXT,
+ check_answered TEXT,
+ check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),
+ check_answered_at INTEGER,
+ lane TEXT,
+ return_trigger TEXT,
+ CHECK(
+   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
+    AND check_explanation IS NULL AND check_about IS NULL)
+   OR
+   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL
+    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)
+ ),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at,lane,return_trigger
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at,lane,return_trigger
+FROM attention_v35;
+DROP TABLE attention_v35;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_sitreps_lane_created ON sitreps(lane,created_at DESC) WHERE archived=0;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_target ON deployments(repo,tier,environment,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_status ON deployments(status,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_task ON deployments(task_id,created_at DESC) WHERE archived=0;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_sitreps_ai AFTER INSERT ON sitreps BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_au AFTER UPDATE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_ad AFTER DELETE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+END;
+CREATE TRIGGER search_handoffs_ai AFTER INSERT ON handoffs BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_au AFTER UPDATE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+END;
+CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
+ DELETE FROM search_documents
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID') IN (old.id,new.id)
+ );
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows
+ WHERE source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+CREATE TRIGGER attention_check_result_insert_all_or_none AFTER INSERT ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+CREATE TRIGGER attention_check_result_update_all_or_none AFTER UPDATE OF check_question, check_choices, check_answer, check_explanation, check_about, check_answered, check_correct, check_answered_at ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+UPDATE sitreps SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE handoffs SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE deployments SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE attention SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
@@ -2572,7 +2919,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 35;
+pub const BOARD_SCHEMA_VERSION: usize = 36;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -3136,7 +3483,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34, BOARD_V35,
+    BOARD_V34, BOARD_V35, BOARD_V36,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4675,9 +5022,9 @@ mod tests {
                 [],
             )
             .expect("insert a pre-snooze row");
-        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v35");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
         assert_eq!(schema_version(&connection).unwrap(), 35);
-        assert_eq!(BOARD_SCHEMA_VERSION, 35);
+        assert_eq!(BOARD_SCHEMA_VERSION, 36);
         let trigger = |connection: &Connection, id: &str| -> Option<String> {
             connection
                 .query_row(
@@ -4703,13 +5050,296 @@ mod tests {
         connection
             .pragma_update(None, "user_version", 34)
             .expect("rewind past v35");
-        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v35 after a rewind");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("rerun v35 after a rewind");
         assert_eq!(schema_version(&connection).unwrap(), 35);
         assert_eq!(
             trigger(&connection, "a-old").as_deref(),
             Some("date:2031-01-01"),
             "the rerun must keep what the column already holds"
         );
+    }
+
+    #[test]
+    fn schema_36_keeps_task_links_without_foreign_keys() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,status,created_at,updated_at) \
+                 VALUES('t-keep','task','kept task','todo',1,1)",
+                [],
+            )
+            .expect("seed the linked task");
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-keep','driver-1','t-keep','seed','kept sitrep',2)",
+                [],
+            )
+            .expect("seed the linked sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-keep','t-keep','manual','pending','seed','kept summary','kept intent','kept next',3)",
+                [],
+            )
+            .expect("seed the linked handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,lane,return_trigger) \
+                 VALUES('a-keep','t-keep','decision','kept question','seed',4,'open','driver-1','date:2031-01-01')",
+                [],
+            )
+            .expect("seed the linked attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-keep','t-keep','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-keep',5,5)",
+                [],
+            )
+            .expect("seed the linked deployment");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v36");
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            BOARD_SCHEMA_VERSION,
+            "the ladder must end at the declared version"
+        );
+        // Every row and its link survive the rebuilds byte-for-byte,
+        // including the v34/v35 attention columns.
+        for (table, id, id_value) in [
+            ("sitreps", "id", "sr-keep"),
+            ("handoffs", "id", "h-keep"),
+            ("attention", "id", "a-keep"),
+            ("deployments", "id", "d-keep"),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE {id}='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the rebuilt link");
+            assert_eq!(
+                link.as_deref(),
+                Some("t-keep"),
+                "{table} lost its task link in the v36 rebuild"
+            );
+        }
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-keep'", [], |row| {
+                row.get(0)
+            })
+            .expect("read the rebuilt lane");
+        assert_eq!(lane.as_deref(), Some("driver-1"));
+        let trigger: Option<String> = connection
+            .query_row(
+                "SELECT return_trigger FROM attention WHERE id='a-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the rebuilt return trigger");
+        assert_eq!(trigger.as_deref(), Some("date:2031-01-01"));
+        // No task_id foreign key stands on any of the four tables: the link
+        // is plain TEXT, so a removal keeps the id instead of nulling it.
+        for table in ["sitreps", "handoffs", "deployments", "attention"] {
+            let fks: Vec<String> = connection
+                .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                !fks.iter().any(|column| column == "task_id"),
+                "{table} still carries a task_id foreign key after v36"
+            );
+        }
+        // With enforcement on, removing the task keeps every link: the
+        // orphaned id is what the read paths gate on.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute("DELETE FROM tasks WHERE id='t-keep'", [])
+            .expect("remove the linked task");
+        for (table, id_value) in [
+            ("sitreps", "sr-keep"),
+            ("handoffs", "h-keep"),
+            ("attention", "a-keep"),
+            ("deployments", "d-keep"),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the orphaned link");
+            assert_eq!(
+                link.as_deref(),
+                Some("t-keep"),
+                "{table} nulled its task link on removal after v36"
+            );
+        }
+        // Re-running the ladder over the migrated shape is stable.
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("re-run the ladder");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+    }
+    #[test]
+    fn schema_36_backfills_pre_v36_nulled_links_from_creation_events() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,status,created_at,updated_at) \
+                 VALUES('t-old','task','removed task','todo',1,1)",
+                [],
+            )
+            .expect("seed the removed task");
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-old','driver-1','t-old','seed','old sitrep',2)",
+                [],
+            )
+            .expect("seed the linked sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-old','t-old','manual','pending','seed','old summary','old intent','old next',3)",
+                [],
+            )
+            .expect("seed the linked handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-old','t-old','decision','old question','seed',4,'open')",
+                [],
+            )
+            .expect("seed the linked attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-old','t-old','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-old',5,5)",
+                [],
+            )
+            .expect("seed the linked deployment");
+        // Genuinely taskless rows, which must stay NULL: a session handoff, a
+        // lanewide sitrep, a taskless deployment and an untagged attention row.
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-lane','driver-1',NULL,'seed','lanewide sitrep',6)",
+                [],
+            )
+            .expect("seed the lanewide sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-session',NULL,'manual','pending','seed','session summary','session intent','session next',7)",
+                [],
+            )
+            .expect("seed the session handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-free',NULL,'decision','untagged question','seed',8,'open')",
+                [],
+            )
+            .expect("seed the untagged attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-free',NULL,'kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-free',9,9)",
+                [],
+            )
+            .expect("seed the taskless deployment");
+        // The creation events the writers left behind, each naming its row id
+        // against the task — with taskless rows recording no task.
+        for (kind, task, payload) in [
+            ("sitrep_posted", Some("t-old"), r#"{"sitrepID":"sr-old"}"#),
+            ("handoff_created", Some("t-old"), r#"{"handoffID":"h-old"}"#),
+            (
+                "attention_raised",
+                Some("t-old"),
+                r#"{"attentionID":"a-old"}"#,
+            ),
+            (
+                "deployment_started",
+                Some("t-old"),
+                r#"{"deploymentID":"d-old"}"#,
+            ),
+            ("sitrep_posted", None, r#"{"sitrepID":"sr-lane"}"#),
+            ("handoff_created", None, r#"{"handoffID":"h-session"}"#),
+            ("attention_raised", None, r#"{"attentionID":"a-free"}"#),
+            ("deployment_started", None, r#"{"deploymentID":"d-free"}"#),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                    rusqlite::params![task, kind, "seed", payload, 10],
+                )
+                .expect("seed the creation event");
+        }
+        connection
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at) \
+                 VALUES('t-old','task_removed','seed','{}',11)",
+                [],
+            )
+            .expect("seed the removal record");
+        // The pre-V36 removal itself: the foreign key nulls every link.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute("DELETE FROM tasks WHERE id='t-old'", [])
+            .expect("remove the linked task");
+        for id_value in ["sr-old", "h-old", "a-old", "d-old"] {
+            let table = if id_value.starts_with("sr-") {
+                "sitreps"
+            } else if id_value.starts_with("h-") {
+                "handoffs"
+            } else if id_value.starts_with("a-") {
+                "attention"
+            } else {
+                "deployments"
+            };
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the nulled link");
+            assert_eq!(link, None, "{table} kept its link on a pre-v36 removal");
+        }
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v36");
+        // Exactly the rows whose creation event names the removed task recover
+        // their link; the genuinely taskless rows stay NULL.
+        for (table, id_value, expected) in [
+            ("sitreps", "sr-old", Some("t-old")),
+            ("handoffs", "h-old", Some("t-old")),
+            ("attention", "a-old", Some("t-old")),
+            ("deployments", "d-old", Some("t-old")),
+            ("sitreps", "sr-lane", None),
+            ("handoffs", "h-session", None),
+            ("attention", "a-free", None),
+            ("deployments", "d-free", None),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the migrated link");
+            assert_eq!(
+                link.as_deref(),
+                expected,
+                "{table} row {id_value} backfilled to the wrong link"
+            );
+        }
     }
 
     fn index_sql(connection: &Connection, name: &str) -> String {
