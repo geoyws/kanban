@@ -59,11 +59,12 @@
 //! here has no `task verdict` verb and no gate); they must COMPILE:
 //! `cargo test --offline --test done_gate_e2e --no-run`.
 
+use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -267,6 +268,31 @@ impl Estate {
 
     /// Record provenance head `head` for `id` via an explicit-flag checkpoint.
     fn checkpoint(&self, id: &str, lease: &str, author: &str, head: &str) {
+        let output = self.checkpoint_state(id, lease, author, head, "continue");
+        assert!(
+            output.status.success(),
+            "checkpoint should have succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "checkpoint stdout is not JSON: {error}\nstdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    }
+
+    /// Checkpoint with an explicit `--state` (the helper above is `continue`
+    /// only); the caller asserts ok vs refusal. Used for `--state done` (DG-17).
+    fn checkpoint_state(
+        &self,
+        id: &str,
+        lease: &str,
+        author: &str,
+        head: &str,
+        state: &str,
+    ) -> Output {
         let repo = self.work.to_str().unwrap().to_owned();
         let args = vec![
             "checkpoint",
@@ -282,7 +308,7 @@ impl Estate {
             "--next-action",
             "verify and close",
             "--state",
-            "continue",
+            state,
             "--repo",
             &repo,
             "--branch",
@@ -293,7 +319,7 @@ impl Estate {
             "clean",
             "--json",
         ];
-        self.ok_json(&args);
+        self.run(&args)
     }
 
     fn release(&self, id: &str, lease: &str) {
@@ -1485,4 +1511,433 @@ fn done_gate_refusals_carry_named_reasons() {
             .unwrap(),
         s7_toggle(&board)
     );
+}
+
+// ---------------------------------------------------------------------------
+// A17 (DG-17): every write that makes a task done is gated — checkpoint
+// `--state done`, `task add --status done`, and import. Each refuses with
+// sentence 1 on the gated board with nothing written, and succeeds on the
+// ungated twin exactly as at the baseline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a17_done_gate_checkpoint_done_is_gated() {
+    let estate = Estate::new("a17-checkpoint");
+    estate.gate_on();
+    estate.add_task("checkpoint work", "t-x", &[]);
+    let lease = estate.claim("t-x", EXEC);
+    estate.checkpoint("t-x", &lease, EXEC, H1);
+
+    // No verdict: the done checkpoint is refused with sentence 1 and writes
+    // nothing — row, lease, checkpoints and events unchanged.
+    let before = estate.snapshot("t-x");
+    let refused = estate.checkpoint_state("t-x", &lease, EXEC, H1, "done");
+    assert!(!refused.status.success(), "gated done checkpoint succeeded");
+    let value: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        value["error"].as_str().unwrap(),
+        s1_no_verdict("t-x"),
+        "refusal wording differs byte-for-byte"
+    );
+    estate.assert_unchanged("t-x", &before);
+    assert_eq!(estate.show("t-x")["status"], "in_progress");
+
+    // Positive: a foreign-actor verdict covering the head lets the same
+    // checkpoint through, closing the row.
+    let aid = estate.resolved_attention("t-x");
+    estate.verdict_ok("t-x", REVIEWER, &[H1], &[&aid], PLANNER);
+    let done = estate.checkpoint_state("t-x", &lease, EXEC, H1, "done");
+    assert!(
+        done.status.success(),
+        "verdict-covered done checkpoint refused\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&done.stdout),
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert_eq!(estate.show("t-x")["status"], "done");
+
+    // Negative control: on the ungated twin the done checkpoint succeeds with
+    // no verdict anywhere (DG-09).
+    let twin = Estate::twin("a17-checkpoint-twin");
+    twin.add_task("twin work", "t-twin", &[]);
+    let twin_lease = twin.claim("t-twin", EXEC);
+    twin.checkpoint("t-twin", &twin_lease, EXEC, H1);
+    let twin_done = twin.checkpoint_state("t-twin", &twin_lease, EXEC, H1, "done");
+    assert!(
+        twin_done.status.success(),
+        "ungated done checkpoint refused\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&twin_done.stdout),
+        String::from_utf8_lossy(&twin_done.stderr)
+    );
+    assert_eq!(twin.show("t-twin")["status"], "done");
+}
+
+#[test]
+fn a17_done_gate_task_add_done_is_refused() {
+    let estate = Estate::new("a17-add");
+    estate.gate_on();
+
+    // A task-type add at `done`: sentence 1 naming the id, and no row exists
+    // afterwards — the refused INSERT lands nothing.
+    let refused = estate.run(&[
+        "task",
+        "add",
+        "finished work",
+        "--id",
+        "t-y",
+        "--status",
+        "done",
+        "--json",
+    ]);
+    assert!(!refused.status.success(), "gated add at done succeeded");
+    let value: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        value["error"].as_str().unwrap(),
+        s1_no_verdict("t-y"),
+        "refusal wording differs byte-for-byte"
+    );
+    let missing = estate.run(&["task", "show", "t-y", "--json"]);
+    assert!(!missing.status.success(), "refused add left a row behind");
+
+    // The gate is task-only (DG-16): a story-type add at `done` behaves as at
+    // the baseline with no verdict demanded.
+    estate.add_task("Epic", "e-1", &["--type", "epic", "--status", "todo"]);
+    estate.add_task(
+        "Story",
+        "s-1",
+        &["--type", "story", "--parent", "e-1", "--status", "done"],
+    );
+    assert_eq!(estate.show("s-1")["status"], "done");
+
+    // Negative control: on the ungated twin the task add at `done` succeeds
+    // with no verdict anywhere (DG-09).
+    let twin = Estate::twin("a17-add-twin");
+    twin.add_task("finished work", "t-y", &["--status", "done"]);
+    assert_eq!(twin.show("t-y")["status"], "done");
+}
+
+#[test]
+fn a17_done_gate_import_done_is_refused() {
+    let estate = Estate::new("a17-import");
+    estate.gate_on();
+    // A pre-existing row, proving the refused import changes nothing else.
+    estate.add_task("existing work", "t-keep", &[]);
+    let keep_before = estate.snapshot("t-keep");
+
+    // The source carries a task-type row at `done` plus an innocent `todo`
+    // row: the refusal names the done row and rolls the whole import back.
+    let source = estate.root.join("kanban.json");
+    fs::write(
+        &source,
+        r#"{"tasks":[{"id":"t-imp-done","status":"done"},{"id":"t-imp-todo","status":"todo"}]}"#,
+    )
+    .unwrap();
+    let refused = estate.run(&[
+        "import",
+        "atmux-json",
+        source.to_str().unwrap(),
+        "--as",
+        PLANNER,
+        "--json",
+    ]);
+    assert!(!refused.status.success(), "gated import of done succeeded");
+    let value: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        value["error"].as_str().unwrap(),
+        s1_no_verdict("t-imp-done"),
+        "refusal wording differs byte-for-byte"
+    );
+    for id in ["t-imp-done", "t-imp-todo"] {
+        let missing = estate.run(&["task", "show", id, "--json"]);
+        assert!(!missing.status.success(), "refused import left {id} behind");
+    }
+    estate.assert_unchanged("t-keep", &keep_before);
+
+    // Negative control: on the ungated twin the same source lands whole, the
+    // done row `done` (DG-09).
+    let twin = Estate::twin("a17-import-twin");
+    let twin_source = twin.root.join("kanban.json");
+    fs::write(
+        &twin_source,
+        r#"{"tasks":[{"id":"t-imp-done","status":"done"},{"id":"t-imp-todo","status":"todo"}]}"#,
+    )
+    .unwrap();
+    twin.ok_json(&[
+        "import",
+        "atmux-json",
+        twin_source.to_str().unwrap(),
+        "--as",
+        PLANNER,
+        "--json",
+    ]);
+    assert_eq!(twin.show("t-imp-done")["status"], "done");
+    assert_eq!(twin.show("t-imp-todo")["status"], "todo");
+}
+
+// ---------------------------------------------------------------------------
+// A18 (DG-18): the verdict list hides evidence the caller cannot read.
+// Tag-scoped managed estate, following tests/authz_bypass_matrix_e2e.rs:
+// boards are seeded while enforcement is `direct`, then a principal is bound
+// for this process's own UID/username with exactly the scopes under test and
+// enforcement flips to `managed` — the broker's socket hop is a separate
+// slice and `routing::board_authz` stands in for it exactly as `local_actor`
+// does for the `access` command family.
+// ---------------------------------------------------------------------------
+
+/// One scope grant: a capability and the ADR-033 atom list it applies to.
+type Scope = (&'static str, Vec<String>);
+
+fn board_scope(capability: &'static str, board: &str) -> Scope {
+    (capability, vec![format!("board:{board}")])
+}
+
+fn tag_scope(capability: &'static str, board: &str, tag: &str) -> Scope {
+    (
+        capability,
+        vec![format!("board:{board}"), format!("tag:{tag}")],
+    )
+}
+
+struct ManagedEstate {
+    root: PathBuf,
+    xdg: PathBuf,
+    work: PathBuf,
+    board_id: String,
+}
+
+impl ManagedEstate {
+    fn new(label: &str) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "kanban-done-gate-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        let xdg = root.join("xdg");
+        let work = root.join("work");
+        for directory in [&xdg, &work] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let mut estate = Self {
+            root,
+            xdg,
+            work,
+            board_id: String::new(),
+        };
+        let board = estate.ok_json(&["init", "--name", BOARD, "--json"]);
+        estate.board_id = Path::new(board["boardPath"].as_str().unwrap())
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        estate
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kanban"));
+        command
+            .current_dir(&self.work)
+            .args(args)
+            .env("XDG_DATA_HOME", &self.xdg)
+            .env("KANBAN_PUBLISHED_SHAS", PUBLISHED)
+            .env_remove("KANBAN_DATA_DIR")
+            .env_remove("KANBAN_DB")
+            .env_remove("KANBAN_PROJECT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "command should have succeeded: {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn ok_json(&self, args: &[&str]) -> Value {
+        serde_json::from_str(&self.ok(args)).unwrap()
+    }
+
+    fn registry(&self) -> Connection {
+        Connection::open(self.xdg.join("kanban").join("registry.db")).unwrap()
+    }
+
+    /// Bind a principal for the identity the spawned binary resolves for
+    /// ITSELF, and give it exactly `scopes`.
+    fn bind_self(&self, principal: &str, scopes: &[Scope]) {
+        self.registry()
+            .execute(
+                "INSERT INTO principals(id,username,uid,enabled,bound_at_epoch,bound_by_event_id) \
+                 VALUES(?1,?2,?3,1,0,'pe-00000000')",
+                rusqlite::params![principal, self_username(), self_uid()],
+            )
+            .unwrap();
+        self.grant(principal, scopes);
+    }
+
+    fn grant(&self, principal: &str, scopes: &[Scope]) {
+        let connection = self.registry();
+        for (capability, atoms) in scopes {
+            connection
+                .execute(
+                    "INSERT INTO grants(id,principal_id,capability,scope,state,origin,\
+                     granted_at_epoch,granted_by_event_id) \
+                     VALUES(?1,?2,?3,?4,'active','grant',0,'pe-00000000')",
+                    rusqlite::params![
+                        format!(
+                            "g-{principal}-{capability}-{}",
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos()
+                        ),
+                        principal,
+                        capability,
+                        serde_json::to_string(atoms).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    fn enforce(&self, state: &str) {
+        self.registry()
+            .execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])
+            .unwrap();
+    }
+}
+
+impl Drop for ManagedEstate {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// This process's effective UID, from the same kernel the guard asks.
+fn self_uid() -> u32 {
+    id_output(&["-u"]).parse().unwrap()
+}
+
+/// This process's effective user name — `getpwuid(geteuid())->pw_name`, which
+/// is exactly what the guard resolves and then puts through the two-way
+/// passwd check.
+fn self_username() -> String {
+    id_output(&["-un"])
+}
+
+fn id_output(args: &[&str]) -> String {
+    let output = Command::new("id").args(args).output().unwrap();
+    assert!(output.status.success(), "id {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
+    let estate = ManagedEstate::new("a18");
+    // Seeded direct, the way a real estate reaches managed with boards in it.
+    estate.ok(&["tag", "add", "visible", "--as", "seed", "--json"]);
+    estate.ok(&["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(&[
+        "task",
+        "add",
+        "listed work",
+        "--id",
+        "t-x",
+        "--tag",
+        "visible",
+        "--json",
+    ]);
+    let aid = estate.ok_json(&[
+        "attention",
+        "raise",
+        "reviewed the pinned diff",
+        "--as",
+        PLANNER,
+        "--kind",
+        "decision",
+        "--task",
+        "t-x",
+        "--tag",
+        "secret",
+        "--json",
+    ])["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok_json(&[
+        "attention",
+        "resolve",
+        &aid,
+        "--as",
+        PLANNER,
+        "--choice",
+        "approve",
+        "--note",
+        "checked the pinned diff",
+        "--json",
+    ]);
+    estate.ok_json(&["task", "verdict", "gate", "on", "--as", GEO, "--json"]);
+    estate.ok_json(&[
+        "task",
+        "verdict",
+        "add",
+        "t-x",
+        "--reviewer",
+        REVIEWER,
+        "--sha",
+        H1,
+        "--evidence",
+        &aid,
+        "--as",
+        PLANNER,
+        "--json",
+    ]);
+    // Direct: the full row answers with the evidence id present.
+    let direct = estate.ok_json(&["task", "verdict", "list", "t-x", "--json"]);
+    assert_eq!(direct.as_array().unwrap().len(), 1);
+    assert_eq!(direct[0]["evidence"], serde_json::json!([&aid]));
+
+    // A principal that reads the board and `visible` but not `secret`.
+    let id = estate.board_id.clone();
+    estate.bind_self(
+        "p-limited",
+        &[
+            board_scope("read", &id),
+            board_scope("write", &id),
+            tag_scope("read", &id, "visible"),
+            tag_scope("write", &id, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+
+    // The verdict row still answers (its task is readable) with writer,
+    // reviewer, SHAs and verdict intact — but the unreadable id is omitted,
+    // never enumerated.
+    let listed = estate.ok_json(&["task", "verdict", "list", "t-x", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["writer"], PLANNER);
+    assert_eq!(listed[0]["reviewer"], REVIEWER);
+    assert_eq!(listed[0]["shas"], serde_json::json!([H1]));
+    assert_eq!(listed[0]["verdict"], "pass");
+    assert_eq!(
+        listed[0]["evidence"],
+        serde_json::json!([]),
+        "hidden attention id enumerated: {listed}"
+    );
+
+    // Granting the hidden tag brings the id back: the omission is authz, not
+    // data loss.
+    estate.grant("p-limited", &[tag_scope("read", &id, "secret")]);
+    let relisted = estate.ok_json(&["task", "verdict", "list", "t-x", "--json"]);
+    assert_eq!(relisted[0]["evidence"], serde_json::json!([&aid]));
 }

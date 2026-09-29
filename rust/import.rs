@@ -529,6 +529,18 @@ fn normalize_and_insert(
         {
             bail!("invalid imported task {}", input.id);
         }
+        // The done gate covers every write that makes a task done (DG-17):
+        // a task-type row at `done` — inserted or flipped by the upsert below
+        // — is refused on a gated board with sentence 1 naming the row, and
+        // the bail rolls the whole import back so nothing is written. Import
+        // takes any `--as` actor, so it is not geoyws-only by design and fails
+        // closed here; stories and epics are DG-16 and take no verdict.
+        if input.task_type == "task"
+            && input.status == "done"
+            && crate::store::done_gate_on(&transaction)?
+        {
+            bail!("{}", crate::store::no_verdict_sentence(&input.id));
+        }
         let completed = if input.status == "done" {
             input.completed_at.or(Some(input.updated_at))
         } else {

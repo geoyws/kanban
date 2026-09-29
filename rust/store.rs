@@ -3277,7 +3277,7 @@ const DONE_GATE_META_KEY: &str = "done_gate";
 /// Whether the done gate guards this board. Absent reads as `off`, so boards
 /// written before the gate (and fresh boards that never toggled it) move
 /// exactly as at the baseline (DG-09, DG-15).
-fn done_gate_on(connection: &Connection) -> Result<bool> {
+pub(crate) fn done_gate_on(connection: &Connection) -> Result<bool> {
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM board_meta WHERE key=?",
@@ -3416,6 +3416,15 @@ enum GateMiss {
     Missing,
 }
 
+/// DG-08 sentence 1, verbatim: the no-verdict refusal. One function, shared
+/// by the move gate and the every-write cover (DG-17: `task add` and import),
+/// so the wording cannot drift between the paths that refuse it.
+pub(crate) fn no_verdict_sentence(task_id: &str) -> String {
+    format!(
+        "task {task_id} has no foreign-actor pass verdict — record one with `task verdict add {task_id} --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done"
+    )
+}
+
 impl GateMiss {
     fn reason(&self) -> &'static str {
         match self {
@@ -3434,9 +3443,7 @@ impl GateMiss {
                 "task {task_id} verdict is stale: it covered {} but the row now stands at {head} — record a fresh verdict at the new head with `task verdict add {task_id} --as <planner>`",
                 covered.join(",")
             ),
-            GateMiss::Missing => format!(
-                "task {task_id} has no foreign-actor pass verdict — record one with `task verdict add {task_id} --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done"
-            ),
+            GateMiss::Missing => no_verdict_sentence(task_id),
         }
     }
 }
@@ -5729,6 +5736,13 @@ impl Store {
             let parent = require_task(&transaction, parent)?;
             require_valid_nesting(&id, &input.task_type, &parent)?;
         }
+        // The done gate covers every write that makes a task done (DG-17), not
+        // just the move: a new row has no holder and no head, and `task add`
+        // carries no override grammar, so a task-type add at `done` on a gated
+        // board is refused with sentence 1 before the INSERT — nothing written.
+        if input.status == "done" && input.task_type == "task" && done_gate_on(&transaction)? {
+            bail!("{}", no_verdict_sentence(&id));
+        }
         transaction.execute(
             "INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![id,input.task_type,input.parent_id,title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,now,now,if input.status == "done" { Some(now) } else { None },input.metadata.to_string()],
@@ -6197,7 +6211,12 @@ impl Store {
 
     /// Read a task's stored verdicts, oldest first. Read-only: answers from
     /// the open connection without taking the write lock, refusing hidden
-    /// rows with the generic denial like every other read.
+    /// rows with the generic denial like every other read. Evidence is
+    /// tag-scoped like the attention rows it cites (DG-18): under enforcement
+    /// an evidence id the caller cannot read is omitted from its array, so the
+    /// list never enumerates hidden attention ids; the verdict rows themselves
+    /// stay, the task read above already authorized them. Fail-closed: an
+    /// unreadable id (missing row, denied tags, lookup error) is omitted.
     pub fn list_verdicts(&self, task_id: &str) -> Result<Vec<Verdict>> {
         self.authz
             .check_read(&task_tags(&self.connection, task_id)?)?;
@@ -6205,11 +6224,22 @@ impl Store {
         if !has_verdicts_table(&self.connection)? {
             return Ok(Vec::new());
         }
-        self.connection
+        let mut verdicts = self
+            .connection
             .prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY seq ASC")?
             .query_map([task_id], verdict_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if self.authz.is_enforcing() {
+            for verdict in &mut verdicts {
+                verdict
+                    .evidence
+                    .retain(|id| match attention_tags(&self.connection, id) {
+                        Ok(tags) => self.authz.permits_read(&tags),
+                        Err(_) => false,
+                    });
+            }
+        }
+        Ok(verdicts)
     }
 
     /// Turn the per-board done gate on or off (DG-15): the
@@ -6966,7 +6996,8 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
-        let prior_status = require_task(&transaction, &input.task_id)?.status;
+        let prior = require_task(&transaction, &input.task_id)?;
+        let prior_status = prior.status.clone();
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -7003,6 +7034,21 @@ impl Store {
             params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
         )?;
         let seq = transaction.last_insert_rowid();
+        // A `done` checkpoint closes the row exactly as a done-move does, so
+        // the done gate covers it too (DG-17): same `enforce_done_gate`, the
+        // author as the closing actor, no `--force` on this verb. The check
+        // runs after the checkpoint INSERT — the verdict must cover the head
+        // this checkpoint records — but before the status flip, inside the one
+        // transaction, so a refusal rolls everything back and writes nothing.
+        if input.state == "done" && prior.task_type == "task" && done_gate_on(&transaction)? {
+            enforce_done_gate(
+                &transaction,
+                &input.task_id,
+                &input.author,
+                false,
+                &prior_status,
+            )?;
+        }
         let (status, completed): (&str, Option<i64>) = match input.state.as_str() {
             "blocked" => ("blocked", None),
             "done" => ("done", Some(now)),
@@ -7021,7 +7067,7 @@ impl Store {
             "checkpoint_added",
             Some(&input.author),
             json!({"seq":seq,"state":input.state}),
-            Some(&prior_status),
+            Some(prior_status.as_str()),
             Some(status),
         )?;
         let result = transaction.query_row(
