@@ -9,14 +9,15 @@
   under attention `a-9254741a` (see the change log).
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `DRAFT` (written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
-  as ADR-047 §6 requires). George approved the slice, its implementation and its tests
+- **Status:** `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria:
+  no findings. Specification readiness only — it authorises neither implementation, nor rollout,
+  nor release). Written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
+  as ADR-047 §6 requires. George approved the slice, its implementation and its tests
   landing in one change with matrix rows (the chip half his sentence names is retired with
   the web view, ADR-053): attention `a-3990a3e3`, choice `approve`,
   2026-09-24. That approval is the slice admission ADR-047 §7 requires: `t-7f596f45` is the
   child row of rollout epic `e-c0852fe7` carrying the work (with `t-fb600b26` alongside it).
-  Open question `OQ-1` in §7 is answered 2026-09-29 (`CLI-07`); no independent readiness
-  gate has been run. This stamp authorises neither rollout nor release; product readiness
+  Open question `OQ-1` in §7 is answered 2026-09-29 (`CLI-07`). Product readiness
   stays `/quality`, then `/tidy`, then the served-tier receipt.
 - **Owner (product scope):** George. He alone resolves scope, the estate map, and the refusal
   wording.
@@ -373,3 +374,5 @@ on the new row.
 - `2026-09-29` — `CLI-07` appended: the attach refusal names the board's estate form as
   the repair, built from the same map `CLI-01` reads (George `a-9254741a`, choice `map`);
   `OQ-1` answered. Status stays `DRAFT`: no independent readiness gate has been run.
+- `2026-09-29` — stamped `SPEC-READY` (independent review against the SDD §1 exit criteria:
+  no findings). No requirement ID changed meaning.
