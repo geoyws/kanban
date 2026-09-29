@@ -471,7 +471,7 @@ served markup, so there is no browser surface to drive.
 
 ## Requirements trace — `docs/specs/deploy.md` DEPLOY-01..DEPLOY-08
 
-The DEPLOY slice is specified on 2026-09-30 on branch `kanban-geoyws-driver` at commit `863667d`;
+The DEPLOY slice is `SPEC-READY` on 2026-09-30 on branch `kanban-geoyws-driver` at commit `863667d`;
 the implementation row is `t-1220f80f`. `Layer` uses the specification's vocabulary: `process`
 is a compiled-binary process-boundary exchange in `tests/e2e.rs`. The one existing name was
 enumerated with `cargo test --test e2e -- --list` at the baseline; every other row is planned,
@@ -480,10 +480,10 @@ its real name. All 8 requirements are `MUST`; the slice has no browser surface.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `DEPLOY-01` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_bdt` on `geoywsMBP` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` |
+| `DEPLOY-01` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_bdt` on `geoywsMBP` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` as planned `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` |
 | `DEPLOY-02` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words`, owed by `t-1220f80f` (the existing test checks substrings only) |
 | `DEPLOY-03` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words`, owed by `t-1220f80f` (the existing test checks substrings only) |
-| `DEPLOY-04` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_p` on `hax` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` |
+| `DEPLOY-04` | MUST | process | `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_p` on `hax` is accepted on an unmapped board; the IFCA-board case is owed by `t-1220f80f` as planned `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` |
 | `DEPLOY-05` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards`, owed by `t-1220f80f` |
 | `DEPLOY-06` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards`, owed by `t-1220f80f` |
 | `DEPLOY-07` | MUST | none | `none` | no e2e coverage — planned `process`: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards`, owed by `t-1220f80f` |

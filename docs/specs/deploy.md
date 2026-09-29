@@ -7,8 +7,11 @@
 - **Baseline:** `2026-09-30` at commit `863667d` on branch `kanban-geoyws-driver`. Every "today"
   claim below cites the line that has it, as `<path>:<line>`. Board schema at the baseline is
   `36` (`rust/db.rs:2920`).
-- **Status:** `DRAFT` on 2026-09-30, pending the independent `/quality spec` gate. No stamp here
-  claims readiness; `SPEC-READY` authorises neither implementation, nor rollout, nor release.
+- **Status:** `SPEC-READY` on 2026-09-30. An independent `/quality spec` review (subagent
+  `DeploySpecReview`, which did not write this document) read commit `e81c286`, checked every
+  `path:line` citation, and found no blocking finding and six non-blocking ones, all fixed in
+  the same change (see §9). This stamp is specification readiness only: it authorises neither
+  rollout nor release, and product readiness stays `/quality`, then `/tidy`.
 - **Owner (product scope):** George. He approved this slice under epic `e-c0852fe7` on attention
   `a-e7c70c63` (2026-09-29, "New DEPLOY slice … owns tier-host validation"); the slice row is
   `t-c720eb6b` and the implementation row is `t-1220f80f`.
@@ -122,10 +125,12 @@ validate on MBP"); ADR-008 (fail closed).
 `ifca`, with exactly
 `tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {board} is in
 estate ifca, so deploy it from geoywsMBP (or geoywsMBA)`,
-and when no estate claims the board (or the board has no registered name), with exactly
+and when no estate claims the board, with exactly
 `tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {board} maps
 to no estate, so deploy it from geoywsMBP (or geoywsMBA)`,
-where `{board}` is the registered name, or `(unnamed)` when there is none. Either refusal writes
+where `{board}` is the board's registered name. `kb init` requires a non-empty `--name`
+(`rust/lib.rs:65`), so every board has one; a board file somehow without one is treated as
+unmapped and names itself `(unnamed)`, which no CLI path can produce. Either refusal writes
 nothing: no attempt row, no event, no capability token.
 
 **DEPLOY-07** — Keep an idempotent replay ahead of the pairing check.
@@ -139,7 +144,8 @@ baseline. The new exception adds no check ahead of the replay.
 **DEPLOY-08** — Change no schema.
 Strength: `MUST` · Layer: `process` · Source: row `t-1220f80f` ("db CHECK migrated with no silent
 widening").
-The `deployments.tier` `CHECK` constrains tier values only (`rust/db.rs:810`, `:1671`, `:2383`)
+Row `t-1220f80f` asked that the db `CHECK` be migrated with no silent widening; measured, there
+is no host rule in the database to migrate. The `deployments.tier` `CHECK` constrains tier values only (`rust/db.rs:810`, `:1671`, `:2383`)
 and holds no host rule, so it needs no migration: the board schema version stays `36`, and the
 pairing stays enforced in `deploy start` alone. A board opened by the new binary reports the same
 schema version it reported before.
@@ -147,8 +153,8 @@ schema version it reported before.
 ## 4. Acceptance examples
 
 Every invocation runs against the compiled binary with `--as` on the write and `--json`. `START`
-abbreviates `kb deploy start --repo geoyws/example --commit <40 hex> --environment env --url
-https://x --as e2e --json`. A board is created with `kb init --name <NAME>`.
+abbreviates `kb deploy start --repo geoyws/example --commit
+1111111111111111111111111111111111111111 --environment env --url https://x --as e2e --json`. A board is created with `kb init --name <NAME>`.
 
 ### A1 (`DEPLOY-05`)
 
@@ -161,8 +167,9 @@ and for a board named `unum`.
 *Given* a board named `px`, *when* `START --tier @_bdt --host hax` runs, *then* it exits non-zero
 with `tier @_bdt on host hax is a dev tier for the unum and geoyws estates only; board px is in
 estate ifca, so deploy it from geoywsMBP (or geoywsMBA)`, and `kb deploy list --all --json` is
-still empty. *Given* a board named `TIERHOST`, the same command is refused with `… board TIERHOST
-maps to no estate, so deploy it from geoywsMBP (or geoywsMBA)` and writes nothing.
+still empty. *Given* a board named `TIERHOST`, the same command is refused with `tier @_bdt on host hax is a
+dev tier for the unum and geoyws estates only; board TIERHOST maps to no estate, so deploy it
+from geoywsMBP (or geoywsMBA)` and writes nothing.
 
 ### A3 (`DEPLOY-02`, `DEPLOY-03`)
 
@@ -184,8 +191,9 @@ id with `"idempotentReplay": true`.
 
 ### A6 (`DEPLOY-08`)
 
-*Given* a board created by the new binary, *when* `kb version` runs, *then* it reports `board
-schema 36`.
+*Given* a board created by the new binary, *when* A1's `START --tier @_bdt --host hax` has run
+on it, *then* the board file's SQLite `user_version` still reads `36`, the version
+`kb version` names as `board schema 36`.
 
 ## 5. Contracts and data
 
@@ -211,7 +219,9 @@ schema 36`.
 - **Security:** the exception widens only what may be recorded, never who may record it: the
   existing authorization on `deploy start` (tag checks against the pointed-at task) runs
   unchanged. The estate comes from the board's registered name through the compiled map, never
-  from a caller-supplied field, so a caller cannot claim an estate.
+  from a `deploy start` field. A board's name changes only through `kb init` on that board,
+  which is audited as `board_initialized` (`rust/store.rs:6041`-`rust/store.rs:6044`), the same
+  path that already decides the board's tag estate.
 - **Operability:** the new refusal names the board, its estate and the host to use instead.
 - **Performance:** observation only, not a budget — one extra `board_meta` read on the refused
   or `hax` path; no timing commitment (ADR-047 §9).
@@ -232,10 +242,10 @@ exist. The matrix section carries the same mapping.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `DEPLOY-01` | `MUST` | `process` | existing: `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_bdt` on `geoywsMBP` accepted; the planned test adds an IFCA and an unmapped board (A4) |
+| `DEPLOY-01` | `MUST` | `process` | existing: `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids`; planned: `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | existing covers the unmapped board; the planned test covers A4's `px` board |
 | `DEPLOY-02` | `MUST` | `process` | planned: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | A3, byte-identical sentence for `hig` on a geoyws board |
 | `DEPLOY-03` | `MUST` | `process` | planned: `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | A3, byte-identical Hetzner-tier sentence |
-| `DEPLOY-04` | `MUST` | `process` | existing: `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` | `@_p` on `hax` accepted; the planned A4 case adds an IFCA board |
+| `DEPLOY-04` | `MUST` | `process` | existing: `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids`; planned: `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | existing covers the unmapped board; the planned test covers A4's `px` board |
 | `DEPLOY-05` | `MUST` | `process` | planned: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | A1 |
 | `DEPLOY-06` | `MUST` | `process` | planned: `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards` | A2, both sentences byte-for-byte, nothing written |
 | `DEPLOY-07` | `MUST` | `process` | planned: `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | A5 replay |
@@ -244,3 +254,8 @@ exist. The matrix section carries the same mapping.
 ## 9. Change log
 
 - `2026-09-30` — slice created at `DEPLOY-01` .. `DEPLOY-08`. No supersessions yet.
+- `2026-09-30` — `SPEC-READY` after independent review. Six non-blocking findings fixed: A4's IFCA
+  halves named a planned test; the security note now names the `kb init` rename path; the
+  unreachable `(unnamed)` case is marked defensive; A6 reads the board file's `user_version`;
+  DEPLOY-08 reads the row's CHECK phrase against the measured schema; A2 and the `START`
+  abbreviation are literal. No requirement changed.
