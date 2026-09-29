@@ -442,6 +442,62 @@ with the web view, ADR-053), so each row says `no e2e coverage` plainly.
 legacy tags already registered stay registered and migrate with `tag rename`; rows keep
 their ids and a refused `task add` writes no row and no event.
 
+## Requirements trace — `docs/specs/linked.md` LINKED-01..LINKED-25
+
+One row per requirement, on branch `wt/t-fe137b57-spec-w1` at 2026-09-26: commit
+`ae2fb8f51ff14844d76317da6739b011a90de391`, where the specification is `SPEC-READY` on
+2026-09-26 and ADR-051 is `Proposed`, so these rows land with the specification and the
+gate reviewer reads the trace rather than a promise of one.
+`Layer` uses the specification's own vocabulary, where `process` is a compiled-binary
+process-boundary exchange with no HTTP and no browser, and `chrome` is a compiled-binary
+test driving real Chrome. Of the 25 requirements — all `MUST` — 1 is proved at `chrome`
+and 24 at `process`; 24 carry `none` and say `no e2e coverage` plainly, each owned by the
+implementation row its Note names — `t-0dcbb1a9` (companions and claim scope per its
+work-package title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257`
+(contributions and consumer integration per its work-package title, `LINKED-15`..`LINKED-21`),
+or `t-db6937ba` (exposure and workflow proof per its work-package title,
+`LINKED-22`..`LINKED-25`). LINKED-09 carries one row naming eight
+existing tests (`tests/e2e.rs:3729`, `:4250`, `:49403`, `:49150`, `:2264`, `:56139`,
+`:56242`, `:16808`, in row order), verified as `fn <name>(` in this build; they prove
+today's gates on today's surface and are re-run unchanged beside the new scope gate. Full
+`cargo test --locked --test e2e -- --list` enumeration ran 2026-09-26 in the Linux container
+(`kanban-gate:1.95-chrome-u501`, image `f542f975e2dc`, host gate slot): 439 tests, each of the
+eight names present exactly once. No test name below is invented: where
+no test observes the behaviour, the row is `none`, following the precedent `docs/specs/spa.md`
+set at creation (`cd55cbc`).
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `LINKED-01` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one stored pairing read identically from both sides) |
+| `LINKED-02` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (`(boardID, id)` identity; display-name/path/token writes refused) |
+| `LINKED-03` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (symmetric edges; no one-sided live exposure) |
+| `LINKED-04` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (incarnation pins across rename/retire/recreate) |
+| `LINKED-05` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (restart-identical reads from both sides) |
+| `LINKED-06` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (unknown/denied refusals with no partial writes or leakage) |
+| `LINKED-07` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (durable binding; only selected tasks claimable) |
+| `LINKED-08` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one gate across candidates, next, named, handoff, session resumption) |
+| `LINKED-09` | MUST | process | `compiled_binary_allows_exactly_one_concurrent_claimer`; `claim_candidates_are_read_only_and_match_the_atomic_scheduler`; `completion_gates_apply_to_lease_taking_handoff_acceptance`; `completion_gates_track_prerequisite_lifecycle_and_cleared_dependencies`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease`; `claim_next_and_candidates_skip_restricted_rows_unless_the_model_matches`; `handoff_accept_honours_the_task_model_allow_list`; `a_transacted_write_is_identical_to_the_same_write_on_its_own` | atomic ownership, read-only scheduler parity, handoff gates, lease rotation, scheduler filtering, and single-board transact identity today; all re-run unchanged beside the new scope gate |
+| `LINKED-10` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (descendants and neighbours stay out until explicitly added) |
+| `LINKED-11` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (revocation/claim serialization; stale-revision refusal) |
+| `LINKED-12` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (append-only audited revisions; `audit verify` healthy) |
+| `LINKED-13` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (frozen parks taking; revoked ends taking, keeps heartbeats) |
+| `LINKED-14` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (triple-checked claims; authorized exit/rebind only) |
+| `LINKED-15` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (append-only contributions with full identity; no short hashes) |
+| `LINKED-16` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exactly one of the four evidence roles) |
+| `LINKED-17` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (merge/squash mapping retained) |
+| `LINKED-18` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exact consumer commit plus complete nested path) |
+| `LINKED-19` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (moving latest and near-misses satisfy nothing) |
+| `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
+| `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
+| `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
+| `LINKED-23` | MUST | chrome | `none` | no e2e coverage — to be written by `t-db6937ba` (served pages match the CLI in real Chrome) |
+| `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
+| `LINKED-25` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (companion moves no gate; two-board transact refused; ordered-pair compensation) |
+
+25 requirements: 25 MUST, no SHOULD or MAY. LINKED-09 carries one row naming eight existing
+tests, re-run unchanged; the remaining 24 requirements carry `none` rows, each owned by
+`t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
