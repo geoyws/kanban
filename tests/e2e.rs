@@ -42362,3 +42362,299 @@ fn compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id() {
         "doctor did not report the nulled row from the reused task id: {links}"
     );
 }
+
+/// A fresh board holding one `todo` row `t-lane` assigned to `assignee`, with
+/// no `lane` column, so no `--lane`/`--role` filter removes it
+/// (docs/specs/claim-routing.md §4).
+fn claim_routing_board(label: &str, assignee: &str) -> Fixture {
+    let fixture = Fixture::new(label);
+    fixture.ok_json(&fixture.main, &["init", "--name", "ROUTE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Sweep the logs",
+            "--id",
+            "t-lane",
+            "--assignee",
+            assignee,
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture
+}
+
+fn claim_candidate_ids(fixture: &Fixture, agent: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["claim", "--candidates", "--as", agent];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    fixture
+        .ok_json(&fixture.main, &args)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The board a refused claim leaves behind: still `todo`, assignee unchanged,
+/// no lease and no `task_claimed` event.
+fn assert_claim_wrote_nothing(fixture: &Fixture, assignee: &str) {
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-lane", "--json"]);
+    assert_eq!(
+        shown["status"], "todo",
+        "a refused claim moved the row: {shown}"
+    );
+    assert_eq!(
+        shown["assignee"], assignee,
+        "a refused claim retargeted the row: {shown}"
+    );
+    assert!(
+        shown["claim"].is_null(),
+        "a refused claim left a lease: {shown}"
+    );
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "t-lane", "--json"]);
+    assert!(
+        !events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "task_claimed"),
+        "a refused claim appended task_claimed: {events}"
+    );
+}
+
+/// CLAIM-01: bare, harness and typed spellings of one lane are one worker, in
+/// both directions, and lane-word lookalikes are not.
+#[test]
+fn claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane() {
+    let lane = vec!["t-lane".to_owned()];
+    let typed = claim_routing_board("claim-routing-typed", "@:px/px/driver-2");
+    for agent in [
+        "driver-2",
+        "claude@driver-2",
+        "codex@driver-2",
+        "@:px/px/driver-2",
+    ] {
+        assert_eq!(
+            claim_candidate_ids(&typed, agent, &[]),
+            lane,
+            "{agent} did not see its own lane's row assigned to @:px/px/driver-2"
+        );
+    }
+    for agent in [
+        "claude@driver-20",
+        "claude@driver-02",
+        "driver-two",
+        "claude@driverless",
+    ] {
+        assert!(
+            claim_candidate_ids(&typed, agent, &[]).is_empty(),
+            "{agent} is not lane driver-2 but saw its row"
+        );
+    }
+    let harness = claim_routing_board("claim-routing-harness", "claude@driver-2");
+    for agent in ["driver-2", "codex@driver-2", "@:kanban/kanban/driver-2"] {
+        assert_eq!(
+            claim_candidate_ids(&harness, agent, &[]),
+            lane,
+            "{agent} did not see its own lane's row assigned to claude@driver-2"
+        );
+    }
+    let trunk = claim_routing_board("claim-routing-trunk", "driver");
+    assert_eq!(claim_candidate_ids(&trunk, "codex@driver", &[]), lane);
+    assert!(claim_candidate_ids(&trunk, "codex@driver-2", &[]).is_empty());
+}
+
+/// CLAIM-02: where either side names no lane, only the byte-identical string
+/// is the same worker.
+#[test]
+fn claim_routing_falls_back_to_exact_strings_without_a_lane() {
+    let lane = vec!["t-lane".to_owned()];
+    for assignee in [
+        "geoyws",
+        "superdriver",
+        "a@b@driver-2",
+        "@:px/px/superdriver",
+    ] {
+        let fixture = claim_routing_board("claim-routing-exact", assignee);
+        assert_eq!(claim_candidate_ids(&fixture, assignee, &[]), lane);
+        for agent in ["driver-2", "claude@driver-2", "@:px/px/driver-2", "Geoyws"] {
+            assert!(
+                claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+                "{agent} saw a row assigned to the lane-less {assignee}"
+            );
+        }
+        let refused = fixture.run(
+            &fixture.main,
+            &["claim", "t-lane", "--as", "claude@driver-2", "--json"],
+        );
+        assert_eq!(
+            refusal_object(&refused),
+            format!("task t-lane is assigned to {assignee}")
+        );
+        assert_claim_wrote_nothing(&fixture, assignee);
+    }
+    let lane_side = claim_routing_board("claim-routing-lane-vs-name", "driver-2");
+    assert!(claim_candidate_ids(&lane_side, "geoyws", &[]).is_empty());
+}
+
+/// CLAIM-03: two typed forms for the same lane word in different estates are
+/// different workers.
+#[test]
+fn claim_routing_refuses_a_typed_lane_from_another_board() {
+    let fixture = claim_routing_board("claim-routing-estate", "@:px/px/driver-2");
+    for agent in [
+        "@:other/kanban/driver-2",
+        "@:px/kanban/driver-2",
+        "@:other/px/driver-2",
+    ] {
+        assert!(
+            claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+            "{agent} saw another estate's row"
+        );
+        let refused = fixture.run(&fixture.main, &["claim", "t-lane", "--as", agent, "--json"]);
+        assert_eq!(
+            refusal_object(&refused),
+            "task t-lane is assigned to @:px/px/driver-2"
+        );
+    }
+    assert_claim_wrote_nothing(&fixture, "@:px/px/driver-2");
+}
+
+/// CLAIM-04: the measured case — a lane asking in its harness spelling sees and
+/// is handed its lane's row.
+#[test]
+fn claim_candidates_show_same_lane_rows_to_the_callers_own_lane() {
+    let fixture = claim_routing_board("claim-routing-candidates", "@:px/px/driver-2");
+    assert_eq!(
+        claim_candidate_ids(&fixture, "claude@driver-2", &[]),
+        vec!["t-lane".to_owned()]
+    );
+    let next = fixture.ok_json(
+        &fixture.main,
+        &["claim", "--next", "--as", "claude@driver-2", "--json"],
+    );
+    assert_eq!(next["taskID"], "t-lane");
+}
+
+/// CLAIM-05: a named claim takes a same-lane row, and the model check still
+/// refuses first.
+#[test]
+fn named_claim_takes_a_same_lane_row() {
+    let bare = claim_routing_board("claim-routing-named-bare", "@:px/px/driver-2");
+    let claimed = bare.ok_json(
+        &bare.main,
+        &["claim", "t-lane", "--as", "driver-2", "--json"],
+    );
+    assert_eq!(claimed["taskID"], "t-lane");
+
+    let fixture = Fixture::new("claim-routing-named-order");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ROUTE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "restricted",
+            "--id",
+            "t-lane",
+            "--assignee",
+            "@:px/px/driver-2",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let model_first = fixture.run(
+        &fixture.main,
+        &["claim", "t-lane", "--as", "claude@driver-3", "--json"],
+    );
+    assert_eq!(
+        refusal_object(&model_first),
+        "task t-lane is restricted to models [Astra]; pass --model with one of them to claim it"
+    );
+    let claimed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-lane",
+            "--as",
+            "claude@driver-2",
+            "--model",
+            "Astra",
+            "--json",
+        ],
+    );
+    assert_eq!(claimed["taskID"], "t-lane");
+}
+
+/// CLAIM-06: a different lane, or a lane-less caller, is refused in the
+/// existing words and the board is untouched.
+#[test]
+fn named_claim_refuses_a_different_lane_in_the_existing_words() {
+    let fixture = claim_routing_board("claim-routing-other-lane", "@:px/px/driver-2");
+    for agent in ["claude@driver-3", "codex@driver", "driver-3", "geoyws"] {
+        let refused = fixture.run(&fixture.main, &["claim", "t-lane", "--as", agent, "--json"]);
+        assert_eq!(
+            refusal_object(&refused),
+            "task t-lane is assigned to @:px/px/driver-2",
+            "{agent} was not refused in the existing words"
+        );
+        assert!(
+            claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+            "{agent} was offered another lane's row"
+        );
+        let next = fixture.run(&fixture.main, &["claim", "--next", "--as", agent, "--json"]);
+        assert!(
+            !String::from_utf8_lossy(&next.stdout).contains("t-lane"),
+            "{agent} was handed another lane's row by --next"
+        );
+    }
+    assert_claim_wrote_nothing(&fixture, "@:px/px/driver-2");
+}
+
+/// CLAIM-07: `--allow-reassign` still bypasses the assignee gate for every
+/// spelling, on both paths.
+#[test]
+fn allow_reassign_still_bypasses_every_assignee_spelling() {
+    for assignee in ["@:px/px/driver-2", "claude@driver-2", "superdriver"] {
+        let fixture = claim_routing_board("claim-routing-reassign", assignee);
+        assert_eq!(
+            claim_candidate_ids(&fixture, "claude@driver-3", &["--allow-reassign"]),
+            vec!["t-lane".to_owned()],
+            "--allow-reassign did not offer the row assigned to {assignee}"
+        );
+        let claimed = fixture.ok_json(
+            &fixture.main,
+            &[
+                "claim",
+                "t-lane",
+                "--as",
+                "claude@driver-3",
+                "--allow-reassign",
+                "--json",
+            ],
+        );
+        assert_eq!(claimed["taskID"], "t-lane");
+    }
+}
+
+/// CLAIM-08: a successful same-lane claim stores the caller's own string,
+/// byte-for-byte, not a canonical spelling.
+#[test]
+fn successful_claim_stores_the_caller_string_verbatim() {
+    let fixture = claim_routing_board("claim-routing-verbatim", "@:px/px/driver-2");
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-lane", "--as", "claude@driver-2", "--json"],
+    );
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-lane", "--json"]);
+    assert_eq!(shown["assignee"], "claude@driver-2");
+    assert_eq!(shown["status"], "in_progress");
+}

@@ -447,29 +447,27 @@ their ids and a refused `task add` writes no row and no event.
 
 ## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
 
-The claim-routing slice is specified but not implemented: the specification is `SPEC-READY` on
-2026-09-29 on branch `kanban-geoyws-driver` at commit `ab7a11a`. The implementation row
-`t-8c698a02` is a later row. No claim-routing test exists at this baseline, so no name below was
-enumerated with `cargo test -- --list` and none is claimed to exist. Every row therefore carries
-`none` / `none` and says `no e2e coverage` plainly, naming the planned layer and test name from
-`docs/specs/claim-routing.md` §8 as what the implementation owes. Of the 8 requirements, all 8
-are `MUST`, all planned at `process` and none yet proved. This slice changes no served markup, so there is no browser
-surface to drive.
+The claim-routing slice is implemented by row `t-8c698a02` on branch `wt/t-8c698a02-impl`
+(base `448d722`), where the specification is `SPEC-READY` on 2026-09-29. `Layer` uses the
+specification's vocabulary: `process` is a compiled-binary process-boundary exchange in
+`tests/e2e.rs`. All 8 requirements are `MUST` and all 8 are proved at `process`; every name was
+enumerated with `cargo test --test e2e -- --list`. Four tests (`CLAIM-01`, `CLAIM-04`,
+`CLAIM-05`, `CLAIM-08`) fail on the baseline and pass with the change; the other four pin the
+refusals and the `--allow-reassign` bypass the change must not widen. This slice changes no
+served markup, so there is no browser surface to drive.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `CLAIM-01` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane`, owed by the `t-8c698a02` implementation |
-| `CLAIM-02` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_falls_back_to_exact_strings_without_a_lane`, owed by the `t-8c698a02` implementation |
-| `CLAIM-03` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_refuses_a_typed_lane_from_another_board`, owed by the `t-8c698a02` implementation |
-| `CLAIM-04` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_candidates_show_same_lane_rows_to_the_callers_own_lane`, owed by the `t-8c698a02` implementation |
-| `CLAIM-05` | MUST | none | `none` | no e2e coverage — planned `process`: `named_claim_takes_a_same_lane_row`, owed by the `t-8c698a02` implementation |
-| `CLAIM-06` | MUST | none | `none` | no e2e coverage — planned `process`: `named_claim_refuses_a_different_lane_in_the_existing_words`, owed by the `t-8c698a02` implementation |
-| `CLAIM-07` | MUST | none | `none` | no e2e coverage — planned `process`: `allow_reassign_still_bypasses_every_assignee_spelling`, owed by the `t-8c698a02` implementation |
-| `CLAIM-08` | MUST | none | `none` | no e2e coverage — planned `process`: `successful_claim_stores_the_caller_string_verbatim`, owed by the `t-8c698a02` implementation |
+| `CLAIM-01` | MUST | process | `claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane` | bare, harness and typed spellings of lane `driver-2` (and trunk `driver`) see each other's rows in both directions; `driver-20`, `driver-02`, `driver-two`, `driverless` do not |
+| `CLAIM-02` | MUST | process | `claim_routing_falls_back_to_exact_strings_without_a_lane` | `geoyws`, `superdriver`, `a@b@driver-2` and `@:px/px/superdriver` match only their exact string; the named claim is refused in the existing words and writes nothing |
+| `CLAIM-03` | MUST | process | `claim_routing_refuses_a_typed_lane_from_another_board` | three typed forms for `driver-2` in another team or board are refused and not offered; the board is untouched |
+| `CLAIM-04` | MUST | process | `claim_candidates_show_same_lane_rows_to_the_callers_own_lane` | the measured case: `claude@driver-2` is offered, and handed by `--next`, the row assigned to `@:px/px/driver-2` |
+| `CLAIM-05` | MUST | process | `named_claim_takes_a_same_lane_row` | bare `driver-2` takes the typed row; the model refusal still comes before the assignee check |
+| `CLAIM-06` | MUST | process | `named_claim_refuses_a_different_lane_in_the_existing_words` | `claude@driver-3`, `codex@driver`, `driver-3` and `geoyws` get `task t-lane is assigned to @:px/px/driver-2`, are not offered it by `--candidates` or `--next`, and the board is untouched |
+| `CLAIM-07` | MUST | process | `allow_reassign_still_bypasses_every_assignee_spelling` | `--allow-reassign` offers and claims rows assigned in typed, harness and lane-less spellings |
+| `CLAIM-08` | MUST | process | `successful_claim_stores_the_caller_string_verbatim` | after `claim --as claude@driver-2` the stored assignee reads `claude@driver-2` |
 
-8 requirements: 8 MUST, no SHOULD or MAY. A lane executor claims its lane's rows in every
-harness spelling, a different lane is still refused in the existing words, `--allow-reassign`
-and the retarget write are unchanged, and no stored string is renamed or migrated.
+8 requirements: 8 MUST, 8 proved at `process`, no SHOULD or MAY.
 
 ## Watch coverage note
 

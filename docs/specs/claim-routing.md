@@ -305,3 +305,6 @@ plainly per the convention at `docs/testing/compiled-rust-e2e-matrix.md:206`-`:2
 - `2026-09-29` — slice created at `CLAIM-01` .. `CLAIM-08`. No supersessions yet.
 - `2026-09-29` — `SPEC-READY` after independent review; matrix preamble reworded from "proved" to
   "planned" (review finding 1). No requirement changed.
+- `2026-09-29` — implemented by `t-8c698a02`: `claim_lane`/`same_claim_worker` in `rust/store.rs`
+  (the `lane_of` of `CLAIM-01`) and the eight §8 tests, now real names in the matrix. No
+  requirement changed.

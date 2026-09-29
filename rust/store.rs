@@ -70,6 +70,11 @@ fn driver_lane_address(value: &str) -> Option<DriverLaneAddress<'_>> {
     if let Some(lane) = driver_lane_name(value) {
         return Some(DriverLaneAddress::Bare(lane));
     }
+    typed_driver_lane(value).map(|(_, _, lane)| DriverLaneAddress::Typed(lane))
+}
+
+/// Split a typed '@:team/project/lane' actor whose last segment is a lane word.
+fn typed_driver_lane(value: &str) -> Option<(&str, &str, &str)> {
     let mut segments = value.strip_prefix("@:")?.split('/');
     let team = segments.next()?;
     let project = segments.next()?;
@@ -77,7 +82,44 @@ fn driver_lane_address(value: &str) -> Option<DriverLaneAddress<'_>> {
     if team.is_empty() || project.is_empty() || segments.next().is_some() {
         return None;
     }
-    driver_lane_name(lane).map(DriverLaneAddress::Typed)
+    driver_lane_name(lane).map(|lane| (team, project, lane))
+}
+
+/// The lane a claim identity names, with the estate a typed form carries
+/// (docs/specs/claim-routing.md CLAIM-01): a bare lane word, a typed
+/// '@:team/project/lane', or a harness '<harness>@<lane>'. Anything else names
+/// no lane and is compared as an exact string (CLAIM-02).
+fn claim_lane(value: &str) -> Option<(&str, Option<(&str, &str)>)> {
+    if let Some(lane) = driver_lane_name(value) {
+        return Some((lane, None));
+    }
+    if value.starts_with("@:") {
+        return typed_driver_lane(value).map(|(team, project, lane)| (lane, Some((team, project))));
+    }
+    let (harness, lane) = value.split_once('@')?;
+    if harness.is_empty() || lane.contains('@') {
+        return None;
+    }
+    driver_lane_name(lane).map(|lane| (lane, None))
+}
+
+/// Whether a stored assignee is the claiming caller's own row: the same
+/// string, or the same lane in any spelling, except that two typed forms
+/// naming different estates stay different workers (CLAIM-01..CLAIM-03).
+fn same_claim_worker(assignee: &str, agent: &str) -> bool {
+    if assignee == agent {
+        return true;
+    }
+    match (claim_lane(assignee), claim_lane(agent)) {
+        (Some((left, left_estate)), Some((right, right_estate))) => {
+            left == right
+                && match (left_estate, right_estate) {
+                    (Some(left_estate), Some(right_estate)) => left_estate == right_estate,
+                    _ => true,
+                }
+        }
+        _ => false,
+    }
 }
 
 fn validate_rule_actor(value: &str) -> Result<&str> {
@@ -3909,7 +3951,7 @@ fn eligible_claim_candidates(
             && (candidate
                 .assignee
                 .as_ref()
-                .is_none_or(|value| value == agent)
+                .is_none_or(|value| same_claim_worker(value, agent))
                 || options.allow_reassign);
         if routable && draft_ancestor(connection, &candidate.id)?.is_none() {
             eligible.push(candidate);
@@ -6977,7 +7019,12 @@ impl Store {
             &allowed_models_of(&transaction, &task.id)?,
             options.model.as_deref(),
         )?;
-        if task.assignee.as_ref().is_some_and(|value| value != &agent) && !options.allow_reassign {
+        if task
+            .assignee
+            .as_deref()
+            .is_some_and(|value| !same_claim_worker(value, &agent))
+            && !options.allow_reassign
+        {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
         let token = Uuid::new_v4().to_string();
