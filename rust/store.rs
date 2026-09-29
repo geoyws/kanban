@@ -590,6 +590,34 @@ pub(crate) fn refuse_bare_tag_name(board: &str, name: &str) -> Result<()> {
     }
 }
 
+/// The `tag add` repair an attach refusal names, built from the same
+/// board-to-estate map `tag add` itself reads (CLI-01/CLI-02): one repair,
+/// one map, never a second board list.
+///
+/// A slashed tag already names its estate, so it is repeated unchanged —
+/// prefixing one would invent a different tag. A bare tag on a mapped board
+/// names that board's `{estate}/{tag}` form, which registers. A bare tag on
+/// an unmapped board names no single form — there is no board truth to build
+/// one from (CLI-03) — only the estate list, with the `<estate>/` placeholder
+/// the registration refusal itself uses. The board is the connection's stored
+/// name; a board with none is unmapped.
+fn attach_repair(connection: &Connection, tag: &str) -> String {
+    if tag.contains('/') {
+        return format!("`tag add {tag}`");
+    }
+    let board: Option<String> = connection
+        .query_row("SELECT value FROM board_meta WHERE key='name'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    match board.as_deref().and_then(estate_for_board) {
+        Some(estate) => format!("`tag add {estate}/{tag}`"),
+        None => format!("`tag add <estate>/{tag}` (estates: {})", ESTATES.join(", ")),
+    }
+}
+
 fn validate_registered_tags(
     connection: &Connection,
     tags: &[String],
@@ -611,9 +639,10 @@ fn validate_registered_tags(
             let suggestion = crate::nearest(&tag, &borrowed)
                 .map(|near| format!(", did you mean {near}?"))
                 .unwrap_or_default();
+            let repair = attach_repair(connection, &tag);
             bail!(
                 "{subject} tag {tag} is not in this board's master file{suggestion} — \
-                 register it first with `tag add {tag}`"
+                 register it first with {repair}"
             );
         }
         canonical.push(tag);
@@ -773,9 +802,10 @@ fn set_tags(connection: &Connection, id: &str, tags: &[String]) -> Result<()> {
             let suggestion = crate::nearest(&tag, &borrowed)
                 .map(|near| format!(", did you mean {near}?"))
                 .unwrap_or_default();
+            let repair = attach_repair(connection, &tag);
             bail!(
                 "tag {tag} is not in this board's master file{suggestion} — \
-                 register it first with `tag add {tag}`"
+                 register it first with {repair}"
             );
         }
         if applied.insert(tag.clone()) {

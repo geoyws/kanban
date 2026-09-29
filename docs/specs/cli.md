@@ -2,10 +2,11 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-06`, stable across wording
+- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-07`, stable across wording
   refinements; numbering is by creation, grouping is by topic. `CLI-06` was
   appended 2026-09-25 under board row `t-6148c0ba` (see the change log); its baseline
-  is commit `869f5cb` on `wt/t-6148c0ba-idshape`.
+  is commit `869f5cb` on `wt/t-6148c0ba-idshape`. `CLI-07` was appended 2026-09-29
+  under attention `a-9254741a` (see the change log).
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `DRAFT` (written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
@@ -14,7 +15,7 @@
   the web view, ADR-053): attention `a-3990a3e3`, choice `approve`,
   2026-09-24. That approval is the slice admission ADR-047 §7 requires: `t-7f596f45` is the
   child row of rollout epic `e-c0852fe7` carrying the work (with `t-fb600b26` alongside it).
-  Open question `OQ-1` in §7 is material and blocks `SPEC-READY`; no independent readiness
+  Open question `OQ-1` in §7 is answered 2026-09-29 (`CLI-07`); no independent readiness
   gate has been run. This stamp authorises neither rollout nor release; product readiness
   stays `/quality`, then `/tidy`, then the served-tier receipt.
 - **Owner (product scope):** George. He alone resolves scope, the estate map, and the refusal
@@ -25,6 +26,10 @@
   - George, 2026-09-24, attention `a-3990a3e3` (choice `approve`): "Spec delta, implementation,
     tests and chips land in one change with matrix rows". This is the slice approval; the chip
     half it names is retired with the web view (ADR-053) and never landed — this slice is CLI-only.
+  - George, 2026-09-29, attention `a-9254741a` (choice `map`): "Suggest the estate form in
+    the attach refusal too. The attach refusal on prjx reads 'register it first with tag
+    add ifca/assistant'. One sentence wording change plus a test; one refusal, one working
+    repair." This answers `OQ-1` and admits `CLI-07`.
   - Board rows `t-7f596f45` and `t-fb600b26` — the requirement source. The estate map below is
     recorded from that contract, not re-decided here: estates `ifca`, `unum`, `geoyws`; IFCA
     boards `px`, `fmx`, `hx`, `hrx`, `ix`, `mx-root`, `prjx-root`, `rentx-root`, `auditx-root`,
@@ -65,7 +70,8 @@ carries the kind's own id shape, so ids stay safe as unquoted shell and URL toke
 
 **In scope.** The `tag add` registration command and its refusal; the compile-time
 board-to-estate map it reads; the unchanged `--tag` filter refusals it is held against;
-and, since `CLI-06`, the `task add --id` shape refusal with the one id check it reads.
+and, since `CLI-06`, the `task add --id` shape refusal with the one id check it reads;
+and, since `CLI-07`, the attach refusals' estate-form repair, built from the same map.
 
 **Boundaries.** The `--tag` filter paths (`task list`, `attention list`, rule task-tag
 validation) are touched only as the behaviour that must not move (`CLI-05`) — they are owned
@@ -99,7 +105,9 @@ rejected tag, `{estate}` for the board's mapped estate, and the estate list in t
 `estate_for_board` over the addressed board's name — inside a batch, the batch's board
 (an item argv carries no selector, so the batch board is the only addressed one); outside
 a batch, the registry selection, falling back to the board's stored name. A board with no
-stored name is unmapped.
+stored name is unmapped. `CLI-07` reuses the attach paths' own `{tag}` and `{subject}`
+points for the rejected tag and the calling path, and reads the board as the connection's
+stored name.
 
 ### Registration
 
@@ -144,6 +152,24 @@ Strength: `MUST` · Layer: `process` · Source: ADR-015; board rows `t-7f596f45`
 succeeds, returns the master-file row, and the tag attaches exactly as a registered tag
 does today (filter, list and rename remain ADR-015's). Data rules: one master-file row
 plus one `tag_added` event, unchanged.
+
+### Attachment
+
+**CLI-07** — an attach refusal names the board's estate form as the repair.
+Strength: `MUST` · Layer: `process` · Source: George `a-9254741a` (choice `map`); ADR-008.
+Attaching a tag no master file holds — row attach (`task add`, `task update --tag`),
+attention attach and subscription registration — exits non-zero and writes nothing with
+the master-file sentence whose repair is built from the same `estate_for_board` map
+`CLI-01` reads, never a second board list: on a board mapped to `{estate}`, a bare
+`{tag}` is refused with `{subject} tag {tag} is not in this board's master file{suggestion}
+— register it first with `tag add {estate}/{tag}`` (with the caller's `{subject}` prefix
+where the path carries one, and none on the row path); on a board the map leaves
+unmapped, with `{subject} tag {tag} is not in this board's master file{suggestion} —
+register it first with `tag add <estate>/{tag}` (estates: ifca, unum, geoyws)`, which
+carries the estate list and suggests no single form. A `{tag}` already carrying `/` is
+repeated unchanged: it names its estate already, and prefixing one would invent a
+different tag. The `claim_candidates` filter shares the same helper, so its sentence
+carries the same working repair; the `CLI-05` sentences are untouched.
 
 ### The behaviour that must not move
 
@@ -261,12 +287,25 @@ accepted (pinned in-process by `a_task_id_has_one_shape_per_kind`); `--id t-1234
 on a task exits zero returning the row with id `t-1234abcd`; and repeating it is refused
 as before (`task t-1234abcd already exists`).
 
+### A9 (`CLI-07`)
+
+*Given* board `prjx` (mapped `ifca`) with an empty master file, and a board no estate
+maps,
+*when* `kanban task add "Chat replies" --id t-chat --tag assistant` runs on each,
+*then* each exits non-zero writing no row (`task list` stays empty), with `tag assistant
+is not in this board's master file — register it first with `tag add ifca/assistant``
+on `prjx` and `register it first with `tag add <estate>/assistant` (estates: ifca, unum,
+geoyws)` on the unmapped board, which suggests no single `estate/assistant` form;
+and *when* `kanban tag add ifca/assistant` then runs on `prjx`,
+*then* it exits zero, and the retried `task add --tag ifca/assistant` carries the tag
+on the new row.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189` for
   `tag add`; `task add` already carries `[--id ID]` at `rust/lib.rs:129`): only the
   refusal set grows, by the two sentences `CLI-01` and `CLI-03` quote and the one
-  sentence `CLI-06` quotes.
+  sentence `CLI-06` quotes. `CLI-07` rewords the attach repair without adding a sentence.
   `--json` refusals keep the error-object shape (an object holding only `error`).
 - **Data invariants:** a refused registration writes nothing: no `tags` row, no `tag_added`
   event, no registry touch; a refused `task add` writes nothing: no row, no event.
@@ -304,7 +343,7 @@ as before (`task t-1234abcd already exists`).
 
 | ID | Question | Owner | Status | Gate it blocks |
 | --- | --- | --- | --- | --- |
-| OQ-1 | The attach refusal's repair `tag add {tag}` names a bare registration `CLI-01` now refuses; keep it (two-step repair) or build `{estate}/{tag}` from the same map? | George | open | `SPEC-READY` |
+| OQ-1 | The attach refusal's repair `tag add {tag}` names a bare registration `CLI-01` now refuses; keep it (two-step repair) or build `{estate}/{tag}` from the same map? | George | answered 2026-09-29 (`a-9254741a`, choice `map`: build the estate form from the same map; an unmapped board carries the estate list with no suggestion, per `CLI-07`) | `SPEC-READY` |
 
 ## 8. Verification
 
@@ -316,6 +355,7 @@ as before (`task t-1234abcd already exists`).
 | `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, attaches, reads back. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
 | `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence, an empty listing and `board_initialized` as the only event; the same id as a `transact` `task_add` item rolls back with the same sentence; `t-1234abcd` accepted; the duplicate refused as before (`task t-1234abcd already exists`). The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. Reads of an opaque, SQL-seeded id stay proven by `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`. no e2e coverage |
+| `CLI-07` | MUST | process | `tag_attach_refusal_names_the_boards_estate_form` | `task add --tag assistant` on `prjx` refused with the exact `tag add ifca/assistant` repair and no row written; the named repair then registers and attaches; the unmapped board carries the estate list with the `<estate>/` placeholder and no single form. no e2e coverage |
 
 ## 9. Change log
 
@@ -329,4 +369,7 @@ as before (`task t-1234abcd already exists`).
 - `2026-09-25` — `/quality` spec review returned `BLOCKED`: `CLI-05` quoted the attach-path
   sentence for the listing filters (fixed to the filter-to-nothing sentence); added A6
   (batch board), A7 (shape/estate branches), the `OQ-1` attach-repair question, and the
-  `e-c0852fe7` admission. Status stays `DRAFT`: `OQ-1` blocks `SPEC-READY`.
+  `e-c0852fe7` admission. Status stays `DRAFT`: no independent readiness gate has been run.
+- `2026-09-29` — `CLI-07` appended: the attach refusal names the board's estate form as
+  the repair, built from the same map `CLI-01` reads (George `a-9254741a`, choice `map`);
+  `OQ-1` answered. Status stays `DRAFT`: no independent readiness gate has been run.

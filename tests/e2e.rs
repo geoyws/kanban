@@ -24263,6 +24263,115 @@ fn tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only() 
     );
 }
 
+/// CLI-07 — attaching an unregistered tag refuses with the board's estate
+/// form, and the named repair is a working one: it registers, and the tag
+/// then attaches. An unmapped board carries the estate list and suggests no
+/// single form.
+#[test]
+fn tag_attach_refusal_names_the_boards_estate_form() {
+    // Mapped board: the refusal names `tag add ifca/assistant`.
+    let fixture = Fixture::new("tag-attach-repair");
+    fixture.ok_json(&fixture.main, &["init", "--name", "prjx", "--json"]);
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unregistered tag was attached"
+    );
+    assert_eq!(
+        refusal_object(&refused),
+        "tag assistant is not in this board's master file — \
+         register it first with `tag add ifca/assistant`",
+        "the attach refusal must name the estate form"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused attach must write no row"
+    );
+    // The suggested repair registers, and the tag then attaches.
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "ifca/assistant", "--as", "geoyws", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "ifca/assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-chat", "--json"])["tags"],
+        json!(["ifca/assistant"]),
+        "the repaired tag must attach and read back"
+    );
+
+    // Unmapped board: the estate list, no single suggestion.
+    let unmapped = Fixture::new("tag-attach-repair-unmapped");
+    unmapped.ok_json(&unmapped.main, &["init", "--name", "SCRATCH", "--json"]);
+    let refused = unmapped.run(
+        &unmapped.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unregistered tag was attached"
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("register it first with `tag add <estate>/assistant`"),
+        "the unmapped attach refusal must name the estate placeholder: {message}"
+    );
+    assert!(
+        message.contains("(estates: ifca, unum, geoyws)"),
+        "the unmapped attach refusal must carry the estate list: {message}"
+    );
+    for estate in ["ifca", "unum", "geoyws"] {
+        assert!(
+            !message.contains(&format!("tag add {estate}/assistant")),
+            "an unmapped board must suggest no single form: {message}"
+        );
+    }
+    assert_eq!(
+        unmapped.ok_json(&unmapped.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused attach must write no row"
+    );
+}
+
 /// CLI-04 — a namespaced name registers exactly as before: it lists, and a
 /// row carries it.
 #[test]
