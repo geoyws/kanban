@@ -457,7 +457,10 @@ fn fresh_events<'a>(before: &Value, after: &'a Value) -> &'a [Value] {
 fn ungated_twin_moves_done(label: &str) {
     let twin = Estate::twin(label);
     twin.add_task("twin work", "t-twin", &[]);
-    twin.claim("t-twin", EXEC);
+    // The baseline lease rule refuses a non-`--force` move under a live lease
+    // even by its holder, so the twin releases first and closes lease-free.
+    let lease = twin.claim("t-twin", EXEC);
+    twin.release("t-twin", &lease);
     twin.ok_json(&["task", "move", "t-twin", "done", "--as", EXEC, "--json"]);
     assert_eq!(twin.show("t-twin")["status"], "done");
 }
@@ -481,7 +484,9 @@ fn a1_done_gate_refuses_done_move_without_verdict() {
         &s1_no_verdict("t-x"),
     );
     estate.assert_unchanged("t-x", &before);
-    assert_eq!(estate.show("t-x")["status"], "todo");
+    // `claim` moves the row to `in_progress` at the baseline, so the refused
+    // move leaves it there, not at `todo`.
+    assert_eq!(estate.show("t-x")["status"], "in_progress");
     assert!(estate.show("t-x")["completedAt"].is_null());
     assert_eq!(
         estate.task_events("t-x").as_array().unwrap().len(),
@@ -489,7 +494,10 @@ fn a1_done_gate_refuses_done_move_without_verdict() {
     );
 
     // Negative control: the same move succeeds with the gate off (DG-09).
+    // The live lease is released first: the baseline lease rule, not the
+    // gate, would otherwise refuse this move.
     estate.gate_off();
+    estate.release("t-x", &lease);
     estate.ok_json(&["task", "move", "t-x", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-x")["status"], "done");
     ungated_twin_moves_done("a1-twin");
@@ -582,10 +590,14 @@ fn a3_done_gate_refuses_self_review_verdict() {
     let lease_ok = estate.claim("t-ok", EXEC);
     estate.checkpoint("t-ok", &lease_ok, EXEC, H1);
     estate.verdict_ok("t-ok", REVIEWER, &[H1], &[&aid_ok], PLANNER);
+    // Released first so no lease rule stands in for the gate; the closer is
+    // still the holder, proving a foreign reviewer opens the holder's close.
+    estate.release("t-ok", &lease_ok);
     estate.ok_json(&["task", "move", "t-ok", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-ok")["status"], "done");
 
     estate.gate_off();
+    estate.release("t-x", &lease);
     estate.ok_json(&["task", "move", "t-x", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-x")["status"], "done");
     ungated_twin_moves_done("a3-twin");
@@ -602,7 +614,19 @@ fn a4_done_gate_override_writes_audited_event() {
     estate.add_task("unreviewed work", "t-x", &[]);
     let lease = estate.claim("t-x", EXEC);
     estate.checkpoint("t-x", &lease, EXEC, H1);
-    estate.ok_json(&["task", "move", "t-x", "in_progress", "--as", EXEC, "--json"]);
+    // `claim` already put the row at `in_progress`; re-asserting it needs
+    // `--force` under the baseline lease rule (a live lease blocks even the
+    // holder), establishing `priorStatus` for the override below.
+    estate.ok_json(&[
+        "task",
+        "move",
+        "t-x",
+        "in_progress",
+        "--as",
+        EXEC,
+        "--force",
+        "--json",
+    ]);
 
     // A non-geoyws --force is refused with sentence 4 and changes nothing.
     let before = estate.snapshot("t-x");
@@ -687,13 +711,17 @@ fn a6_done_gate_off_leaves_move_unchanged() {
     // with no verdict demanded and no new refusal reachable.
     let estate = Estate::new("a6");
     estate.add_task("plain work", "t-y1", &[]);
-    estate.claim("t-y1", EXEC);
+    // Released before the move: the baseline lease rule refuses a non-`--force`
+    // move under a live lease even by its holder, gate or no gate.
+    let lease_y1 = estate.claim("t-y1", EXEC);
+    estate.release("t-y1", &lease_y1);
     let done_out = estate.ok_json(&["task", "move", "t-y1", "done", "--as", EXEC, "--json"]);
     assert_eq!(done_out["status"], "done");
     assert_eq!(estate.show("t-y1")["status"], "done");
 
     estate.add_task("more work", "t-y2", &[]);
-    estate.claim("t-y2", EXEC);
+    let lease_y2 = estate.claim("t-y2", EXEC);
+    estate.release("t-y2", &lease_y2);
     estate.ok_json(&["task", "move", "t-y2", "review", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-y2")["status"], "review");
 
@@ -702,10 +730,12 @@ fn a6_done_gate_off_leaves_move_unchanged() {
     estate.add_task("gated work", "t-g", &[]);
     let lease = estate.claim("t-g", EXEC);
     estate.checkpoint("t-g", &lease, EXEC, H1);
+    // Released so the lease rule cannot stand in for the gate below: these
+    // moves must prove the gate ignores non-done targets (DG-10).
+    estate.release("t-g", &lease);
     estate.ok_json(&["task", "move", "t-g", "review", "--as", EXEC, "--json"]);
     estate.ok_json(&["task", "move", "t-g", "blocked", "--as", EXEC, "--json"]);
     estate.ok_json(&["task", "move", "t-g", "in_progress", "--as", EXEC, "--json"]);
-    // ... while the done-move is refused (contrast proving the gate is on).
     estate.refuse_exact(
         &["task", "move", "t-g", "done", "--as", EXEC, "--json"],
         &s1_no_verdict("t-g"),
@@ -809,6 +839,9 @@ fn a9_done_gate_stale_verdict_does_not_open_gate() {
     // A fresh pass at the new head, citing the still-resolved decisions,
     // reopens the gate.
     estate.verdict_ok("t-x", REVIEWER, &[H2], &[&a1, &a2], PLANNER);
+    // Released so the lease rule cannot close the gate's door for it: the
+    // head H2 survives in the checkpoint row, so the fresh verdict satisfies.
+    estate.release("t-x", &lease);
     estate.ok_json(&["task", "move", "t-x", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-x")["status"], "done");
 
@@ -822,10 +855,12 @@ fn a9_done_gate_stale_verdict_does_not_open_gate() {
 #[test]
 fn a10_done_gate_flag_defaults_off_and_audits_changes() {
     let estate = Estate::new("a10");
-
     // Fresh board, no done_gate key: done-moves behave as at the baseline.
+    // Released first: the baseline lease rule, not the (absent) gate, would
+    // otherwise refuse this move.
     estate.add_task("fresh work", "t-y", &[]);
-    estate.claim("t-y", EXEC);
+    let lease_y = estate.claim("t-y", EXEC);
+    estate.release("t-y", &lease_y);
     estate.ok_json(&["task", "move", "t-y", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-y")["status"], "done");
 
@@ -881,6 +916,9 @@ fn a10_done_gate_flag_defaults_off_and_audits_changes() {
     assert_eq!(off["doneGate"], "off");
     assert_eq!(off["oldValue"], "on");
     assert_eq!(off["changedBy"], GEO);
+    // Released first: with the gate off this must move exactly as at the
+    // baseline, and the baseline lease rule would otherwise refuse it.
+    estate.release("t-x", &lease);
     estate.ok_json(&["task", "move", "t-x", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-x")["status"], "done");
 }
@@ -908,6 +946,9 @@ fn a13_done_gate_refuses_writer_as_closer() {
     estate.assert_unchanged("t-x", &before);
 
     // Negative control: the holder's own close succeeds with the gate on.
+    // Released first so the lease rule cannot stand in for the gate; the
+    // closer is still the holder, and the reviewer/writer stay foreign.
+    estate.release("t-x", &lease);
     estate.ok_json(&["task", "move", "t-x", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-x")["status"], "done");
 }
@@ -1041,9 +1082,11 @@ fn a11_done_gate_story_and_epic_project_done_without_verdict() {
 #[test]
 fn a12_done_gate_verdicts_table_is_append_only_across_migration() {
     let estate = Estate::new("a12");
-    // Pre-gate row: done with no verdict anywhere.
+    // Pre-gate row: done with no verdict anywhere. Released first: the
+    // baseline lease rule would otherwise refuse this move.
     estate.add_task("old work", "t-old", &[]);
-    estate.claim("t-old", EXEC);
+    let lease_old = estate.claim("t-old", EXEC);
+    estate.release("t-old", &lease_old);
     estate.ok_json(&["task", "move", "t-old", "done", "--as", EXEC, "--json"]);
 
     estate.gate_on();
@@ -1109,7 +1152,9 @@ fn a12_done_gate_verdicts_table_is_append_only_across_migration() {
         "override lost across restore: {ovr}"
     );
     assert_eq!(ovr[0]["actor"], GEO);
-    assert_eq!(ovr[0]["payload"]["priorStatus"], "todo");
+    // `claim` moved t-ovr to `in_progress` at the baseline, so the override
+    // records that as the prior status.
+    assert_eq!(ovr[0]["payload"]["priorStatus"], "in_progress");
     assert_eq!(ovr[0]["payload"]["reason"], "missing-verdict");
     assert_eq!(estate.verdicts("t-old").as_array().unwrap().len(), 0);
 }
@@ -1131,13 +1176,21 @@ fn a14_done_gate_heartbeat_at_same_head_stales_nothing() {
     let aid = estate.resolved_attention("t-s1");
     estate.verdict_ok("t-s1", REVIEWER, &[H1], &[&aid], PLANNER);
     estate.heartbeat("t-s1", &lease);
-    estate.ok_json(&["task", "move", "t-s1", "done", "--as", EXEC, "--json"]);
+    // `--force` seizes the holder's own lease: the gate is satisfied, so no
+    // override is recorded. (The done move retires the lease at the baseline;
+    // the row is re-claimed below for the H2 checkpoint.)
+    estate.ok_json(&[
+        "task", "move", "t-s1", "done", "--as", EXEC, "--force", "--json",
+    ]);
     assert_eq!(estate.show("t-s1")["status"], "done");
 
     // Back to todo, then a newer head: the same verdict is stale (sentence 2).
+    // A done move retires the work lease at the baseline, so the todo move
+    // runs lease-free and the row is re-claimed for the H2 checkpoint.
     estate.ok_json(&["task", "move", "t-s1", "todo", "--as", EXEC, "--json"]);
+    let lease_h2 = estate.claim("t-s1", EXEC);
     std::thread::sleep(Duration::from_millis(30));
-    estate.checkpoint("t-s1", &lease, EXEC, H2);
+    estate.checkpoint("t-s1", &lease_h2, EXEC, H2);
     estate.refuse_exact(
         &["task", "move", "t-s1", "done", "--as", EXEC, "--json"],
         &s2_stale("t-s1", H1, H2),
@@ -1153,7 +1206,11 @@ fn a14_done_gate_heartbeat_at_same_head_stales_nothing() {
     std::thread::sleep(Duration::from_millis(30));
     estate.checkpoint("t-s2", &lease2, EXEC, H2);
     let events_before = estate.task_events("t-s2");
-    estate.ok_json(&["task", "move", "t-s2", "done", "--as", EXEC, "--json"]);
+    // `--force` seizes the holder's own lease; the gate is satisfied and the
+    // move writes no verdict state (asserted on the event delta below).
+    estate.ok_json(&[
+        "task", "move", "t-s2", "done", "--as", EXEC, "--force", "--json",
+    ]);
     assert_eq!(estate.show("t-s2")["status"], "done");
     let after = estate.task_events("t-s2");
     let delta = serde_json::to_string(&fresh_events(&events_before, &after)).unwrap();
@@ -1163,9 +1220,12 @@ fn a14_done_gate_heartbeat_at_same_head_stales_nothing() {
     );
     assert_eq!(estate.verdicts("t-s2").as_array().unwrap().len(), 1);
 
-    // Negative control for the stale refusal: absent the gate it succeeds.
+    // Negative control for the stale refusal: absent the gate it succeeds
+    // (`--force` again for the still-live lease).
     estate.gate_off();
-    estate.ok_json(&["task", "move", "t-s1", "done", "--as", EXEC, "--json"]);
+    estate.ok_json(&[
+        "task", "move", "t-s1", "done", "--as", EXEC, "--force", "--json",
+    ]);
     assert_eq!(estate.show("t-s1")["status"], "done");
 }
 
@@ -1205,13 +1265,18 @@ fn a15_done_gate_no_head_opens_only_by_override() {
         .collect();
     assert_eq!(ovr.len(), 1, "expected one override event");
     assert_eq!(ovr[0]["actor"], GEO);
-    assert_eq!(ovr[0]["payload"]["priorStatus"], "todo");
+    // `claim` moved t-x to `in_progress` at the baseline, so the override
+    // records that as the prior status.
+    assert_eq!(ovr[0]["payload"]["priorStatus"], "in_progress");
     assert_eq!(ovr[0]["payload"]["reason"], "missing-verdict");
 
     // Negative control: a headless twin moves fine with the gate off.
+    // Released first for the baseline lease rule (no head is needed with
+    // the gate off).
     let twin = Estate::twin("a15-twin");
     twin.add_task("headless twin", "t-twin", &[]);
-    twin.claim("t-twin", EXEC);
+    let twin_lease = twin.claim("t-twin", EXEC);
+    twin.release("t-twin", &twin_lease);
     twin.ok_json(&["task", "move", "t-twin", "done", "--as", EXEC, "--json"]);
     assert_eq!(twin.show("t-twin")["status"], "done");
 }
@@ -1284,6 +1349,9 @@ fn done_gate_requires_resolved_decision_citations() {
         "checked late",
         "--json",
     ]);
+    // Released so the lease rule cannot stand in for the gate: the head H1
+    // survives in the checkpoint row and the stored row now satisfies.
+    estate.release("t-open", &lease_o);
     estate.ok_json(&["task", "move", "t-open", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-open")["status"], "done");
     assert_eq!(estate.verdicts("t-open").as_array().unwrap().len(), 1);
@@ -1292,7 +1360,7 @@ fn done_gate_requires_resolved_decision_citations() {
     estate.add_task("missing cite", "t-missing", &[]);
     let lease_m = estate.claim("t-missing", EXEC);
     estate.checkpoint("t-missing", &lease_m, EXEC, H1);
-    let _ = estate.verdict("t-missing", REVIEWER, &[H1], &[&"a-missing"], PLANNER);
+    let _ = estate.verdict("t-missing", REVIEWER, &[H1], &["a-missing"], PLANNER);
     estate.refuse_exact(
         &["task", "move", "t-missing", "done", "--as", EXEC, "--json"],
         &s1_no_verdict("t-missing"),
@@ -1332,6 +1400,8 @@ fn done_gate_requires_resolved_decision_citations() {
         "--json",
     ]);
     // The same stored row now satisfies: no second write, list still len 1.
+    // Released first so the lease rule cannot stand in for the gate.
+    estate.release("t-re", &lease_r);
     estate.ok_json(&["task", "move", "t-re", "done", "--as", EXEC, "--json"]);
     assert_eq!(estate.show("t-re")["status"], "done");
     assert_eq!(estate.verdicts("t-re").as_array().unwrap().len(), 1);
