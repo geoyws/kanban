@@ -733,6 +733,193 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
     );
 }
 
+/// ACC-14, removed-task tails: every event of a task that was tagged and
+/// then removed stays tag-gated on each tail that serves it, and the tails
+/// agree with search.
+///
+/// CLI-process port of the HTTP-era `..._on_every_tail_over_http`: serve is
+/// retired, so the served routes are gone and board-wide `events`,
+/// `events --task`, a `watch --follow` stream and CLI `search` carry the
+/// claim instead. The caller holds only board read on Alpha — no tag scope
+/// at all — and full ownership of Beta so the whole-estate reads answer.
+///
+/// The fixture creates a task untagged, edits its body so a `task_updated`
+/// event carries the draft in `previousBody` while its snapshot still reads
+/// `tags: []`, tags the task `secret`, then removes it. The `events` rows
+/// survive the delete, so the pre-tag event is reachable through every tail.
+/// The draft token appears nowhere else on either board, so its absence
+/// proves each tail withheld the event rather than merely ranking it below
+/// something.
+///
+/// The denied half reads board-wide `events`, `events --task`, one
+/// `watch --follow` stream and `search`: none carries the token, and the
+/// `--task` refusal answers exactly like a never-created id. The owner half
+/// grants that same principal `secret` read and reads again: `events`,
+/// `watch --follow` and `search` all carry the token. A fix that simply hid
+/// every removed-task event would fail here, so what is proved is gating,
+/// not hiding.
+#[test]
+fn a_removed_tasks_trail_stays_tag_gated_on_every_tail() {
+    let estate = ManagedEstate::new("acc14-removed-task-tails");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "removed tail",
+            "--id",
+            "t-evttail",
+            "--body",
+            "draft cinderquorum notes",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-evttail",
+            "--body",
+            "final wording",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-evttail",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-evttail", "--as", "seed"]);
+
+    estate.bind_self("p-tail-reader", &[board_scope("read", &estate.id_a)]);
+    estate.grant("p-tail-reader", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+
+    // The denied half: no tail carries the removed task's pre-tag draft.
+    let events = estate.ok(&work_a, &["events", "--json"]);
+    assert!(
+        !events.contains("cinderquorum"),
+        "board-wide events handed over a removed task's pre-tag draft: {events}"
+    );
+    let rows: Vec<Value> = serde_json::from_str(&events).unwrap();
+    assert!(
+        rows.iter()
+            .all(|event| event["taskID"] != serde_json::json!("t-evttail")),
+        "board-wide events served a removed task's trail: {events}"
+    );
+    // `events --task` on the gone row refuses exactly like a never-created
+    // id — the same exit code and the same stderr modulo the id — and leaks
+    // nothing either way.
+    let named = estate.run(&work_a, &["events", "--task", "t-evttail", "--json"]);
+    let unknown = estate.run(&work_a, &["events", "--task", "t-never-created", "--json"]);
+    assert!(
+        !named.status.success(),
+        "events --task on a removed task should fail, not serve its trail"
+    );
+    assert_eq!(
+        named.status.code(),
+        unknown.status.code(),
+        "the gone row's --task refusal exits differently from an unknown id"
+    );
+    let named_stderr = String::from_utf8_lossy(&named.stderr).into_owned();
+    let unknown_stderr = String::from_utf8_lossy(&unknown.stderr).into_owned();
+    assert_eq!(
+        named_stderr.replace("t-evttail", "t-never-created"),
+        unknown_stderr,
+        "the gone row's --task refusal reads differently from an unknown id"
+    );
+    assert!(
+        !named_stderr.contains("cinderquorum") && !unknown_stderr.contains("cinderquorum"),
+        "events --task leaked the removed task's draft in its refusal: {named_stderr}"
+    );
+    // CLI search drops the gone row's pre-tag event for the tag-less reader:
+    // the receipt echoes the query, so what must be empty is the results.
+    let search: Value =
+        serde_json::from_str(&estate.ok(&work_a, &["search", "cinderquorum", "--json"])).unwrap();
+    assert!(
+        search["results"].as_array().is_some_and(Vec::is_empty),
+        "search handed over a removed task's pre-tag event: {search}"
+    );
+    // The live tail withholds it too. The stream replays from cursor 0, so
+    // the pre-tag event is offered to the filter; heartbeats prove the
+    // stream stayed alive while it stayed quiet.
+    {
+        let mut stream = Stream::start(
+            estate
+                .command(&work_a)
+                .args(["watch", "--follow", "--json"]),
+        );
+        thread::sleep(SETTLE);
+        let quiet = stream.drain();
+        assert!(
+            !quiet.join("\n").contains("cinderquorum"),
+            "watch --follow handed over a removed task's pre-tag draft:\n{}",
+            quiet.join("\n")
+        );
+        assert!(
+            stream.running(),
+            "the watch process exited instead of withholding the row"
+        );
+        assert!(
+            !quiet.is_empty(),
+            "the stream produced nothing at all, so nothing was measured"
+        );
+    }
+
+    // The owner half: the same principal with `secret` read keeps the trail
+    // on every tail, so the rule gates rather than hides.
+    estate.enforce("direct");
+    estate.grant(
+        "p-tail-reader",
+        &[tag_scope("read", &estate.id_a, "secret")],
+    );
+    estate.enforce("managed");
+    let events = estate.ok(&work_a, &["events", "--json"]);
+    assert!(
+        events.contains("cinderquorum"),
+        "the tag holder lost the removed task's audit trail in events: {events}"
+    );
+    let search: Value =
+        serde_json::from_str(&estate.ok(&work_a, &["search", "cinderquorum", "--json"])).unwrap();
+    assert!(
+        !search["results"].as_array().is_some_and(Vec::is_empty)
+            && search.to_string().contains("cinderquorum"),
+        "the tag holder lost the removed task's audit trail in search: {search}"
+    );
+    let mut stream = Stream::start(
+        estate
+            .command(&work_a)
+            .args(["watch", "--follow", "--json"]),
+    );
+    let deadline = Instant::now() + APPEAR;
+    loop {
+        let seen = stream.drain().join("\n");
+        if seen.contains("cinderquorum") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the tag holder never received the removed task's trail on watch --follow"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 4. Projection: no bulk path is the one way to read everything.
 // ---------------------------------------------------------------------------

@@ -556,6 +556,21 @@ an owner re-read shows each task-scoped ledger holding only its birth event, wit
 attention row and no sitrep created. *When* no enforcement applies, *then* an unknown id
 keeps its plain `not found` message and authorized attaches work as before.
 
+### A22 — a removed task's trail stays tag-gated on every tail (`ACC-14`)
+
+*Given* an untagged task whose body edit leaves a unique token in a
+*`task_updated.previousBody` while its snapshot still reads `tags: []`,
+*when* the task is tagged `secret` and then removed, *then* a managed
+*caller holding only board read sees the token on no tail — not in
+*board-wide `events`, not in a `watch --follow` stream, not in `search` —
+*while `events --task` on the gone row refuses exactly like a
+*never-created id, and the same caller granted `secret` read still reads
+*the token in `events`, in `watch --follow` and in `search` alike.
+*Removal never loosens a tag: a removed task's events authorize against
+*the task's last-known tags from its `task_removed` snapshots plus each
+*event's own snapshot, so the tails and the index agree instead of the
+*index dropping what the tails serve.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -656,7 +671,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -746,3 +761,21 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   keeps only its birth event, and no attention row or sitrep is created. The remaining attach
   paths from the pre-serve fix (checkpoint, handoff, edges, subscriptions, deploy) are
   unchanged by this port and carry no new evidence here.
+
+- 2026-09-29 — ACC-14 removed-task tail evidence landed (`t-bd66208d` port of `b7407a1`,
+  CLI paths only): `a_removed_tasks_trail_stays_tag_gated_on_every_tail` tags a
+  task `secret` after a body edit and then removes it: a caller holding only
+  board read sees the pre-tag `previousBody` draft on no tail — board-wide
+  `events`, a `watch --follow` stream, CLI `search` — and `events --task` on
+  the gone row refuses exactly like a never-created id, while the same caller
+  granted `secret` read keeps the trail on each of them (A22). The landing
+  fixed the leak as a bug; requirement wording is unchanged. The tails
+  authorized a removed task's events against the empty tag set of the missing
+  row plus each event's own snapshot, so a pre-tag event stayed readable to
+  any board reader, while the index dropped those same events under its
+  stale-task rule. A removed task's events are now authorized against the
+  task's last-known tags — the union of its `task_removed` snapshots — plus
+  each event's own snapshot, in the tails and in the index alike; the served
+  HTTP route halves of the pre-serve fix are moot with serve retired, and a
+  removed task with no removal record still fails closed with the stale-entry
+  tag.

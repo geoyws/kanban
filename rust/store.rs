@@ -727,6 +727,7 @@ pub(crate) struct SearchTagCache {
     task_exists: HashMap<String, bool>,
     attention_tags: HashMap<String, Vec<String>>,
     attention_exists: HashMap<String, bool>,
+    removed_task_tags: HashMap<String, Option<Vec<String>>>,
 }
 
 impl SearchTagCache {
@@ -775,6 +776,59 @@ impl SearchTagCache {
         self.attention_exists.insert(id.to_owned(), exists != 0);
         Ok(exists != 0)
     }
+
+    /// The last-known tag evidence for a task that no longer exists: the
+    /// union of the `_semanticV1.tags` snapshots frozen into EVERY
+    /// `task_removed` event naming it, or `None` when no removal record
+    /// names it at all.
+    ///
+    /// `remove_task` writes its `task_removed` event before the DELETE, so
+    /// each removal snapshot holds the tag set the task carried at that
+    /// removal. The union over all of them — rather than the latest alone —
+    /// is what keeps a removed-and-recreated-and-removed-untagged task from
+    /// laundering its secret-era history: a tag present at ANY removal
+    /// still gates every one of the task's events. `Some(vec![])` means the
+    /// task was removed while carrying no tag, which authorizes exactly like
+    /// a live untagged task; `None` (no removal record: legacy rows, a
+    /// partial restore) fails closed at the caller with
+    /// [`crate::search::STALE_INDEX_TAG`].
+    pub(crate) fn removed_task_final_tags(
+        &mut self,
+        connection: &Connection,
+        id: &str,
+    ) -> Result<Option<Vec<String>>> {
+        if let Some(cached) = self.removed_task_tags.get(id) {
+            return Ok(cached.clone());
+        }
+        let mut statement = connection.prepare(
+            "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq ASC",
+        )?;
+        let payloads = statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let found = !payloads.is_empty();
+        let mut union = Vec::new();
+        for payload in &payloads {
+            // Fail closed: an unreadable removal record is an error, never
+            // an untagged task.
+            let value: Value = serde_json::from_str(payload).with_context(|| {
+                format!("task {id} carries a task_removed payload that is not JSON")
+            })?;
+            if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
+                union.extend(
+                    frozen
+                        .iter()
+                        .filter_map(|tag| tag.as_str())
+                        .map(str::to_owned),
+                );
+            }
+        }
+        union.sort();
+        union.dedup();
+        let answer = found.then_some(union);
+        self.removed_task_tags.insert(id.to_owned(), answer.clone());
+        Ok(answer)
+    }
 }
 
 /// The tags one EVENT exposes, which is more than the tags its row carries
@@ -810,10 +864,19 @@ impl SearchTagCache {
 /// visible only to a caller who could see the row both as it is and as that
 /// event recorded it.
 ///
-/// An event whose task has since been removed yields only its snapshot tags:
-/// there is no live row left to read, and the snapshot is the strictest
-/// evidence remaining. An event whose attention row is gone yields, the same
-/// way, whatever that payload wrote down about it.
+/// An event whose task has since been removed is authorized against that
+/// task's LAST-KNOWN tags — the union of every `task_removed` snapshot for
+/// it — together with the event's own snapshot above, never against the
+/// empty tag set of the missing row. Dropping removed-task events outright
+/// (the search index's old rule) would close the leak but take the owner's
+/// audit trail with it: a `task_updated.previousBody` written before a
+/// later `secret` tag must stay readable to a caller holding `secret` after
+/// the remove, while staying denied to a caller holding only board read.
+/// The union is that rule — the all-of-tag check over live-plus-recorded
+/// sets, with the removal snapshots standing in for the live set that is
+/// gone. A removed task with NO removal record fails closed with
+/// [`crate::search::STALE_INDEX_TAG`]. An event whose attention row is gone
+/// yields, the same way, whatever that payload wrote down about it.
 pub(crate) fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
     cached_event_tags(connection, event, &mut SearchTagCache::default())
 }
@@ -827,7 +890,24 @@ pub(crate) fn cached_event_tags(
     cache: &mut SearchTagCache,
 ) -> Result<Vec<String>> {
     let mut tags = match event.task_id.as_deref() {
-        Some(id) => cache.task_tags(connection, id)?,
+        Some(id) => {
+            if cache.task_exists(connection, id)? {
+                cache.task_tags(connection, id)?
+            } else {
+                // No live row left: the removal snapshots are the strictest
+                // evidence remaining, and the empty tag set of the missing
+                // row would authorize a pre-tag event for any board reader.
+                // The snapshots come from the `task_removed` records, not
+                // from the union of this task's events' own snapshots: a
+                // pre-tag event's snapshot is `[]`, so that union would
+                // authorize exactly the leak being closed, while the removal
+                // record holds the live tag set at the moment the task left.
+                let Some(final_tags) = cache.removed_task_final_tags(connection, id)? else {
+                    return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
+                };
+                final_tags
+            }
+        }
         None => Vec::new(),
     };
     let recorded = |pointer: &str| -> Vec<String> {
@@ -866,10 +946,14 @@ pub(crate) fn cached_event_tags(
 /// hands the row's id, kind, tags and choices to a caller every listing
 /// withholds it from (ACC-14).
 ///
-/// A document whose event is gone (a stale index entry) or whose `source_id`
-/// is not an event sequence yields the tag that can never be satisfied, so
-/// it is dropped rather than trusted — the same stale-entry rule
-/// [`crate::search::STALE_INDEX_TAG`] states.
+/// A document whose TASK is gone is authorized exactly like the tails
+/// authorize that event: against the task's last-known tags from its
+/// `task_removed` snapshots plus the event's own snapshot, through
+/// [`cached_event_tags`] below. The tails and the index therefore agree —
+/// an owner holding the tag keeps the removed task's trail in both, and a
+/// tag-less reader gets it in neither — instead of the index dropping what
+/// the tails serve. A removed task with no removal record at all still
+/// yields [`crate::search::STALE_INDEX_TAG`].
 ///
 /// The live tag reads are served from a per-request [`SearchTagCache`], and —
 /// when `search.rs` already loaded the event row with its document (`t-e9c0127a`)
@@ -878,8 +962,8 @@ pub(crate) fn cached_event_tags(
 /// row for the document, which is exactly the stale index entry the re-SELECT
 /// path drops, so the fail-closed behaviour is identical either way: an
 /// unparsable `source_id` or a missing event row yields
-/// [`crate::search::STALE_INDEX_TAG`], a task that no longer exists yields it
-/// too, and a payload that is not JSON is an error, never an untagged event.
+/// [`crate::search::STALE_INDEX_TAG`], and a payload that is not JSON is an
+/// error, never an untagged event.
 pub(crate) fn cached_event_authorization_tags(
     connection: &Connection,
     source_id: &str,
@@ -906,21 +990,10 @@ pub(crate) fn cached_event_authorization_tags(
             (task_id, payload)
         }
     };
-    // The index outlives the row: the removal trigger re-inserts every event
-    // document tied to the deleted task, whose live tags are gone with it.
-    // An event written before the task was tagged then authorizes against
-    // nothing but its own snapshot, so the document is stale and stays
-    // dropped — the same existence rule the task branch of `document_row_tags`
-    // applies.
-    let task_gone = match task_id.as_deref() {
-        Some(task_id) => !cache.task_exists(connection, task_id)?,
-        None => false,
-    };
-    if task_gone {
-        return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
-    }
     // Fail closed: a payload the store cannot parse is an error, not an
-    // untagged event.
+    // untagged event. A task that no longer exists is NOT dropped here:
+    // `cached_event_tags` authorizes it against its last-known removal
+    // tags, the same rule the tails filter on.
     let payload: Value = serde_json::from_str(&payload)
         .with_context(|| format!("event {seq} carries a payload that is not JSON"))?;
     cached_event_tags(
@@ -3765,11 +3838,15 @@ impl Store {
         if !self.authz.is_enforcing() {
             return Ok(events);
         }
+        // One cache for the whole tail: the tag sets depend only on the
+        // source tables, so every event about one task — including a
+        // removed one, whose removal snapshots are read once — shares them.
+        let mut cache = SearchTagCache::default();
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             if self
                 .authz
-                .permits_read(&event_tags(&self.connection, &event)?)
+                .permits_read(&cached_event_tags(&self.connection, &event, &mut cache)?)
             {
                 out.push(event);
             }
