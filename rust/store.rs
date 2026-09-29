@@ -681,6 +681,37 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// An absent row under managed enforcement answers the same generic denial a
+/// denied row answers, so a tag-denied id and a never-created id are
+/// indistinguishable. The attach lookups below all read the row's tags first,
+/// which are empty for an absent row, so a caller holding board scope would
+/// otherwise get `not found` for the unknown id beside `denied or not found`
+/// for the denied one. Outside enforcement the guard cannot deny, so the
+/// plain `not found` message stays exactly as it was.
+fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContext) -> Result<T> {
+    match row {
+        Some(row) => Ok(row),
+        None if authz.is_enforcing() => Err(crate::authz::DeniedOrNotFound.into()),
+        None => Err(anyhow::anyhow!("{kind} {id} not found")),
+    }
+}
+
+/// Authorize linking a new row to a task — a note, an attention row, a
+/// sitrep. The caller must hold the task's own tags at BOTH read and write:
+/// a caller who cannot read the task must not attach to it, because the
+/// write would otherwise confirm the row exists while every listing
+/// withholds it. An absent id answers the generic denial under enforcement
+/// rather than `not found`, so a denied task and a never-created one are
+/// indistinguishable. Nothing is written here; callers run this before their
+/// first INSERT, and add the archived refusal themselves where the path used
+/// to require an active task.
+fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str) -> Result<Task> {
+    let tags = task_tags(connection, id)?;
+    authz.check_read(&tags)?;
+    authz.check_write(&tags, &tags)?;
+    absent_as_denied(get_task(connection, id)?, "task", id, authz)
+}
+
 /// A per-search-request cache of tag sets and row-existence answers
 /// (`t-e9c0127a`). Authorizing every indexed document on every request used to
 /// cost, per event document, a primary-key SELECT of the full payload, a JSON
@@ -5966,9 +5997,13 @@ impl Store {
     pub fn add_note(&mut self, id: &str, author: &str, kind: &str, body: &str) -> Result<TaskNote> {
         validate(kind, &NOTE_KINDS, "note kind")?;
         let transaction = self.begin_write()?;
-        // Notes carry no tags of their own: board scope, under the lock.
-        self.authz.check_write(&[], &[])?;
-        require_active_task(&transaction, id)?;
+        // Notes carry no tags of their own, so they are authorized against the
+        // task they attach to: a caller who cannot read the task must not
+        // learn it exists through a write, and an absent id answers as denied.
+        let task = authorize_task_attach(&transaction, &self.authz, id)?;
+        if task.archived {
+            bail!("task {id} is archived history and cannot be changed");
+        }
         let now = now_ms();
         transaction.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
@@ -6376,7 +6411,14 @@ impl Store {
         let author = nonempty(author, "author")?.to_owned();
         let transaction = self.begin_write()?;
         if let Some(id) = task_id {
-            require_active_task(&transaction, id)?;
+            // A sitrep that names a task attaches to it: authorized against
+            // that task's own tags — read as well as write — with an absent
+            // id answering as denied. A lanewide sitrep names no task and
+            // keeps its existing scope.
+            let task = authorize_task_attach(&transaction, &self.authz, id)?;
+            if task.archived {
+                bail!("task {id} is archived history and cannot be changed");
+            }
         }
         let now = now_ms();
         let id = format!("sr-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -6504,9 +6546,15 @@ impl Store {
         let check = check.as_ref();
         let transaction = self.begin_write()?;
         // A new attention row has no old tag set; authorization above checked
-        // exactly the resulting tags before semantic validation.
+        // exactly the resulting tags before semantic validation. The task it
+        // is raised against is a second row the caller attaches to, so that
+        // row's own tags are checked too — read as well as write — with an
+        // absent id answering as denied.
         if let Some(id) = task_id {
-            require_active_task(&transaction, id)?;
+            let task = authorize_task_attach(&transaction, &self.authz, id)?;
+            if task.archived {
+                bail!("task {id} is archived history and cannot be changed");
+            }
         }
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);

@@ -1083,9 +1083,29 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     // Revoke, with the stream still open and the process untouched.
     estate.revoke_atom("tag:live");
 
-    // After revocation: the next event on the same row must not be delivered.
+    // The write stops too: without the tag the caller cannot attach to the
+    // row at all, so the refused note never reaches the ledger.
+    estate.denied(&work_a, &note_on(&watched_id, "after-revocation"));
+
+    // To observe what the LIVE stream does with an event it must not deliver,
+    // that event has to be written by someone who still may: restore the tag,
+    // write the note, and revoke again — all with the stream still open.
+    // Anything the stream delivered while the grant was back is drained, so
+    // what follows measures only the revoked state.
+    estate.enforce("direct");
+    estate.grant(
+        "p-watcher",
+        &[
+            tag_scope("read", &estate.id_a, "live"),
+            tag_scope("write", &estate.id_a, "live"),
+        ],
+    );
+    estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-revocation"));
+    estate.revoke_atom("tag:live");
+    // After revocation: the next event on the same row must not be delivered.
+    stream.drain();
     thread::sleep(SETTLE);
     let after = stream.drain();
     assert_eq!(
@@ -1114,7 +1134,13 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     // SAME process, which is only possible because the authority is re-minted
     // once per poll rather than cached for the life of the stream.
     estate.enforce("direct");
-    estate.grant("p-watcher", &[tag_scope("read", &estate.id_a, "live")]);
+    estate.grant(
+        "p-watcher",
+        &[
+            tag_scope("read", &estate.id_a, "live"),
+            tag_scope("write", &estate.id_a, "live"),
+        ],
+    );
     estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-restore"));
@@ -1553,4 +1579,177 @@ fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
         order_before,
         "the anchors' result order moved when a denied document appeared: {before} vs {after}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task-attach writes: note, attention raise --task, sitrep post --task.
+// ---------------------------------------------------------------------------
+
+/// ACC-14, task-attach writes (`t-d2fd604a` port of `9626f1f`, CLI paths
+/// only): a managed caller holding board read and write (plus `visible` at
+/// both capabilities) but no `secret` scope must not attach a note, an
+/// attention row or a sitrep to a `secret` task, and a denied task id must
+/// answer byte-identically to a never-created id on each of those three
+/// writes — with nothing recorded.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The pre-serve fix covered further attach paths
+/// (checkpoint, handoff with a task, parent and dependency edges,
+/// subscription subjects and relations, `deploy start --task`); their store
+/// paths are unchanged by this port, so no test pins them here.
+#[test]
+fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id() {
+    fn sitrep_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "sitrep",
+            "post",
+            "attach probe body",
+            "--as",
+            "probe",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--dirty",
+            "clean",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    fn raise_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "attention",
+            "raise",
+            "attach probe body",
+            "--kind",
+            "decision",
+            "--as",
+            "probe",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    let estate = ManagedEstate::new("acc14-task-attach");
+    let work_a = estate.work_a.clone();
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    // Unmanaged first: where no guard can deny, an unknown id keeps its plain
+    // message on the paths that previously answered it.
+    for (args, what) in [
+        (note_on("t-never-created", "unmanaged probe"), "note add"),
+        (raise_on_task("t-never-created"), "attention raise --task"),
+        (sitrep_on_task("t-never-created"), "sitrep post --task"),
+    ] {
+        let plain = estate.run(&work_a, &args);
+        assert!(!plain.status.success(), "{what} should fail unmanaged");
+        let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+        assert!(
+            plain_stderr.contains("task t-never-created not found"),
+            "{what} lost its plain unmanaged message: {plain_stderr}"
+        );
+        assert!(
+            plain_stderr.find(DENIED).is_none(),
+            "{what} answers a denial where no guard can deny: {plain_stderr}"
+        );
+    }
+    for (id, title, tag) in [
+        ("t-attach-secret", "the attach secret task", "secret"),
+        ("t-attach-visible", "the attach visible task", "visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--type", "story", "--tag", tag, "--as", "seed",
+                "--json",
+            ],
+        );
+    }
+    estate.bind_self(
+        "p-attach",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+    // Each task-attach write: the denied id and the never-created id exit
+    // with the same code and byte-identical stderr — the generic denial —
+    // and the denied form must not succeed.
+    let assert_write_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            denied.status.code() != Some(0),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_write_identical(
+        &note_on("t-attach-secret", "attach probe body"),
+        &note_on("t-never-created", "attach probe body"),
+        "note add",
+    );
+    assert_write_identical(
+        &raise_on_task("t-attach-secret"),
+        &raise_on_task("t-never-created"),
+        "attention raise --task",
+    );
+    assert_write_identical(
+        &sitrep_on_task("t-attach-secret"),
+        &sitrep_on_task("t-never-created"),
+        "sitrep post --task",
+    );
+    // Nothing was written. As the board owner the same caller re-reads every
+    // row the refused writes could have touched: each task-scoped ledger
+    // holds only its birth event, and no attention row or sitrep was created.
+    estate.grant("p-attach", &owner_of(&estate.id_a));
+    for task in ["t-attach-secret", "t-attach-visible"] {
+        let ledger = estate.ok(&work_a, &["events", "--task", task, "--all", "--json"]);
+        let events: Vec<Value> = serde_json::from_str(&ledger).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a refused attach wrote to {task}: {ledger}"
+        );
+        assert!(
+            ledger.contains("task_added"),
+            "{task} lost its birth event: {ledger}"
+        );
+    }
+    let raised = estate.ok_json(&work_a, &["attention", "list", "--all", "--json"]);
+    assert!(
+        raised.as_array().unwrap().is_empty(),
+        "a refused attention raise was recorded: {raised}"
+    );
+    let sitreps = estate.ok_json(&work_a, &["sitrep", "list", "--all", "--json"]);
+    assert!(
+        sitreps.as_array().unwrap().is_empty(),
+        "a refused sitrep post was recorded: {sitreps}"
+    );
+    // The control path works: as the owner the same caller attaches a note
+    // to the secret task, so the denials above came from the tag and not a
+    // broken write path.
+    estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
 }
