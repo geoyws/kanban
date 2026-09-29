@@ -447,13 +447,13 @@ their ids and a refused `task add` writes no row and no event.
 
 ## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
 
-The claim-routing slice is specified but not implemented: the specification is at `Proposed`
+The claim-routing slice is specified but not implemented: the specification is `SPEC-READY` on
 2026-09-29 on branch `kanban-geoyws-driver` at commit `ab7a11a`. The implementation row
 `t-8c698a02` is a later row. No claim-routing test exists at this baseline, so no name below was
 enumerated with `cargo test -- --list` and none is claimed to exist. Every row therefore carries
 `none` / `none` and says `no e2e coverage` plainly, naming the planned layer and test name from
 `docs/specs/claim-routing.md` §8 as what the implementation owes. Of the 8 requirements, all 8
-are `MUST`, all proved at `process`. This slice changes no served markup, so there is no browser
+are `MUST`, all planned at `process` and none yet proved. This slice changes no served markup, so there is no browser
 surface to drive.
 
 | Requirement | Strength | Layer | Existing test | Note |

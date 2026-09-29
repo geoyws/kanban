@@ -9,9 +9,13 @@
   at the baseline is `36` (`rust/db.rs:2920`), and no `lane_of` function exists yet: the two claim
   paths compare the whole assignee string to `--as` (see Sources). The specification is written
   before the implementation, as ADR-047 §6 requires.
-- **Status:** `Proposed` on 2026-09-29. This stamp claims no readiness: `SPEC-READY` waits for the
-  independent `/quality spec` gate, which main runs; product readiness after that stays
-  `/quality`, then `/tidy`. No served-tier evidence is owed: the slice changes no served markup.
+- **Status:** `SPEC-READY` on 2026-09-29. An independent `/quality spec` review (subagent
+  `ClaimRoutingSpecReview`, which did not write this document) read commit `5e12247`, checked
+  every `path:line` citation against the code, and found one non-blocking finding: the matrix
+  preamble said the rows were "proved" at `process` while every row is still planned. That wording
+  is fixed. This stamp claims specification readiness only; product readiness after
+  implementation stays `/quality`, then `/tidy`. No served-tier evidence is owed: the slice
+  changes no served markup.
 - **Owner (product scope):** George. He alone resolves scope, the open questions in §7, and
   whether a non-goal in §2 is reinstated. He approved this slice under epic `e-c0852fe7` on
   attention `a-4a6388df` (board row `t-9c195580`); the implementation row is `t-8c698a02`.
@@ -299,3 +303,5 @@ plainly per the convention at `docs/testing/compiled-rust-e2e-matrix.md:206`-`:2
 ## 9. Change log
 
 - `2026-09-29` — slice created at `CLAIM-01` .. `CLAIM-08`. No supersessions yet.
+- `2026-09-29` — `SPEC-READY` after independent review; matrix preamble reworded from "proved" to
+  "planned" (review finding 1). No requirement changed.
