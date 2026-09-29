@@ -832,11 +832,9 @@ rollback_activation_view() {
     done
   fi
 
-  # Restoring the links restores the PATHS. If this activation had already
-  # restarted the unit, the PROCESS is still the candidate's, so it has to
-  # follow the links back before the candidate's executable is deleted from
-  # under it - and a recovery that cannot be proved keeps the candidate on
-  # disk and says so next to the failure that started this.
+  # Restoring the links restores the PATHS. No service runs from a release
+  # since `kanban serve` was retired (ADR-053), so no process has to follow
+  # them back before the candidate's directory is removed.
   # `current` may legitimately hold a relative target - ensure_safe_release_view
   # accepts one, resolving it against the link's own directory - so the value
   # is restored verbatim and normalised against the install root before it is
@@ -2131,11 +2129,9 @@ rollback_activation_view() {
     done
   fi
 
-  # Restoring the links restores the PATHS. If this activation had already
-  # restarted the unit, the PROCESS is still the candidate's, so it has to
-  # follow the links back before the candidate's executable is deleted from
-  # under it - and a recovery that cannot be proved keeps the candidate on
-  # disk and says so next to the failure that started this.
+  # Restoring the links restores the PATHS. No service runs from a release
+  # since `kanban serve` was retired (ADR-053), so no process has to follow
+  # them back before the candidate's directory is removed.
   # `current` may legitimately hold a relative target - ensure_safe_release_view
   # accepts one, resolving it against the link's own directory - so the value
   # is restored verbatim and normalised against the install root before it is
