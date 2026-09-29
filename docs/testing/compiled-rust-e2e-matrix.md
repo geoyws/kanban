@@ -416,3 +416,41 @@ field-for-field with Ord; board schema stands at 35 and no migration rides this 
   redaction, repeatable semantic filters, sparse matches before `--limit`,
   removed-subject replay, and historical relation-target replay.
 - This matrix does not claim deployment evidence or full-suite release status.
+
+## Requirements trace — `docs/specs/done-gate.md` DG-01..DG-16
+
+One row per requirement, on branch `wt/t-7038c70a-impl` at the implementation
+commit (dirty, uncommitted per the slice contract: no commit, branch or push
+from the implementation task). `Layer` uses the specification's own
+vocabulary, where `process` is a compiled-binary process-boundary exchange in
+`tests/done_gate_e2e.rs` and `unit` is an in-process `#[test]`. All sixteen
+requirements are `MUST` at `process`; the `process` names below are the
+specification §8 plan, proved by the sibling e2e slice in
+`tests/done_gate_e2e.rs` and enumerated with
+`cargo test --locked --test done_gate_e2e -- --list` on integration — they do
+not exist in this change, following the `MODEL` precedent of landing the
+trace with the fixed test set. Every row carries `no e2e coverage` plainly:
+the whole surface is CLI, so no row has browser evidence. Where an in-process
+unit test in `rust/store.rs` (`mod tests`) or `rust/db.rs` (`mod tests`)
+already pins the same obligation in this change, the Note names it; those
+`unit` names were enumerated with `cargo test --locked --lib -- --list`
+before the row landed.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `DG-01` | MUST | process | `done_gate_refuses_done_move_without_verdict` | no e2e coverage; unit `done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing` holds the sentence-1 wording byte-exact with row, lease and event count unchanged |
+| `DG-02` | MUST | process | `done_gate_rejects_incomplete_verdict_record` | no e2e coverage; unit `done_gate_empty_evidence_never_satisfies` holds the empty-evidence refusal as sentence 1, and `done_gate_opens_for_a_foreign_planner_verdict_covering_the_head` the stored five-field row surviving restart, retag-free moves and the citing move |
+| `DG-03` | MUST | process | `done_gate_refuses_self_review_verdict` | no e2e coverage; unit `done_gate_refuses_self_review_but_a_foreign_closer_passes` (A3 holder-as-reviewer plus A13 writer-as-closer, then the foreign closer succeeding) and `done_gate_released_holder_is_still_the_holder_of_record` (A16) hold sentence 3 byte-exact |
+| `DG-04` | MUST | process | `done_gate_requires_resolved_decision_citations` | no e2e coverage; unit `done_gate_cited_decisions_must_be_resolved_at_the_move` holds the open-refuses, resolved-opens, reopened-refuses lifecycle |
+| `DG-05` | MUST | process | `done_gate_force_requires_geoyws` | no e2e coverage; unit `done_gate_override_is_geoyws_only_and_audited` holds the sentence-4 refusal for a non-`geoyws` force with the row unchanged |
+| `DG-06` | MUST | process | `done_gate_override_writes_audited_event` | no e2e coverage; unit `done_gate_override_is_geoyws_only_and_audited` reads the `done_gate_override` row back: actor `geoyws`, task, prior status and the `missing-verdict` reason on the hash chain |
+| `DG-07` | MUST | process | `done_gate_refuses_executor_written_verdict` | no e2e coverage; unit `done_gate_refuses_an_executor_written_verdict` holds sentence 3 for the holder-written row, nothing stored, head unmoved, the later done-move still refused |
+| `DG-08` | MUST | process | `done_gate_refusals_carry_named_reasons` | no e2e coverage; the seven verbatim sentences are held byte-exact by the unit suite: 1 in `done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing`, 2 in `done_gate_stale_verdict_refuses_until_a_fresh_one_lands`, 3 in `done_gate_refuses_self_review_but_a_foreign_closer_passes`, 4 in `done_gate_override_is_geoyws_only_and_audited`, 5 and 6 in `done_gate_refuses_short_and_unpublished_shas`, 7 in `done_gate_flag_defaults_off_and_audits_changes` |
+| `DG-09` | MUST | process | `done_gate_off_leaves_move_unchanged` | no e2e coverage; unit `done_gate_off_and_non_done_moves_are_untouched` moves `done` with the flag absent exactly as at the baseline |
+| `DG-10` | MUST | process | `done_gate_fires_only_on_done` | no e2e coverage; unit `done_gate_off_and_non_done_moves_are_untouched` moves to `review` under the gate with no verdict demanded |
+| `DG-11` | MUST | process | `done_gate_verdicts_table_is_append_only_across_migration` | no e2e coverage; unit `board_v37_adds_an_append_only_verdicts_table_and_a_rewound_rerun_keeps_rows` (`rust/db.rs`) holds the forward-only step and the rewind-rerun, and `done_gate_migration_carries_verdicts_and_overrides_forward` holds pre-gate rows verdict-free with stored rows and override events surviving a reopen |
+| `DG-12` | MUST | process | `done_gate_verdict_add_verb_records_pass_only` | no e2e coverage; unit `done_gate_opens_for_a_foreign_planner_verdict_covering_the_head` records the `pass`-only row through the holder/lease write check, and `done_gate_refuses_an_executor_written_verdict` the refused half |
+| `DG-13` | MUST | process | `done_gate_refuses_short_and_unpublished_shas` | no e2e coverage; unit `done_gate_refuses_short_and_unpublished_shas` holds sentences 5 and 6 byte-exact with nothing stored; publication is the `KANBAN_PUBLISHED_SHAS` allowlist, fail-closed when unset (see `IMPL-NOTES.md`) |
+| `DG-14` | MUST | process | `done_gate_stale_verdict_does_not_open_gate` | no e2e coverage; unit `done_gate_stale_verdict_refuses_until_a_fresh_one_lands` holds sentence 2 byte-exact, `done_gate_head_ordering_prefers_newest_time_then_source_then_row`, `done_gate_head_tie_break_prefers_claims_then_checkpoints` and `done_gate_head_tie_within_checkpoints_prefers_the_newest_row` hold the newest-time plus tie-break ordering, `done_gate_heartbeat_at_an_unchanged_head_stales_nothing` the heartbeat and satisfy-again rules, `done_gate_no_head_opens_only_by_override` the no-head rule, and `done_gate_abbreviated_provenance_never_matches_a_full_sha` the exact-match rule |
+| `DG-15` | MUST | process | `done_gate_flag_defaults_off_and_audits_changes` | no e2e coverage; unit `done_gate_flag_defaults_off_and_audits_changes` holds absent-as-off, the `geoyws` on-toggle with its `off`-to-`on` audit event, the sentence-7 refused toggle changing nothing, and the off-toggle restoring the baseline |
+| `DG-16` | MUST | process | `done_gate_story_and_epic_project_done_without_verdict` | no e2e coverage; unit `done_gate_story_and_epic_moves_take_no_verdict` holds the story-projection refusal with no gate sentence and the direct epic move succeeding with no verdict |

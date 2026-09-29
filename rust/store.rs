@@ -3266,6 +3266,299 @@ fn require_free_lease(
     Ok(Some(claim))
 }
 
+/// The done gate (DG-01..DG-16): a gated `task move ID done` needs a
+/// planner-written foreign-actor `pass` verdict covering the task's current
+/// head, or a `geoyws --force` override that is audited.
+///
+/// The gate lives in `board_meta` under this key with value `on` or `off`;
+/// an absent key reads as `off` (DG-15). It needs no schema step.
+const DONE_GATE_META_KEY: &str = "done_gate";
+
+/// Whether the done gate guards this board. Absent reads as `off`, so boards
+/// written before the gate (and fresh boards that never toggled it) move
+/// exactly as at the baseline (DG-09, DG-15).
+fn done_gate_on(connection: &Connection) -> Result<bool> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM board_meta WHERE key=?",
+            [DONE_GATE_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref() == Some("on"))
+}
+
+/// Whether the `verdicts` table stands on this board. A board opened
+/// read-only below `BOARD_V37` has none, and reads as "no verdict" (DG-11)
+/// rather than failing the gate lookup.
+fn has_verdicts_table(connection: &Connection) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='verdicts')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+fn verdict_row(row: &Row<'_>) -> rusqlite::Result<Verdict> {
+    Ok(Verdict {
+        task_id: row.get("task_id")?,
+        writer: row.get("writer")?,
+        reviewer: row.get("reviewer")?,
+        shas: serde_json::from_str(row.get::<_, String>("shas")?.as_str()).unwrap_or_default(),
+        verdict: row.get("verdict")?,
+        evidence: serde_json::from_str(row.get::<_, String>("evidence")?.as_str())
+            .unwrap_or_default(),
+        created_at: row.get("created_at")?,
+    })
+}
+
+/// A reviewed SHA (DG-13): exactly 40 lowercase-hex characters. Anything
+/// else — short, malformed, empty, uppercase — is refused with sentence 5.
+fn is_full_sha(sha: &str) -> bool {
+    sha.len() == 40
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// The SHAs the ledger confirms as published on origin (DG-13).
+///
+/// The ledger has no git/origin channel, so publication is decided by an
+/// explicit allowlist, failing closed: `KANBAN_PUBLISHED_SHAS` holds the
+/// published set as comma- and/or whitespace-separated full SHAs. When the
+/// variable is SET (even empty), membership decides; when it is UNSET the
+/// host cannot confirm publication and `None` refuses every citing write
+/// with sentence 6, which the specification explicitly blesses. Tests
+/// control the decision by setting the variable per process (process layer)
+/// or under a lock (in-process unit tests).
+fn published_shas() -> Option<HashSet<String>> {
+    let raw = std::env::var("KANBAN_PUBLISHED_SHAS").ok()?;
+    Some(
+        raw.split([',', ' ', '\t', '\n'])
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The claim holder of record (DG-03): any actor named as holder in the
+/// task's live `task_claims` row or its claim-event history
+/// (`task_claimed`, `claim_heartbeat`, `claim_released`, `claim_expired`) —
+/// holds or held, including a holder who has since released.
+fn claim_holders_of_record(connection: &Connection, task_id: &str) -> Result<HashSet<String>> {
+    let mut holders = HashSet::new();
+    if has_claims_table(connection)? {
+        let live: Vec<String> = connection
+            .prepare("SELECT agent_id FROM task_claims WHERE task_id=?")?
+            .query_map([task_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        holders.extend(live);
+    }
+    let past: Vec<String> = connection
+        .prepare(
+            "SELECT DISTINCT actor FROM events WHERE task_id=? AND kind IN \
+             ('task_claimed','claim_heartbeat','claim_released','claim_expired') AND actor IS NOT NULL",
+        )?
+        .query_map([task_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    holders.extend(past);
+    Ok(holders)
+}
+
+/// The task's current head (DG-14): the `head_sha` of its newest
+/// work-provenance row across `checkpoints`, `task_claims`, `handoffs` and
+/// `sitreps`. Newest is by row time, skipping null (and empty) heads; ties
+/// break toward `task_claims`, then `checkpoints`, then `handoffs`, then
+/// `sitreps`, then the greatest `rowid`. A heartbeat that re-records the
+/// `task_claims` row at a new `heartbeat_at` is automatically re-read here,
+/// so an unchanged head stales nothing and a changed one stales every prior
+/// verdict. Comparison against verdict SHAs is exact string match, so an
+/// abbreviated provenance `--head` never matches a 40-character verdict SHA.
+fn current_task_head(connection: &Connection, task_id: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT head_sha FROM ( \
+               SELECT head_sha, heartbeat_at AS t, 0 AS rank, rowid AS rid FROM task_claims \
+                WHERE task_id=? AND head_sha IS NOT NULL AND head_sha <> '' \
+               UNION ALL SELECT head_sha, created_at, 1, rowid FROM checkpoints \
+                WHERE task_id=? AND head_sha IS NOT NULL AND head_sha <> '' \
+               UNION ALL SELECT head_sha, created_at, 2, rowid FROM handoffs \
+                WHERE task_id=? AND head_sha IS NOT NULL AND head_sha <> '' \
+               UNION ALL SELECT head_sha, created_at, 3, rowid FROM sitreps \
+                WHERE task_id=? AND head_sha IS NOT NULL AND head_sha <> '' \
+             ) ORDER BY t DESC, rank ASC, rid DESC LIMIT 1",
+            params![task_id, task_id, task_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Whether an attention row exists and is `resolved` (DG-04). Open, missing
+/// or reopened rows fail the gate.
+fn attention_is_resolved(connection: &Connection, id: &str) -> Result<bool> {
+    let status: Option<String> = connection
+        .query_row("SELECT status FROM attention WHERE id=?", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(status.as_deref() == Some("resolved"))
+}
+
+/// Why a gated done-move is refused, in the order the sentences take
+/// precedence: a self-review collision (sentence 3) over a stale head
+/// (sentence 2) over everything else (sentence 1).
+enum GateMiss {
+    SelfReview { actor: String },
+    Stale { covered: Vec<String>, head: String },
+    Missing,
+}
+
+impl GateMiss {
+    fn reason(&self) -> &'static str {
+        match self {
+            GateMiss::SelfReview { .. } => "self-review",
+            GateMiss::Stale { .. } => "stale",
+            GateMiss::Missing => "missing-verdict",
+        }
+    }
+
+    fn sentence(&self, task_id: &str) -> String {
+        match self {
+            GateMiss::SelfReview { actor } => format!(
+                "task {task_id} verdict is self-review: {actor} is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
+            ),
+            GateMiss::Stale { covered, head } => format!(
+                "task {task_id} verdict is stale: it covered {} but the row now stands at {head} — record a fresh verdict at the new head with `task verdict add {task_id} --as <planner>`",
+                covered.join(",")
+            ),
+            GateMiss::Missing => format!(
+                "task {task_id} has no foreign-actor pass verdict — record one with `task verdict add {task_id} --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done"
+            ),
+        }
+    }
+}
+
+/// The unsatisfied-gate refusal for this done-move, if any (DG-01..DG-04,
+/// DG-13, DG-14). `None` opens the gate. Every stored verdict for the task
+/// is considered newest-first: a reviewer or writer collision anywhere
+/// names sentence 3; otherwise a verdict that passes every check except the
+/// head names sentence 2; anything else — no rows, empty or unresolved
+/// evidence, an unpublished SHA, no head anywhere — is sentence 1.
+/// Staleness is a relation between the cited SHAs and the current head, not
+/// a mark on the verdict: an older verdict whose SHAs again include the head
+/// after later work satisfies again with no new write.
+fn find_gate_miss(
+    connection: &Connection,
+    task_id: &str,
+    closer: &str,
+) -> Result<Option<GateMiss>> {
+    if !has_verdicts_table(connection)? {
+        return Ok(Some(GateMiss::Missing));
+    }
+    let verdicts = connection
+        .prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY seq DESC")?
+        .query_map([task_id], verdict_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if verdicts.is_empty() {
+        return Ok(Some(GateMiss::Missing));
+    }
+    let holders = claim_holders_of_record(connection, task_id)?;
+    let head = current_task_head(connection, task_id)?;
+    let published = published_shas();
+    let mut collision: Option<String> = None;
+    let mut stale: Option<Vec<String>> = None;
+    for verdict in &verdicts {
+        // The reviewer MUST differ from the claim holder of record and from
+        // the closing actor; a stored writer that is the closer (or a
+        // holder) collides the same way (DG-03).
+        if holders.contains(&verdict.reviewer) || verdict.reviewer == closer {
+            if collision.is_none() {
+                collision = Some(verdict.reviewer.clone());
+            }
+            continue;
+        }
+        if verdict.writer == closer || holders.contains(&verdict.writer) {
+            if collision.is_none() {
+                collision = Some(verdict.writer.clone());
+            }
+            continue;
+        }
+        if verdict.verdict != "pass"
+            || verdict.shas.is_empty()
+            || !verdict.shas.iter().all(|sha| is_full_sha(sha))
+            || !verdict
+                .shas
+                .iter()
+                .all(|sha| published.as_ref().is_some_and(|set| set.contains(sha)))
+            || verdict.evidence.is_empty()
+        {
+            continue;
+        }
+        let mut cited_resolved = true;
+        for id in &verdict.evidence {
+            if !attention_is_resolved(connection, id)? {
+                cited_resolved = false;
+                break;
+            }
+        }
+        if !cited_resolved {
+            continue;
+        }
+        match head.as_deref() {
+            // No current head: no verdict satisfies (DG-14); only the DG-06
+            // override opens the gate.
+            None => continue,
+            Some(head) if verdict.shas.iter().any(|sha| sha == head) => return Ok(None),
+            Some(_) if stale.is_none() => stale = Some(verdict.shas.clone()),
+            Some(_) => {}
+        }
+    }
+    if let Some(actor) = collision {
+        return Ok(Some(GateMiss::SelfReview { actor }));
+    }
+    if let (Some(covered), Some(head)) = (stale, head) {
+        return Ok(Some(GateMiss::Stale { covered, head }));
+    }
+    Ok(Some(GateMiss::Missing))
+}
+
+/// Enforce the done gate inside `move_task` (DG-01, DG-05, DG-06). The caller
+/// has already passed the story projection and the prerequisite gates and
+/// has not yet seized any lease, so a refusal leaves the row, its lease and
+/// the event history unchanged. A satisfied gate returns silently; a
+/// `geoyws --force` past an unsatisfied one writes the audited override
+/// event and returns silently; anything else bails with its DG-08 sentence.
+fn enforce_done_gate(
+    connection: &Connection,
+    task_id: &str,
+    actor: &str,
+    force: bool,
+    prior_status: &str,
+) -> Result<()> {
+    let Some(miss) = find_gate_miss(connection, task_id, actor)? else {
+        return Ok(());
+    };
+    if force {
+        if actor != OPERATOR_ACTOR {
+            bail!(
+                "task {task_id} done-move past the gate needs `--force --as geoyws` — only geoyws may override, and the override is recorded"
+            );
+        }
+        event(
+            connection,
+            Some(task_id),
+            "done_gate_override",
+            Some(actor),
+            json!({"priorStatus": prior_status, "reason": miss.reason()}),
+        )?;
+        return Ok(());
+    }
+    bail!("{}", miss.sentence(task_id));
+}
+
 /// Keep the newest `limit` entries of an oldest-first list.
 /// Returns true when anything was dropped.
 /// How many sitreps stay *current* in one lane.
@@ -5818,6 +6111,157 @@ impl Store {
         Ok(out)
     }
 
+    /// Store one review verdict (DG-11, DG-12): the `task verdict add` verb.
+    /// It records a `pass` and nothing else; a review that fails records
+    /// nothing. The write is refused — storing nothing and advancing no head
+    /// — when the writer or the reviewer is the claim holder of record or
+    /// holds the work lease (DG-03, DG-07, DG-12, sentence 3), when a SHA is
+    /// not a full 40-character commit SHA (DG-13, sentence 5), or when a SHA
+    /// cannot be confirmed as published on origin (DG-13, sentence 6). The
+    /// closing-actor half of the collision is enforced at move time by DG-03,
+    /// since the closer is not yet known at write time. Empty evidence is
+    /// stored, not refused: such a verdict simply never satisfies DG-01.
+    pub fn add_verdict(&mut self, input: VerdictInput) -> Result<Verdict> {
+        let writer = nonempty(&input.writer, "writer")?.to_owned();
+        let reviewer = nonempty(&input.reviewer, "reviewer")?.to_owned();
+        if input.shas.is_empty() {
+            bail!("a verdict cites at least one reviewed SHA");
+        }
+        let transaction = self.begin_write()?;
+        // Under the mutation lock, and before the row is opened: a verdict
+        // write does not retag, so the old and resulting tag sets are the row's.
+        let old_tags = task_tags(&transaction, &input.task_id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
+        require_active_task(&transaction, &input.task_id)?;
+        for sha in &input.shas {
+            if !is_full_sha(sha) {
+                bail!(
+                    "task {} verdict refused: `{sha}` is not a full 40-character commit SHA — cite the published commit the reviewer checked",
+                    input.task_id
+                );
+            }
+        }
+        let published = published_shas();
+        for sha in &input.shas {
+            if !published.as_ref().is_some_and(|set| set.contains(sha)) {
+                bail!(
+                    "task {} verdict refused: `{sha}` is not published on origin — the verdict must cite a commit SHA published on origin",
+                    input.task_id
+                );
+            }
+        }
+        // The ledger distinguishes planner from executor by actor and
+        // lease-hold, not by self-asserted role strings (DG-07): the writer
+        // or reviewer who holds or held the claim, or who holds the live
+        // lease, is the worker and may author no verdict.
+        let mut barred = claim_holders_of_record(&transaction, &input.task_id)?;
+        if let Some(lease) = active_claim(&transaction, &input.task_id, now_ms())? {
+            barred.insert(lease.agent_id);
+        }
+        if barred.contains(&reviewer) {
+            bail!(
+                "task {} verdict is self-review: {reviewer} is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict",
+                input.task_id
+            );
+        }
+        if barred.contains(&writer) {
+            bail!(
+                "task {} verdict is self-review: {writer} is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict",
+                input.task_id
+            );
+        }
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,created_at) VALUES(?,?,?,?,?,?,?)",
+            params![
+                input.task_id,
+                writer,
+                reviewer,
+                serde_json::to_string(&input.shas)?,
+                "pass",
+                serde_json::to_string(&input.evidence)?,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(Verdict {
+            task_id: input.task_id,
+            writer,
+            reviewer,
+            shas: input.shas,
+            verdict: "pass".to_owned(),
+            evidence: input.evidence,
+            created_at: now,
+        })
+    }
+
+    /// Read a task's stored verdicts, oldest first. Read-only: answers from
+    /// the open connection without taking the write lock, refusing hidden
+    /// rows with the generic denial like every other read.
+    pub fn list_verdicts(&self, task_id: &str) -> Result<Vec<Verdict>> {
+        self.authz
+            .check_read(&task_tags(&self.connection, task_id)?)?;
+        require_active_task(&self.connection, task_id)?;
+        if !has_verdicts_table(&self.connection)? {
+            return Ok(Vec::new());
+        }
+        self.connection
+            .prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY seq ASC")?
+            .query_map([task_id], verdict_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Turn the per-board done gate on or off (DG-15): the
+    /// `task verdict gate` verb. Only `geoyws` may toggle; anyone else is
+    /// refused and changes nothing. Every change writes one hash-chained
+    /// audit event naming the actor, the board, and the old and new values,
+    /// with an absent key audited as old value `off`.
+    pub fn set_done_gate(&mut self, on: bool, actor: &str) -> Result<DoneGateState> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        // Board scope, under the lock: the flag is board metadata, not a row.
+        self.authz.check_write(&[], &[])?;
+        let board: String = transaction
+            .query_row("SELECT value FROM board_meta WHERE key='name'", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .unwrap_or_default();
+        if actor != OPERATOR_ACTOR {
+            bail!(
+                "done_gate on board {board} unchanged — only geoyws may turn the gate on or off; run `task verdict gate on|off --as geoyws`"
+            );
+        }
+        let old: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM board_meta WHERE key=?",
+                [DONE_GATE_META_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let old_value = old.unwrap_or_else(|| "off".to_owned());
+        let new_value = if on { "on" } else { "off" }.to_owned();
+        transaction.execute(
+            "INSERT INTO board_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![DONE_GATE_META_KEY, new_value],
+        )?;
+        event(
+            &transaction,
+            None,
+            "done_gate_toggled",
+            Some(&actor),
+            json!({"board": board, "oldValue": old_value, "newValue": new_value}),
+        )?;
+        transaction.commit()?;
+        Ok(DoneGateState {
+            board,
+            done_gate: new_value,
+            old_value,
+            changed_by: actor,
+        })
+    }
+
     pub fn move_task(
         &mut self,
         id: &str,
@@ -5866,6 +6310,16 @@ impl Store {
                 _ => GateCaller::Unleased,
             };
             require_no_blocking_gates(&transaction, id, caller)?;
+        }
+        // The done gate fires only on moves to `done` (DG-10), only for task
+        // rows — stories and epics project `done` from children with no
+        // verdict demanded and none checked (DG-16) — and only with the flag
+        // on (DG-15; off or absent moves exactly as at the baseline, DG-09).
+        // It runs after the prerequisite gates and before the lease seize, so
+        // a refusal leaves the row, its lease and the event history unchanged
+        // (DG-01).
+        if status == "done" && current.task_type == "task" && done_gate_on(&transaction)? {
+            enforce_done_gate(&transaction, id, &actor, force, &current.status)?;
         }
         let seized = require_free_lease(&transaction, id, &actor, force, "move")?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
@@ -17532,5 +17986,1055 @@ mod tests {
         );
         drop(store);
         fs::remove_dir_all(parent).unwrap();
+    }
+    // ---- Done gate (DG-01..DG-16) ----
+    //
+    // Publication is process-global state (`KANBAN_PUBLISHED_SHAS`), so every
+    // test below sets it explicitly under one lock and restores it after:
+    // a suite running in parallel must never inherit another test's set.
+    static DONE_GATE_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn with_published_shas(shas: &[String], test: impl FnOnce()) {
+        // A panicking test must not poison the suite: recover the guard.
+        let _guard = DONE_GATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let prior = std::env::var("KANBAN_PUBLISHED_SHAS").ok();
+        // Held under the lock, restored below: the only env mutation in the
+        // gate tests, matching the adapter_process precedent.
+        unsafe { std::env::set_var("KANBAN_PUBLISHED_SHAS", shas.join(",")) };
+        test();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("KANBAN_PUBLISHED_SHAS", value) },
+            None => unsafe { std::env::remove_var("KANBAN_PUBLISHED_SHAS") },
+        }
+    }
+
+    fn done_gate_sha(fill: char) -> String {
+        std::iter::repeat_n(fill, 40).collect()
+    }
+
+    fn gated_board(name: &str) -> Store {
+        let mut store = test_store(name);
+        store
+            .initialize(name, "seed")
+            .expect("initialize gated board");
+        store
+    }
+
+    fn gate_on(store: &mut Store) {
+        store
+            .set_done_gate(true, "geoyws")
+            .expect("turn the gate on");
+    }
+
+    fn seed_lane_task(store: &mut Store, id: &str) {
+        store
+            .add_task(task_input(id, "gated fixture", vec![], vec![]))
+            .expect("seed task");
+    }
+
+    fn claim_with_head(store: &mut Store, id: &str, agent: &str, head: &str) -> String {
+        let mut options = claim_options(agent);
+        options.git = Some(crate::gitctx::GitContext {
+            worktree: "lane".to_owned(),
+            worktree_kind: "linked",
+            branch: None,
+            head: head.to_owned(),
+            dirty: 0,
+            root_worktree: None,
+            root_branch: None,
+            root_head: None,
+        });
+        store
+            .claim(Some(id), options)
+            .expect("claim")
+            .claim
+            .lease_token
+    }
+
+    fn checkpoint_with_head(store: &mut Store, id: &str, token: &str, author: &str, head: &str) {
+        let mut input = checkpoint_input(id, author);
+        input.lease_token = token.to_owned();
+        input.head_sha = Some(head.to_owned());
+        store.checkpoint(input).expect("checkpoint");
+    }
+
+    fn resolved_decision(store: &mut Store, task_id: &str, raiser: &str) -> String {
+        let raised = store
+            .raise_attention(
+                "the decision under review",
+                "decision",
+                raiser,
+                Some(task_id),
+                3,
+                &[],
+                &DecisionCard::default(),
+                None,
+                None,
+            )
+            .expect("raise decision");
+        store
+            .resolve_attention(
+                &raised.id,
+                raiser,
+                &AttentionAnswer::custom("other", "settled"),
+                None,
+            )
+            .expect("resolve decision");
+        raised.id
+    }
+
+    fn record_verdict(
+        store: &mut Store,
+        task_id: &str,
+        reviewer: &str,
+        shas: Vec<String>,
+        evidence: Vec<String>,
+        writer: &str,
+    ) -> Verdict {
+        store
+            .add_verdict(VerdictInput {
+                task_id: task_id.to_owned(),
+                reviewer: reviewer.to_owned(),
+                shas,
+                evidence,
+                writer: writer.to_owned(),
+            })
+            .expect("record verdict")
+    }
+
+    fn event_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn task_status(store: &Store, id: &str) -> String {
+        store
+            .connection
+            .query_row("SELECT status FROM tasks WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn verdict_row_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM verdicts", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing() {
+        // A1 (DG-01, DG-08, DG-15).
+        with_published_shas(&[], || {
+            let mut store = gated_board("done-gate-no-verdict");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            claim_with_head(&mut store, "t-x", "lane-e", &done_gate_sha('1'));
+            let status_before = task_status(&store, "t-x");
+            let events_before = event_count(&store);
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x has no foreign-actor pass verdict — record one with `task verdict add t-x --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done"
+            );
+            assert_eq!(task_status(&store, "t-x"), status_before);
+            assert_eq!(event_count(&store), events_before);
+            assert!(
+                active_claim(&store.connection, "t-x", now_ms())
+                    .unwrap()
+                    .is_some(),
+                "a gate refusal seizes no lease"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_opens_for_a_foreign_planner_verdict_covering_the_head() {
+        // A2 (DG-02, DG-04, DG-11, DG-12).
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-foreign-pass");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            claim_with_head(&mut store, "t-x", "lane-e", &head);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            let verdict = record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![head.clone()],
+                vec![decision],
+                "planner",
+            );
+            assert_eq!(verdict.verdict, "pass");
+            assert_eq!(verdict_row_count(&store), 1);
+            // The holder seizes its own lease on the way: the gate is
+            // satisfied, so no override is recorded. (Releasing first would
+            // delete the claim row that carries the head.)
+            let task = store
+                .move_task("t-x", "done", "lane-e", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            assert!(
+                task.completed_at.is_some(),
+                "a gated done-move still stamps completion"
+            );
+            assert_eq!(
+                store.list_verdicts("t-x").unwrap().len(),
+                1,
+                "the verdict survives the move that cited it"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_refuses_self_review_but_a_foreign_closer_passes() {
+        // A3 + A13 (DG-03, DG-08).
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-self-review");
+            seed_lane_task(&mut store, "t-x");
+            seed_lane_task(&mut store, "t-y");
+            gate_on(&mut store);
+            // A verdict naming lane-e is legal at write time, before lane-e
+            // ever claimed; the collision fires at move time.
+            let early = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-e",
+                vec![head.clone()],
+                vec![early],
+                "planner",
+            );
+            claim_with_head(&mut store, "t-x", "lane-e", &head);
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
+            );
+            // Writer-as-closer collides the same way, while the holder closes clean.
+            claim_with_head(&mut store, "t-y", "lane-e", &head);
+            let fresh = resolved_decision(&mut store, "t-y", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-y",
+                "lane-r",
+                vec![head.clone()],
+                vec![fresh],
+                "planner",
+            );
+            let error = store
+                .move_task("t-y", "done", "planner", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-y verdict is self-review: planner is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
+            );
+            // The holder seizes its own lease: gate satisfied, no override.
+            let task = store
+                .move_task("t-y", "done", "lane-e", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_override_is_geoyws_only_and_audited() {
+        // A4 (DG-05, DG-06, DG-08).
+        with_published_shas(&[], || {
+            let mut store = gated_board("done-gate-override");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            let status_before = task_status(&store, "t-x");
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), true)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x done-move past the gate needs `--force --as geoyws` — only geoyws may override, and the override is recorded"
+            );
+            assert_eq!(task_status(&store, "t-x"), status_before);
+            let task = store
+                .move_task("t-x", "done", "geoyws", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            let (kind, actor, payload): (String, Option<String>, String) = store
+                .connection
+                .query_row(
+                    "SELECT kind, actor, payload FROM events WHERE kind='done_gate_override'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(kind, "done_gate_override");
+            assert_eq!(actor.as_deref(), Some("geoyws"));
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["priorStatus"], json!("todo"));
+            assert_eq!(payload["reason"], json!("missing-verdict"));
+        });
+    }
+
+    #[test]
+    fn done_gate_refuses_an_executor_written_verdict() {
+        // A5 (DG-07, DG-12, DG-08).
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-executor-write");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            claim_with_head(&mut store, "t-x", "lane-e", &head);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            let error = store
+                .add_verdict(VerdictInput {
+                    task_id: "t-x".to_owned(),
+                    reviewer: "lane-r".to_owned(),
+                    shas: vec![head.clone()],
+                    evidence: vec![decision],
+                    writer: "lane-e".to_owned(),
+                })
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
+            );
+            assert_eq!(verdict_row_count(&store), 0);
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "the refused write opened nothing: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_off_and_non_done_moves_are_untouched() {
+        // A6 (DG-09, DG-10).
+        with_published_shas(&[], || {
+            let mut store = gated_board("done-gate-off");
+            seed_lane_task(&mut store, "t-y");
+            seed_lane_task(&mut store, "t-z");
+            let task = store
+                .move_task("t-y", "done", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            gate_on(&mut store);
+            let task = store
+                .move_task("t-z", "review", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "review");
+        });
+    }
+
+    #[test]
+    fn done_gate_empty_evidence_never_satisfies() {
+        // A7 (DG-02, DG-08): an empty-evidence row is storable but opens nothing.
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-empty-evidence");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            claim_with_head(&mut store, "t-x", "lane-e", &head);
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![head.clone()],
+                vec![],
+                "planner",
+            );
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "empty evidence refuses as no verdict: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_refuses_short_and_unpublished_shas() {
+        // A8 (DG-13, DG-08).
+        let published = done_gate_sha('1');
+        let unpublished = done_gate_sha('2');
+        with_published_shas(&[published], || {
+            let mut store = gated_board("done-gate-shas");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            let error = store
+                .add_verdict(VerdictInput {
+                    task_id: "t-x".to_owned(),
+                    reviewer: "lane-r".to_owned(),
+                    shas: vec!["abc123".to_owned()],
+                    evidence: vec!["a-1".to_owned()],
+                    writer: "planner".to_owned(),
+                })
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x verdict refused: `abc123` is not a full 40-character commit SHA — cite the published commit the reviewer checked"
+            );
+            let error = store
+                .add_verdict(VerdictInput {
+                    task_id: "t-x".to_owned(),
+                    reviewer: "lane-r".to_owned(),
+                    shas: vec![unpublished.clone()],
+                    evidence: vec!["a-1".to_owned()],
+                    writer: "planner".to_owned(),
+                })
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "task t-x verdict refused: `{unpublished}` is not published on origin — the verdict must cite a commit SHA published on origin"
+                )
+            );
+            assert_eq!(verdict_row_count(&store), 0);
+        });
+    }
+
+    #[test]
+    fn done_gate_stale_verdict_refuses_until_a_fresh_one_lands() {
+        // A9 (DG-14, DG-08).
+        let old = done_gate_sha('1');
+        let head = done_gate_sha('2');
+        with_published_shas(&[old.clone(), head.clone()], || {
+            let mut store = gated_board("done-gate-stale");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            store
+                .connection
+                .execute(
+                    "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
+                     VALUES('t-x','lane-e','continue','s','i','n',?,100)",
+                    params![old],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
+                     VALUES('t-x','lane-e','continue','s','i','n',?,200)",
+                    params![head],
+                )
+                .unwrap();
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![old.clone()],
+                vec![decision.clone()],
+                "planner",
+            );
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "task t-x verdict is stale: it covered {old} but the row now stands at {head} — record a fresh verdict at the new head with `task verdict add t-x --as <planner>`"
+                )
+            );
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![head],
+                vec![decision],
+                "planner",
+            );
+            let task = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_flag_defaults_off_and_audits_changes() {
+        // A10 (DG-15, DG-09).
+        with_published_shas(&[], || {
+            let mut store = gated_board("done-gate-flag");
+            seed_lane_task(&mut store, "t-y");
+            // Absent key reads as off: the baseline move succeeds.
+            let task = store
+                .move_task("t-y", "done", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            seed_lane_task(&mut store, "t-x");
+            let receipt = store.set_done_gate(true, "geoyws").unwrap();
+            assert_eq!(receipt.done_gate, "on");
+            assert_eq!(receipt.old_value, "off");
+            let (kind, actor, payload): (String, Option<String>, String) = store
+                .connection
+                .query_row(
+                    "SELECT kind, actor, payload FROM events WHERE kind='done_gate_toggled'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(kind, "done_gate_toggled");
+            assert_eq!(actor.as_deref(), Some("geoyws"));
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["board"], json!("done-gate-flag"));
+            assert_eq!(payload["oldValue"], json!("off"));
+            assert_eq!(payload["newValue"], json!("on"));
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "the flag-on move is gated: {error}"
+            );
+            let error = store
+                .set_done_gate(false, "lane-e")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "done_gate on board done-gate-flag unchanged — only geoyws may turn the gate on or off; run `task verdict gate on|off --as geoyws`"
+            );
+            let still_refused = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                still_refused.contains("has no foreign-actor pass verdict"),
+                "a refused toggle changes nothing: {still_refused}"
+            );
+            store.set_done_gate(false, "geoyws").unwrap();
+            let task = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_story_and_epic_moves_take_no_verdict() {
+        // A11 (DG-16, DG-10).
+        with_published_shas(&[], || {
+            let mut store = gated_board("done-gate-scope");
+            store
+                .add_task(gate_row("s-1", "story", None))
+                .expect("seed story");
+            store
+                .add_task(gate_row("e-1", "epic", None))
+                .expect("seed epic");
+            gate_on(&mut store);
+            let error = store
+                .move_task("s-1", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("projected from its gate"),
+                "a direct story move is refused by the projection rule: {error}"
+            );
+            assert!(
+                !error.contains("verdict"),
+                "the projection refusal carries no gate sentence: {error}"
+            );
+            let task = store
+                .move_task("e-1", "done", "lane-e", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_migration_carries_verdicts_and_overrides_forward() {
+        // A12 (DG-11, DG-06): pre-gate done rows gain no verdict, and stored
+        // verdict rows and override events survive a reopen.
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let path = board_db_path("done-gate-migrate");
+            let mut store = Store::open(&path).expect("open migrating board");
+            store.initialize("migrate", "seed").expect("initialize");
+            seed_lane_task(&mut store, "t-old");
+            store
+                .move_task("t-old", "done", "lane-e", json!({}), false)
+                .unwrap();
+            gate_on(&mut store);
+            seed_lane_task(&mut store, "t-x");
+            seed_lane_task(&mut store, "t-o");
+            claim_with_head(&mut store, "t-x", "lane-e", &head);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![head.clone()],
+                vec![decision],
+                "planner",
+            );
+            store
+                .move_task("t-x", "done", "lane-e", json!({}), true)
+                .unwrap();
+            // No verdict anywhere on t-o: only the audited override moves it.
+            store
+                .move_task("t-o", "done", "geoyws", json!({}), true)
+                .unwrap();
+            drop(store);
+            let mut reopened = Store::open(&path).expect("reopen migrated board");
+            assert_eq!(
+                reopened.list_verdicts("t-old").unwrap().len(),
+                0,
+                "a pre-gate done row gains no verdict"
+            );
+            assert_eq!(reopened.list_verdicts("t-x").unwrap().len(), 1);
+            let overrides: i64 = reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='done_gate_override'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(overrides, 1, "the override event survives the reopen");
+            seed_lane_task(&mut reopened, "t-new");
+            let error = reopened
+                .move_task("t-new", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "a new move under the gate is refused until a verdict is earned: {error}"
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        });
+    }
+
+    #[test]
+    fn done_gate_head_ordering_prefers_newest_time_then_source_then_row() {
+        // DG-14: newest row time wins; ties break task_claims, then
+        // checkpoints, then handoffs, then sitreps, then the greatest rowid.
+        let heads: Vec<String> = ['1', '2', '3', '4', '5', '6']
+            .iter()
+            .map(|fill| done_gate_sha(*fill))
+            .collect();
+        with_published_shas(&heads, || {
+            // Newest time wins across all four tables.
+            let mut store = gated_board("done-gate-head-time");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            for (sql, head) in [
+                "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
+                 VALUES('t-x','planter','continue','s','i','n',?,100)",
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,head_sha,created_at) \
+                 VALUES('h-time','t-x','manual','pending','planter','s','i','n',?,200)",
+                "INSERT INTO task_claims(task_id,agent_id,lease_token,claimed_at,heartbeat_at,expires_at,head_sha) \
+                 VALUES('t-x','planter','tok-time',50,150,1,?)",
+                "INSERT INTO sitreps(id,lane,task_id,author,body,head_sha,created_at) \
+                 VALUES('sr-time','driver','t-x','planter','b',?,300)",
+            ]
+            .iter()
+            .zip(heads.iter())
+            {
+                store.connection.execute(sql, params![head]).unwrap();
+            }
+            // The sitrep at t=300 is newest: only its head opens the gate.
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![heads[3].clone()],
+                vec![decision.clone()],
+                "planner",
+            );
+            let task = store
+                .move_task("t-x", "done", "lane-x", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_head_tie_break_prefers_claims_then_checkpoints() {
+        // DG-14 tie-break, all rows re-recorded at the same instant.
+        let claim_head = done_gate_sha('1');
+        let checkpoint_head = done_gate_sha('2');
+        let handoff_head = done_gate_sha('3');
+        let sitrep_head = done_gate_sha('4');
+        with_published_shas(
+            &[
+                claim_head.clone(),
+                checkpoint_head.clone(),
+                handoff_head.clone(),
+                sitrep_head.clone(),
+            ],
+            || {
+                let mut store = gated_board("done-gate-head-tie");
+                seed_lane_task(&mut store, "t-x");
+                seed_lane_task(&mut store, "t-y");
+                gate_on(&mut store);
+                for task in ["t-x", "t-y"] {
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO task_claims(task_id,agent_id,lease_token,claimed_at,heartbeat_at,expires_at,head_sha) \
+                             VALUES(?,'planter',? || '-tok',500,500,1,?)",
+                            params![task, task, claim_head],
+                        )
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
+                             VALUES(?,'planter','continue','s','i','n',?,500)",
+                            params![task, checkpoint_head],
+                        )
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,head_sha,created_at) \
+                             VALUES(? || '-h',?,'manual','pending','planter','s','i','n',?,500)",
+                            params![task, task, handoff_head],
+                        )
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO sitreps(id,lane,task_id,author,body,head_sha,created_at) \
+                             VALUES(? || '-sr','driver',?,'planter','b',?,500)",
+                            params![task, task, sitrep_head],
+                        )
+                        .unwrap();
+                }
+                // The live claim row wins the tie even though it is expired:
+                // holder-of-record history never moves the head by itself.
+                let decision = resolved_decision(&mut store, "t-x", "lane-r");
+                record_verdict(
+                    &mut store,
+                    "t-x",
+                    "lane-r",
+                    vec![claim_head.clone()],
+                    vec![decision],
+                    "planner",
+                );
+                let task = store
+                    .move_task("t-x", "done", "lane-x", json!({}), false)
+                    .unwrap();
+                assert_eq!(task.status, "done");
+                // The checkpoint head loses the same tie: stale, not missing.
+                let decision = resolved_decision(&mut store, "t-y", "lane-r");
+                record_verdict(
+                    &mut store,
+                    "t-y",
+                    "lane-r",
+                    vec![checkpoint_head.clone()],
+                    vec![decision],
+                    "planner",
+                );
+                let error = store
+                    .move_task("t-y", "done", "lane-x", json!({}), false)
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    error,
+                    format!(
+                        "task t-y verdict is stale: it covered {checkpoint_head} but the row now stands at {claim_head} — record a fresh verdict at the new head with `task verdict add t-y --as <planner>`"
+                    )
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn done_gate_head_tie_within_checkpoints_prefers_the_newest_row() {
+        // DG-14: same table, same instant — the greatest row id wins.
+        let older = done_gate_sha('1');
+        let newer = done_gate_sha('2');
+        with_published_shas(&[older.clone(), newer.clone()], || {
+            let mut store = gated_board("done-gate-head-seq");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            for head in [&older, &newer] {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
+                         VALUES('t-x','planter','continue','s','i','n',?,700)",
+                        params![head],
+                    )
+                    .unwrap();
+            }
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![newer.clone()],
+                vec![decision],
+                "planner",
+            );
+            let task = store
+                .move_task("t-x", "done", "lane-x", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_heartbeat_at_an_unchanged_head_stales_nothing() {
+        // A14 (DG-14): a re-recorded claim at the same head keeps the verdict
+        // fresh; an older verdict whose SHAs again include the head after
+        // later work satisfies again with no new write.
+        let first = done_gate_sha('1');
+        let second = done_gate_sha('2');
+        with_published_shas(&[first.clone(), second.clone()], || {
+            let mut store = gated_board("done-gate-heartbeat");
+            seed_lane_task(&mut store, "t-a");
+            seed_lane_task(&mut store, "t-b");
+            gate_on(&mut store);
+            let token = claim_with_head(&mut store, "t-a", "lane-e", &first);
+            let decision = resolved_decision(&mut store, "t-a", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-a",
+                "lane-r",
+                vec![first.clone()],
+                vec![decision],
+                "planner",
+            );
+            store.heartbeat("t-a", &token, 60_000, None).unwrap();
+            // The holder seizes its own lease on the way: the gate is
+            // satisfied, so no override is recorded.
+            let task = store
+                .move_task("t-a", "done", "lane-e", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            // Recorded early, covering both heads: fresh at the first, fresh
+            // again at the second — staleness is a relation, not a mark.
+            let token = claim_with_head(&mut store, "t-b", "lane-e", &first);
+            let decision = resolved_decision(&mut store, "t-b", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-b",
+                "lane-r",
+                vec![first.clone(), second.clone()],
+                vec![decision],
+                "planner",
+            );
+            checkpoint_with_head(&mut store, "t-b", &token, "lane-e", &second);
+            let task = store
+                .move_task("t-b", "done", "lane-e", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+        });
+    }
+
+    #[test]
+    fn done_gate_no_head_opens_only_by_override() {
+        // A15 (DG-14, DG-06).
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-no-head");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![head.clone()],
+                vec![decision],
+                "planner",
+            );
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "with no head anywhere no verdict satisfies: {error}"
+            );
+            let task = store
+                .move_task("t-x", "done", "geoyws", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            let reason: String = store
+                .connection
+                .query_row(
+                    "SELECT json_extract(payload,'$.reason') FROM events WHERE kind='done_gate_override'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "missing-verdict");
+        });
+    }
+
+    #[test]
+    fn done_gate_released_holder_is_still_the_holder_of_record() {
+        // A16 (DG-03, DG-08).
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-released");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-e",
+                vec![head.clone()],
+                vec![decision],
+                "planner",
+            );
+            let token = claim_with_head(&mut store, "t-x", "lane-e", &head);
+            store.release("t-x", &token, false).unwrap();
+            assert!(
+                active_claim(&store.connection, "t-x", now_ms())
+                    .unwrap()
+                    .is_none(),
+                "the release landed"
+            );
+            let error = store
+                .move_task("t-x", "done", "lane-x", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_cited_decisions_must_be_resolved_at_the_move() {
+        // DG-04: an open citation refuses; resolving it opens; reopening it
+        // refuses again.
+        let head = done_gate_sha('1');
+        with_published_shas(std::slice::from_ref(&head), || {
+            let mut store = gated_board("done-gate-evidence");
+            seed_lane_task(&mut store, "t-a");
+            seed_lane_task(&mut store, "t-c");
+            gate_on(&mut store);
+            let open = store
+                .raise_attention(
+                    "the undecided question",
+                    "decision",
+                    "lane-r",
+                    Some("t-a"),
+                    3,
+                    &[],
+                    &DecisionCard::default(),
+                    None,
+                    None,
+                )
+                .expect("raise open decision")
+                .id;
+            claim_with_head(&mut store, "t-a", "lane-e", &head);
+            record_verdict(
+                &mut store,
+                "t-a",
+                "lane-r",
+                vec![head.clone()],
+                vec![open.clone()],
+                "planner",
+            );
+            let error = store
+                .move_task("t-a", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "an open citation satisfies nothing: {error}"
+            );
+            store
+                .resolve_attention(
+                    &open,
+                    "lane-r",
+                    &AttentionAnswer::custom("other", "settled"),
+                    None,
+                )
+                .unwrap();
+            let task = store
+                .move_task("t-a", "done", "lane-e", json!({}), true)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            let cited = resolved_decision(&mut store, "t-c", "lane-r");
+            claim_with_head(&mut store, "t-c", "lane-e", &head);
+            record_verdict(
+                &mut store,
+                "t-c",
+                "lane-r",
+                vec![head.clone()],
+                vec![cited.clone()],
+                "planner",
+            );
+            store
+                .reopen_attention(&cited, "lane-r", "second look")
+                .unwrap();
+            let error = store
+                .move_task("t-c", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("has no foreign-actor pass verdict"),
+                "a reopened citation refuses again: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn done_gate_abbreviated_provenance_never_matches_a_full_sha() {
+        // DG-14: exact string match — a 7-char provenance head is stale
+        // against the 40-char verdict SHA it abbreviates.
+        let full = done_gate_sha('1');
+        let abbreviated = full[..7].to_owned();
+        with_published_shas(std::slice::from_ref(&full), || {
+            let mut store = gated_board("done-gate-abbrev");
+            seed_lane_task(&mut store, "t-x");
+            gate_on(&mut store);
+            claim_with_head(&mut store, "t-x", "lane-e", &abbreviated);
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![full.clone()],
+                vec![decision],
+                "planner",
+            );
+            let error = store
+                .move_task("t-x", "done", "lane-e", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "task t-x verdict is stale: it covered {full} but the row now stands at {abbreviated} — record a fresh verdict at the new head with `task verdict add t-x --as <planner>`"
+                )
+            );
+        });
     }
 }

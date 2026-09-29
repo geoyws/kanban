@@ -122,6 +122,8 @@ pub const BOARD_EVENT_KINDS: &[&str] = &[
     "deployment_abandoned",
     "deployment_finished",
     "deployment_started",
+    "done_gate_override",
+    "done_gate_toggled",
     "epic_advanced",
     "handoff_accepted",
     "handoff_created",
@@ -483,6 +485,26 @@ pub struct Claim {
     pub model: Option<String>,
 }
 
+/// One stored review verdict (DG-02, DG-11): the planner-written foreign-actor
+/// `pass` a gated done-move must cite. Append-only: rows are never updated
+/// and never deleted, and a newer verdict is a newer row. The writer is the
+/// actor from `--as` at write time and is immutable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub writer: String,
+    pub reviewer: String,
+    /// Full 40-character commit SHAs published on origin (DG-13).
+    pub shas: Vec<String>,
+    /// Always `pass`: a review that fails records nothing (DG-12).
+    pub verdict: String,
+    /// Attention decision IDs the reviewer checked (DG-04).
+    pub evidence: Vec<String>,
+    pub created_at: i64,
+}
+
 /// A newly granted lease plus the active rules that frame its work.
 ///
 /// Flattening preserves the existing top-level claim wire shape. This is not a
@@ -837,6 +859,26 @@ pub struct CheckpointInput {
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
     pub root_head: Option<String>,
+}
+
+/// The planner-written `pass` verdict `task verdict add` stores (DG-12).
+#[derive(Debug, Clone)]
+pub struct VerdictInput {
+    pub task_id: String,
+    pub reviewer: String,
+    pub shas: Vec<String>,
+    pub evidence: Vec<String>,
+    pub writer: String,
+}
+
+/// The receipt `task verdict gate` prints (DG-15).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoneGateState {
+    pub board: String,
+    pub done_gate: String,
+    pub old_value: String,
+    pub changed_by: String,
 }
 
 /// The one actor who may settle or reopen anyone's attention item and whom
