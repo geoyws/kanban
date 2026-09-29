@@ -14,9 +14,10 @@
   import id-overlap refusal (`rust/import.rs:462`-`rust/import.rs:472`). The specification is
   written before the implementation, as ADR-047 §6 requires (per
   `docs/specs/README.md:15-21`).
-- **Status:** `PROPOSAL` (not `SPEC-READY`: readiness needs the independent review against the
-  SDD §1 exit criteria, which main arranges — the writer does not self-stamp; it authorises
-  neither implementation nor rollout nor release).
+- **Status:** `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria
+  over two rounds: two BLOCKED findings, both closed and re-verified; OQ-1/OQ-2 carry documented
+  defaults, OQ-3 gates implementation only. Specification readiness only — it authorises neither
+  implementation, nor rollout, nor release).
 - **Owner (product scope):** George. He alone resolves scope, the normalisation and `touches`
   open questions in §7, and whether a non-goal in §2 is reinstated. He planned this slice on
   2026-09-28 (planner pane, `e-e7aa716a`); no explicit slice row under epic `e-c0852fe7` is
