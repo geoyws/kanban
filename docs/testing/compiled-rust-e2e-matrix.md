@@ -444,25 +444,33 @@ their ids and a refused `task add` writes no row and no event.
 
 ## Requirements trace — `docs/specs/linked.md` LINKED-01..LINKED-25
 
-One row per requirement, on branch `wt/t-fe137b57-spec-w1` at 2026-09-26: commit
-`ae2fb8f51ff14844d76317da6739b011a90de391`, where the specification is `SPEC-READY` on
-2026-09-26 and ADR-051 is `Proposed`, so these rows land with the specification and the
-gate reviewer reads the trace rather than a promise of one.
+One row per requirement, on branch `wt/t-fe137b57-land` at 2026-09-29: commit
+`361d7e3` (spec content merged at `3cb07ed`; code tree identical), where the
+specification is `SPEC-READY` on 2026-09-26 and ADR-051 is `Proposed`, so these
+rows land with the specification refresh and the gate reviewer reads the trace
+rather than a promise of one.
 `Layer` uses the specification's own vocabulary, where `process` is a compiled-binary
-process-boundary exchange with no HTTP and no browser, and `chrome` is a compiled-binary
-test driving real Chrome. Of the 25 requirements — all `MUST` — 1 is proved at `chrome`
-and 24 at `process`; 24 carry `none` and say `no e2e coverage` plainly, each owned by the
+process-boundary exchange with no HTTP and no browser; `chrome` named only the
+withdrawn LINKED-23 and names no active LINKED requirement; `http` names no
+active LINKED requirement and is kept in the specification only so the withdrawn
+row stays readable. Of the 25 IDs, never reused — 24 active requirements, all
+`MUST`, plus 1 withdrawn (`LINKED-23`, with the served surface per ADR-053):
+24 carry `process` rows and 1 carries the withdrawn `chrome` row; 23 active rows
+carry `none` and say `no e2e coverage` plainly, each owned by the
 implementation row its Note names — `t-0dcbb1a9` (companions and claim scope per its
 work-package title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257`
 (contributions and consumer integration per its work-package title, `LINKED-15`..`LINKED-21`),
 or `t-db6937ba` (exposure and workflow proof per its work-package title,
-`LINKED-22`..`LINKED-25`). LINKED-09 carries one row naming eight
-existing tests (`tests/e2e.rs:3729`, `:4250`, `:49403`, `:49150`, `:2264`, `:56139`,
-`:56242`, `:16808`, in row order), verified as `fn <name>(` in this build; they prove
+`LINKED-22`, `LINKED-24`, `LINKED-25`; `LINKED-23` is withdrawn with the served
+surface and owned by no implementation row). LINKED-09 carries one row naming eight
+existing tests (`tests/e2e.rs:2854`, `:3375`, `:37865`, `:37612`, `:1370`, `:40330`,
+`:40433`, `:15889`, in row order), verified as `fn <name>(` in this build; they prove
 today's gates on today's surface and are re-run unchanged beside the new scope gate. Full
 `cargo test --locked --test e2e -- --list` enumeration ran 2026-09-26 in the Linux container
 (`kanban-gate:1.95-chrome-u501`, image `f542f975e2dc`, host gate slot): 439 tests, each of the
-eight names present exactly once. No test name below is invented: where
+eight names present exactly once — that count is the 2026-09-26 record; the web retirement
+(ADR-053) has since removed the served-surface tests, so the current tree lists fewer and no
+fresh full enumeration is claimed here. No test name below is invented: where
 no test observes the behaviour, the row is `none`, following the precedent `docs/specs/spa.md`
 set at creation (`cd55cbc`).
 
@@ -490,13 +498,15 @@ set at creation (`cd55cbc`).
 | `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
 | `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
-| `LINKED-23` | MUST | chrome | `none` | no e2e coverage — to be written by `t-db6937ba` (served pages match the CLI in real Chrome) |
+| `LINKED-23` | WITHDRAWN 2026-09-29 | chrome (retired) | none | withdrawn with the served surface (ADR-053) — no test to be written, owned by no implementation row; ID reserved, never reused |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
 | `LINKED-25` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (companion moves no gate; two-board transact refused; ordered-pair compensation) |
 
-25 requirements: 25 MUST, no SHOULD or MAY. LINKED-09 carries one row naming eight existing
-tests, re-run unchanged; the remaining 24 requirements carry `none` rows, each owned by
-`t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states.
+25 IDs, never reused: 24 active requirements, all `MUST`, no `SHOULD` and no
+`MAY`, plus 1 withdrawn (`LINKED-23`). LINKED-09 carries one row naming eight existing
+tests, re-run unchanged; the remaining 23 active requirements carry `none` rows, each owned by
+`t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states (`LINKED-23` withdrawn with the
+served surface, owned by no implementation row).
 
 ## Watch coverage note
 

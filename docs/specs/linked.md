@@ -4,8 +4,8 @@
 
 - **Slice ID:** `LINKED`. Requirement IDs are `LINKED-01` .. `LINKED-25`, stable across wording
   refinements; numbering is by creation, grouping is by topic.
-- **Baseline:** `2026-09-26` at commit `ae2fb8f51ff14844d76317da6739b011a90de391` on branch
-  `kanban-geoyws-driver`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
+- **Baseline:** `2026-09-29` at commit `361d7e3` on branch
+  `wt/t-fe137b57-land` (spec content merged at `3cb07ed`; code tree identical). Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-26 (independent gate by a reviewer applying the SDD §1 exit criteria over four rounds; eight findings closed — LINKED-09 merged to one trace row, resumption bound to the existing `claim --session`/`handoff accept --session` entry points, revocation stated as LINKED-14's authorized exit with audited UNFREEZE and release-only revoked leases, the ordered pair's order and compensation defined in LINKED-25 with no dependency on `e-df626704`, §7 heading restored, LINKED-02 repaired, `none`-row owners grounded in the parent's work packages with `--list` enumeration recorded, and the release citation corrected to `rust/lib.rs:169`). It authorises neither implementation nor release.
   <!-- SPEC-READY is stamped here by an independent reviewer against the SDD reference's §1 exit
   criteria, not by the writer of this document. It authorises neither implementation nor rollout
@@ -41,14 +41,14 @@
     membership revisions and contribution receipts join.
   - `docs/adr/ADR-047-kanban-adopts-specification-driven-development.md` — the conventions this
     document is written under; §9 is why §6 carries no invented budget.
-  - `docs/PRD.md:9`-`docs/PRD.md:12` (one durable place to coordinate atomic ownership and
-    preserve evidence) and `docs/PRD.md:31` (prevent concurrent ownership) — the product-level
-    statements these requirements refine. Neither document changes for this slice (see §5).
-  - Shipped surface at the baseline: `rust/lib.rs:156` (`claim [ID | --next] --as AGENT`),
-    `rust/lib.rs:165` (`claim --candidates`, read-only), `rust/lib.rs:184` (`handoff accept`),
-    `rust/lib.rs:131`-`rust/lib.rs:133` (`task add --depends-on`, local scalars),
-    `rust/lib.rs:327`-`rust/lib.rs:328` (`claim` has no `--force`), `rust/model.rs:458`
-    (`RELATION_KINDS`, exactly `parent`, `ancestor`, `depends-on` — companion is none of them).
+- `docs/PRD.md:9`-`docs/PRD.md:12` (one durable place to coordinate atomic ownership and
+  preserve evidence) and `docs/PRD.md:32` (prevent concurrent ownership) — the product-level
+  statements these requirements refine. Neither document changes for this slice (see §5).
+- Shipped surface at the baseline: `rust/lib.rs:152` (`claim [ID | --next] --as AGENT`),
+  `rust/lib.rs:161` (`claim --candidates`, read-only), `rust/lib.rs:180` (`handoff accept`),
+  `rust/lib.rs:125`-`rust/lib.rs:127` (`task add --depends-on`, local scalars),
+  `rust/lib.rs:325`-`rust/lib.rs:326` (`claim` has no `--force`), `rust/model.rs:378`
+  (`RELATION_KINDS`, exactly `parent`, `ancestor`, `depends-on` — companion is none of them).
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries the slice's evidence
   table; the matrix section is the trace of record and the two are kept identical by the same
   change.
@@ -67,15 +67,16 @@ only the tasks explicitly selected for it.
   closes it on exact evidence.
 - Agent lanes bound to the joint feature (`--as AGENT`, with lane and session), which claim,
   hand off, resume through the existing `--session` entry points, and record contributions only
-  inside the selected set, through the CLI, the in-binary MCP server, and the served UI.
+  inside the selected set, through the CLI and the in-binary MCP server. (The served UI this
+  line named on 2026-09-26 is retired — ADR-053 — so LINKED-23 is withdrawn, not re-homed.)
 - The authoritative registry (on `hax`), which owns the shared records; the two boards, which
   keep owning their tasks, states, and leases.
 
-**In scope.** The one stored companion relation and its two-sided exposure; the selected work
-set with audited membership revisions; the single claim gate across candidates, next/named
-claims, lease-taking handoffs, and session resumption through the existing `--session` entry
-points (`rust/lib.rs:156`, `rust/lib.rs:184`); the append-only contributions and integration
-receipts with their evidence roles; the CLI/MCP/served agreement over that surface.
+- **In scope.** The one stored companion relation and its two-sided exposure; the selected work
+  set with audited membership revisions; the single claim gate across candidates, next/named
+  claims, lease-taking handoffs, and session resumption through the existing `--session` entry
+  points (`rust/lib.rs:152`, `rust/lib.rs:180`); the append-only contributions and integration
+  receipts with their evidence roles; the CLI/MCP agreement over that surface.
 
 **Boundaries.**
 
@@ -109,8 +110,11 @@ receipts with their evidence roles; the CLI/MCP/served agreement over that surfa
 Strength keywords are BCP 14. `Layer` names the one layer that proves the requirement:
 
 - `unit` — an in-process Rust `#[test]` reading produced bytes, not a browser.
-- `http` — a compiled-binary HTTP exchange against `kanban serve`, no browser.
-- `chrome` — a compiled-binary end-to-end test driving real Chrome.
+- `http` — a compiled-binary HTTP exchange against `kanban serve`, no browser. Retired with
+  the serve surface (ADR-053); it names no active LINKED requirement and is kept here only so
+  the withdrawn rows stay readable.
+- `chrome` — a compiled-binary end-to-end test driving real Chrome. It named only the
+  withdrawn LINKED-23; it names no active LINKED requirement.
 - `process` — a compiled-binary process-boundary exchange, no HTTP and no browser.
 
 IDs are assigned in creation order and never reused; the groups below are topical.
@@ -197,10 +201,10 @@ granted claim's event.`
 
 **LINKED-08** — Hold one claim gate across every claim path.
 Strength: `MUST` · Layer: `process` · Source: `e-73bf760f` scope (acceptance B); ADR-051 §2.
-`Candidates (`rust/lib.rs:165`), `--next` and named claims (`rust/lib.rs:156`), lease-taking
-handoff acceptance (`rust/lib.rs:184`), and resumption share one selected-scope gate. Resumption
+`Candidates (`rust/lib.rs:161`), `--next` and named claims (`rust/lib.rs:152`), lease-taking
+handoff acceptance (`rust/lib.rs:180`), and resumption share one selected-scope gate. Resumption
 is exactly the two existing entry points presenting `--session`: a `claim` with `--session ID`
-(`rust/lib.rs:156`) and a `handoff accept` with `--session ID` (`rust/lib.rs:184`) — no new verb
+(`rust/lib.rs:152`) and a `handoff accept` with `--session ID` (`rust/lib.rs:180`) — no new verb
 exists for resuming, and the field shape is unchanged. What the gate refuses by one path it
 refuses by all of them, and the `claim --candidates` read never offers a row the atomic claim
 path would refuse.`
@@ -259,7 +263,7 @@ binding is the authorized exit in LINKED-14's third ending, recorded as an audit
 stating the reason; it ends taking immediately, while leases already granted keep their
 heartbeat until expiry or release — but those leases cannot take new work and cannot be handed
 to another lane. The only permitted ending for such a lease is `release ID --lease TOKEN`
-(`rust/lib.rs:169`), returning the task to its board's claimable set.`
+(`rust/lib.rs:165`), returning the task to its board's claimable set.`
 `Failure behaviour: a claim against a frozen set is refused naming the freeze; a new claim or a
 forward handoff on a revoked binding is refused naming the revocation; in both cases live leases
 are untouched.`
@@ -357,14 +361,20 @@ points (ADR-010's generated surface: one operation, one tool).`
 `Failure behaviour: a behaviour the CLI refuses and MCP accepts, or sentences that differ
 between the two, is a defect in the adapter, and the MCP side is fixed to match the CLI.`
 
-**LINKED-23** — Show the same joint state in the served web UI.
+**LINKED-23** — Show the same joint state in the served web UI. WITHDRAWN 2026-09-29.
 Strength: `MUST` · Layer: `chrome` · Source: `e-73bf760f` scope (acceptance D).
-`The served UI shows the same pairing, attribution, and evidence the CLI reads: the same
-related item on both boards' pages, the same worker on each task, the same commits behind each
-deliverable. Where the UI cannot render a state, it says so rather than rendering a different
-one.`
-`Failure behaviour: a page that shows a companion the CLI denies, or hides evidence the CLI
-shows, is a defect in the projection, fixed to match the CLI.`
+`WITHDRAWN with the surface it named: `kanban serve`, the `web/` SPA, and every HTTP route
+were deleted with no successor (ADR-053, accepted 2026-09-28), so there is no served page left
+to show the pairing, attribution, or evidence. The ID stays reserved and is never reused; the
+original 2026-09-26 wording is retained below the withdrawal line for review traceability and
+imposes no obligation. Re-homing this requirement onto any future exposure is George's
+decision, not an implementation inference.`
+`Original (no force): the served UI shows the same pairing, attribution, and evidence the CLI
+reads: the same related item on both boards' pages, the same worker on each task, the same
+commits behind each deliverable. Where the UI cannot render a state, it says so rather than
+rendering a different one.`
+`Original failure behaviour (no force): a page that shows a companion the CLI denies, or hides
+evidence the CLI shows, is a defect in the projection, fixed to match the CLI.`
 
 **LINKED-24** — Fail, recover, save, and reopen on the real compiled binary.
 Strength: `MUST` · Layer: `process` · Source: `e-73bf760f` scope (acceptance D).
@@ -464,18 +474,18 @@ the feature with one deliverable still open,
 naming the kind mismatch, the close is refused naming each open deliverable, and neither board
 shows the feature — or any task of it — as jointly delivered.
 
-### A7 — CLI, MCP, and UI agree, and recovery replays nothing (LINKED-22, LINKED-23, LINKED-24)
+### A7 — CLI and MCP agree, and recovery replays nothing (LINKED-22, LINKED-24)
 
 *Given* a live pairing with a bound worker, one recorded contribution, and one scope refusal on
 record,
 *when* the same pairing read, attribution read, evidence read, and out-of-set claim are issued
-through the CLI and through the real stdio MCP server; the two boards' pages are opened in real
-Chrome; the registry process is killed mid-write and the lane's session is saved and reopened on
-the real compiled binary,
-*then* CLI and MCP answer byte-identical results in identical words, both pages show the same
-companion, worker, and commits the CLI shows, and after recovery the bindings, leases, and
-evidence are exactly what the triple held — the interrupted write retried once answers the
-stored result instead of doubling it.
+through the CLI and through the real stdio MCP server; and the registry process is killed
+mid-write and the lane's session is saved and reopened on the real compiled binary,
+*then* CLI and MCP answer byte-identical results in identical words, and after recovery the
+bindings, leases, and evidence are exactly what the triple held — the interrupted write
+retried once answers the stored result instead of doubling it. (The two-boards'-pages Chrome
+steps this example carried on 2026-09-26 left with LINKED-23: the served surface is retired,
+ADR-053.)
 
 ### A8 — Companion never gates, and no batch ever spans boards (LINKED-09, LINKED-25)
 
@@ -496,7 +506,7 @@ and reported, never silently rolled back.
   id)` with `boardID` a UUID string and `id` the exact item ID — the spelling commissioned for
   both slices in the approved scope (George, 2026-09-25, `a-93efef34`); this slice defines that
   spelling from that source and takes no implementation dependency on `e-df626704` (`todo`).
-  Local `--depends-on ID ...` scalars are unchanged (`rust/lib.rs:131`). Event payloads carry
+  Local `--depends-on ID ...` scalars are unchanged (`rust/lib.rs:127`). Event payloads carry
   the binding triple, the set revision, the evidence role, and full object IDs. This settles
   the deferred protocol/CLI field-name decision: field shape only, no new verb is named here.
 - **Data invariants:** one stored pairing row per companion (LINKED-01); endpoints are UUIDs plus
@@ -523,17 +533,18 @@ and reported, never silently rolled back.
 
 - **Reliability:** every LINKED write is fail-closed with no partial state (LINKED-01, LINKED-06,
   LINKED-11, LINKED-24, LINKED-25); recovery replays nothing already written (LINKED-24).
-- **Accessibility:** N/A — this slice adds no operator-facing markup of its own; the served pages
-  it touches keep the obligations of their own slices, and LINKED-23 requires the projection to
-  match the CLI rather than invent a rendering.
+- **Accessibility:** N/A — this slice adds no operator-facing markup of its own. There is no
+  served page left for it to touch (ADR-053); LINKED-23, which required the projection to match
+  the CLI rather than invent a rendering, is withdrawn with that surface.
 - **Privacy:** contributions and receipts carry actor, lane, and session identifiers by design
   (LINKED-15); like every board read they are served only to callers authorized to read the
   board, and LINKED-06's refusal leaks neither content nor cause.
 - **Security:** bindings check the full `(actor, lane, session)` triple on every claim path
   (LINKED-14); membership writes need membership authority and pairing writes need pairing
   authority (LINKED-01, LINKED-12); no confused-deputy addressing exists because display names,
-  paths, and tokens are never identity (LINKED-02); lease tokens stay structurally absent from
-  served projections as today.
+  paths, and tokens are never identity (LINKED-02); served projections no longer exist
+  (ADR-053), so there is no projection for a lease token to appear in, and CLI/MCP output
+  rules on tokens are unchanged.
 - **Operability:** membership revisions are auditable and `audit verify`-healthy (LINKED-12);
   failed ordered pairs report both halves and their compensation (LINKED-25); frozen sets park
   taking without stranding holding (LINKED-13).
@@ -563,18 +574,23 @@ verbatim. `Layer` is named precisely and is never `e2e` for an in-process test.
 `Test name` is the **existing** test that observes the behaviour today, verified as
 `fn <name>(` in `tests/e2e.rs` at the baseline. Exactly one requirement — LINKED-09, the
 existing-gates-still-hold rule — has such tests, named semicolon-separated in its one row
-`(`tests/e2e.rs:3729`, `:4250`, `:49403`, `:49150`, `:2264`, `:56139`, `:56242`, `:16808`,
+(`tests/e2e.rs:2854`, `:3375`, `:37865`, `:37612`, `:1370`, `:40330`, `:40433`, `:15889`,
 in row order): they prove today's gates on today's surface, and the implementation re-runs
-them unchanged beside the new scope gate. Full `cargo test --locked --test e2e -- --list`
-enumeration ran 2026-09-26 in the Linux container (`kanban-gate:1.95-chrome-u501`, image
-`f542f975e2dc`, host gate slot): 439 tests, each of the eight names present exactly once.
+them unchanged beside the new scope gate. Each of the eight names was re-verified present
+exactly once as `fn <name>(` at the refreshed baseline. Full `cargo test --locked --test e2e
+-- --list` enumeration ran 2026-09-26 in the Linux container (`kanban-gate:1.95-chrome-u501`,
+image `f542f975e2dc`, host gate slot): 439 tests, each of the eight names present exactly
+once — that count is the 2026-09-26 record; the web retirement (ADR-053) has since removed
+the served-surface tests, so the current tree lists fewer and no fresh full enumeration is
+claimed here.
 Every other requirement is greenfield registry behaviour with no observing test
 at the baseline, so its row is `none` and its Note says `no e2e coverage` plainly and names
 the owning implementation row — `t-0dcbb1a9` (companions and claim scope per its work-package
 title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257` (contributions and
 consumer integration per its work-package title, `LINKED-15`..`LINKED-21`), or `t-db6937ba`
-(exposure and workflow proof per its work-package title, `LINKED-22`..`LINKED-25`) — which
-writes the fixed test set the implementation lands under. This is the precedent `docs/specs/spa.md`
+(exposure and workflow proof per its work-package title, `LINKED-22`, `LINKED-24`,
+`LINKED-25`; `LINKED-23` is withdrawn with the served surface and owned by no implementation
+row) — which writes the fixed test set the implementation lands under. This is the precedent `docs/specs/spa.md`
 set at creation (`cd55cbc`): real names where the behaviour is observable today, `none` plus the
 owning row where it is not — and no invented name anywhere: every name below was verified in the
 tree, and every `none` says so.
@@ -603,22 +619,24 @@ tree, and every `none` says so.
 | `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
 | `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
-| `LINKED-23` | MUST | chrome | `none` | no e2e coverage — to be written by `t-db6937ba` (served pages match the CLI in real Chrome) |
+| `LINKED-23` | WITHDRAWN 2026-09-29 | chrome (retired) | `none` | withdrawn with the served surface (ADR-053) — no test to be written, owned by no implementation row; ID reserved, never reused |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
 | `LINKED-25` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (companion moves no gate; two-board transact refused; ordered-pair compensation) |
 
-**Counts.** 25 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 24 `process`, 1
-`chrome`. By group: shared records 6 (`LINKED-01`..`LINKED-06`), bounded claims 8
+**Counts.** 25 IDs, never reused: 24 active requirements, all `MUST`, no `SHOULD` and no
+`MAY`, plus 1 withdrawn (`LINKED-23`). By layer: 24 `process`, and the withdrawn `chrome`
+row. By group: shared records 6 (`LINKED-01`..`LINKED-06`), bounded claims 8
 (`LINKED-07`..`LINKED-14`), delivery evidence 7 (`LINKED-15`..`LINKED-21`), surfaces and the
-sibling slice 4 (`LINKED-22`..`LINKED-25`). LINKED-09 carries one row naming eight existing
-tests; the remaining 24 requirements carry `none` rows, each owned by `t-0dcbb1a9`,
-`t-9eff9257`, or `t-db6937ba` as its Note states.
+sibling slice 4 (`LINKED-22`..`LINKED-25`, of which `LINKED-23` is withdrawn). LINKED-09
+carries one row naming eight existing tests; the remaining 23 active requirements carry
+`none` rows, each owned by `t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states.
 
 **How §4 reaches every MUST.** A1 covers `LINKED-01`, `LINKED-02`, `LINKED-03`, `LINKED-05`; A2
 covers `LINKED-02`, `LINKED-04`, `LINKED-06`; A3 covers `LINKED-07`, `LINKED-08`, `LINKED-10`;
 A4 covers `LINKED-11`, `LINKED-12`, `LINKED-13`, `LINKED-14`; A5 covers `LINKED-15`,
 `LINKED-16`, `LINKED-17`, `LINKED-18`; A6 covers `LINKED-19`, `LINKED-20`, `LINKED-21`; A7
-covers `LINKED-22`, `LINKED-23`, `LINKED-24`; A8 covers `LINKED-09`, `LINKED-25`. Every MUST is
+covers `LINKED-22`, `LINKED-24` (`LINKED-23` withdrawn, reached from its §3 withdrawal note
+and its §8 row instead); A8 covers `LINKED-09`, `LINKED-25`. Every active MUST is
 reachable from §4 and from §8.
 
 ## 9. Change log
@@ -643,3 +661,26 @@ reachable from §4 and from §8.
   titles (`t-0dcbb1a9` LINKED-01..08/10..14, `t-9eff9257` LINKED-15..21, `t-db6937ba` LINKED-22..25);
   `cargo test --locked --test e2e -- --list` enumerated in the Linux container (439 tests, eight
   LINKED-09 names each present once); revoked-lease release cited at `rust/lib.rs:169`.
+- `2026-09-29` — baseline refreshed to `361d7e3` on `wt/t-fe137b57-land` (SPEC-READY stamp of
+  2026-09-26 kept verbatim, including its `rust/lib.rs:169` which was correct in that tree).
+  Citation corrections, all verified in this tree, none changing a requirement's meaning except
+  where noted: `claim` 156→`rust/lib.rs:152`, `claim --candidates` 165→`rust/lib.rs:161`,
+  `handoff accept` 184→`rust/lib.rs:180` (§1, LINKED-08, §2); `task add --depends-on`
+  131–133→`rust/lib.rs:125`–`rust/lib.rs:127` (§1, §5); `claim` has no `--force`
+  327–328→`rust/lib.rs:325`–`rust/lib.rs:326` (§1); `RELATION_KINDS`
+  `rust/model.rs:458`→`rust/model.rs:378`, content unchanged (§1); revoked-lease `release`
+  `rust/lib.rs:169`→`rust/lib.rs:165` (LINKED-13); `docs/PRD.md:31`→`docs/PRD.md:32`
+  (prevent-concurrent-ownership goal; §1); the eight LINKED-09 `tests/e2e.rs` lines re-pointed
+  to `2854`, `3375`, `37865`, `37612`, `1370`, `40330`, `40433`, `15889` in row order, each
+  re-verified present exactly once as `fn <name>(` (§8); the 439-test `--list` enumeration is
+  kept as the dated 2026-09-26 record with no fresh count claimed (§8). ADR numbering checked:
+  no collision — the lane holds ADR-051 (this slice) through ADR-055, so no renumber. Matrix
+  section placement checked: the LINKED trace sits with the other `Requirements trace` sections
+  before `Watch coverage note`, merged as a pure addition.
+  MATERIAL change (re-review required): `LINKED-23` WITHDRAWN — the served web UI it named was
+  deleted with no successor (ADR-053, accepted 2026-09-28: `kanban serve`, `web/` SPA, `/live`,
+  every HTTP route gone; `rust/serve.rs` absent from this tree; `web-ui.md`/`spa.md` withdrawn).
+  The requirement was rewritten nowhere CLI-only because its entire subject was the retired
+  surface; the ID stays reserved. §2 actors/in-scope, the `http`/`chrome` layer notes, A7, §6
+  Accessibility/Security, §8 counts/coverage, and the matrix LINKED-23 row move in the same
+  change, kept verbatim-identical with the matrix section.
