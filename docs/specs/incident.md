@@ -2,7 +2,7 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `INCIDENT`. Requirement IDs are `INCIDENT-01` .. `INCIDENT-15`, stable across wording
+- **Slice ID:** `INCIDENT`. Requirement IDs are `INCIDENT-01` .. `INCIDENT-16`, stable across wording
   refinements; numbering is by creation, grouping is by topic (`INCIDENT-15` joined by the
   2026-09-28 OQ-3 verdict).
 - **Baseline:** `2026-09-28` at commit `ae2fb8f51ff14844d76317da6739b011a90de391` on branch
@@ -37,9 +37,13 @@
     links to tasks, attention, deployments, sitreps, and hosts; evidence as a pointer holding no
     secret; no claims on incidents; a reviewed close that refuses an absent written review
     (cause, impact, what worked, what did not) and an absent follow-up task or explicit
-    no-follow-up reason; every board; `/incidents` and `/incident/<board>/<id>`; open `SEV1`/`SEV2`
-    on Needs you; medic markdown receipts remain evidence; P1 implementation after the makeover
-    epic `e-02a9f510`.
+    no-follow-up reason; every board; medic markdown receipts remain evidence.
+    *Superseded 2026-09-29 (George walkthrough, kb `t-d94b9d1c` note 519; web retirement
+    `e-caeb1449`, ADR-053):* the source sentences `/incidents` and `/incident/<board>/<id>`,
+    open `SEV1`/`SEV2` on Needs you, and P1 implementation after the makeover epic `e-02a9f510`
+    are `VOID` — the serve layer is deleted with no replacement UI, the Needs-you queue carries
+    no incidents, the makeover is cancelled. The surviving source is `/kb-att` as the incident
+    surface (`INCIDENT-16`).
   - Source epic `e-b481f61b` on the board is the authority for the decisions above; this slice's
     scope is the docs specification, ADR, and matrix rows only — no product edits.
   - `docs/adr/ADR-052-incidents-are-typed-rows-with-a-reviewed-close.md` — the decision this
@@ -56,10 +60,10 @@
     than reusing their resolve ladder (see ADR-052).
   - Shipped surface at the baseline: `BOARD_SCHEMA_VERSION` and `BOARD_MIGRATIONS`
     (`/Users/geoyws/work/src/kanban/rust/db.rs:2552`,
-    `/Users/geoyws/work/src/kanban/rust/db.rs:3086-3091`); the served route table
-    (`/Users/geoyws/work/src/kanban/rust/serve.rs:631-646`); the Needs-you projection
-    (`/Users/geoyws/work/src/kanban/rust/projection.rs:325`); the id-shape refusal precedent
-    (`/Users/geoyws/work/src/kanban/rust/model.rs:972`).
+    `/Users/geoyws/work/src/kanban/rust/db.rs:3086-3091`); the served route table and the
+    Needs-you projection (both retired 2026-09-29 with the serve layer under ADR-053 — cited
+    here only as baseline history, no line cite owed to deleted code); the id-shape refusal
+    precedent (`/Users/geoyws/work/src/kanban/rust/model.rs:972`).
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries the slice's evidence
   table; the matrix section `## Requirements trace — docs/specs/incident.md` is the trace
   of record when it lands (convention at
@@ -76,15 +80,16 @@ written review and a follow-up — and never as a task that a lane can claim.
 - **Lane agents** — open incidents, append timeline entries, attach links and evidence pointers,
   and move them along the lifecycle from the CLI.
 - **The board operator (George)** — authors the written review, decides the follow-up, and reads
-  open `SEV1`/`SEV2` incidents on Needs you and on the served pages.
+  the lane's open incidents on `/kb-att`, `SEV1` first, then oldest first (`INCIDENT-16`).
 - **Adapter clients (MCP)** — read incidents through the generated surface; no new trust boundary
   is added.
 
 **In scope.** The `i-` incident identity; the severity and status enums; the three timestamps; the
 append-only timeline; the five link targets; the evidence pointer; the claim exclusion; the two
-reviewed-close refusals; the `/incidents` and `/incident/<board>/<id>` pages; the Needs-you rule
-for open `SEV1`/`SEV2`; the board schema migration; process-boundary and served-bytes evidence
-for each mandatory requirement.
+reviewed-close refusals; the `/kb-att` open-incident ordering (`INCIDENT-16`, superseding the
+retired `/incidents` and `/incident/<board>/<id>` pages and the Needs-you rule 2026-09-29);
+the board schema migration; process-boundary evidence for each mandatory requirement (no
+served-bytes evidence is owed — ADR-053).
 
 **Boundaries.**
 
@@ -111,8 +116,9 @@ for each mandatory requirement.
 - **A product definition of what each severity means.** `SEV1`–`SEV4` are labels with an order;
   what counts as a `SEV1` is operator practice, not a documented rule (the same cut the
   `COMPLAINT` slice makes for what counts as a complaint).
-- **A second ordering on the list page.** `/incidents` contains exactly the set §3 fixes; display
-  order is unspecified in this slice and no test pins it.
+- **A second ordering on the CLI list.** The retired `/incidents` page fixed only the set, never
+  the order; `kanban incident list` display order is unspecified in this slice and no test pins
+  it. Ordering is fixed, once, by `INCIDENT-16` on `/kb-att`.
 - **Paging, search indexing, or notification policy for incidents.** Search, watch, and
   notification behaviour for the new rows is untouched; if a later slice touches it, it specifies
   it then (ADR-047 §6).
@@ -290,41 +296,49 @@ the existing verbs — `incident note` timeline entries and ordinary task creati
 (`INCIDENT-02`) record their acting `--as` caller on the timeline without an actor gate: OQ-3
 decided only the reviewed transition, and this requirement fixes no gate beyond it.
 
-### Served surface
+### Served surface (retired 2026-09-29 — ADR-053)
 
 **INCIDENT-11** — Serve the incident list and the incident detail on every board.
-Strength: `MUST` · Layer: `unit` · Source: George 2026-09-28 (`/incidents`,
+Strength: `MUST` · Layer: `process` · Source: George 2026-09-28 (`/incidents`,
 `/incident/<board>/<id>`).
-`GET /incidents` renders the incident list and `GET /incident/<board>/<id>` renders the detail:
-identity, severity, status, the three timestamps, the timeline in append order, the links, the
-evidence pointer as given, and, once closed, the review and the follow-up. The list contains
-exactly the set the lifecycle fixes — no filtering by severity or status beyond what
-`INCIDENT-12` fixes for Needs you; display order is a non-goal (§2).
-Rendering contract: the pages render inside the existing shell and inherit its width, contrast,
-and keyboard behaviour (no new interaction pattern, no browser write verb); the JSON projection
-beside them answers the same rows the CLI would show the same principal — the same board and
-tag authorization enforced inside the store, not by a filter in the route (the SPA-08 rule at
-`/Users/geoyws/work/src/kanban/docs/specs/spa.md:205-216`) — and the SPA mounts both routes on
-that projection, reading `bodyHtml`-style typeset content where prose renders and never a second
-query language in the web layer. CLI reads stay primary: `kanban incident list [--status
-open|mitigated|resolved|reviewed] [--severity SEV1|SEV2|SEV3|SEV4] [--all] [--limit N] [--json]`
-and `kanban incident show ID [--json]` answer exactly what the pages render.
+*Superseded 2026-09-29 (George walkthrough, kb `t-d94b9d1c` note 519; web retirement
+`e-caeb1449`, ADR-053):* the served sentences are `VOID` — both routes are deleted with the
+serve layer, no replacement UI, no shim. What stays in force: the CLI reads `kanban incident
+list [--status open|mitigated|resolved|reviewed] [--severity SEV1|SEV2|SEV3|SEV4] [--all]
+[--limit N] [--json]` and `kanban incident show ID [--json]` are now the only incident reads,
+answering identity, severity, status, the three timestamps, the timeline in append order, the
+links, the evidence pointer as given, and — once closed — the review and the follow-up, to the
+same principal under the same board and tag authorization enforced inside the store (Layer for
+these surviving sentences is `process`; the §8 row carries the correction).
 Tenancy: naming an unreadable, unknown, or retired board — or an unknown or unreadable `i-` id —
-produces the one non-enumerating refusal: the HTML arm answers the existing not-found page and
-the JSON arm answers `denied or not found`, with no body that distinguishes unknown from
-unreadable and no enumeration oracle in a list (unreadable rows are skipped, never refused
-mid-enumeration, per `/Users/geoyws/work/src/kanban/rust/authz.rs:213-218`).
-No write verb is added to the browser: the served surface stays read-only under ADR-016, and the
-reviewed close stays a CLI/MCP write.
+answers `denied or not found`, with no body that distinguishes unknown from unreadable and no
+enumeration oracle in a list (unreadable rows are skipped, never refused mid-enumeration, per
+`/Users/geoyws/work/src/kanban/rust/authz.rs:213-218`).
+No write verb is added anywhere new: the reviewed close stays a CLI/MCP write.
 
 **INCIDENT-12** — Show open SEV1 and SEV2 incidents on Needs you.
 Strength: `MUST` · Layer: `unit` · Source: George 2026-09-28 (open SEV1/2 on Needs you).
+*Superseded 2026-09-29 (same walkthrough):* the Needs-you queue no longer carries incidents —
+superseded by `INCIDENT-16`. The `needs_you` projection itself is unchanged: it carries
+attention cards exactly as at the baseline, and no incident entry joins it. The sentences below
+are kept as history.
 An incident with status `open` and severity `SEV1` or `SEV2` appears on the Needs-you queue
 (`/Users/geoyws/work/src/kanban/rust/projection.rs:325` — the `needs_you` projection, whose
 per-board `Store::attention` merge the incident entries join); every other
 combination — `mitigated`, `resolved`, `reviewed`, or `SEV3`/`SEV4` at any status — does not.
 The existing attention cards on that queue are unchanged: same order, same shape, same counts
 apart from the added incident entries.
+
+**INCIDENT-16** — List the lane's open incidents on `/kb-att`, `SEV1` first, then oldest first.
+Strength: `MUST` · Layer: `process` · Source: George 2026-09-29 (walkthrough, kb
+`t-d94b9d1c` note 519; skills-root `/kb-att` rule "Incidents before attention").
+The `/kb-att` digest carries `## Open incidents in lane` above the open attention rows and lists
+the lane's open incidents — status `open` at any severity, no incident at any other status:
+every open `SEV1` first (oldest first among them), then every other open incident oldest first,
+ordered by (`severity = SEV1` first, then `detected_at` ascending). A `mitigated`, `resolved`,
+or `reviewed` incident is never listed. The digest is produced at the process boundary from the
+CLI reads — severity and `detected_at` ride `kanban incident list` — and ships with kanban
+`t-9703ff91`; this slice specifies the ordering only.
 
 **INCIDENT-13** — Leave medic markdown receipts working exactly as today.
 Strength: `MUST` · Layer: `process` · Source: George 2026-09-28 (medic receipts remain evidence).
@@ -420,6 +434,8 @@ and a follow-up task id that does not exist is refused quoting that id instead.
 
 ### A8 (`INCIDENT-11`)
 
+*Superseded 2026-09-29 — the served sentences are `VOID` (see `INCIDENT-11`); the example is kept
+as history. Its surviving half — CLI parity and the non-enumerating denial — is proven by A13.*
 *Given* a board with one open and one reviewed incident,
 *when* a client reads `GET /incidents` and `GET /incident/<board>/<id>` for each,
 *then* the list page contains exactly both incidents with their ids, severities, and statuses;
@@ -434,6 +450,9 @@ principal.
 
 ### A9 (`INCIDENT-12`)
 
+*Superseded 2026-09-29 — superseded by A13.* The Needs-you queue this example proves no longer
+carries incidents (see `INCIDENT-12`, superseded by `INCIDENT-16`). The example is kept as
+history.
 *Given* four incidents — open `SEV1`, open `SEV2`, open `SEV4`, and mitigated `SEV1`,
 *when* the Needs-you queue is projected,
 *then* it contains the open `SEV1` and the open `SEV2` and neither of the other two, and every
@@ -468,8 +487,19 @@ change, no stamp, no timeline entry, no event;
 *then* the incident reads `reviewed`, with the review and the follow-up stored on the row and
 appended to the timeline verbatim.
 
+### A13 (`INCIDENT-16`, `INCIDENT-11`)
+
+*Given* a lane holding open `SEV1` incidents `i-a` (detected first) and `i-b` (detected later),
+an open `SEV3` incident `i-c` older than both, and a `mitigated` `SEV1` incident `i-d`,
+*when* the `/kb-att` digest is produced,
+*then* `## Open incidents in lane` stands above the attention rows and lists `i-a`, `i-b`,
+`i-c` in that order — `SEV1` first, then oldest first — naming neither `i-d` nor any `resolved`
+or `reviewed` row; and `kanban incident list` and `kanban incident show` answer the same rows
+to the same principal, refusing an unknown or unreadable `i-` id with `denied or not found`
+without distinguishing unknown from unreadable.
+
 Where the template asks for more categories: invalid input is A2 (plus the `INCIDENT-01` id-shape
-and duplicate-`--id` refusals); unauthorised access is the second half of A8 plus A12 — the
+and duplicate-`--id` refusals); unauthorised access is the denial half of A13 plus A12 — the
 reviewed-transition actor gate is decided (OQ-3 closed by `a-915fa4cc`: only geoyws,
 `INCIDENT-15`), and beyond it this specification fixes no permission beyond the existing
 board/tag authorization it inherits; failure recovery needs no
@@ -482,10 +512,11 @@ slice adds no write path beyond the existing single-writer migration transaction
 
 - **Interface version or schema:** the CLI gains the pinned `incident` group — `open`, `mitigate`,
   `resolve`, `review`, `note`, `link`/`unlink`, `evidence`, `list`, `show` — and the
-  `schema --json` surface publishes them with no renamed operation and no changed flag elsewhere;
-  the served pages gain `GET /incidents` and `GET /incident/<board>/<id>` beside the baseline
-  route table, with a JSON projection answering the same rows to the same principal and no new
-  write verb in the browser.
+  `schema --json` surface publishes them with no renamed operation and no changed flag elsewhere.
+  *Superseded 2026-09-29:* the baseline promised served pages (`GET /incidents` and
+  `GET /incident/<board>/<id>`) beside the route table with a JSON projection — retired with
+  the serve layer (ADR-053; see `INCIDENT-11`). The `/kb-att` digest section (`INCIDENT-16`)
+  consumes the CLI reads, not a JSON projection; no browser write verb ever existed.
 - **Data invariants:** incident ids are unique per board and match `i-<suffix>`; severity is always
   one of four values; status is always one of four values and moves only forward along
   `INCIDENT-02`; `detected_at <= mitigated_at <= resolved_at` once the later stamps exist;
@@ -507,9 +538,9 @@ slice adds no write path beyond the existing single-writer migration transaction
 - **Reliability:** N/A — the slice adds no new failure mode: opens, moves, links, and the two
   reviewed-close gates refuse fail-closed with no partial write, and the migration runs inside
   the runner's per-step transaction.
-- **Accessibility:** the two new pages render inside the existing shell and inherit its width,
-  contrast, and keyboard behaviour; no new interaction pattern is introduced (no new browser
-  write verb).
+- **Accessibility:** N/A after the 2026-09-29 retirement — no pages ship, so no shell, width,
+  contrast, or keyboard contract is owed. (The retired sentences crediting the shell stay above
+  as history.)
 - **Privacy:** incident rows inherit the containing board's tenancy and tag visibility
   (`INCIDENT-05`, `INCIDENT-11`): the timeline records the acting caller's existing identity and
   nothing else, and no new retention rule is invented.
@@ -521,10 +552,10 @@ slice adds no write path beyond the existing single-writer migration transaction
   per `/Users/geoyws/work/src/kanban/rust/authz.rs:34`); validation and encoding applies because
   severity, status, id shape, and the review/follow-up gates refuse fail-closed with sentences
   that name the fix (`INCIDENT-01`, `INCIDENT-02`, `INCIDENT-09`, `INCIDENT-10`); stored content
-  is agent-authored text rendered inert by the existing shell, with the evidence pointer never
-  fetched or expanded (`INCIDENT-06`). Authentication, session management, and cryptography add
-  no incident-specific contract: this slice inherits the existing trusted-edge identity and
-  creates no secret, credential, or session mechanism. `INCIDENT-07` records the
+  is agent-authored text surfaced through CLI reads and the `/kb-att` digest, with the evidence
+  pointer never fetched or expanded (`INCIDENT-06`). Authentication, session management, and
+  cryptography add no incident-specific contract: this slice inherits the existing trusted-edge
+  identity and creates no secret, credential, or session mechanism. `INCIDENT-07` records the
   keep-secrets-out practice as a `SHOULD`, explicitly not an enforced gate.
 - **Operability:** a failed migration step leaves the board at its prior `user_version` with
   prior data intact, because the version bump commits only with the step; the operator re-runs
@@ -574,15 +605,16 @@ than hidden.
 | `INCIDENT-08` | `MUST` | `process` | planned: `incident_ids_refuse_claims_and_leave_queue_unchanged` | `no e2e coverage` |
 | `INCIDENT-09` | `MUST` | `process` | planned: `incident_reviewed_close_refuses_missing_four_part_review` | asserts the A7 sentence via `incident review`; `no e2e coverage` |
 | `INCIDENT-10` | `MUST` | `process` | planned: `incident_reviewed_close_needs_followup_or_reason` | asserts the A7 sentences including the cross-board follow-up refusal; `no e2e coverage` |
-| `INCIDENT-11` | `MUST` | `unit` | planned: `incident_pages_render_list_and_detail_bytes` | reads the served bytes of both routes plus the CLI list/show parity and the A8 denial half; `no e2e coverage` |
-| `INCIDENT-12` | `MUST` | `unit` | planned: `needs_you_carries_open_sev1_sev2_only` | `no e2e coverage` |
+| `INCIDENT-11` | `MUST` | `process` | planned: `incident_cli_list_and_show_answer_same_rows` | superseded 2026-09-29: the served sentences are `VOID`; proves the surviving CLI list/show parity and the A8 denial half (A13); `no e2e coverage` |
+| `INCIDENT-12` | `MUST` | `unit` | planned: `needs_you_carries_no_incidents` | superseded 2026-09-29 by `INCIDENT-16`: proves the Needs-you queue carries attention cards only; `no e2e coverage` |
 | `INCIDENT-13` | `MUST` | `process` | planned: `medic_receipts_unchanged_beside_incidents` | `no e2e coverage` |
 | `INCIDENT-14` | `MUST` | `process` | planned: `incident_migration_carries_prior_board_forward_empty` | seeds a V33 board, migrates to the next free version, re-opens; `no e2e coverage` |
 | `INCIDENT-15` | `MUST` | `process` | planned: `incident_reviewed_transition_is_geoyws_only` | asserts the A12 refusal sentence for a lane actor and the geoyws close carrying agent-authored material; `no e2e coverage` |
+| `INCIDENT-16` | `MUST` | `process` | planned: `kb_att_lists_open_incidents_sev1_first_oldest_first` | asserts the A13 ordering, the mitigated/resolved/reviewed exclusion, and the CLI parity plus denial half; `no e2e coverage` |
 
-No `chrome` evidence is planned: the slice adds two read-only pages with no new interaction
-pattern and no browser write verb, so the served-bytes `unit` evidence plus process-boundary
-exchanges prove what the slice states; the matrix rows say `no e2e coverage` plainly per the
+No `chrome` evidence is planned: the slice ships no pages and no browser surface at all after
+the 2026-09-29 retirement, so process-boundary exchanges prove what the slice states; the matrix
+rows say `no e2e coverage` plainly per the
 convention at
 `/Users/geoyws/work/src/kanban/docs/testing/compiled-rust-e2e-matrix.md:224-236`.
 
@@ -601,3 +633,11 @@ convention at
   file or propose the follow-up) with acceptance A12 and a verification row; superseded the OQ-3
   `OPEN` sentences under `INCIDENT-01`/`INCIDENT-09` and updated the §2/§4/§5/§7 notes. Slice IDs
   now `INCIDENT-01` .. `INCIDENT-15`; no other requirement changed.
+- `2026-09-29` — web-retirement delta (George walkthrough, kb `t-d94b9d1c` note 519; web
+  retirement `e-caeb1449`, ADR-053): superseded the `/incidents` and `/incident/<board>/<id>`
+  served sentences (`INCIDENT-11` `VOID`, CLI reads survive as the only reads, Layer
+  `unit` → `process`), the Needs-you strip (`INCIDENT-12` superseded, projection unchanged),
+  and the makeover-epic `e-02a9f510` implementation gate (`VOID`); added `INCIDENT-16` (`/kb-att`
+  ordering) with acceptance A13 and a verification row; served halves of A8/A9 kept as history.
+  OQ-3, `INCIDENT-15`, A12, and the `SPEC-READY` stamp are untouched. Slice IDs now
+  `INCIDENT-01` .. `INCIDENT-16`; no other requirement changed.
