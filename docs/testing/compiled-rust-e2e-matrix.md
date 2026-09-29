@@ -445,6 +445,32 @@ with the web view, ADR-053), so each row says `no e2e coverage` plainly.
 legacy tags already registered stay registered and migrate with `tag rename`; rows keep
 their ids and a refused `task add` writes no row and no event.
 
+## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
+
+The claim-routing slice is specified but not implemented: the specification is at `Proposed`
+2026-09-29 on branch `kanban-geoyws-driver` at commit `ab7a11a`. The implementation row
+`t-8c698a02` is a later row. No claim-routing test exists at this baseline, so no name below was
+enumerated with `cargo test -- --list` and none is claimed to exist. Every row therefore carries
+`none` / `none` and says `no e2e coverage` plainly, naming the planned layer and test name from
+`docs/specs/claim-routing.md` §8 as what the implementation owes. Of the 8 requirements, all 8
+are `MUST`, all proved at `process`. This slice changes no served markup, so there is no browser
+surface to drive.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `CLAIM-01` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane`, owed by the `t-8c698a02` implementation |
+| `CLAIM-02` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_falls_back_to_exact_strings_without_a_lane`, owed by the `t-8c698a02` implementation |
+| `CLAIM-03` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_routing_refuses_a_typed_lane_from_another_board`, owed by the `t-8c698a02` implementation |
+| `CLAIM-04` | MUST | none | `none` | no e2e coverage — planned `process`: `claim_candidates_show_same_lane_rows_to_the_callers_own_lane`, owed by the `t-8c698a02` implementation |
+| `CLAIM-05` | MUST | none | `none` | no e2e coverage — planned `process`: `named_claim_takes_a_same_lane_row`, owed by the `t-8c698a02` implementation |
+| `CLAIM-06` | MUST | none | `none` | no e2e coverage — planned `process`: `named_claim_refuses_a_different_lane_in_the_existing_words`, owed by the `t-8c698a02` implementation |
+| `CLAIM-07` | MUST | none | `none` | no e2e coverage — planned `process`: `allow_reassign_still_bypasses_every_assignee_spelling`, owed by the `t-8c698a02` implementation |
+| `CLAIM-08` | MUST | none | `none` | no e2e coverage — planned `process`: `successful_claim_stores_the_caller_string_verbatim`, owed by the `t-8c698a02` implementation |
+
+8 requirements: 8 MUST, no SHOULD or MAY. A lane executor claims its lane's rows in every
+harness spelling, a different lane is still refused in the existing words, `--allow-reassign`
+and the retarget write are unchanged, and no stored string is renamed or migrated.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
