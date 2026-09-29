@@ -155,10 +155,16 @@ as_gate() {
 mkdir -p /tmp/gate-home
 chown "$uid:$gid" /tmp/gate-home
 cd /work
+# t-d2d4937d: gate stdout is the shared docker pipe, and an inheriting child
+# (browser, spawned test process) can set O_NONBLOCK on it; the next libtest
+# burst then dies with EAGAIN and the step loses its verdict. A regular file
+# ignores O_NONBLOCK, so the gate writes to one and it is replayed to stdout
+# only after every child has exited.
+out=/tmp/gate-output.log
+status=0
 if [[ -z "$loop_target" ]]; then
-    as_gate bash scripts/release-gate.sh
-    exit
-fi
+    as_gate bash scripts/release-gate.sh >"$out" 2>&1 || status=$?
+else
 as_gate cargo test --locked --test "$loop_target" --no-run
 # `--exact` with a name that matches nothing runs zero tests and exits 0, so a
 # typo would count as a clean loop. Refuse up front, then count an iteration
@@ -170,6 +176,7 @@ if [[ "$listed" != 1 ]]; then
     exit 64
 fi
 pass=0 fail=0
+{
 for i in $(seq 1 "$iterations"); do
     if as_gate cargo test --locked --test "$loop_target" -- --exact "$loop_test" \
         --test-threads=1 >/tmp/iteration.log 2>&1 &&
@@ -182,6 +189,10 @@ for i in $(seq 1 "$iterations"); do
 done
 echo "container-gate: loop $loop_target::$loop_test pass=$pass fail=$fail n=$iterations"
 ((fail == 0))
+} >"$out" 2>&1 || status=$?
+fi
+cat "$out"
+exit "$status"
 '
 
 run_container=(
