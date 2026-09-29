@@ -546,6 +546,50 @@ pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     Ok(name)
 }
 
+/// The estate a board files namespaced tags under: the compile-time
+/// board-to-estate map.
+///
+/// Boards follow durable product-estate ownership boundaries, and a bare tag
+/// carries no estate — so `tag add` builds the repair from this table rather
+/// than asking the caller to guess. An unmapped board gets the estate list
+/// with no suggestion, because there is no board truth to build one from.
+/// Adding a fourth estate, or moving a board, is a deliberate edit here —
+/// the one board vocabulary beside [`ESTATES`] — never a side effect of a
+/// mistyped tag.
+pub(crate) fn estate_for_board(board: &str) -> Option<&'static str> {
+    match board {
+        "px" | "fmx" | "hx" | "hrx" | "ix" | "mx-root" | "prjx-root" | "rentx-root"
+        | "auditx-root" | "ifca-docs" | "prjx" => Some("ifca"),
+        "kanban" | "omp" | "acies" | "dotfiles" | "geoyws" | "atmux" | "dash" | "gitea"
+        | "journal" | "orch" | "hax" => Some("geoyws"),
+        "memberx" => Some("unum"),
+        name if name.starts_with("unum") => Some("unum"),
+        _ => None,
+    }
+}
+
+/// Refuse a bare tag name on `tag add` with the board's namespaced form.
+///
+/// A slashed name is not bare — its estate was already checked by
+/// [`validate_tag_name`] — so this answers `Ok` for anything carrying `/`
+/// and for nothing else. The refusal writes nothing; it names the exact
+/// registration to run instead.
+pub(crate) fn refuse_bare_tag_name(board: &str, name: &str) -> Result<()> {
+    if name.contains('/') {
+        return Ok(());
+    }
+    let estates = ESTATES.join(", ");
+    match estate_for_board(board) {
+        Some(estate) => {
+            bail!("tag {name} is not namespaced: use {estate}/{name} (estates: {estates})")
+        }
+        None => bail!(
+            "tag {name} is not namespaced: no estate maps this board, so register it as \
+             <estate>/{name} (estates: {estates})"
+        ),
+    }
+}
+
 fn validate_registered_tags(
     connection: &Connection,
     tags: &[String],
@@ -5407,14 +5451,19 @@ impl Store {
         if input.stale_minutes.is_some_and(|value| value < 0) {
             bail!("stale minutes must be non-negative");
         }
-        let id = input.id.unwrap_or_else(|| {
-            let prefix = match input.task_type.as_str() {
-                "epic" => "e",
-                "story" => "s",
-                _ => "t",
-            };
-            format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
-        });
+        let id = match input.id {
+            // An explicit id must already be the kind's own shape; the refusal
+            // runs before the write transaction opens, so it writes nothing.
+            Some(value) => task_id(&value, &input.task_type)?,
+            None => {
+                let prefix = match input.task_type.as_str() {
+                    "epic" => "e",
+                    "story" => "s",
+                    _ => "t",
+                };
+                format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
+            }
+        };
         let title = nonempty(&input.title, "title")?.to_owned();
         let transaction = self.begin_write()?;
         // A new row has no old tag set; the resulting set is what the caller
@@ -10490,7 +10539,7 @@ mod tests {
 
         store.add_tag("old", None, Some(actor)).unwrap();
         store.add_tag("new", None, Some(actor)).unwrap();
-        let task_id = Uuid::new_v4().to_string();
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
         store
             .add_task(task_input(
                 &task_id,
@@ -11982,7 +12031,7 @@ mod tests {
             seed.add_tag("visible", None, Some("seed")).expect("tag");
             seed.add_tag("secret", None, Some("seed")).expect("tag");
 
-            let mut epic = task_input("t-epic", "secret epic", vec!["secret".to_owned()], vec![]);
+            let mut epic = task_input("e-epic", "secret epic", vec!["secret".to_owned()], vec![]);
             epic.task_type = "epic".to_owned();
             seed.add_task(epic).expect("seed epic");
             seed.add_task(task_input(
@@ -12001,21 +12050,21 @@ mod tests {
             .expect("seed open prerequisite");
 
             let mut story = task_input(
-                "t-visible",
+                "s-visible",
                 "visible row",
                 vec!["visible".to_owned()],
                 vec!["t-secret".to_owned(), "t-open".to_owned()],
             );
             story.task_type = "story".to_owned();
-            story.parent_id = Some("t-epic".to_owned());
+            story.parent_id = Some("e-epic".to_owned());
             seed.add_task(story).expect("seed visible row");
 
             let mut child =
                 task_input("t-child", "secret child", vec!["secret".to_owned()], vec![]);
-            child.parent_id = Some("t-visible".to_owned());
+            child.parent_id = Some("s-visible".to_owned());
             seed.add_task(child).expect("seed secret child");
             let mut leaf = task_input("t-leaf", "visible leaf", vec!["visible".to_owned()], vec![]);
-            leaf.parent_id = Some("t-visible".to_owned());
+            leaf.parent_id = Some("s-visible".to_owned());
             seed.add_task(leaf).expect("seed visible leaf");
         }
 
@@ -12043,15 +12092,15 @@ mod tests {
         // The control: the row whose relations are read IS readable, and the
         // rows hanging off it are not.
         store
-            .require_task("t-visible")
-            .expect("task show t-visible");
-        for hidden in ["t-secret", "t-epic", "t-child"] {
+            .require_task("s-visible")
+            .expect("task show s-visible");
+        for hidden in ["t-secret", "e-epic", "t-child"] {
             assert_denied(store.require_task(hidden), &format!("task show {hidden}"));
         }
 
         // 1. The dependency listing: the denied prerequisite is absent, the
         //    readable one is there in full.
-        let dependencies = store.dependencies("t-visible").expect("dependencies");
+        let dependencies = store.dependencies("s-visible").expect("dependencies");
         assert_eq!(
             dependencies
                 .iter()
@@ -12063,7 +12112,7 @@ mod tests {
 
         // 2. The gate: BOTH prerequisites, because the gate is what refuses
         //    the claim — with the denied one's title blanked and nothing else.
-        let gates = store.blocking_gates("t-visible").expect("blocking gates");
+        let gates = store.blocking_gates("s-visible").expect("blocking gates");
         assert_eq!(
             gates
                 .iter()
@@ -12075,15 +12124,15 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("t-visible", "t-open", Some("open prerequisite"), "todo"),
-                ("t-visible", "t-secret", None, "todo"),
+                ("s-visible", "t-open", Some("open prerequisite"), "todo"),
+                ("s-visible", "t-secret", None, "todo"),
             ],
             "the gate must keep the denied prerequisite and lose only its title"
         );
         // The listing form answers identically, including for a row that
         // INHERITS the gate from the readable story above it.
         let listed_gates = store
-            .blocking_gates_for(&["t-visible".to_owned(), "t-leaf".to_owned()])
+            .blocking_gates_for(&["s-visible".to_owned(), "t-leaf".to_owned()])
             .expect("blocking gates for a listing");
         assert_eq!(
             listed_gates[0], gates,
@@ -12099,8 +12148,8 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("t-visible", "t-open", Some("open prerequisite")),
-                ("t-visible", "t-secret", None),
+                ("s-visible", "t-open", Some("open prerequisite")),
+                ("s-visible", "t-secret", None),
             ],
             "the inherited gate must read the same way"
         );
@@ -12108,7 +12157,7 @@ mod tests {
         // 3. The chain: truncated at the denied epic, never refused, and the
         //    readable run nearest the row is intact.
         assert!(
-            store.ancestors("t-visible").expect("ancestors").is_empty(),
+            store.ancestors("s-visible").expect("ancestors").is_empty(),
             "a denied ancestor must not be in the chain"
         );
         assert_eq!(
@@ -12118,14 +12167,14 @@ mod tests {
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            ["t-visible"],
+            ["s-visible"],
             "the chain must keep the readable run and stop at the boundary"
         );
 
         // 4. The context packet reads all three through the store, so it is
         //    true by construction — asserted because it is the surface the
         //    finding was filed against.
-        let packet = store.context_packet("t-visible").expect("context packet");
+        let packet = store.context_packet("s-visible").expect("context packet");
         assert!(
             packet.ancestors.is_empty(),
             "the packet leaked the denied epic"
@@ -12150,7 +12199,7 @@ mod tests {
         let direct = Store::open(&path).expect("open direct");
         assert_eq!(
             direct
-                .dependencies("t-visible")
+                .dependencies("s-visible")
                 .expect("direct dependencies")
                 .len(),
             2,
@@ -12158,7 +12207,7 @@ mod tests {
         );
         assert_eq!(
             direct
-                .blocking_gates("t-visible")
+                .blocking_gates("s-visible")
                 .expect("direct gate")
                 .iter()
                 .map(|gate| gate.prerequisite_title.as_deref())
@@ -12168,12 +12217,12 @@ mod tests {
         );
         assert_eq!(
             direct
-                .ancestors("t-visible")
+                .ancestors("s-visible")
                 .expect("direct ancestors")
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            ["t-epic"],
+            ["e-epic"],
             "the direct estate must still see the whole chain"
         );
     }
@@ -15538,6 +15587,62 @@ mod tests {
             .to_string();
         assert!(estate.contains("acme"), "{estate}");
         assert!(estate.contains("ifca, unum, geoyws"), "{estate}");
+    }
+
+    /// CLI-02 — every named board files under its estate, and nothing else
+    /// files anywhere.
+    ///
+    /// The map is the repair `tag add` names, so a board filed wrong here
+    /// sends the operator to register under the wrong owner. One table,
+    /// because every row here is the same question.
+    #[test]
+    fn estate_for_board_maps_each_named_board_to_its_estate() {
+        for (board, estate) in [
+            ("px", "ifca"),
+            ("fmx", "ifca"),
+            ("hx", "ifca"),
+            ("hrx", "ifca"),
+            ("ix", "ifca"),
+            ("mx-root", "ifca"),
+            ("prjx-root", "ifca"),
+            ("rentx-root", "ifca"),
+            ("auditx-root", "ifca"),
+            ("ifca-docs", "ifca"),
+            ("prjx", "ifca"),
+            ("kanban", "geoyws"),
+            ("omp", "geoyws"),
+            ("acies", "geoyws"),
+            ("dotfiles", "geoyws"),
+            ("geoyws", "geoyws"),
+            ("atmux", "geoyws"),
+            ("dash", "geoyws"),
+            ("gitea", "geoyws"),
+            ("journal", "geoyws"),
+            ("orch", "geoyws"),
+            ("hax", "geoyws"),
+            ("unum", "unum"),
+            ("unum-ledger", "unum"),
+            ("memberx", "unum"),
+        ] {
+            assert_eq!(
+                estate_for_board(board),
+                Some(estate),
+                "board {board} must file under {estate}"
+            );
+        }
+        for board in ["scratch", "TAGS", "Alpha", "", "ifca"] {
+            assert_eq!(
+                estate_for_board(board),
+                None,
+                "board {board} must map to no estate"
+            );
+        }
+        // A slashed name is never bare, on any board: the estate half was
+        // already checked by `validate_tag_name`, so there is nothing left to
+        // refuse here.
+        for board in ["prjx", "kanban", "memberx", "scratch"] {
+            refuse_bare_tag_name(board, "ifca/assistant").expect("a namespaced name is never bare");
+        }
     }
 
     #[test]

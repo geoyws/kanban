@@ -7307,9 +7307,25 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "tag" && sub == Some("add") {
         let name = rest.first().context("tag name is required")?;
+        // The shape first, so a malformed name keeps `validate_tag_name`'s
+        // sentence; then the namespace, built from the board's own estate.
+        let name = crate::store::validate_tag_name(name)?;
+        // Inside a batch the board is the one transact opened: an item argv
+        // carries no board selector (`plan_transact` refuses one), so the
+        // registry selection would fall through to the cwd's workspace and
+        // name the wrong estate — or bail on a retired cwd board that has
+        // nothing to do with the batch.
+        let board = if store.in_batch() {
+            store.board_name()?.unwrap_or_default()
+        } else {
+            selected_board_name(&args)?
+                .or(store.board_name()?)
+                .unwrap_or_default()
+        };
+        crate::store::refuse_bare_tag_name(&board, &name)?;
         return print(
             &store.add_tag(
-                name,
+                &name,
                 args.one("description"),
                 Some(args.one("as").unwrap_or("system@cli")),
             )?,

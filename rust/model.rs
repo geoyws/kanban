@@ -957,6 +957,42 @@ fn calendar_date(text: &str) -> bool {
 /// which is why the rewrite verbs refuse them by name.
 pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandoned"];
 
+/// Validate an explicit task-row identity against the board's own id shape
+/// for the kind being created.
+///
+/// The generator mints `{e|s|t}-<8 lowercase hex>` (`Store::add_task_in_sprint`),
+/// and the search index recognises exactly that generated shape
+/// (`canonical_generated_id_query` in `rust/search.rs`); the word suffixes
+/// already on boards (e.g. `e-q4`, documented in `skills/kb/SKILL.md:584`)
+/// widen it beyond generated hex: 1-62 lowercase letters, digits, dot,
+/// underscore, or hyphen, at most 64 characters total with the kind prefix.
+/// Everything else — whitespace, control characters, shell metacharacters
+/// (`bogus id!`, and `?`/`#`/`/` with them), uppercase, an empty suffix, and
+/// a prefix that does not match the kind — is refused with the expected
+/// shape, before the first write, so the CLI, `transact` batches and MCP
+/// share the one refusal. Opaque ids a legacy import can carry (e.g. the
+/// fixture `t-mobile/opaque?#`) keep reading back — reads never check the
+/// shape, and the atmux import writes by direct SQL and is not validated.
+pub fn task_id(value: &str, task_type: &str) -> Result<String> {
+    let prefix = match task_type {
+        "epic" => "e-",
+        "story" => "s-",
+        _ => "t-",
+    };
+    let suffix = value.strip_prefix(prefix).unwrap_or("");
+    if value.len() > 64
+        || suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "invalid {task_type} id {value:?}: expected {prefix}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)"
+        );
+    }
+    Ok(value.to_owned())
+}
+
 /// Validate the durable sprint identity shared by sprint rows and rule scopes.
 pub fn sprint_id(value: &str) -> Result<String> {
     if value.len() > 64
@@ -2608,6 +2644,65 @@ mod tests {
             vec!["Astra".to_owned(), "blender".to_owned()]
         );
         assert!(validate_model_names(&["has space".to_owned()]).is_err());
+    }
+
+    /// The board's own id shape per kind: generated hex and legacy words —
+    /// refused with the expected shape otherwise. The process test proves the
+    /// CLI refusal end to end; this pins the boundaries it does not enumerate
+    /// (case, the rejected separators, the length bound, the empty suffix).
+    /// Opaque ids already on boards (`t-mobile/opaque?#`) are a read path,
+    /// not this check: they arrive through the import, which writes by direct
+    /// SQL, and reads never validate.
+    #[test]
+    fn a_task_id_has_one_shape_per_kind() {
+        for (kind, good) in [
+            ("task", "t-1234abcd"),
+            ("task", "t-ui-2"),
+            ("epic", "e-1234abcd"),
+            ("epic", "e-ui"),
+            ("epic", "e-q4"),
+            ("story", "s-1234abcd"),
+            ("story", "s-parent"),
+            ("task", &format!("t-{}", "a".repeat(62))),
+        ] {
+            assert_eq!(task_id(good, kind).unwrap(), good, "{kind} {good} refused");
+        }
+        for (kind, bad) in [
+            ("task", "bogus id!"),
+            ("task", "t-has space"),
+            ("task", "t-has\ttab"),
+            ("task", "t-line\nbreak"),
+            ("task", "t-bang!"),
+            ("task", "t-dollar$"),
+            ("task", "t-a/b"),
+            ("task", "t-a?b"),
+            ("task", "t-UPPER"),
+            ("task", "t-"),
+            ("task", "t"),
+            ("task", ""),
+            ("task", "e-1234abcd"),
+            ("task", "s-1234abcd"),
+            ("task", "sp-1234abcd"),
+            ("task", "b-1"),
+            ("task", "rm"),
+            ("epic", "t-1234abcd"),
+            ("story", "t-1234abcd"),
+            ("task", &format!("t-{}", "a".repeat(63))),
+        ] {
+            let error = task_id(bad, kind).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid {kind} id {bad:?}: expected {}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+                    match kind {
+                        "epic" => "e-",
+                        "story" => "s-",
+                        _ => "t-",
+                    }
+                ),
+                "{kind} {bad} was accepted or refused with the wrong sentence"
+            );
+        }
     }
 
     /// One well-formed pair of tokens, which every refusal case breaks in

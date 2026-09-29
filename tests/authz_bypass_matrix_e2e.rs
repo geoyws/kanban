@@ -411,7 +411,7 @@ fn restore_requires_whole_board_read_for_every_rescue_only_board() {
     estate.id_b = board_id(&estate.board_b);
     estate.ok_json(
         &work_b,
-        &["tag", "add", "private", "--as", "seed", "--json"],
+        &["tag", "add", "geoyws/private", "--as", "seed", "--json"],
     );
     estate.ok_json(
         &work_b,
@@ -420,7 +420,7 @@ fn restore_requires_whole_board_read_for_every_rescue_only_board() {
             "add",
             "beta secret",
             "--tag",
-            "private",
+            "geoyws/private",
             "--as",
             "seed",
             "--json",
@@ -503,8 +503,14 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
     let estate = ManagedEstate::new("retag");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "alpha", "--as", "seed", "--json"]);
-    estate.ok_json(&work_a, &["tag", "add", "beta", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/alpha", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/beta", "--as", "seed", "--json"],
+    );
     let row = estate.ok_json(
         &work_a,
         &[
@@ -512,7 +518,7 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
             "add",
             "movable subject",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--as",
             "seed",
             "--json",
@@ -526,21 +532,29 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
         &[
             board_scope("read", &estate.id_a),
             board_scope("write", &estate.id_a),
-            tag_scope("read", &estate.id_a, "alpha"),
-            tag_scope("write", &estate.id_a, "alpha"),
+            tag_scope("read", &estate.id_a, "geoyws/alpha"),
+            tag_scope("write", &estate.id_a, "geoyws/alpha"),
         ],
     );
     estate.enforce("managed");
 
     estate.denied(
         &work_a,
-        &["task", "update", &row_id, "--tag", "beta", "--as", "actor"],
+        &[
+            "task",
+            "update",
+            &row_id,
+            "--tag",
+            "geoyws/beta",
+            "--as",
+            "actor",
+        ],
     );
 
     // The refused write did not partly apply: the row is still `alpha`, which
     // this caller can still see.
     let after = estate.ok_json(&work_a, &["task", "show", &row_id, "--json"]);
-    assert_eq!(after["tags"], serde_json::json!(["alpha"]));
+    assert_eq!(after["tags"], serde_json::json!(["geoyws/alpha"]));
 
     // Now the read half. Retag the row to `beta` through the direct estate —
     // the guard is not what is under test here — then desynchronise the index
@@ -548,7 +562,15 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
     estate.enforce("direct");
     estate.ok_json(
         &work_a,
-        &["task", "update", &row_id, "--tag", "beta", "--as", "seed"],
+        &[
+            "task",
+            "update",
+            &row_id,
+            "--tag",
+            "geoyws/beta",
+            "--as",
+            "seed",
+        ],
     );
     let board = Connection::open(&estate.board_a).unwrap();
     let stale = board
@@ -577,7 +599,7 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
-        "beta",
+        "geoyws/beta",
         "the row itself should really carry beta"
     );
     drop(board);
@@ -591,7 +613,7 @@ fn retagging_is_refused_and_a_stale_index_copy_does_not_reveal_the_row() {
         "a stale index copy revealed a row the caller may not see: {hits}"
     );
     assert!(
-        !hits.contains("beta"),
+        !hits.contains("geoyws/beta"),
         "the hidden row's tag leaked through the receipt: {hits}"
     );
 }
@@ -614,7 +636,10 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
     let estate = ManagedEstate::new("history");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     let hidden = estate.ok_json(
         &work_a,
         &[
@@ -638,7 +663,13 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
     estate.ok_json(
         &work_a,
         &[
-            "task", "update", &hidden_id, "--tag", "secret", "--as", "seed",
+            "task",
+            "update",
+            &hidden_id,
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
         ],
     );
 
@@ -655,7 +686,7 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
             "add",
             "formerly classified",
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -706,7 +737,8 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
     for event in &events {
         let frozen = &event["payload"]["_semanticV1"]["tags"];
         assert!(
-            frozen != &serde_json::json!(["secret"]) && !frozen.to_string().contains("secret"),
+            frozen != &serde_json::json!(["geoyws/secret"])
+                && !frozen.to_string().contains("geoyws/secret"),
             "an event's semantic snapshot named the tag the caller lacks: {event}"
         );
         assert!(
@@ -724,7 +756,10 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
     // Granting the tag makes exactly the withheld trail appear, which is what
     // proves the tag was the reason.
     estate.enforce("direct");
-    estate.grant("p-board-only", &[tag_scope("read", &estate.id_a, "secret")]);
+    estate.grant(
+        "p-board-only",
+        &[tag_scope("read", &estate.id_a, "geoyws/secret")],
+    );
     estate.enforce("managed");
     assert!(
         estate
@@ -762,7 +797,10 @@ fn history_does_not_reconstruct_a_row_or_name_the_tag_that_hid_it() {
 fn a_removed_tasks_trail_stays_tag_gated_on_every_tail() {
     let estate = ManagedEstate::new("acc14-removed-task-tails");
     let work_a = estate.work_a.clone();
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     estate.ok_json(
         &work_a,
         &[
@@ -798,7 +836,7 @@ fn a_removed_tasks_trail_stays_tag_gated_on_every_tail() {
             "update",
             "t-evttail",
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -886,7 +924,7 @@ fn a_removed_tasks_trail_stays_tag_gated_on_every_tail() {
     estate.enforce("direct");
     estate.grant(
         "p-tail-reader",
-        &[tag_scope("read", &estate.id_a, "secret")],
+        &[tag_scope("read", &estate.id_a, "geoyws/secret")],
     );
     estate.enforce("managed");
     let events = estate.ok(&work_a, &["events", "--json"]);
@@ -935,7 +973,10 @@ fn bulk_projections_do_not_hand_over_rows_the_row_surfaces_withhold() {
     let estate = ManagedEstate::new("projection");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     let subject = estate.ok_json(
         &work_a,
         &["task", "add", "deployed subject", "--as", "seed", "--json"],
@@ -975,7 +1016,7 @@ fn bulk_projections_do_not_hand_over_rows_the_row_surfaces_withhold() {
             "update",
             &subject_id,
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
         ],
@@ -1014,8 +1055,8 @@ fn bulk_projections_do_not_hand_over_rows_the_row_surfaces_withhold() {
     estate.grant(
         "p-board-only",
         &[
-            tag_scope("read", &estate.id_a, "secret"),
-            tag_scope("write", &estate.id_a, "secret"),
+            tag_scope("read", &estate.id_a, "geoyws/secret"),
+            tag_scope("write", &estate.id_a, "geoyws/secret"),
         ],
     );
     // `backup` is an ESTATE-wide command: it walks every registered board, so
@@ -1228,7 +1269,10 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     let estate = ManagedEstate::new("revocation");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "live", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/live", "--as", "seed", "--json"],
+    );
     let watched = estate.ok_json(
         &work_a,
         &[
@@ -1236,7 +1280,7 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
             "add",
             "watched row",
             "--tag",
-            "live",
+            "geoyws/live",
             "--as",
             "seed",
             "--json",
@@ -1249,17 +1293,19 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
         &[
             board_scope("read", &estate.id_a),
             board_scope("write", &estate.id_a),
-            tag_scope("read", &estate.id_a, "live"),
-            tag_scope("write", &estate.id_a, "live"),
+            tag_scope("read", &estate.id_a, "geoyws/live"),
+            tag_scope("write", &estate.id_a, "geoyws/live"),
         ],
     );
     estate.enforce("managed");
 
-    let mut stream = Stream::start(
-        estate
-            .command(&work_a)
-            .args(["watch", "--tag", "live", "--follow", "--json"]),
-    );
+    let mut stream = Stream::start(estate.command(&work_a).args([
+        "watch",
+        "--tag",
+        "geoyws/live",
+        "--follow",
+        "--json",
+    ]));
 
     // Before revocation: a note on the watched row is delivered as an event
     // envelope. The envelope carries the event's identity, not the note body,
@@ -1268,7 +1314,7 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     stream.wait_for_event(APPEAR);
 
     // Revoke, with the stream still open and the process untouched.
-    estate.revoke_atom("tag:live");
+    estate.revoke_atom("tag:geoyws/live");
 
     // The write stops too: without the tag the caller cannot attach to the
     // row at all, so the refused note never reaches the ledger.
@@ -1283,14 +1329,14 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     estate.grant(
         "p-watcher",
         &[
-            tag_scope("read", &estate.id_a, "live"),
-            tag_scope("write", &estate.id_a, "live"),
+            tag_scope("read", &estate.id_a, "geoyws/live"),
+            tag_scope("write", &estate.id_a, "geoyws/live"),
         ],
     );
     estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-revocation"));
-    estate.revoke_atom("tag:live");
+    estate.revoke_atom("tag:geoyws/live");
     // After revocation: the next event on the same row must not be delivered.
     stream.drain();
     thread::sleep(SETTLE);
@@ -1324,8 +1370,8 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     estate.grant(
         "p-watcher",
         &[
-            tag_scope("read", &estate.id_a, "live"),
-            tag_scope("write", &estate.id_a, "live"),
+            tag_scope("read", &estate.id_a, "geoyws/live"),
+            tag_scope("write", &estate.id_a, "geoyws/live"),
         ],
     );
     estate.enforce("managed");
@@ -1544,7 +1590,10 @@ fn search_scores_are_a_function_of_permitted_documents_only() {
     let estate = ManagedEstate::new("search-oracle");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
 
     // Board read plus board write: untagged rows, and nothing tagged.
     estate.bind_self(
@@ -1612,7 +1661,7 @@ fn search_scores_are_a_function_of_permitted_documents_only() {
             "--body",
             &denied_body,
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -1656,7 +1705,10 @@ fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
     let estate = ManagedEstate::new("search-oracle-idf");
     let work_a = estate.work_a.clone();
 
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     estate.bind_self(
         "p-oracle-idf",
         &[
@@ -1734,7 +1786,7 @@ fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
             "--body",
             &denied_body,
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -1747,7 +1799,7 @@ fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
         !after.to_string().contains("Vault note") && !after.to_string().contains("zzqxj9vlt"),
         "the denied row leaked into the receipt: {after}"
     );
-    for (anchor_id, name) in [(&anchor_a, "alpha"), (&anchor_b, "beta")] {
+    for (anchor_id, name) in [(&anchor_a, "geoyws/alpha"), (&anchor_b, "geoyws/beta")] {
         let hit_before = task_hit(&before, anchor_id, "before");
         let hit_after = task_hit(&after, anchor_id, "after");
         assert_eq!(
@@ -1824,7 +1876,7 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
     }
     let estate = ManagedEstate::new("acc14-task-attach");
     let work_a = estate.work_a.clone();
-    for tag in ["visible", "secret"] {
+    for tag in ["geoyws/visible", "geoyws/secret"] {
         estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
     }
     // Unmanaged first: where no guard can deny, an unknown id keeps its plain
@@ -1847,8 +1899,12 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
         );
     }
     for (id, title, tag) in [
-        ("t-attach-secret", "the attach secret task", "secret"),
-        ("t-attach-visible", "the attach visible task", "visible"),
+        ("s-attach-secret", "the attach secret task", "geoyws/secret"),
+        (
+            "s-attach-visible",
+            "the attach visible task",
+            "geoyws/visible",
+        ),
     ] {
         estate.ok_json(
             &work_a,
@@ -1863,8 +1919,8 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
         &[
             board_scope("read", &estate.id_a),
             board_scope("write", &estate.id_a),
-            tag_scope("read", &estate.id_a, "visible"),
-            tag_scope("write", &estate.id_a, "visible"),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
         ],
     );
     estate.enforce("managed");
@@ -1894,17 +1950,17 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
         );
     };
     assert_write_identical(
-        &note_on("t-attach-secret", "attach probe body"),
+        &note_on("s-attach-secret", "attach probe body"),
         &note_on("t-never-created", "attach probe body"),
         "note add",
     );
     assert_write_identical(
-        &raise_on_task("t-attach-secret"),
+        &raise_on_task("s-attach-secret"),
         &raise_on_task("t-never-created"),
         "attention raise --task",
     );
     assert_write_identical(
-        &sitrep_on_task("t-attach-secret"),
+        &sitrep_on_task("s-attach-secret"),
         &sitrep_on_task("t-never-created"),
         "sitrep post --task",
     );
@@ -1912,7 +1968,7 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
     // row the refused writes could have touched: each task-scoped ledger
     // holds only its birth event, and no attention row or sitrep was created.
     estate.grant("p-attach", &owner_of(&estate.id_a));
-    for task in ["t-attach-secret", "t-attach-visible"] {
+    for task in ["s-attach-secret", "s-attach-visible"] {
         let ledger = estate.ok(&work_a, &["events", "--task", task, "--all", "--json"]);
         let events: Vec<Value> = serde_json::from_str(&ledger).unwrap();
         assert_eq!(
@@ -1938,7 +1994,7 @@ fn note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id()
     // The control path works: as the owner the same caller attaches a note
     // to the secret task, so the denials above came from the tag and not a
     // broken write path.
-    estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
+    estate.ok(&work_a, &note_on("s-attach-secret", "control note"));
 }
 
 /// ACC-14, removed-task links (A23): removing a `secret` task keeps its
@@ -1965,7 +2021,10 @@ fn removed_task_links_stay_tag_gated_on_every_listing_search_and_lane() {
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
     let estate = ManagedEstate::new("acc14-removed-task-links");
     let work_a = estate.work_a.clone();
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     estate.ok_json(
         &work_a,
         &[
@@ -1975,7 +2034,7 @@ fn removed_task_links_stay_tag_gated_on_every_listing_search_and_lane() {
             "--id",
             "t-gone-secret",
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -2524,7 +2583,10 @@ fn removed_task_ids_are_never_reused_and_probe_like_live_denied_ids() {
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
     let estate = ManagedEstate::new("acc14-id-reuse");
     let work_a = estate.work_a.clone();
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     for (id, title) in [
         ("t-sec", "the reuse secret task"),
         ("t-sec-live", "the live secret task"),
@@ -2532,7 +2594,16 @@ fn removed_task_ids_are_never_reused_and_probe_like_live_denied_ids() {
         estate.ok_json(
             &work_a,
             &[
-                "task", "add", title, "--id", id, "--tag", "secret", "--as", "seed", "--json",
+                "task",
+                "add",
+                title,
+                "--id",
+                id,
+                "--tag",
+                "geoyws/secret",
+                "--as",
+                "seed",
+                "--json",
             ],
         );
     }
@@ -2628,8 +2699,8 @@ fn removed_task_ids_are_never_reused_and_probe_like_live_denied_ids() {
     estate.grant(
         "p-id-reuse",
         &[
-            tag_scope("read", &estate.id_a, "secret"),
-            tag_scope("write", &estate.id_a, "secret"),
+            tag_scope("read", &estate.id_a, "geoyws/secret"),
+            tag_scope("write", &estate.id_a, "geoyws/secret"),
         ],
     );
     let owner = estate.ok(&work_a, &["sitrep", "list", "--task", "t-sec", "--json"]);
@@ -2714,7 +2785,10 @@ fn reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny() {
 fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
     let estate = ManagedEstate::new("acc14-accept-orphan");
     let work_a = estate.work_a.clone();
-    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
     estate.ok_json(
         &work_a,
         &[
@@ -2724,7 +2798,7 @@ fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
             "--id",
             "t-orphan-secret",
             "--tag",
-            "secret",
+            "geoyws/secret",
             "--as",
             "seed",
             "--json",
@@ -2825,8 +2899,8 @@ fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
     estate.grant(
         "p-orphan",
         &[
-            tag_scope("read", &estate.id_a, "secret"),
-            tag_scope("write", &estate.id_a, "secret"),
+            tag_scope("read", &estate.id_a, "geoyws/secret"),
+            tag_scope("write", &estate.id_a, "geoyws/secret"),
         ],
     );
     let accepted = estate.ok_json(

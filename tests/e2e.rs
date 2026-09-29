@@ -1034,7 +1034,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
     );
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "pubsub", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/pubsub", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
@@ -1054,7 +1054,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             "--parent",
             "e-sub",
             "--tag",
-            "pubsub",
+            "geoyws/pubsub",
             "--as",
             "geoyws",
             "--json",
@@ -1079,7 +1079,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             "--current-status",
             "in_progress",
             "--tag",
-            "pubsub",
+            "geoyws/pubsub",
             "--consumer",
             "codex.queue",
             "--action",
@@ -1597,7 +1597,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
         &[
             "tag",
             "add",
-            "handoff",
+            "geoyws/handoff",
             "--description",
             "handoff lifecycle",
             "--as",
@@ -1614,7 +1614,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
             "--as",
             "geoyws",
             "--tag",
-            "handoff",
+            "geoyws/handoff",
             "--json",
         ],
     );
@@ -1630,7 +1630,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
                 "--id",
                 &task_id,
                 "--tag",
-                "handoff",
+                "geoyws/handoff",
                 "--json",
             ],
         );
@@ -1686,7 +1686,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|tag| tag == "handoff")),
+                    .any(|tag| tag == "geoyws/handoff")),
             "task-scoped rules were lost when no claim was minted"
         );
         assert_eq!(
@@ -1754,7 +1754,14 @@ fn sprint_search_is_board_scoped_fresh_rebuildable_and_exactly_cited() {
 
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "sp-deadbeef", "--as", "operator", "--json"],
+        &[
+            "tag",
+            "add",
+            "geoyws/sp-deadbeef",
+            "--as",
+            "operator",
+            "--json",
+        ],
     );
     fixture.ok_json(
         &fixture.main,
@@ -1765,7 +1772,7 @@ fn sprint_search_is_board_scoped_fresh_rebuildable_and_exactly_cited() {
             "--id",
             "t-collision",
             "--tag",
-            "sp-deadbeef",
+            "geoyws/sp-deadbeef",
             "--as",
             "operator",
             "--json",
@@ -2052,11 +2059,11 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-A", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "release", "--as", "tester", "--json"],
+        &["tag", "add", "geoyws/release", "--as", "tester", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "ops", "--as", "tester", "--json"],
+        &["tag", "add", "geoyws/ops", "--as", "tester", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
@@ -2069,9 +2076,9 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "--body",
             "Install the optimized binary and restart the live service safely.",
             "--tag",
-            "release",
+            "geoyws/release",
             "--tag",
-            "ops",
+            "geoyws/ops",
             "--as",
             "tester",
             "--json",
@@ -2127,9 +2134,9 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "search",
             "deploy the live build",
             "--tag",
-            "release",
+            "geoyws/release",
             "--tag",
-            "ops",
+            "geoyws/ops",
             "--max-chars",
             "1000",
             "--json",
@@ -2159,7 +2166,7 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "add",
             "Canary feedback tier rule.",
             "--tag",
-            "release",
+            "geoyws/release",
             "--as",
             "tester",
             "--json",
@@ -2173,7 +2180,7 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "--source",
             "rule",
             "--tag",
-            "release",
+            "geoyws/release",
             "--json",
         ],
     );
@@ -2183,7 +2190,10 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
         rule_search["results"][0]["citation"],
         format!("kanban://rules/rule/{}", rule["id"].as_str().unwrap())
     );
-    assert_eq!(rule_search["results"][0]["tags"], json!(["ALL", "release"]));
+    assert_eq!(
+        rule_search["results"][0]["tags"],
+        json!(["ALL", "geoyws/release"])
+    );
 
     let rebuilt = fixture.ok_json(
         &fixture.main,
@@ -2348,7 +2358,14 @@ fn compiled_binary_excludes_tag_only_canonical_id_collisions() {
     fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-C", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "sub-deadbeef", "--as", "tester", "--json"],
+        &[
+            "tag",
+            "add",
+            "geoyws/sub-deadbeef",
+            "--as",
+            "tester",
+            "--json",
+        ],
     );
     fixture.ok_json(
         &fixture.main,
@@ -2361,7 +2378,7 @@ fn compiled_binary_excludes_tag_only_canonical_id_collisions() {
             "--body",
             "No literal match lives here.",
             "--tag",
-            "sub-deadbeef",
+            "geoyws/sub-deadbeef",
             "--as",
             "tester",
             "--json",
@@ -2411,7 +2428,7 @@ fn compiled_binary_keeps_linked_deployment_search_documents_after_task_mutations
     );
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "release", "--as", "tester", "--json"],
+        &["tag", "add", "geoyws/release", "--as", "tester", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
@@ -2503,7 +2520,7 @@ fn compiled_binary_keeps_linked_deployment_search_documents_after_task_mutations
             "update",
             "t-deploy-search",
             "--tag",
-            "release",
+            "geoyws/release",
             "--as",
             "tester",
             "--json",
@@ -3358,14 +3375,14 @@ fn compiled_binary_enforces_pull_routing_task_graph_and_story_gates() {
 fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
     let fixture = Fixture::new("claim-candidates");
     fixture.ok_json(&fixture.main, &["init", "--name", "CANDIDATES", "--json"]);
-    for tag in ["claims", "other"] {
+    for tag in ["geoyws/claims", "geoyws/other"] {
         fixture.ok_json(
             &fixture.main,
             &["tag", "add", tag, "--as", "geoyws", "--json"],
         );
     }
     let add = |id: &str, extra: &[&str]| {
-        let mut args = vec!["task", "add", id, "--id", id, "--tag", "claims"];
+        let mut args = vec!["task", "add", id, "--id", id, "--tag", "geoyws/claims"];
         args.extend_from_slice(extra);
         args.push("--json");
         fixture.ok_json(&fixture.main, &args)
@@ -3402,7 +3419,7 @@ fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
             "--id",
             "t-ready-other-tag",
             "--tag",
-            "other",
+            "geoyws/other",
             "--priority",
             "2",
             "--json",
@@ -3438,7 +3455,7 @@ fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
             "--as",
             "worker",
             "--tag",
-            "claims",
+            "geoyws/claims",
             "--limit",
             "10",
             "--json",
@@ -3447,7 +3464,7 @@ fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
     assert_eq!(candidates.as_array().unwrap().len(), 2);
     assert_eq!(candidates[0]["id"], "t-ready-first");
     assert_eq!(candidates[1]["id"], "t-base");
-    assert_eq!(candidates[0]["tags"], json!(["claims"]));
+    assert_eq!(candidates[0]["tags"], json!(["geoyws/claims"]));
     assert_eq!(candidates[0]["priority"], 1);
     assert_eq!(candidates[0]["driverOnly"], false);
     assert!(candidates[0].get("leaseToken").is_none());
@@ -5704,7 +5721,7 @@ impl SealedEstate {
     fn new(label: &str) -> Self {
         let fixture = Fixture::new(label);
         fixture.ok_json(&fixture.main, &["init", "--name", "SEALED", "--json"]);
-        fixture.ok_json(&fixture.main, &["tag", "add", "infra", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", "geoyws/infra", "--json"]);
         for id in ["t-read-1", "t-read-2"] {
             fixture.ok_json(
                 &fixture.main,
@@ -5715,7 +5732,7 @@ impl SealedEstate {
                     "--id",
                     id,
                     "--tag",
-                    "infra",
+                    "geoyws/infra",
                     "--json",
                 ],
             );
@@ -7372,18 +7389,19 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
     );
 
     // Sub-aliases apply only where the second positional is a subcommand. A
-    // task genuinely called `rm` must not be rewritten into a removal.
+    // task id can never collide with one: ids carry their kind prefix
+    // (`t-` here), so the second positional of `n` still reads as the row.
     kb_json(
         &fixture.main,
-        &["t", "new", "edge case", "--id", "rm", "--json"],
+        &["t", "new", "edge case", "--id", "t-rm", "--json"],
     );
     kb_json(
         &fixture.main,
-        &["n", "rm", "note on task rm", "--as", "geoyws", "--json"],
+        &["n", "t-rm", "note on task t-rm", "--as", "geoyws", "--json"],
     );
     assert_eq!(
-        kb_json(&fixture.main, &["t", "cat", "rm", "--json"])["id"],
-        "rm"
+        kb_json(&fixture.main, &["t", "cat", "t-rm", "--json"])["id"],
+        "t-rm"
     );
 
     // Aliases are an exact-match table, so an unlisted one stays unknown
@@ -8501,7 +8519,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
                 "add",
                 "symbolic",
                 "--id",
-                &format!("t-{symbol}"),
+                &format!("t-{}", symbol.to_lowercase()),
                 "--priority",
                 symbol,
                 "--json",
@@ -9222,7 +9240,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             "add",
             "in the second snapshot",
             "--id",
-            "b-1",
+            "t-b1",
             "--json",
         ],
     );
@@ -9239,7 +9257,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             "add",
             "after the second snapshot",
             "--id",
-            "b-2",
+            "t-b2",
             "--json",
         ],
     );
@@ -9309,7 +9327,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             &[
                 "task",
                 "show",
-                "b-2",
+                "t-b2",
                 "--db",
                 copy.to_str().unwrap(),
                 "--json"
@@ -9324,7 +9342,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             &[
                 "task",
                 "show",
-                "b-1",
+                "t-b1",
                 "--db",
                 bee_board.to_str().unwrap(),
                 "--json",
@@ -9669,7 +9687,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         &[
             "tag",
             "add",
-            "scheduler",
+            "geoyws/scheduler",
             "--description",
             "queue selection",
             "--as",
@@ -9691,7 +9709,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
             "--priority",
             "1",
             "--tag",
-            "scheduler",
+            "geoyws/scheduler",
             "--json",
         ],
     );
@@ -9813,7 +9831,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         .iter()
         .find(|task| task["id"] == "t-first")
         .unwrap();
-    assert_eq!(dependency["tags"], json!(["scheduler"]));
+    assert_eq!(dependency["tags"], json!(["geoyws/scheduler"]));
 }
 
 #[test]
@@ -11015,10 +11033,10 @@ fn compiled_binary_events_after_before_archive_and_schema_match() {
     fixture.ok_json(&fixture.main, &["init", "--name", "EVENTS", "--json"]);
 
     for (id, title) in [
-        ("e-1", "first event"),
-        ("e-2", "second event"),
-        ("e-3", "third event"),
-        ("e-4", "fourth event"),
+        ("t-1", "first event"),
+        ("t-2", "second event"),
+        ("t-3", "third event"),
+        ("t-4", "fourth event"),
     ] {
         fixture.ok_json(&fixture.main, &["task", "add", title, "--id", id, "--json"]);
     }
@@ -11780,7 +11798,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
         &fixture.main,
         &["init", "--name", "WATCH-SEMANTIC-ENVELOPE", "--json"],
     );
-    for tag in ["alpha", "zeta"] {
+    for tag in ["geoyws/alpha", "geoyws/zeta"] {
         fixture.ok_json(
             &fixture.main,
             &["tag", "add", tag, "--as", "geoyws", "--json"],
@@ -11846,9 +11864,9 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             "--depends-on",
             "t-base",
             "--tag",
-            "zeta",
+            "geoyws/zeta",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--as",
             "geoyws",
             "--json",
@@ -11933,7 +11951,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
         );
         assert_eq!(event["actor"], "geoyws", "{event}");
         assert_eq!(event["subject"], json!({"type":"task","id":"t-child"}));
-        assert_eq!(event["tags"], json!(["alpha", "zeta"]));
+        assert_eq!(event["tags"], json!(["geoyws/alpha", "geoyws/zeta"]));
         assert!(event["payload"].get("_semanticV1").is_none(), "{event}");
         assert!(serde_json::to_vec(&event["metadata"]).unwrap().len() <= 16_384);
         let relations = event["relations"].as_array().unwrap();
@@ -12003,7 +12021,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
         &fixture.main,
         &["init", "--name", "WATCH-SEMANTIC-FILTERS", "--json"],
     );
-    for tag in ["alpha", "zeta"] {
+    for tag in ["geoyws/alpha", "geoyws/zeta"] {
         fixture.ok_json(
             &fixture.main,
             &["tag", "add", tag, "--as", "geoyws", "--json"],
@@ -12082,9 +12100,9 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--depends-on",
             "t-base",
             "--tag",
-            "zeta",
+            "geoyws/zeta",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--as",
             "geoyws",
             "--json",
@@ -12148,9 +12166,9 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--current-status",
             "done",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--tag",
-            "zeta",
+            "geoyws/zeta",
             "--cursor",
             "0",
             "--limit",
@@ -12182,7 +12200,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
     );
     assert_eq!(cursor_json["priorStatuses"], json!(["todo"]));
     assert_eq!(cursor_json["currentStatuses"], json!(["done"]));
-    assert_eq!(cursor_json["tags"], json!(["alpha", "zeta"]));
+    assert_eq!(cursor_json["tags"], json!(["geoyws/alpha", "geoyws/zeta"]));
 
     fixture.ok_json(
         &fixture.main,
@@ -12203,9 +12221,9 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--task",
             "t-child",
             "--tag",
-            "zeta",
+            "geoyws/zeta",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--current-status",
             "done",
             "--prior-status",
@@ -12257,7 +12275,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--current-status",
             "done",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--cursor",
             &cursor,
             "--json",
@@ -14589,7 +14607,7 @@ fn a_batched_read_is_byte_identical_to_the_same_read_on_its_own() {
     fixture.ok_json(&fixture.main, &["init", "--name", "BATCHID", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "driver", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/driver", "--as", "geoyws", "--json"],
     );
     let mut task_ids = Vec::new();
     for index in 0..3 {
@@ -14603,7 +14621,7 @@ fn a_batched_read_is_byte_identical_to_the_same_read_on_its_own() {
                 "--id",
                 &id,
                 "--tag",
-                "driver",
+                "geoyws/driver",
                 "--lane",
                 "driver",
                 "--json",
@@ -17102,7 +17120,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         &fixture.main,
         &["task", "add", "Work", "--id", "t-1", "--json"],
     );
-    for tag in ["infra", "ui"] {
+    for tag in ["geoyws/infra", "geoyws/ui"] {
         fixture.ok_json(
             &fixture.main,
             &["tag", "add", tag, "--as", "geoyws", "--json"],
@@ -17122,13 +17140,13 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "--task",
             "t-1",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
     assert_eq!(blocking["status"], "open");
     assert_eq!(blocking["taskID"], "t-1");
-    assert_eq!(blocking["tags"], json!(["infra"]));
+    assert_eq!(blocking["tags"], json!(["geoyws/infra"]));
     let approval = fixture.ok_json(
         &fixture.main,
         &[
@@ -17154,13 +17172,13 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "--as",
             "claude/driver-2",
             "--tag",
-            "ui",
+            "geoyws/ui",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
-    assert_eq!(retagged["tags"], json!(["infra", "ui"]));
+    assert_eq!(retagged["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     let corrected = fixture.ok_json(
         &fixture.main,
         &[
@@ -17178,7 +17196,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         corrected["body"],
         "The manual is authoritative; confirm the migration timing."
     );
-    assert_eq!(corrected["tags"], json!(["infra", "ui"]));
+    assert_eq!(corrected["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     let updates = fixture.ok_json(
         &fixture.main,
         &["events", "--kind", "attention_updated", "--json"],
@@ -17190,13 +17208,16 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     );
     assert_eq!(
         updates[0]["payload"]["previousTags"],
-        json!(["infra", "ui"])
+        json!(["geoyws/infra", "geoyws/ui"])
     );
     assert_eq!(updates[1]["payload"]["changed"], json!(["tags"]));
-    assert_eq!(updates[1]["payload"]["previousTags"], json!(["infra"]));
+    assert_eq!(
+        updates[1]["payload"]["previousTags"],
+        json!(["geoyws/infra"])
+    );
     let infra = fixture.ok_json(
         &fixture.main,
-        &["attention", "list", "--tag", "infra", "--json"],
+        &["attention", "list", "--tag", "geoyws/infra", "--json"],
     );
     assert_eq!(infra.as_array().unwrap().len(), 1);
     assert_eq!(infra[0]["id"], blocking["id"]);
@@ -17538,7 +17559,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .iter()
         .find(|item| item["id"] == blocking["id"])
         .unwrap();
-    assert_eq!(survivor["tags"], json!(["infra", "ui"]));
+    assert_eq!(survivor["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
         36
@@ -23821,7 +23842,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
         &[
             "tag",
             "add",
-            "infra",
+            "geoyws/infra",
             "--description",
             "hosts, containers, deploys",
             "--as",
@@ -23829,7 +23850,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "--json",
         ],
     );
-    assert_eq!(registered["name"], "infra");
+    assert_eq!(registered["name"], "geoyws/infra");
     assert_eq!(registered["description"], "hosts, containers, deploys");
     assert_eq!(registered["createdBy"], "geoyws");
     assert_eq!(registered["uses"], 0);
@@ -23837,7 +23858,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     // Registering the same concept twice is the collision the file exists to
     // prevent, so it is refused rather than treated as an upsert -- a silent
     // second add would quietly discard the first one's description.
-    let again = fixture.run(&fixture.main, &["tag", "add", "infra", "--json"]);
+    let again = fixture.run(&fixture.main, &["tag", "add", "geoyws/infra", "--json"]);
     assert!(!again.status.success(), "a tag was registered twice");
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("already in the master file"),
@@ -23855,8 +23876,8 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
         String::from_utf8_lossy(&shouted.stderr)
     );
 
-    fixture.ok_json(&fixture.main, &["tag", "add", "queuer", "--json"]);
-    fixture.ok_json(&fixture.main, &["tag", "add", "askie", "--json"]);
+    fixture.ok_json(&fixture.main, &["tag", "add", "geoyws/queuer", "--json"]);
+    fixture.ok_json(&fixture.main, &["tag", "add", "geoyws/askie", "--json"]);
 
     // Every row type carries tags, because the axis is "which subsystem" and a
     // plan belongs to one as much as the task it produces does.
@@ -23873,9 +23894,9 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "--status",
             "draft",
             "--tag",
-            "queuer",
+            "geoyws/queuer",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -23890,7 +23911,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "--parent",
             "e-plan",
             "--tag",
-            "queuer",
+            "geoyws/queuer",
             "--json",
         ],
     );
@@ -23903,7 +23924,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "--id",
             "t-chat",
             "--tag",
-            "askie",
+            "geoyws/askie",
             "--json",
         ],
     );
@@ -23911,7 +23932,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     let plan = fixture.ok_json(&fixture.main, &["task", "show", "e-plan", "--json"]);
     assert_eq!(
         plan["tags"],
-        json!(["infra", "queuer"]),
+        json!(["geoyws/infra", "geoyws/queuer"]),
         "a draft epic must carry its tags, and read back sorted"
     );
 
@@ -23921,17 +23942,24 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     let typo = fixture.run(
         &fixture.main,
         &[
-            "task", "update", "t-chat", "--tag", "askiee", "--as", "geoyws", "--json",
+            "task",
+            "update",
+            "t-chat",
+            "--tag",
+            "geoyws/askiee",
+            "--as",
+            "geoyws",
+            "--json",
         ],
     );
     assert!(!typo.status.success(), "an unregistered tag was attached");
     let error = String::from_utf8_lossy(&typo.stderr).to_string();
     assert!(error.contains("master file"), "{error}");
-    assert!(error.contains("did you mean askie?"), "{error}");
-    assert!(error.contains("tag add askiee"), "{error}");
+    assert!(error.contains("did you mean geoyws/askie?"), "{error}");
+    assert!(error.contains("tag add geoyws/askiee"), "{error}");
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-chat", "--json"])["tags"],
-        json!(["askie"]),
+        json!(["geoyws/askie"]),
         "a refused update must leave the existing tags alone"
     );
 
@@ -23939,7 +23967,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     // "is anyone using this".
     let queuer = fixture.ok_json(
         &fixture.main,
-        &["task", "list", "--tag", "queuer", "--json"],
+        &["task", "list", "--tag", "geoyws/queuer", "--json"],
     );
     let ids = queuer
         .as_array()
@@ -23962,17 +23990,27 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
         .collect::<Vec<_>>();
     assert_eq!(
         uses,
-        vec![("askie", 1), ("infra", 1), ("queuer", 2)],
+        vec![
+            ("geoyws/askie", 1),
+            ("geoyws/infra", 1),
+            ("geoyws/queuer", 2)
+        ],
         "tag list must report real use counts, sorted by name"
     );
 
     // Filtering by a tag nobody registered is refused rather than answered with
     // an empty list: an empty list reads as "nothing is tagged that", which is
     // exactly how a typo becomes a wrong answer somebody acts on.
-    let ghost = fixture.run(&fixture.main, &["task", "list", "--tag", "infr", "--json"]);
+    let ghost = fixture.run(
+        &fixture.main,
+        &["task", "list", "--tag", "geoyws/infr", "--json"],
+    );
     assert!(!ghost.status.success(), "an unregistered filter answered");
     let ghost_error = String::from_utf8_lossy(&ghost.stderr).to_string();
-    assert!(ghost_error.contains("did you mean infra?"), "{ghost_error}");
+    assert!(
+        ghost_error.contains("did you mean geoyws/infra?"),
+        "{ghost_error}"
+    );
     assert!(ghost_error.contains("read like an answer"), "{ghost_error}");
 
     // --tag replaces wholesale rather than appending, and --clear-tags is the
@@ -23984,7 +24022,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "update",
             "e-plan",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--clear-tags",
             "--as",
             "geoyws",
@@ -24004,19 +24042,26 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     let replaced = fixture.ok_json(
         &fixture.main,
         &[
-            "task", "update", "e-plan", "--tag", "infra", "--as", "geoyws", "--json",
+            "task",
+            "update",
+            "e-plan",
+            "--tag",
+            "geoyws/infra",
+            "--as",
+            "geoyws",
+            "--json",
         ],
     );
     assert_eq!(
         replaced["tags"],
-        json!(["infra"]),
+        json!(["geoyws/infra"]),
         "--tag must replace, not append"
     );
 
     // Retiring a tag that rows still carry would strip them silently, so it is
     // refused and says how many -- the operator gets the number they need to
     // decide, not just a no.
-    let in_use = fixture.run(&fixture.main, &["tag", "remove", "queuer", "--json"]);
+    let in_use = fixture.run(&fixture.main, &["tag", "remove", "geoyws/queuer", "--json"]);
     assert!(!in_use.status.success(), "an in-use tag was retired");
     let in_use_error = String::from_utf8_lossy(&in_use.stderr).to_string();
     assert!(in_use_error.contains("carried by 1 row"), "{in_use_error}");
@@ -24025,7 +24070,13 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "tag", "remove", "queuer", "--force", "--as", "geoyws", "--json",
+            "tag",
+            "remove",
+            "geoyws/queuer",
+            "--force",
+            "--as",
+            "geoyws",
+            "--json",
         ],
     );
     assert_eq!(
@@ -24052,7 +24103,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
         .iter()
         .find(|event| event["kind"] == "tag_removed")
         .expect("the removal must be recorded");
-    assert_eq!(removal["payload"]["tag"], "queuer");
+    assert_eq!(removal["payload"]["tag"], "geoyws/queuer");
     assert_eq!(
         removal["payload"]["strippedFrom"], 1,
         "the trail must say how many rows lost the tag"
@@ -24072,6 +24123,396 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     );
 }
 
+/// CLI-01 — `tag add` refuses a bare name with the board's own namespaced
+/// form, on every mapped estate, and writes nothing.
+#[test]
+fn tag_add_refuses_a_bare_name_with_the_boards_mapped_estate() {
+    for (board, estate) in [
+        ("prjx", "ifca"),
+        ("kanban", "geoyws"),
+        ("memberx", "unum"),
+        ("unum-ledger", "unum"),
+    ] {
+        let fixture = Fixture::new("tag-namespace-refusal");
+        fixture.ok_json(&fixture.main, &["init", "--name", board, "--json"]);
+        let refused = fixture.run(&fixture.main, &["tag", "add", "assistant", "--json"]);
+        assert!(
+            !refused.status.success(),
+            "a bare tag was registered on {board}"
+        );
+        assert_eq!(
+            refusal_object(&refused),
+            format!(
+                "tag assistant is not namespaced: use {estate}/assistant (estates: ifca, unum, geoyws)"
+            ),
+            "wrong repair on {board}"
+        );
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["tag", "list", "--json"]),
+            json!([]),
+            "a refused registration must leave the master file empty on {board}"
+        );
+        let kinds = fixture
+            .ok_json(&fixture.main, &["events", "--limit", "50", "--json"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !kinds.contains(&"tag_added".to_owned()),
+            "a refused registration must append no event on {board}: {kinds:?}"
+        );
+    }
+    // A7 — the shape and estate checks run before the namespace check, with
+    // their own baseline sentences, on the mapped board too.
+    let shaped = Fixture::new("tag-namespace-shape-first");
+    shaped.ok_json(&shaped.main, &["init", "--name", "prjx", "--json"]);
+    for (name, sentence) in [
+        (
+            "Assistant",
+            "tag Assistant is not a usable name: lowercase letters, digits and inner \
+             hyphens only, so one concept cannot arrive under two spellings",
+        ),
+        (
+            "ifac/assistant",
+            "tag ifac/assistant names estate ifac, which is not registered: a namespaced tag \
+             is filed under one of ifca, unum, geoyws, so one subsystem cannot arrive under \
+             two owners",
+        ),
+    ] {
+        let refused = shaped.run(&shaped.main, &["tag", "add", name, "--json"]);
+        assert!(!refused.status.success(), "a malformed tag was registered");
+        let message = refusal_object(&refused);
+        assert_eq!(message, sentence, "wrong baseline sentence for {name}");
+        assert!(
+            !message.contains("not namespaced"),
+            "the shape check must not speak of namespaces: {message}"
+        );
+    }
+    assert_eq!(
+        shaped.ok_json(&shaped.main, &["tag", "list", "--json"]),
+        json!([]),
+        "a refused registration must leave the master file empty"
+    );
+}
+
+/// CLI-01 — a batched bare registration is refused against the batch's
+/// board, not the cwd's. An item argv carries no board selector
+/// (`plan_transact` refuses one), so resolving the board from the workspace
+/// would name the wrong estate — or bail on a retired cwd board that has
+/// nothing to do with the batch.
+#[test]
+fn tag_add_in_transact_refuses_against_the_batch_board_not_the_cwd() {
+    let fixture = Fixture::new("tag-namespace-transact");
+    fixture.ok_json(&fixture.main, &["init", "--name", "prjx", "--json"]);
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "kanban", "--json"]);
+    let items = serde_json::to_string(&[serde_json::json!({
+        "name": "tag_add",
+        "arguments": {"name": "assistant"},
+    })])
+    .unwrap();
+    // From the geoyws board's own checkout, against the ifca board.
+    let batch = fixture.run(
+        &fixture.worktree,
+        &["transact", "--project", "prjx", "--items", &items, "--json"],
+    );
+    assert!(!batch.status.success(), "a batched bare tag was registered");
+    let stdout = String::from_utf8_lossy(&batch.stdout).to_string();
+    assert!(
+        stdout.contains("not namespaced: use ifca/assistant"),
+        "the refusal named the wrong board's estate: {stdout}"
+    );
+    assert!(
+        !stdout.contains("geoyws/assistant"),
+        "the refusal named the cwd board's estate: {stdout}"
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["tag", "list", "--project", "prjx", "--json"]
+        ),
+        json!([]),
+        "a refused batch must land nothing on the batch board"
+    );
+}
+
+/// CLI-03 — an unmapped board is refused with the estate list and no single
+/// suggestion, because there is no board truth to build one from.
+#[test]
+fn tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only() {
+    let fixture = Fixture::new("tag-namespace-unmapped");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SCRATCH", "--json"]);
+    let refused = fixture.run(&fixture.main, &["tag", "add", "assistant", "--json"]);
+    assert!(!refused.status.success(), "a bare tag was registered");
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("(estates: ifca, unum, geoyws)"),
+        "the refusal must carry the estate list: {message}"
+    );
+    for estate in ["ifca", "unum", "geoyws"] {
+        assert!(
+            !message.contains(&format!("use {estate}/")),
+            "an unmapped board must suggest no single form: {message}"
+        );
+    }
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["tag", "list", "--json"]),
+        json!([]),
+        "a refused registration must leave the master file empty"
+    );
+}
+
+/// CLI-04 — a namespaced name registers exactly as before: it lists, and a
+/// row carries it.
+#[test]
+fn tag_add_registers_a_namespaced_tag() {
+    let fixture = Fixture::new("tag-namespace-success");
+    fixture.ok_json(&fixture.main, &["init", "--name", "prjx", "--json"]);
+    let registered = fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "ifca/assistant", "--as", "geoyws", "--json"],
+    );
+    assert_eq!(registered["name"], "ifca/assistant");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "ifca/assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-chat", "--json"])["tags"],
+        json!(["ifca/assistant"]),
+        "a registered namespaced tag must attach and read back"
+    );
+}
+
+/// CLI-05 — the `--tag` filters refuse unknown names exactly as today: the
+/// master-file sentence on the two listings, the registry sentence on rules,
+/// and never the `tag add` namespace sentence, which registers rather than
+/// reads.
+#[test]
+fn tag_filters_refuse_unknown_names_exactly_as_before() {
+    let fixture = Fixture::new("tag-filter-refusal");
+    fixture.ok_json(&fixture.main, &["init", "--name", "FILTERS", "--json"]);
+    let listed = fixture.run(&fixture.main, &["task", "list", "--tag", "nope", "--json"]);
+    assert!(!listed.status.success(), "an unknown tag filtered");
+    let message = refusal_object(&listed);
+    assert!(
+        message.contains("is not in this board's master file"),
+        "{message}"
+    );
+    assert!(message.contains("filter to nothing"), "{message}");
+    assert!(!message.contains("not namespaced"), "{message}");
+    let attention = fixture.run(
+        &fixture.main,
+        &["attention", "list", "--tag", "nope", "--json"],
+    );
+    assert!(!attention.status.success(), "an unknown tag filtered");
+    let message = refusal_object(&attention);
+    assert!(
+        message.contains("is not in this board's master file"),
+        "{message}"
+    );
+    assert!(message.contains("filter to nothing"), "{message}");
+    assert!(!message.contains("not namespaced"), "{message}");
+    let rule = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "A shared rule.",
+            "--tag",
+            "nope",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert!(!rule.status.success(), "an unknown rule tag was accepted");
+    let message = refusal_object(&rule);
+    assert!(
+        message.contains("is not registered on any active board"),
+        "{message}"
+    );
+    assert!(!message.contains("not namespaced"), "{message}");
+}
+
+/// CLI-06 — `task add --id` validates the id against the board's own id
+/// shape for the kind being created and refuses anything else with the
+/// expected shape, writing nothing. A well-formed explicit id keeps working
+/// (the watcher's idempotent `t-<8 hex>`), and a duplicate is still refused
+/// by the primary key as before.
+#[test]
+fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
+    let fixture = Fixture::new("task-id-shape");
+    fixture.ok_json(&fixture.main, &["init", "--name", "IDSHAPE", "--json"]);
+    // `bogus id!`: whitespace and `!` are outside the shape, and the refusal
+    // names the shape the id should have had.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "bogus id!",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "a spaced id was filed");
+    assert_eq!(
+        refusal_object(&refused),
+        "invalid task id \"bogus id!\": expected t-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "wrong repair for a misshaped id"
+    );
+    // A wrong-kind prefix: an epic id filed as a task, and a task id filed
+    // as an epic. Both name the kind's own prefix.
+    let epic_as_task = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "e-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !epic_as_task.status.success(),
+        "an epic id was filed as a task"
+    );
+    assert_eq!(
+        refusal_object(&epic_as_task),
+        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "wrong repair for a wrong-kind prefix"
+    );
+    let task_as_epic = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "plan",
+            "--id",
+            "t-1234abcd",
+            "--type",
+            "epic",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !task_as_epic.status.success(),
+        "a task id was filed as an epic"
+    );
+    assert_eq!(
+        refusal_object(&task_as_epic),
+        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "wrong repair for a wrong-kind prefix"
+    );
+    // Every refusal above wrote nothing: the board is still empty, and no
+    // refusal appended an event — the trail still holds only the init row.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused id must leave the board empty"
+    );
+    let kinds = fixture
+        .ok_json(&fixture.main, &["events", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["board_initialized"],
+        "a refusal appended an event: {kinds:?}"
+    );
+    // The same id offered as a `transact` `task_add` item rolls the batch
+    // back with the same sentence: the check lives in the store, which every
+    // surface reaches.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            serde_json::json!({ "name": "task_add", "arguments": {"title": "title", "id": "bogus id!"} }),
+        ],
+    );
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    assert!(
+        envelope["results"][0]["error"].as_str().is_some_and(
+            |error| error.contains("invalid task id \"bogus id!\": expected t-<suffix>")
+        ),
+        "{envelope}"
+    );
+    // A well-formed explicit id is accepted: the deterministic `t-<8 hex>`
+    // a watcher derives to make filing idempotent.
+    let created = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "t-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert_eq!(created["id"], "t-1234abcd");
+    // The duplicate is still refused as before, by the primary key.
+    let duplicate = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "t-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !duplicate.status.success(),
+        "a duplicate id was filed twice"
+    );
+    assert!(
+        refusal_object(&duplicate).contains("task t-1234abcd already exists"),
+        "the duplicate must still be refused as before: {}",
+        String::from_utf8_lossy(&duplicate.stdout)
+    );
+}
+
 #[test]
 fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
     // A tag is carried by rows in three places and scoped by rules in a
@@ -24086,7 +24527,10 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
         &["init", "--name", "OTHERBOARD", "--json"],
     );
     for cwd in [&fixture.main, &fixture.worktree] {
-        fixture.ok_json(cwd, &["tag", "add", "infra", "--as", "geoyws", "--json"]);
+        fixture.ok_json(
+            cwd,
+            &["tag", "add", "geoyws/infra", "--as", "geoyws", "--json"],
+        );
     }
 
     fixture.ok_json(
@@ -24098,14 +24542,21 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
             "--id",
             "t-live",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
     fixture.ok_json(
         &fixture.main,
         &[
-            "task", "add", "Old work", "--id", "t-old", "--tag", "infra", "--json",
+            "task",
+            "add",
+            "Old work",
+            "--id",
+            "t-old",
+            "--tag",
+            "geoyws/infra",
+            "--json",
         ],
     );
     fixture.ok_json(
@@ -24146,7 +24597,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
             "--as",
             "geoyws",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -24159,7 +24610,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
             "--as",
             "geoyws",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -24174,7 +24625,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
             "--board",
             "OTHERBOARD",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -24184,7 +24635,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
         &[
             "tag",
             "rename",
-            "infra",
+            "geoyws/infra",
             "ifca/infra",
             "--as",
             "geoyws",
@@ -24194,7 +24645,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
     assert_eq!(
         renamed,
         json!({
-            "old": "infra",
+            "old": "geoyws/infra",
             "new": "ifca/infra",
             "tasks": 1,
             "archivedTasks": 1,
@@ -24247,7 +24698,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
     let entry = master.as_array().unwrap();
     assert_eq!(entry.len(), 1, "{master}");
     assert_eq!(entry[0]["name"], "ifca/infra");
-    assert_eq!(entry[0]["renamedFrom"], "infra");
+    assert_eq!(entry[0]["renamedFrom"], "geoyws/infra");
     assert_eq!(entry[0]["createdBy"], "geoyws", "provenance is preserved");
     assert_eq!(entry[0]["uses"], 3);
 
@@ -24274,7 +24725,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
     assert!(
         tags.iter()
             .any(|(body, tags)| body.starts_with("Other board infra rule")
-                && tags == &json!(["ONLY:OTHERBOARD", "infra"])),
+                && tags == &json!(["ONLY:OTHERBOARD", "geoyws/infra"])),
         "another board's rule must be untouched: {tags:?}"
     );
 
@@ -24285,7 +24736,7 @@ fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
         .iter()
         .find(|event| event["kind"] == "tag_renamed")
         .expect("the rename must be in the ledger");
-    assert_eq!(rename_event["payload"]["old"], "infra");
+    assert_eq!(rename_event["payload"]["old"], "geoyws/infra");
     assert_eq!(rename_event["payload"]["new"], "ifca/infra");
     assert_eq!(rename_event["payload"]["tasks"], 1);
     assert_eq!(rename_event["payload"]["archivedTasks"], 1);
@@ -24308,11 +24759,11 @@ fn tag_rename_refuses_unknown_existing_and_malformed_names() {
     fixture.ok_json(&fixture.main, &["init", "--name", "REFUSALS", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "infra", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/infra", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "queuer", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/queuer", "--as", "geoyws", "--json"],
     );
 
     let unknown = fixture.run(
@@ -24331,13 +24782,20 @@ fn tag_rename_refuses_unknown_existing_and_malformed_names() {
 
     let taken = fixture.run(
         &fixture.main,
-        &["tag", "rename", "infra", "queuer", "--as", "geoyws"],
+        &[
+            "tag",
+            "rename",
+            "geoyws/infra",
+            "geoyws/queuer",
+            "--as",
+            "geoyws",
+        ],
     );
     assert!(!taken.status.success(), "a rename merged two tags");
     let taken = String::from_utf8_lossy(&taken.stderr).to_string();
     assert!(
         taken.contains(
-            "tag queuer is already in the master file and a rename does not merge two tags \
+            "tag geoyws/queuer is already in the master file and a rename does not merge two tags \
              into one — pick a free name, or retire one of them with `kanban tag remove` first"
         ),
         "{taken}"
@@ -24345,7 +24803,14 @@ fn tag_rename_refuses_unknown_existing_and_malformed_names() {
 
     let shouted = fixture.run(
         &fixture.main,
-        &["tag", "rename", "infra", "Ifca/infra", "--as", "geoyws"],
+        &[
+            "tag",
+            "rename",
+            "geoyws/infra",
+            "Ifca/infra",
+            "--as",
+            "geoyws",
+        ],
     );
     assert!(!shouted.status.success(), "a malformed name was accepted");
     let shouted = String::from_utf8_lossy(&shouted.stderr).to_string();
@@ -24359,7 +24824,14 @@ fn tag_rename_refuses_unknown_existing_and_malformed_names() {
 
     let estate = fixture.run(
         &fixture.main,
-        &["tag", "rename", "infra", "acme/infra", "--as", "geoyws"],
+        &[
+            "tag",
+            "rename",
+            "geoyws/infra",
+            "acme/infra",
+            "--as",
+            "geoyws",
+        ],
     );
     assert!(!estate.status.success(), "an unregistered estate was taken");
     let estate = String::from_utf8_lossy(&estate.stderr).to_string();
@@ -24381,7 +24853,7 @@ fn tag_rename_refuses_unknown_existing_and_malformed_names() {
             .iter()
             .map(|row| row["name"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        vec!["infra".to_owned(), "queuer".to_owned()]
+        vec!["geoyws/infra".to_owned(), "geoyws/queuer".to_owned()]
     );
 }
 
@@ -24396,12 +24868,19 @@ fn tag_rename_is_admissible_inside_transact() {
     fixture.ok_json(&fixture.main, &["init", "--name", "TRANSACTED", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "infra", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/infra", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
         &[
-            "task", "add", "Ship it", "--id", "t-ship", "--tag", "infra", "--json",
+            "task",
+            "add",
+            "Ship it",
+            "--id",
+            "t-ship",
+            "--tag",
+            "geoyws/infra",
+            "--json",
         ],
     );
     fixture.ok_json(
@@ -24413,7 +24892,7 @@ fn tag_rename_is_admissible_inside_transact() {
             "--as",
             "geoyws",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -24429,7 +24908,7 @@ fn tag_rename_is_admissible_inside_transact() {
         &[
             json!({
                 "name": "tag_rename",
-                "arguments": { "old": "infra", "new": "ifca/infra", "as": "geoyws" },
+                "arguments": { "old": "geoyws/infra", "new": "ifca/infra", "as": "geoyws" },
             }),
             json!({
                 "name": "task_update",
@@ -24442,16 +24921,16 @@ fn tag_rename_is_admissible_inside_transact() {
     assert_eq!(rolled_back["rolledBack"], true, "{rolled_back}");
     assert_eq!(
         fixture.ok_json(&fixture.main, &["tag", "list", "--json"])[0]["name"],
-        "infra",
+        "geoyws/infra",
         "the rename survived a rolled-back batch"
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-ship", "--json"])["tags"],
-        json!(["infra"])
+        json!(["geoyws/infra"])
     );
     assert_eq!(
         rule_tags(&fixture),
-        json!(["ALL", "infra"]),
+        json!(["ALL", "geoyws/infra"]),
         "the registry rewrite must wait for the board's commit"
     );
 
@@ -24462,7 +24941,7 @@ fn tag_rename_is_admissible_inside_transact() {
         &[
             json!({
                 "name": "tag_rename",
-                "arguments": { "old": "infra", "new": "ifca/infra", "as": "geoyws" },
+                "arguments": { "old": "geoyws/infra", "new": "ifca/infra", "as": "geoyws" },
             }),
             json!({
                 "name": "task_update",
@@ -26386,14 +26865,17 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
     );
     fixture.ok_json(&second, &["init", "--name", "RULE-TAGS-TWO", "--json"]);
     fixture.ok_json(&third, &["init", "--name", "RULE-TAGS-THREE", "--json"]);
-    for tag in ["infra", "queuer"] {
+    for tag in ["geoyws/infra", "geoyws/queuer"] {
         fixture.ok_json(
             &fixture.main,
             &["tag", "add", tag, "--as", "geoyws", "--json"],
         );
     }
     for cwd in [&fixture.main, &second, &third] {
-        fixture.ok_json(cwd, &["tag", "add", "shared", "--as", "geoyws", "--json"]);
+        fixture.ok_json(
+            cwd,
+            &["tag", "add", "geoyws/shared", "--as", "geoyws", "--json"],
+        );
     }
 
     let scoped = fixture.ok_json(
@@ -26405,13 +26887,16 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "--as",
             "geoyws",
             "--tag",
-            "queuer",
+            "geoyws/queuer",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
-    assert_eq!(scoped["tags"], json!(["ALL", "infra", "queuer"]));
+    assert_eq!(
+        scoped["tags"],
+        json!(["ALL", "geoyws/infra", "geoyws/queuer"])
+    );
 
     let global = fixture.ok_json(
         &fixture.main,
@@ -26426,13 +26911,13 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "--board",
             "RULE-TAGS-TWO",
             "--tag",
-            "shared",
+            "geoyws/shared",
             "--json",
         ],
     );
     assert_eq!(
         global["tags"],
-        json!(["ONLY:RULE-TAGS-ONE", "ONLY:RULE-TAGS-TWO", "shared"])
+        json!(["ONLY:RULE-TAGS-ONE", "ONLY:RULE-TAGS-TWO", "geoyws/shared"])
     );
 
     let args = vec![
@@ -26462,7 +26947,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "--id",
             "t-tagged",
             "--tag",
-            "queuer",
+            "geoyws/queuer",
             "--json",
         ],
     );
@@ -26484,7 +26969,16 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
     ] {
         fixture.ok_json(
             cwd,
-            &["task", "add", id, "--id", id, "--tag", "shared", "--json"],
+            &[
+                "task",
+                "add",
+                id,
+                "--id",
+                id,
+                "--tag",
+                "geoyws/shared",
+                "--json",
+            ],
         );
         let tagged_claim = fixture.ok_json(cwd, &["claim", id, "--as", "worker", "--json"]);
         let has_global = tagged_claim["rules"]
@@ -26551,7 +27045,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "--id",
             "t-handoff-tagged",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--json",
         ],
     );
@@ -26597,7 +27091,13 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
     let remove_in_use = fixture.run(
         &fixture.main,
         &[
-            "tag", "remove", "infra", "--as", "geoyws", "--force", "--json",
+            "tag",
+            "remove",
+            "geoyws/infra",
+            "--as",
+            "geoyws",
+            "--force",
+            "--json",
         ],
     );
     assert!(
@@ -26630,7 +27130,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
     );
     assert_eq!(
         events[0]["payload"]["previousTags"],
-        json!(["ALL", "infra", "queuer"])
+        json!(["ALL", "geoyws/infra", "geoyws/queuer"])
     );
 }
 
@@ -27143,7 +27643,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     fixture.ok_json(&second, &["init", "--name", "TWO", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "infra", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/infra", "--as", "geoyws", "--json"],
     );
     let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
     let board_path = |name: &str| {
@@ -27160,7 +27660,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     registry
         .execute(
             "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags,task_tags) \
-             VALUES('g-late','Late rolling-upgrade rule.','geoyws',0,3,3,'[\"ALL\"]','[\"infra\"]')",
+             VALUES('g-late','Late rolling-upgrade rule.','geoyws',0,3,3,'[\"ALL\"]','[\"geoyws/infra\"]')",
             [],
         )
         .unwrap();
@@ -27175,7 +27675,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     Connection::open(&one_path)
         .unwrap()
         .execute(
-            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-one','ONE infrastructure rule.','geoyws',0,1,1,'[\"infra\"]')",
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-one','ONE infrastructure rule.','geoyws',0,1,1,'[\"geoyws/infra\"]')",
             [],
         )
         .unwrap();
@@ -27211,7 +27711,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Vec<String>>(&imported_one.0).unwrap(),
-        ["ONLY:ONE", "infra"]
+        ["ONLY:ONE", "geoyws/infra"]
     );
     assert_eq!(imported_one.1, "ONE");
     assert_eq!(imported_one.2, one["id"]);
@@ -27233,7 +27733,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Vec<String>>(&late_tags).unwrap(),
-        ["ALL", "infra"]
+        ["ALL", "geoyws/infra"]
     );
     drop(registry);
 
@@ -27536,7 +28036,7 @@ fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
         );
     }
     for cwd in [&fixture.main, &second] {
-        fixture.ok_json(cwd, &["tag", "add", "infra", "--json"]);
+        fixture.ok_json(cwd, &["tag", "add", "geoyws/infra", "--json"]);
     }
     let scoped = fixture.ok_json(
         &fixture.main,
@@ -27549,7 +28049,7 @@ fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
             "--sprint",
             "sp-shared",
             "--tag",
-            "infra",
+            "geoyws/infra",
             "--as",
             "operator",
             "--json",
@@ -27557,7 +28057,7 @@ fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
     );
     assert_eq!(
         scoped["tags"],
-        json!(["ONLY:ONE", "SPRINT:sp-shared", "infra"])
+        json!(["ONLY:ONE", "SPRINT:sp-shared", "geoyws/infra"])
     );
     let rule_id = scoped["id"].as_str().unwrap();
 
@@ -27572,7 +28072,7 @@ fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
             args.extend(["--sprint", "sp-shared"]);
         }
         if tag {
-            args.extend(["--tag", "infra"]);
+            args.extend(["--tag", "geoyws/infra"]);
         }
         args.push("--json");
         fixture.ok_json(cwd, &args);
@@ -27685,7 +28185,7 @@ fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
             "--json",
         ],
     );
-    assert_eq!(cleared["tags"], json!(["ONLY:ONE", "infra"]));
+    assert_eq!(cleared["tags"], json!(["ONLY:ONE", "geoyws/infra"]));
     let conflict = fixture.run(
         &fixture.main,
         &[
@@ -27823,11 +28323,11 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
     source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
     source.ok_json(
         &source.main,
-        &["tag", "add", "alpha", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/alpha", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
-        &["tag", "add", "beta", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/beta", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
@@ -27838,7 +28338,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "--board",
             "ALPHA",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--as",
             "geoyws",
             "--json",
@@ -27853,7 +28353,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "--board",
             "BETA",
             "--tag",
-            "beta",
+            "geoyws/beta",
             "--as",
             "geoyws",
             "--json",
@@ -27974,11 +28474,11 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
     source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
     source.ok_json(
         &source.main,
-        &["tag", "add", "alpha", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/alpha", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
-        &["tag", "add", "beta", "--as", "geoyws", "--json"],
+        &["tag", "add", "geoyws/beta", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
@@ -27989,7 +28489,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "--board",
             "ALPHA",
             "--tag",
-            "alpha",
+            "geoyws/alpha",
             "--as",
             "geoyws",
             "--json",
@@ -28004,7 +28504,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "--board",
             "BETA",
             "--tag",
-            "beta",
+            "geoyws/beta",
             "--as",
             "geoyws",
             "--json",
