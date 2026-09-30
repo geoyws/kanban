@@ -18,9 +18,12 @@
 //! the authority on its own layout, so it is asked — the same reason the MCP
 //! server runs the CLI instead of reimplementing it.
 //!
-//! Every failure degrades to `None`. A directory that is not a repository, or a
-//! machine with no git, records no provenance and never fails a command that
-//! was not about git in the first place.
+//! Every failure degrades to `None` here. A directory that is not a repository,
+//! or a machine with no git, resolves to no context. What the caller does with
+//! that `None` is its own decision: the CLI's provenance-bearing writes
+//! (checkpoint, handoff create, sitrep post) refuse it rather than store a
+//! blank field, while claim and heartbeat accept it as a truthful "no
+//! checkout".
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};

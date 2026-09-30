@@ -587,9 +587,9 @@ impl ResolvedDispatch {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::model::Subscription;
+    use crate::model::{OPERATOR_ACTOR, Subscription};
     use serde_json::json;
     use std::ffi::{OsStr, OsString};
     use std::fs;
@@ -598,9 +598,14 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
 
+    /// Serialises every unit test that sets `KANBAN_DATA_DIR` in-process.
+    /// `data_root()` re-reads the environment on each call, so two tests
+    /// swapping the variable concurrently would read each other's roots.
+    /// Sibling modules that resolve a board through `data_root()` take this
+    /// guard before constructing a [`TestRoot`].
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -652,7 +657,10 @@ mod tests {
         root
     }
 
-    struct TestRoot {
+    /// A private data root: an empty directory installed as `KANBAN_DATA_DIR`
+    /// for the lifetime of the value, so `data_root()` readers never touch the
+    /// operator's registry. Hold [`env_guard`] first.
+    pub(crate) struct TestRoot {
         path: PathBuf,
         executable: PathBuf,
         original: Option<std::ffi::OsString>,
@@ -660,7 +668,7 @@ mod tests {
     }
 
     impl TestRoot {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let path = temp_root();
             let executable = path.join("dispatch-ok.sh");
             fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -777,9 +785,9 @@ mod tests {
             secret_ref: secret_ref.map(str::to_owned),
             status: "active".to_owned(),
             created_at: 1,
-            created_by: "geo".to_owned(),
+            created_by: OPERATOR_ACTOR.to_owned(),
             updated_at: 1,
-            updated_by: "geo".to_owned(),
+            updated_by: OPERATOR_ACTOR.to_owned(),
             paused_at: None,
             paused_by: None,
         }

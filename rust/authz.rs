@@ -1,0 +1,526 @@
+//! The central authorization guard (ADR-038 clause 5).
+//!
+//! One decision — allow, or the single generic denial — for every read and
+//! write of a board row, computed from an already-minted authority map and an
+//! explicit enforcement state. This is the only place the clause-5 all-of-tag
+//! and both-scopes rules live; the surfaces that will enforce them
+//! (t-90903ebe) call in rather than re-derive them.
+//!
+//! The guard is pure: it reads no filesystem, no registry, and no enforcement
+//! state. The caller performs the single enforcement read
+//! ([`crate::routing::enforcement_state`]) and mints the authority
+//! ([`crate::policy::Registry::principal_authority`] or
+//! [`crate::policy::authority`]), then hands both in. Taking the enforcement
+//! state as an argument keeps the guard testable and keeps the read with the
+//! caller, while the required (non-optional) parameter makes it structurally
+//! impossible to call the guard without stating an enforcement state.
+//!
+//! The estate is `direct` today. Outside [`Enforcement::Managed`] the guard is
+//! a no-op that permits everything, so every existing single-user caller keeps
+//! behaving exactly as it does now; `direct` and `prepared` estates are
+//! unchanged.
+
+use crate::policy::{Capability, ScopeTuple, satisfies};
+use crate::routing::Enforcement;
+use anyhow::Result;
+use std::collections::HashMap;
+use std::fmt;
+
+/// The one refusal a denied access produces. Byte-identical whether the row is
+/// invisible to the caller or absent from the board, and carrying no tag,
+/// board, or row detail, so a denial is not an existence oracle. This is the
+/// same generic wording [`crate::policy`] uses for every non-enumerating
+/// denial; there is deliberately no second string.
+const DENIED_OR_NOT_FOUND: &str = "denied or not found";
+
+/// The one typed authorization refusal.
+///
+/// The display text remains the non-enumerating public sentence, while the
+/// type lets whole-estate listings skip only authorization refusals. An I/O,
+/// schema or SQLite error with coincidentally similar text must still abort
+/// the listing.
+#[derive(Debug)]
+pub(crate) struct DeniedOrNotFound;
+
+impl fmt::Display for DeniedOrNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(DENIED_OR_NOT_FOUND)
+    }
+}
+
+impl std::error::Error for DeniedOrNotFound {}
+
+/// Apply the whole-estate listing policy to one board read.
+///
+/// Authorization refusal contributes no row; every other failure propagates.
+/// This is shared by the JSON projections and the CLI dashboard so their
+/// treatment of a denied board cannot drift.
+pub(crate) fn permitted_listing_board<T>(read: Result<T>) -> Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.downcast_ref::<DeniedOrNotFound>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Decide whether a caller may read one row: it must satisfy `read` at
+/// `{board:ID}` and at `{board:ID, tag:SLUG}` for every tag the row carries.
+/// An untagged row needs only the board scope.
+///
+/// `authority` is the caller's already-minted authority map — the value
+/// [`crate::policy::authority`] produces from active grants, or that
+/// [`crate::policy::Registry::principal_authority`] returns. It is never
+/// reconstructed here from a username, actor string, or selector, because
+/// those cannot produce authority.
+///
+/// Returns `Ok(())` when permitted, and the generic
+/// [`DENIED_OR_NOT_FOUND`] otherwise. Outside [`Enforcement::Managed`] this
+/// always permits.
+pub fn check_read(
+    enforcement: Enforcement,
+    authority: &HashMap<ScopeTuple, Capability>,
+    board_id: &str,
+    tags: &[String],
+) -> Result<()> {
+    if !enforcement.is_managed() {
+        return Ok(());
+    }
+    check_scopes(authority, board_id, tags, Capability::Read)
+}
+
+/// Decide whether a caller may write one row. A write must satisfy the
+/// read-style all-of-tag check at `write` against **both** the old tag set and
+/// the resulting tag set, so a retag is permitted only to a caller who could
+/// see the row before *and* after the change.
+///
+/// The arguments are the same shape as [`check_read`]: the minted authority
+/// and an explicit enforcement state, never a caller-supplied identity claim.
+pub fn check_write(
+    enforcement: Enforcement,
+    authority: &HashMap<ScopeTuple, Capability>,
+    board_id: &str,
+    old_tags: &[String],
+    resulting_tags: &[String],
+) -> Result<()> {
+    if !enforcement.is_managed() {
+        return Ok(());
+    }
+    check_scopes(authority, board_id, old_tags, Capability::Write)?;
+    check_scopes(authority, board_id, resulting_tags, Capability::Write)
+}
+
+/// The all-of-tag requirement for one tag set at one capability: board scope
+/// first, then every tag. The `{board, *}` wildcard is honoured exactly once,
+/// inside [`satisfies`] in the lattice, not re-derived here — this loop only
+/// asks `satisfies` about `{board:ID, tag:SLUG}`, which is precisely the one
+/// tuple the wildcard satisfier rule crosses.
+fn check_scopes(
+    authority: &HashMap<ScopeTuple, Capability>,
+    board_id: &str,
+    tags: &[String],
+    capability: Capability,
+) -> Result<()> {
+    if !satisfies(
+        authority,
+        &ScopeTuple::Board {
+            board_id: board_id.to_owned(),
+        },
+        capability,
+    ) {
+        return Err(DeniedOrNotFound.into());
+    }
+    for tag in tags {
+        if !satisfies(
+            authority,
+            &ScopeTuple::BoardTag {
+                board_id: board_id.to_owned(),
+                tag: tag.to_owned(),
+            },
+            capability,
+        ) {
+            return Err(DeniedOrNotFound.into());
+        }
+    }
+    Ok(())
+}
+
+/// The one authorization context a [`crate::store::Store`] carries: the
+/// enforcement state, the caller's already-minted authority map, and the
+/// board's immutable UUID (ADR-032). It is resolved once — the enforcement
+/// read is one call — and handed to the store, never re-derived per surface.
+///
+/// Every board-row surface checks through this context, so a surface cannot
+/// state an authorization decision without one: the store's field is
+/// non-optional, private, and set at open. In the direct (single-user) estate
+/// there is no principal, so the authority map is empty and — because
+/// [`check_read`]/[`check_write`] no-op outside [`Enforcement::Managed`] — the
+/// guard permits everything, exactly as before.
+#[derive(Debug, Clone)]
+pub struct AuthzContext {
+    enforcement: Enforcement,
+    authority: HashMap<ScopeTuple, Capability>,
+    board_id: String,
+}
+
+impl AuthzContext {
+    /// The direct-estate context for a board opened by its file path: no
+    /// principal exists, so the authority map is empty and the enforcement
+    /// state is `Direct`. This is what `Store::open` and its siblings build.
+    pub fn direct(board_id: String) -> Self {
+        Self {
+            enforcement: Enforcement::Direct,
+            authority: HashMap::new(),
+            board_id,
+        }
+    }
+
+    /// A fully-specified context: the enforcement state the caller read, the
+    /// authority the caller minted, and the board UUID. Used by the managed
+    /// broker path and by tests that drive tenancy isolation.
+    pub fn new(
+        enforcement: Enforcement,
+        authority: HashMap<ScopeTuple, Capability>,
+        board_id: String,
+    ) -> Self {
+        Self {
+            enforcement,
+            authority,
+            board_id,
+        }
+    }
+
+    /// The board UUID this context authorizes against.
+    pub fn board_id(&self) -> &str {
+        &self.board_id
+    }
+
+    /// Whether the guard is live at all — that is, whether the estate is
+    /// [`Enforcement::Managed`].
+    ///
+    /// Surfaces that reach a row indirectly (a search index, an event tail, a
+    /// deployment projection) have to read each row's REAL tags to check it,
+    /// and that read costs a query per row. Outside `Managed` the answer is
+    /// always "permitted", so those surfaces ask this first and skip the work
+    /// entirely: the direct estate pays nothing for a guard that cannot deny.
+    /// It is never a substitute for [`check_read`]/[`check_write`] — it only
+    /// says whether asking them could change an outcome.
+    pub fn is_enforcing(&self) -> bool {
+        self.enforcement.is_managed()
+    }
+
+    /// [`Self::check_read`] as a predicate, for filtering an enumeration.
+    ///
+    /// A caller who NAMES one row is told `denied or not found`; a caller who
+    /// asks for a LIST is simply not handed the rows it may not see, because a
+    /// refusal in the middle of an enumeration is an existence oracle — it
+    /// says "there is something here you cannot have", which is exactly what
+    /// the single generic denial exists to avoid.
+    pub fn permits_read(&self, tags: &[String]) -> bool {
+        self.check_read(tags).is_ok()
+    }
+
+    /// The all-of-tag read check for a row carrying `tags`.
+    pub fn check_read(&self, tags: &[String]) -> Result<()> {
+        check_read(self.enforcement, &self.authority, &self.board_id, tags)
+    }
+
+    /// The both-scopes write check: `old_tags` (what the caller could see
+    /// before) and `resulting_tags` (what the caller could see after) must
+    /// both satisfy `write`.
+    pub fn check_write(&self, old_tags: &[String], resulting_tags: &[String]) -> Result<()> {
+        check_write(
+            self.enforcement,
+            &self.authority,
+            &self.board_id,
+            old_tags,
+            resulting_tags,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Capability, ScopeTuple, authority};
+    use crate::routing::Enforcement;
+
+    /// The immutable per-board UUID (ADR-032) the scope atoms key on.
+    const BOARD: &str = "a1b2c3d4-e5f6-4789-abcd-ef0123456789";
+
+    fn grants(pairs: &[(ScopeTuple, Capability)]) -> HashMap<ScopeTuple, Capability> {
+        authority(pairs.iter().cloned())
+    }
+
+    fn board() -> ScopeTuple {
+        ScopeTuple::Board {
+            board_id: BOARD.to_owned(),
+        }
+    }
+
+    fn tag(slug: &str) -> ScopeTuple {
+        ScopeTuple::BoardTag {
+            board_id: BOARD.to_owned(),
+            tag: slug.to_owned(),
+        }
+    }
+
+    fn wildcard() -> ScopeTuple {
+        ScopeTuple::BoardWildcard {
+            board_id: BOARD.to_owned(),
+        }
+    }
+
+    #[test]
+    fn untagged_row_needs_only_board_scope() {
+        let board_read = grants(&[(board(), Capability::Read)]);
+        assert!(
+            check_read(Enforcement::Managed, &board_read, BOARD, &[]).is_ok(),
+            "board read alone must permit an untagged row"
+        );
+        let none = grants(&[]);
+        assert_eq!(
+            check_read(Enforcement::Managed, &none, BOARD, &[])
+                .unwrap_err()
+                .to_string(),
+            DENIED_OR_NOT_FOUND,
+            "a caller without board scope must be denied an untagged row"
+        );
+    }
+
+    #[test]
+    fn one_tag_row_permitted_when_tag_held() {
+        let a = grants(&[
+            (board(), Capability::Read),
+            (tag("alpha"), Capability::Read),
+        ]);
+        assert!(
+            check_read(Enforcement::Managed, &a, BOARD, &["alpha".to_owned()]).is_ok(),
+            "board plus the single tag must permit a one-tag row"
+        );
+    }
+
+    #[test]
+    fn three_tag_row_denied_to_caller_holding_two() {
+        let two = grants(&[
+            (board(), Capability::Read),
+            (tag("alpha"), Capability::Read),
+            (tag("beta"), Capability::Read),
+        ]);
+        assert!(
+            check_read(
+                Enforcement::Managed,
+                &two,
+                BOARD,
+                &["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            )
+            .is_err(),
+            "holding two of three tags must not permit the row"
+        );
+        let three = grants(&[
+            (board(), Capability::Read),
+            (tag("alpha"), Capability::Read),
+            (tag("beta"), Capability::Read),
+            (tag("gamma"), Capability::Read),
+        ]);
+        assert!(
+            check_read(
+                Enforcement::Managed,
+                &three,
+                BOARD,
+                &["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            )
+            .is_ok(),
+            "holding all three tags must permit the row"
+        );
+    }
+
+    #[test]
+    fn wildcard_permits_tag_never_granted_individually() {
+        let a = grants(&[(board(), Capability::Read), (wildcard(), Capability::Read)]);
+        assert!(
+            check_read(Enforcement::Managed, &a, BOARD, &["gamma".to_owned()]).is_ok(),
+            "{{board, *}} read must satisfy a tag the caller was never granted individually"
+        );
+    }
+
+    #[test]
+    fn retag_denied_when_only_old_scope_held() {
+        let old_only = grants(&[
+            (board(), Capability::Write),
+            (tag("alpha"), Capability::Write),
+        ]);
+        assert!(
+            check_write(
+                Enforcement::Managed,
+                &old_only,
+                BOARD,
+                &["alpha".to_owned()],
+                &["beta".to_owned()],
+            )
+            .is_err(),
+            "a caller who could see only the old tag must not retag"
+        );
+    }
+
+    #[test]
+    fn retag_denied_when_only_resulting_scope_held() {
+        let resulting_only = grants(&[
+            (board(), Capability::Write),
+            (tag("beta"), Capability::Write),
+        ]);
+        assert!(
+            check_write(
+                Enforcement::Managed,
+                &resulting_only,
+                BOARD,
+                &["alpha".to_owned()],
+                &["beta".to_owned()],
+            )
+            .is_err(),
+            "a caller who could see only the resulting tag must not retag"
+        );
+    }
+
+    #[test]
+    fn retag_permitted_when_both_scopes_held() {
+        let both = grants(&[
+            (board(), Capability::Write),
+            (tag("alpha"), Capability::Write),
+            (tag("beta"), Capability::Write),
+        ]);
+        assert!(
+            check_write(
+                Enforcement::Managed,
+                &both,
+                BOARD,
+                &["alpha".to_owned()],
+                &["beta".to_owned()],
+            )
+            .is_ok(),
+            "a caller who could see the row before and after must be able to retag"
+        );
+    }
+
+    #[test]
+    fn read_insufficient_for_write() {
+        let read_only = grants(&[
+            (board(), Capability::Read),
+            (tag("alpha"), Capability::Read),
+            (tag("beta"), Capability::Read),
+        ]);
+        assert!(
+            check_write(
+                Enforcement::Managed,
+                &read_only,
+                BOARD,
+                &["alpha".to_owned()],
+                &["beta".to_owned()],
+            )
+            .is_err(),
+            "read authority must not satisfy a write check"
+        );
+    }
+
+    #[test]
+    fn direct_and_prepared_permit_what_managed_denies() {
+        let none = grants(&[]);
+        let tags = ["alpha".to_owned()];
+        // The Managed case this names: empty authority denies a read and a
+        // write of the same row.
+        assert!(check_read(Enforcement::Managed, &none, BOARD, &tags).is_err());
+        assert!(
+            check_write(
+                Enforcement::Managed,
+                &none,
+                BOARD,
+                &tags,
+                &["beta".to_owned()],
+            )
+            .is_err()
+        );
+        for enforcement in [Enforcement::Direct, Enforcement::Prepared] {
+            assert!(
+                check_read(enforcement, &none, BOARD, &tags).is_ok(),
+                "{enforcement:?} must permit what Managed denies"
+            );
+            assert!(
+                check_write(enforcement, &none, BOARD, &tags, &["beta".to_owned()]).is_ok(),
+                "{enforcement:?} must permit what Managed denies"
+            );
+        }
+    }
+
+    #[test]
+    fn denial_byte_identical_for_invisible_and_absent_row() {
+        // Invisible: the caller sees the board but not the row's tag.
+        let sees_board = grants(&[(board(), Capability::Read)]);
+        let invisible = check_read(
+            Enforcement::Managed,
+            &sees_board,
+            BOARD,
+            &["secret".to_owned()],
+        )
+        .unwrap_err()
+        .to_string();
+        // Absent: the caller holds no board scope at all, so the row is not
+        // there to them.
+        let none = grants(&[]);
+        let absent = check_read(Enforcement::Managed, &none, BOARD, &["secret".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            invisible, DENIED_OR_NOT_FOUND,
+            "an invisible-row denial must be the generic string"
+        );
+        assert_eq!(
+            absent, DENIED_OR_NOT_FOUND,
+            "an absent-row denial must be the generic string"
+        );
+        assert_eq!(
+            invisible, absent,
+            "the two denials must be byte-identical, carrying no row detail"
+        );
+    }
+
+    #[test]
+    fn authz_context_carries_the_board_and_delegates_to_the_guard() {
+        // The direct context permits everything (empty authority, no-op guard).
+        let direct = AuthzContext::direct(BOARD.to_owned());
+        assert_eq!(direct.board_id(), BOARD);
+        assert!(direct.check_read(&["secret".to_owned()]).is_ok());
+        assert!(
+            direct
+                .check_write(&["secret".to_owned()], &["other".to_owned()])
+                .is_ok(),
+            "the direct estate must permit what managed denies"
+        );
+
+        // A fully-specified managed context delegates to check_read/check_write
+        // with the board and authority it was built from.
+        let managed = AuthzContext::new(
+            Enforcement::Managed,
+            grants(&[(board(), Capability::Read)]),
+            BOARD.to_owned(),
+        );
+        assert_eq!(managed.board_id(), BOARD);
+        assert!(
+            managed.check_read(&[]).is_ok(),
+            "board read permits an untagged row"
+        );
+        assert!(
+            managed.check_read(&["secret".to_owned()]).is_err(),
+            "board read alone must deny a tagged row"
+        );
+        // A write context with read-only authority denies.
+        let read_only = AuthzContext::new(
+            Enforcement::Managed,
+            grants(&[(board(), Capability::Read)]),
+            BOARD.to_owned(),
+        );
+        assert_eq!(
+            read_only.check_write(&[], &[]).unwrap_err().to_string(),
+            DENIED_OR_NOT_FOUND,
+            "read authority must not satisfy a write check"
+        );
+    }
+}

@@ -1,0 +1,129 @@
+{
+  "fixture_id": "kanban-agent-loop-v1",
+  "description": "The board reads a resuming driver performs: /session cont Step 0-1, then the /kb-att lane read, then the claim-candidates and cold-start packet reads from the kb skill. Every read is read-only on the board and returns --json.",
+  "board": "kanban",
+  "ssh_target": "hax",
+  "expected_remote_hostname": "hax",
+  "kb_exec": "/root/.local/bin/kb",
+  "lane": "driver",
+  "actor": "bench@driver",
+  "warmups": 5,
+  "iterations": 30,
+  "per_read_timeout_s": 60,
+  "ssh_compression": "no",
+  "controlmaster_path": "/tmp/kb-bench-%C",
+  "controlmaster_persist": "60",
+  "reads": [
+    {
+      "id": "workspace_list",
+      "argv": ["workspace", "list"],
+      "tool": "workspace_list",
+      "args": {},
+      "board_scoped": false,
+      "source": "session/SKILL.md:206 (`kb-remote ws ls --json`, registry discovery before PROJECT is known)",
+      "consumed": "name, rootPath of every row (session/SKILL.md:283-299 resolves PROJECT from the row whose rootPath prefixes the worktree)"
+    },
+    {
+      "id": "handoff_pending",
+      "argv": ["handoff", "list", "--status", "pending"],
+      "tool": "handoff_list",
+      "args": {"status": "pending"},
+      "board_scoped": true,
+      "source": "session/SKILL.md:722 (`handoff list --status pending --json`; no --to, see the comment above it). The served binary has no --limit on handoff list; ADR-037 says it must grow one before it can refuse.",
+      "consumed": "id, to, branch, repoPath, dirtySummary, headSha of the lane's or unaddressed rows (session/SKILL.md:725-740)"
+    },
+    {
+      "id": "attention_open_100",
+      "argv": ["attention", "list", "--status", "open", "--limit", "100"],
+      "tool": "attention_list",
+      "args": {"status": "open", "limit": "100"},
+      "board_scoped": true,
+      "source": "session/SKILL.md:810 (`attention list --status open --json`); --limit 100 is the default that call relied on, passed explicitly per ADR-037",
+      "consumed": "id, kind, body head, taskID for the Needs-George digest (session/SKILL.md:1088)"
+    },
+    {
+      "id": "stale",
+      "argv": ["stale"],
+      "tool": "stale",
+      "args": {},
+      "board_scoped": true,
+      "source": "session/SKILL.md:819 (`stale --json`)",
+      "consumed": "array length; rows only when non-empty (session/SKILL.md:822-829)"
+    },
+    {
+      "id": "attention_open_500",
+      "argv": ["attention", "list", "--status", "open", "--limit", "500"],
+      "tool": "attention_list",
+      "args": {"status": "open", "limit": "500"},
+      "board_scoped": true,
+      "source": "kb-att/scripts/lane-att.sh:77",
+      "consumed": "rows whose raisedBy ends in @LANE or whose taskID is in the lane (lane-att.sh:101-103); id set for O(1) membership (lane-att.sh:91)"
+    },
+    {
+      "id": "attention_resolved_500",
+      "argv": ["attention", "list", "--status", "resolved", "--limit", "500"],
+      "tool": "attention_list",
+      "args": {"status": "resolved", "limit": "500"},
+      "board_scoped": true,
+      "source": "kb-att/scripts/lane-att.sh:78",
+      "consumed": "newest 200 rows projected to id, kind, taskID, raisedBy, resolvedBy, resolvedAt, body[0:300], resolution[0:300] (lane-att.sh:131-135); id set (lane-att.sh:92)"
+    },
+    {
+      "id": "task_list",
+      "argv": ["task", "list"],
+      "tool": "task_list",
+      "args": {},
+      "board_scoped": true,
+      "source": "kb-att/scripts/lane-att.sh:79 (`t ls --json`, the full board)",
+      "consumed": "id -> {title,status,lane,priority} index (lane-att.sh:87-88); lane rows projected to id,title,status,lane,priority,tags (lane-att.sh:124-125); blocked lane rows (lane-att.sh:104); drafts (lane-draft-classify.jq). The full list never crosses the wire in the deployed script (lane-att.sh:50-52)."
+    },
+    {
+      "id": "context_blocked_1",
+      "argv": ["context", "t-0110a25c"],
+      "tool": "context",
+      "args": {"id": "t-0110a25c"},
+      "board_scoped": true,
+      "normalize_drop_keys": ["generatedAt"],
+      "source": "kb-att/scripts/lane-att.sh:110 (`ctx <id> --json` per blocked lane task; t-0110a25c was blocked in lane driver on 2026-09-05)",
+      "consumed": "checkpoints | last (lane-att.sh:111): nextAction, summary, state, createdAt"
+    },
+    {
+      "id": "context_blocked_2",
+      "argv": ["context", "t-8c656910"],
+      "tool": "context",
+      "args": {"id": "t-8c656910"},
+      "board_scoped": true,
+      "normalize_drop_keys": ["generatedAt"],
+      "source": "kb-att/scripts/lane-att.sh:110 (`ctx <id> --json` per blocked lane task; t-8c656910 was blocked in lane driver on 2026-09-05)",
+      "consumed": "checkpoints | last (lane-att.sh:111): nextAction, summary, state, createdAt"
+    },
+    {
+      "id": "claim_candidates",
+      "argv": ["claim", "--candidates", "--as", "bench@driver", "--lane", "driver", "--limit", "100"],
+      "tool": "claim",
+      "args": {"candidates": true, "as": "bench@driver", "lane": "driver", "limit": "100"},
+      "board_scoped": true,
+      "source": "kb/upstream/SKILL.md:416-418 (`kb claim --candidates --as $AGENT --project NAME [--lane LANE] [--limit N] --json`); read-only per ADR-026 (rust/store.rs claim_candidates)",
+      "consumed": "id, title, status, lane, priority of the ordered candidates; the worker picks the first wise one"
+    },
+    {
+      "id": "sitrep_lane_20",
+      "argv": ["sitrep", "list", "--lane", "driver", "--limit", "20"],
+      "tool": "sitrep_list",
+      "args": {"lane": "driver", "limit": "20"},
+      "board_scoped": true,
+      "source": "kb/upstream/SKILL.md:327 (`kb sr ls --lane LANE --json`, the current view newest first); --limit 20 is the ADR-037 default passed explicitly",
+      "consumed": "body, author, createdAt, taskID of the newest rows"
+    },
+    {
+      "id": "context_candidate",
+      "argv": ["context", "t-5c98cfcf"],
+      "tool": "context",
+      "args": {"id": "t-5c98cfcf"},
+      "board_scoped": true,
+      "normalize_drop_keys": ["generatedAt"],
+      "source": "kb/upstream/SKILL.md:579 (`kb ctx <id> --json`, the bounded cold-start packet for a resuming agent); t-5c98cfcf was the first claim candidate for lane driver on 2026-09-05",
+      "consumed": "task, ancestors, checkpoints, handoffs, notes, rules, sitreps, dependencies, truncated"
+    }
+  ]
+}

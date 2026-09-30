@@ -1,46 +1,101 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn fake_adapter() -> &'static Path {
-    static ADAPTER: OnceLock<PathBuf> = OnceLock::new();
-    ADAPTER
-        .get_or_init(|| {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/dispatcher_fake_adapter.rs");
-            let root = env::temp_dir().join(format!(
-                "kanban-dispatcher-adapter-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&root).unwrap();
-            let binary = root.join("fake-adapter");
-            let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "compile fake adapter from {}",
-                source.display()
-            );
-            binary
+/// A per-delivery deadline wide enough that it cannot lose a race.
+///
+/// Only ONE test here is about the deadline itself (`sleep` mode, whose adapter
+/// sleeps 30s against a deliberately tight 500ms - a 60x margin, so it is a
+/// decision and not a coin toss). Everywhere else the deadline is incidental to
+/// the property under test, and a tight one is a bug: each delivery `exec`s a
+/// freshly compiled adapter binary, so the budget covers a cold spawn. Under a
+/// loaded full-suite run that spawn can stall, and the delivery is then
+/// reclassified as `adapter_timeout` - turning an asserted success into 0
+/// succeeded, or a specific asserted error into the wrong error. Measured
+/// 2026-09-06: `dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary`
+/// failed exactly that way once in a full run and passed on re-run (t-0ca6de57).
+const AMPLE_TIMEOUT_MS: &str = "30000";
+
+/// Compile a fixture fake program into `target` and make it executable.
+fn compile_fake(source: &str, target: &Path) {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "compile fake from {}",
+        source_path.display()
+    );
+    let mut permissions = fs::metadata(target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).unwrap();
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(rendered, "{byte:02x}").unwrap();
+    }
+    rendered
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The app-server adapter checks the `optOutNotificationMethods` it sends at
+/// `initialize` against the `ServerNotification` variants of the schema the
+/// codex it is about to run generates, so the fake codex driven here has to
+/// generate one that declares them. Mirrors `protocol_schema` in
+/// `codex_app_server_adapter_e2e.rs`; it is a stub for the fake codex, not a
+/// protocol reference.
+fn protocol_schema() -> Vec<u8> {
+    let variants: Vec<Value> = [
+        "configWarning",
+        "remoteControl/status/changed",
+        "mcpServer/startupStatus/updated",
+        "thread/status/changed",
+        "account/rateLimits/updated",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
+        "item/reasoning/textDelta",
+    ]
+    .into_iter()
+    .map(|method| {
+        json!({
+            "properties": {
+                "method": {"enum": [method], "type": "string"},
+                "params": {"$ref": "#/definitions/Notification"},
+            },
+            "required": ["method", "params"],
+            "type": "object",
         })
-        .as_path()
+    })
+    .collect();
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "CodexAppServerProtocolV2",
+        "type": "object",
+        "definitions": {
+            "ServerNotification": {"title": "ServerNotification", "oneOf": variants},
+        },
+    })
+    .to_string()
+    .into_bytes()
 }
 
 struct Fixture {
@@ -64,6 +119,8 @@ impl Fixture {
         let data = root.join("data");
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let output = Self::kanban_command(&project, &data)
             .args(["init", "--name", "DISPATCH-E2E", "--json"])
             .output()
@@ -143,17 +200,57 @@ impl Fixture {
         assert_success(&output, "subscription add");
     }
 
+    fn add_app_server_subscription(&self, timeout_ms: &str) {
+        let output = self.kanban(&[
+            "subscription",
+            "add",
+            "--id",
+            "sub-app-server",
+            "--consumer",
+            "codex.app-server",
+            "--action",
+            "start-readonly-turn",
+            "--timeout-ms",
+            timeout_ms,
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--kind",
+            "tag_added",
+            "--as",
+            "test@dispatcher",
+            "--json",
+        ]);
+        assert_success(&output, "app-server subscription add");
+    }
+
     fn append_event(&self, tag: &str) {
-        let output = self.kanban(&["tag", "add", tag, "--as", "test@dispatcher", "--json"]);
+        // `tag add` registers only namespaced tags; the estate half is never
+        // asserted here, only the delivery the event triggers.
+        let namespaced = format!("geoyws/{tag}");
+        let output = self.kanban(&[
+            "tag",
+            "add",
+            &namespaced,
+            "--as",
+            "test@dispatcher",
+            "--json",
+        ]);
         assert_success(&output, "tag add");
     }
 
     fn write_config(&self, primary_mode: &str, other_mode: Option<&str>) {
+        let fake_adapter = self.root.join("fake-adapter");
+        compile_fake("tests/fixtures/dispatcher_fake_adapter.rs", &fake_adapter);
+        let capture = &self.capture;
         let action = |mode: &str| {
             json!({
                 "capability": "deliver",
-                "executable": fake_adapter(),
-                "args": [mode, self.capture],
+                "executable": &fake_adapter,
+                "args": [mode, capture],
             })
         };
         let mut consumers = serde_json::Map::new();
@@ -186,6 +283,97 @@ impl Fixture {
         serde_json::to_writer_pretty(&mut file, &json!({"version": 1, "consumers": consumers}))
             .unwrap();
         file.write_all(b"\n").unwrap();
+    }
+
+    fn write_real_app_server_config(&self) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let codex = self.root.join("fake-codex");
+        compile_fake(
+            "tests/fixtures/codex_app_server_adapter_fake_codex.rs",
+            &codex,
+        );
+        let codex_home = self.root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
+        let child_pid = self.root.join("app-server.pid");
+        let grandchild_pid = self.root.join("app-server-grandchild.pid");
+        let adapter_pid = self.root.join("app-server-adapter.pid");
+        let cwd = self.project.canonicalize().unwrap();
+        let codex_home = codex_home.canonicalize().unwrap();
+        let initialize_response = json!({
+            "id": 1,
+            "result": {
+                "codexHome": codex_home,
+                "platformFamily": "unix",
+                "platformOs": "linux",
+                "userAgent": format!(
+                    "kanban-codex-app-server-adapter/{version} (Ubuntu 24.4.0; x86_64) unknown (kanban-codex-app-server-adapter; {version})",
+                    version = env!("CARGO_PKG_VERSION")
+                ),
+            }
+        })
+        .to_string();
+        let protocol_schema = protocol_schema();
+        let scenario = format!(
+            "version.stdout=hex:{}\nhelp.stdout=hex:{}\nschema.protocol=hex:{}\nlisten.response1=hex:{}\nlisten.stubborn_after_stage=1\nlisten.adapter_pid_file={}\nlisten.pid_file={}\nlisten.grandchild_pid_file={}\n",
+            hex_encode(format!("codex-cli {}\n", env!("CARGO_PKG_VERSION")).as_bytes()),
+            hex_encode(b"Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\n"),
+            hex_encode(&protocol_schema),
+            hex_encode(initialize_response.as_bytes()),
+            adapter_pid.display(),
+            child_pid.display(),
+            grandchild_pid.display(),
+        );
+        fs::write(self.root.join("scenario.txt"), scenario).unwrap();
+
+        let client_hash = sha256(b"{\"kind\":\"client-request\"}");
+        let protocol_hash = sha256(&protocol_schema);
+        let args = vec![
+            "--codex".to_owned(),
+            codex.to_string_lossy().into_owned(),
+            "--codex-home".to_owned(),
+            codex_home.to_string_lossy().into_owned(),
+            "--cwd".to_owned(),
+            cwd.to_string_lossy().into_owned(),
+            "--required-version".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            "--client-request-sha256".to_owned(),
+            client_hash,
+            "--protocol-schema-sha256".to_owned(),
+            protocol_hash,
+            "--protocol-timeout-ms".to_owned(),
+            "5000".to_owned(),
+        ];
+        let config = json!({
+            "version": 1,
+            "consumers": {
+                "codex.app-server": {
+                    "capabilities": ["start"],
+                    "actions": {
+                        "start-readonly-turn": {
+                            "capability": "start",
+                            "executable": env!("CARGO_BIN_EXE_kanban-codex-app-server-adapter"),
+                            "args": args,
+                        }
+                    },
+                    "secrets": {}
+                }
+            }
+        });
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.data.join("dispatchers.json"))
+            .unwrap();
+        serde_json::to_writer_pretty(&mut file, &config).unwrap();
+        file.write_all(b"\n").unwrap();
+        (
+            adapter_pid,
+            child_pid,
+            grandchild_pid,
+            self.root.join("capture.ndjson"),
+        )
     }
 
     fn seed(&self, mode: &str, timeout_ms: &str, max_retries: &str) {
@@ -236,6 +424,42 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("timed out waiting for {}", path.display());
 }
 
+fn wait_with_output_bounded(mut child: Child, timeout: Duration, label: &str) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "{label} did not exit within {timeout:?}; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn pid_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks process existence/permission.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn assert_pid_disappears(pid: i32, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_exists(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !pid_exists(pid),
+        "{label} process {pid} survived cancellation"
+    );
+}
+
 #[test]
 fn dispatcher_help_version_and_conflicts_cross_the_compiled_process_boundary() {
     let fixture = Fixture::new("surface");
@@ -270,8 +494,8 @@ fn dispatcher_help_version_and_conflicts_cross_the_compiled_process_boundary() {
 fn dispatcher_success_targets_one_consumer_and_resolves_every_explicit_selector() {
     let fixture = Fixture::new("success");
     fixture.write_config("success", Some("exit"));
-    fixture.add_subscription("sub-primary", "consumer.test", "1000", "1");
-    fixture.add_subscription("sub-other", "consumer.other", "1000", "1");
+    fixture.add_subscription("sub-primary", "consumer.test", AMPLE_TIMEOUT_MS, "1");
+    fixture.add_subscription("sub-other", "consumer.other", AMPLE_TIMEOUT_MS, "1");
     fixture.append_event("dispatch-success");
 
     let output = fixture
@@ -343,12 +567,42 @@ fn dispatcher_success_targets_one_consumer_and_resolves_every_explicit_selector(
 }
 
 #[test]
+fn dispatcher_rejects_retired_board_paths_before_it_can_claim() {
+    let fixture = Fixture::new("retired-db");
+    let board_path = fixture.board.to_str().unwrap().to_owned();
+    let retired = fixture.kanban(&[
+        "workspace",
+        "retire",
+        "DISPATCH-E2E",
+        "--as",
+        "test@dispatcher",
+        "--note",
+        "retire dispatcher board",
+        "--json",
+    ]);
+    assert_success(&retired, "retire dispatcher board");
+
+    let output = fixture
+        .dispatcher()
+        .args(["--db", &board_path, "--once", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "dispatcher accepted a retired board path"
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("retire dispatcher board"), "{stderr}");
+}
+
+#[test]
 fn dispatcher_failure_modes_are_safe_and_durable() {
     for (mode, expected, timeout) in [
-        ("exit", "adapter_exit", "5000"),
-        ("malformed", "adapter_response_invalid", "5000"),
-        ("mismatch", "adapter_response_invalid", "5000"),
-        ("oversized", "adapter_stdout_overflow", "5000"),
+        ("exit", "adapter_exit", AMPLE_TIMEOUT_MS),
+        ("malformed", "adapter_response_invalid", AMPLE_TIMEOUT_MS),
+        ("mismatch", "adapter_response_invalid", AMPLE_TIMEOUT_MS),
+        ("oversized", "adapter_stdout_overflow", AMPLE_TIMEOUT_MS),
         ("sleep", "adapter_timeout", "500"),
     ] {
         let fixture = Fixture::new(mode);
@@ -387,7 +641,7 @@ fn dispatcher_failure_modes_are_safe_and_durable() {
 #[test]
 fn dispatcher_missing_config_fails_before_materialize_or_claim() {
     let fixture = Fixture::new("config-before-claim");
-    fixture.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    fixture.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     fixture.append_event("dispatch-config-before-claim");
     let output = fixture
         .dispatcher()
@@ -406,11 +660,48 @@ fn dispatcher_missing_config_fails_before_materialize_or_claim() {
     assert_eq!(count, 0);
 }
 
+/// Say WHY a delivery did not succeed, in the panic message itself.
+///
+/// `succeeded: 0` on its own cannot distinguish "the dispatcher refused" from
+/// "the adapter breached its deadline" from "nothing was queued at all", which
+/// is precisely the ambiguity that left t-0ca6de57 undiagnosable after the
+/// fact. Reads the durable row and its newest attempt, and reports absence as
+/// absence rather than unwrapping into a second, less informative panic.
+fn delivery_diagnosis(fixture: &Fixture, subscription: &str) -> String {
+    let connection = fixture.db();
+    let delivery = connection
+        .query_row(
+            "SELECT status, attempts FROM subscription_deliveries WHERE subscription_id=?1",
+            [subscription],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map(|(status, attempts)| format!("delivery status={status} attempts={attempts}"))
+        .unwrap_or_else(|error| format!("no delivery row ({error})"));
+    let attempt = connection
+        .query_row(
+            "SELECT attempt, outcome, COALESCE(error_code,'-') FROM subscription_delivery_attempts \
+             WHERE subscription_id=?1 ORDER BY attempt DESC LIMIT 1",
+            [subscription],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map(|(attempt, outcome, code)| {
+            format!("newest attempt #{attempt} outcome={outcome} error={code}")
+        })
+        .unwrap_or_else(|error| format!("no attempt row ({error})"));
+    format!("{delivery}; {attempt}")
+}
+
 #[test]
 fn dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary() {
     let fixture = Fixture::new("pause-resume");
     fixture.write_config("success", None);
-    fixture.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    fixture.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     assert_success(
         &fixture.kanban(&[
             "subscription",
@@ -462,16 +753,19 @@ fn dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary() {
         .output()
         .unwrap();
     assert_success(&resumed, "resumed dispatcher");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&resumed.stdout).unwrap()["succeeded"],
-        1
+        report["succeeded"],
+        1,
+        "a resumed subscription must deliver. {}, report={report}",
+        delivery_diagnosis(&fixture, "sub-e2e")
     );
 }
 
 #[test]
 fn concurrent_dispatcher_processes_deliver_one_event_only_once() {
     let fixture = Fixture::new("concurrent");
-    fixture.seed("success", "1000", "1");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "1");
     let args = ["--db", fixture.board.to_str().unwrap(), "--once", "--json"];
     let first = fixture.dispatcher().args(args).spawn().unwrap();
     let second = fixture.dispatcher().args(args).spawn().unwrap();
@@ -516,10 +810,15 @@ fn concurrent_dispatcher_processes_deliver_one_event_only_once() {
     );
 }
 
+// `KANBAN_DISPATCHER_TEST_CRASH_AFTER_EVENT_ID` is honoured only by the
+// `#[cfg(debug_assertions)]` seam in `after_adapter_success` (rust/dispatcher.rs).
+// A release binary never exits 86, so this test exists only in debug test
+// binaries; `release_binary_ignores_dispatcher_crash_seam` is the release proof.
+#[cfg(debug_assertions)]
 #[test]
 fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
     let fixture = Fixture::new("crash-recovery");
-    fixture.seed("success", "5000", "2");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "2");
     let event_id: String = fixture
         .db()
         .query_row(
@@ -551,18 +850,36 @@ fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
         )
         .unwrap();
     assert_eq!(leased, "leased");
-    thread::sleep(Duration::from_millis(36_200));
 
-    let recovered = fixture
-        .dispatcher()
-        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
-        .output()
-        .unwrap();
-    assert_success(&recovered, "crash recovery");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&recovered.stdout).unwrap()["succeeded"],
-        1
-    );
+    // POLL for recovery rather than sleeping a precomputed constant. The old
+    // `sleep(36_200)` silently mirrored two numbers living in other files -
+    // this fixture's deadline and LEASE_CLEANUP_HEADROOM_MS
+    // (rust/dispatcher.rs:26) - so widening the incidental deadlines broke it
+    // and revealed the coupling (t-0ca6de57). Polling has no number to drift.
+    //
+    // Recovery cannot come sooner than the lease regardless of how often we
+    // ask: the sweep schedules the retry from `lease_deadline_at`, not from
+    // `now` (rust/store.rs:2730). I checked that by making the sweep ignore
+    // the deadline entirely - the row was reclaimed at once and STILL was not
+    // delivered for ~60s. So the loop is a bound, not a busy-wait shortcut.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let attempt = fixture
+            .dispatcher()
+            .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+            .output()
+            .unwrap();
+        assert_success(&attempt, "crash recovery");
+        if serde_json::from_slice::<Value>(&attempt.stdout).unwrap()["succeeded"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an expired lease was never reclaimed. {}",
+            delivery_diagnosis(&fixture, "sub-e2e")
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
     let db = fixture.db();
     let status: String = db
         .query_row(
@@ -594,11 +911,59 @@ fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
     );
 }
 
+// Release-side counterpart of the `#[cfg(debug_assertions)]` crash test above:
+// the crash env var must be inert in a release dispatcher, so the delivery is
+// acked on the first attempt. This is what a release run reports instead of
+// silently running one fewer test.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_binary_ignores_dispatcher_crash_seam() {
+    let fixture = Fixture::new("release-crash-seam-inert");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "2");
+    let event_id: String = fixture
+        .db()
+        .query_row(
+            "SELECT event_hash FROM events WHERE kind='tag_added' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let output = fixture
+        .dispatcher()
+        .env("KANBAN_DISPATCHER_TEST_CRASH_AFTER_EVENT_ID", &event_id)
+        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "release dispatcher honoured the debug-only crash seam; the debug-only test \
+         dispatcher_crash_after_adapter_success_recovers_at_least_once is intentionally \
+         excluded from release test binaries (cfg(debug_assertions)); run `cargo test` \
+         without --release to exercise the seam. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["succeeded"],
+        1
+    );
+    let status: String = fixture
+        .db()
+        .query_row(
+            "SELECT status FROM subscription_deliveries WHERE subscription_id='sub-e2e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "acked");
+}
+
 #[test]
 fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
     let idle = Fixture::new("signal-idle");
     idle.write_config("success", None);
-    idle.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    idle.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     let child = idle
         .dispatcher()
         .args(["--db", idle.board.to_str().unwrap(), "--json"])
@@ -614,7 +979,7 @@ fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
     );
 
     let running = Fixture::new("signal-adapter");
-    running.seed("sleep", "5000", "1");
+    running.seed("sleep", AMPLE_TIMEOUT_MS, "1");
     let child = running
         .dispatcher()
         .args(["--db", running.board.to_str().unwrap(), "--once", "--json"])
@@ -635,4 +1000,83 @@ fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
         )
         .unwrap();
     assert_eq!(state, ("retry_wait".into(), "adapter_cancelled".into()));
+}
+
+#[test]
+fn dispatcher_sigterm_contains_real_app_server_adapter_and_stubborn_descendants() {
+    let fixture = Fixture::new("real-app-server-signal");
+    let before = fs::read_dir(&fixture.project)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let (adapter_pid_file, child_pid_file, grandchild_pid_file, capture) =
+        fixture.write_real_app_server_config();
+    fixture.add_app_server_subscription(AMPLE_TIMEOUT_MS);
+    fixture.append_event("dispatch-real-app-server-signal");
+
+    let child = fixture
+        .dispatcher()
+        .stdin(Stdio::null())
+        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+        .spawn()
+        .unwrap();
+    wait_for_file(&adapter_pid_file, Duration::from_secs(5));
+    wait_for_file(&child_pid_file, Duration::from_secs(5));
+    wait_for_file(&grandchild_pid_file, Duration::from_secs(5));
+    wait_for_file(&capture, Duration::from_secs(5));
+    let adapter_pid: i32 = fs::read_to_string(&adapter_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let app_server_pid: i32 = fs::read_to_string(&child_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let grandchild_pid: i32 = fs::read_to_string(&grandchild_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(pid_exists(adapter_pid));
+    assert!(pid_exists(app_server_pid));
+    assert!(pid_exists(grandchild_pid));
+
+    let signal_started = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = wait_with_output_bounded(child, Duration::from_secs(2), "dispatcher SIGTERM");
+    let cancellation_elapsed = signal_started.elapsed();
+    eprintln!(
+        "dispatcher_cancellation_elapsed_ms={}",
+        cancellation_elapsed.as_millis()
+    );
+    assert_success(&output, "real app-server adapter SIGTERM");
+    assert!(
+        cancellation_elapsed < Duration::from_secs(1),
+        "cancellation elapsed={cancellation_elapsed:?}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed"], 1);
+    let state: (String, String) = fixture
+        .db()
+        .query_row(
+            "SELECT status,last_error_code FROM subscription_deliveries WHERE subscription_id='sub-app-server'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("retry_wait".into(), "adapter_cancelled".into()));
+
+    assert_pid_disappears(adapter_pid, "app-server adapter");
+    assert_pid_disappears(app_server_pid, "app-server");
+    assert_pid_disappears(grandchild_pid, "app-server grandchild");
+    let capture_text = fs::read_to_string(&capture).unwrap();
+    assert!(capture_text.contains("\"stage\":\"1\""), "{capture_text}");
+    assert!(
+        capture_text.contains("\"phase\":\"stubborn\""),
+        "{capture_text}"
+    );
+    let after = fs::read_dir(&fixture.project)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "adapter mutated its configured cwd");
 }

@@ -1,0 +1,3144 @@
+{
+  "schema": "kanban-agent-loop-benchmark-receipt/1",
+  "fixture": {
+    "fixture_id": "kanban-agent-loop-v1f",
+    "description": "The board reads a resuming driver performs: /session cont Step 0-1, then the /kb-att lane read, then the claim-candidates and cold-start packet reads from the kb skill. Every read is read-only on the board and returns --json.",
+    "board": "kanban",
+    "ssh_target": "hax",
+    "expected_remote_hostname": "hax",
+    "kb_exec": "/root/.local/bin/kb-bench",
+    "lane": "driver",
+    "actor": "bench@driver",
+    "warmups": 5,
+    "iterations": 30,
+    "per_read_timeout_s": 60,
+    "ssh_compression": "no",
+    "controlmaster_path": "/tmp/kb-bench-%C",
+    "controlmaster_persist": "60",
+    "reads": [
+      {
+        "id": "workspace_list",
+        "argv": [
+          "workspace",
+          "list"
+        ],
+        "tool": "workspace_list",
+        "args": {},
+        "board_scoped": false,
+        "source": "session/SKILL.md:206 (`kb-remote ws ls --json`, registry discovery before PROJECT is known)",
+        "consumed": "name, rootPath of every row (session/SKILL.md:283-299 resolves PROJECT from the row whose rootPath prefixes the worktree)",
+        "normalize_drop_keys": [
+          "lastUsedAt"
+        ],
+        "volatile_note": "Selecting a board stamps the workspace row lastUsedAt, so the bench reads themselves move it; excluded from the digest, not from the response."
+      },
+      {
+        "id": "handoff_pending",
+        "argv": [
+          "handoff",
+          "list",
+          "--status",
+          "pending"
+        ],
+        "tool": "handoff_list",
+        "args": {
+          "status": "pending"
+        },
+        "board_scoped": true,
+        "source": "session/SKILL.md:722 (`handoff list --status pending --json`; no --to, see the comment above it). The served binary has no --limit on handoff list; ADR-037 says it must grow one before it can refuse.",
+        "consumed": "id, to, branch, repoPath, dirtySummary, headSha of the lane's or unaddressed rows (session/SKILL.md:725-740)"
+      },
+      {
+        "id": "attention_open_100",
+        "argv": [
+          "attention",
+          "list",
+          "--status",
+          "open",
+          "--limit",
+          "100"
+        ],
+        "tool": "attention_list",
+        "args": {
+          "status": "open",
+          "limit": "100"
+        },
+        "board_scoped": true,
+        "source": "session/SKILL.md:810 (`attention list --status open --json`); --limit 100 is the default that call relied on, passed explicitly per ADR-037",
+        "consumed": "id, kind, body head, taskID for the Needs-George digest (session/SKILL.md:1088)"
+      },
+      {
+        "id": "stale",
+        "argv": [
+          "stale"
+        ],
+        "tool": "stale",
+        "args": {},
+        "board_scoped": true,
+        "source": "session/SKILL.md:819 (`stale --json`)",
+        "consumed": "array length; rows only when non-empty (session/SKILL.md:822-829)"
+      },
+      {
+        "id": "attention_open_500",
+        "argv": [
+          "attention",
+          "list",
+          "--status",
+          "open",
+          "--limit",
+          "500"
+        ],
+        "tool": "attention_list",
+        "args": {
+          "status": "open",
+          "limit": "500"
+        },
+        "board_scoped": true,
+        "source": "kb-att/scripts/lane-att.sh:77",
+        "consumed": "rows whose raisedBy ends in @LANE or whose taskID is in the lane (lane-att.sh:101-103); id set for O(1) membership (lane-att.sh:91)"
+      },
+      {
+        "id": "attention_resolved_500",
+        "argv": [
+          "attention",
+          "list",
+          "--status",
+          "resolved",
+          "--limit",
+          "500"
+        ],
+        "tool": "attention_list",
+        "args": {
+          "status": "resolved",
+          "limit": "500"
+        },
+        "board_scoped": true,
+        "source": "kb-att/scripts/lane-att.sh:78",
+        "consumed": "newest 200 rows projected to id, kind, taskID, raisedBy, resolvedBy, resolvedAt, body[0:300], resolution[0:300] (lane-att.sh:131-135); id set (lane-att.sh:92)"
+      },
+      {
+        "id": "task_list",
+        "argv": [
+          "task",
+          "list"
+        ],
+        "tool": "task_list",
+        "args": {},
+        "board_scoped": true,
+        "source": "kb-att/scripts/lane-att.sh:79 (`t ls --json`, the full board)",
+        "consumed": "id -> {title,status,lane,priority} index (lane-att.sh:87-88); lane rows projected to id,title,status,lane,priority,tags (lane-att.sh:124-125); blocked lane rows (lane-att.sh:104); drafts (lane-draft-classify.jq). The full list never crosses the wire in the deployed script (lane-att.sh:50-52)."
+      },
+      {
+        "id": "context_blocked_1",
+        "argv": [
+          "context",
+          "t-0110a25c"
+        ],
+        "tool": "context",
+        "args": {
+          "id": "t-0110a25c"
+        },
+        "board_scoped": true,
+        "normalize_drop_keys": [
+          "generatedAt"
+        ],
+        "source": "kb-att/scripts/lane-att.sh:110 (`ctx <id> --json` per blocked lane task; t-0110a25c was blocked in lane driver on 2026-09-05)",
+        "consumed": "checkpoints | last (lane-att.sh:111): nextAction, summary, state, createdAt"
+      },
+      {
+        "id": "context_blocked_2",
+        "argv": [
+          "context",
+          "t-8c656910"
+        ],
+        "tool": "context",
+        "args": {
+          "id": "t-8c656910"
+        },
+        "board_scoped": true,
+        "normalize_drop_keys": [
+          "generatedAt"
+        ],
+        "source": "kb-att/scripts/lane-att.sh:110 (`ctx <id> --json` per blocked lane task; t-8c656910 was blocked in lane driver on 2026-09-05)",
+        "consumed": "checkpoints | last (lane-att.sh:111): nextAction, summary, state, createdAt"
+      },
+      {
+        "id": "claim_candidates",
+        "argv": [
+          "claim",
+          "--candidates",
+          "--as",
+          "bench@driver",
+          "--lane",
+          "driver",
+          "--limit",
+          "100"
+        ],
+        "tool": "claim",
+        "args": {
+          "candidates": true,
+          "as": "bench@driver",
+          "lane": "driver",
+          "limit": "100"
+        },
+        "board_scoped": true,
+        "source": "kb/upstream/SKILL.md:416-418 (`kb claim --candidates --as $AGENT --project NAME [--lane LANE] [--limit N] --json`); read-only per ADR-026 (rust/store.rs claim_candidates)",
+        "consumed": "id, title, status, lane, priority of the ordered candidates; the worker picks the first wise one"
+      },
+      {
+        "id": "sitrep_lane_20",
+        "argv": [
+          "sitrep",
+          "list",
+          "--lane",
+          "driver",
+          "--limit",
+          "20"
+        ],
+        "tool": "sitrep_list",
+        "args": {
+          "lane": "driver",
+          "limit": "20"
+        },
+        "board_scoped": true,
+        "source": "kb/upstream/SKILL.md:327 (`kb sr ls --lane LANE --json`, the current view newest first); --limit 20 is the ADR-037 default passed explicitly",
+        "consumed": "body, author, createdAt, taskID of the newest rows"
+      },
+      {
+        "id": "context_candidate",
+        "argv": [
+          "context",
+          "t-5c98cfcf"
+        ],
+        "tool": "context",
+        "args": {
+          "id": "t-5c98cfcf"
+        },
+        "board_scoped": true,
+        "normalize_drop_keys": [
+          "generatedAt"
+        ],
+        "source": "kb/upstream/SKILL.md:579 (`kb ctx <id> --json`, the bounded cold-start packet for a resuming agent); t-5c98cfcf was the first claim candidate for lane driver on 2026-09-05",
+        "consumed": "task, ancestors, checkpoints, handoffs, notes, rules, sitreps, dependencies, truncated"
+      }
+    ],
+    "frozen_from": {
+      "fixture_id": "kanban-agent-loop-v1",
+      "note": "Identical reads, order and pinned ids to kanban-agent-loop-v1. The only change is kb_exec: a wrapper that points KANBAN_DATA_DIR at /root/bench-fixture on hax, an isolated registry holding one board named kanban, adopted from the 2026-09-06 16:44 CEST backup of the live kanban board (board uuid 67686472). Nothing writes to it, which is what the first v1 receipt lacked: 7 of 12 reads drifted because the live board was being written during the 74-minute run. Authorized by a-c9c08e5e, decided 2026-09-06.",
+      "snapshot": "kanban-pre-1de9bbf-20260906-164437/boards/67686472-56b0-4eba-a428-0a8e3eb5dd24.db"
+    },
+    "path": "docs/testing/bench/fixture-frozen.json",
+    "sha256": "7cd42dab0bfdd247a1250cc29f1c1a56a20d71171fb901d014974c3ca450210c"
+  },
+  "run": {
+    "started_at": "2026-09-06T18:11:11.592+00:00",
+    "command": "docs/testing/bench/agent-loop-bench.py --fixture docs/testing/bench/fixture-frozen.json --out /tmp/kbatt-work/bench-v1f-3.json",
+    "warmups": 5,
+    "iterations": 30,
+    "percentile_method": "nearest-rank over successful measured loops: value at ceil(P/100*n), 1-indexed",
+    "timing": "wall clock, time.perf_counter_ns on the client, per read and per loop",
+    "bytes": "application-layer: request = the exec command string (ssh arms) or the JSON-RPC frame (mcp); response = stdout bytes (ssh arms) or the JSON-RPC frame (mcp); body_bytes = the kb --json output either way. Not wire bytes.",
+    "client": {
+      "at": "2026-09-06T18:11:11.600+00:00",
+      "hostname": "geoywsMBP.local",
+      "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "python": "3.14.7",
+      "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+      "loadavg": [
+        3.04,
+        5.05,
+        6.32
+      ],
+      "build_processes": {
+        "count": 0,
+        "names": []
+      }
+    },
+    "ssh_effective_options": {
+      "addressfamily": "any",
+      "batchmode": "no",
+      "canonicalizehostname": "false",
+      "compression": "yes",
+      "controlmaster": "auto",
+      "controlpath": "/Users/geoyws/.ssh/cm/a7a8e81f3d2e152176c30f24738effd2086b4b16",
+      "controlpersist": "600",
+      "gssapiauthentication": "no",
+      "hostname": "178.63.205.39",
+      "identityfile": "~/.ssh/hetzner_ax42",
+      "port": "22",
+      "user": "root"
+    },
+    "rtt": {
+      "host": "178.63.205.39",
+      "min_ms": 168.3,
+      "avg_ms": 168.675,
+      "max_ms": 169.795,
+      "stdev_ms": 0.563
+    },
+    "finished_at": "2026-09-06T18:33:41.432+00:00"
+  },
+  "arms": [
+    {
+      "arm": "ssh",
+      "description": "one fresh ssh connection per logical read, exactly what kb-board/kb-remote do today",
+      "transport": {
+        "kind": "ssh-per-read",
+        "ssh_argv_prefix": [
+          "ssh",
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "Compression=no",
+          "-o",
+          "ControlMaster=no",
+          "-o",
+          "ControlPath=none",
+          "--",
+          "hax"
+        ],
+        "compression": "no",
+        "note": "the deployed kb-remote wrapper additionally wraps every call in `bash -c` with a hostname guard (kb-remote:290); the bench checks the hostname once in setup and runs kb directly"
+      },
+      "started_at": "2026-09-06T18:11:12.679+00:00",
+      "requests_per_loop": 12,
+      "host_before": {
+        "at": "2026-09-06T18:11:15.249+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "0.71 1.06 1.11 2/12593 3485872",
+        "uptime": " 20:11:15 up 105 days, 20:00, 14 users,  load average: 0.71, 1.06, 1.11",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13532808 kB;Buffers: 13927652 kB;Cached: 56050596 kB;",
+        "load1": 0.71,
+        "load5": 1.06,
+        "load15": 1.11
+      },
+      "client_before": {
+        "at": "2026-09-06T18:11:15.261+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          3.12,
+          5.03,
+          6.31
+        ],
+        "build_processes": {
+          "count": 0,
+          "names": []
+        }
+      },
+      "setup": {
+        "cold_probe_ms": 2407.659,
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "remote_hostname": "hax"
+      },
+      "reuse_before": {
+        "phase": "before",
+        "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+        "authenticated_lines": 1,
+        "mux_lines": 0
+      },
+      "reuse_after": {
+        "phase": "after",
+        "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+        "authenticated_lines": 1,
+        "mux_lines": 0
+      },
+      "host_after": {
+        "at": "2026-09-06T18:28:14.632+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "1.52 1.16 1.07 1/12604 3700208",
+        "uptime": " 20:28:14 up 105 days, 20:17, 14 users,  load average: 1.52, 1.16, 1.07",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13505964 kB;Buffers: 13927652 kB;Cached: 56062488 kB;",
+        "load1": 1.52,
+        "load5": 1.16,
+        "load15": 1.07
+      },
+      "client_after": {
+        "at": "2026-09-06T18:28:14.641+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          13.51,
+          7.43,
+          6.05
+        ],
+        "build_processes": {
+          "count": 1,
+          "names": [
+            "cargo"
+          ]
+        }
+      },
+      "teardown": {},
+      "finished_at": "2026-09-06T18:28:14.717+00:00",
+      "warmups": {
+        "count": 5,
+        "loop_ms": [
+          29948.478,
+          30884.942,
+          28935.422,
+          28729.28,
+          28661.712
+        ],
+        "ok": 5
+      },
+      "measured": {
+        "iterations_requested": 30,
+        "iterations_run": 30,
+        "iterations_ok": 30,
+        "failures": 0,
+        "loop_ms": {
+          "n": 30,
+          "min": 28108.431,
+          "p50": 28392.828,
+          "p95": 31905.851,
+          "p99": 32419.763,
+          "max": 32419.763,
+          "mean": 28765.639,
+          "stdev": 1103.716
+        },
+        "loop_ms_samples": [
+          28465.162,
+          28435.211,
+          30669.07,
+          28461.827,
+          32419.763,
+          28629.222,
+          28251.655,
+          28505.346,
+          31905.851,
+          28481.117,
+          28270.322,
+          28396.287,
+          30947.555,
+          28392.828,
+          28241.527,
+          28449.406,
+          28310.804,
+          28397.209,
+          28179.734,
+          28174.487,
+          28414.398,
+          28227.001,
+          28356.249,
+          28283.998,
+          28521.16,
+          28260.244,
+          28285.638,
+          28267.635,
+          28260.027,
+          28108.431
+        ],
+        "bytes_sent_per_loop": {
+          "n": 30,
+          "min": 916.0,
+          "p50": 916.0,
+          "p95": 916.0,
+          "p99": 916.0,
+          "max": 916.0,
+          "mean": 916.0,
+          "stdev": 0.0
+        },
+        "bytes_received_per_loop": {
+          "n": 30,
+          "min": 3633544.0,
+          "p50": 3633544.0,
+          "p95": 3633544.0,
+          "p99": 3633544.0,
+          "max": 3633544.0,
+          "mean": 3633544.0,
+          "stdev": 0.0
+        },
+        "body_bytes_per_loop": {
+          "n": 30,
+          "min": 3633544.0,
+          "p50": 3633544.0,
+          "p95": 3633544.0,
+          "p99": 3633544.0,
+          "max": 3633544.0,
+          "mean": 3633544.0,
+          "stdev": 0.0
+        },
+        "per_read": {
+          "workspace_list": {
+            "ms": {
+              "n": 30,
+              "min": 2062.065,
+              "p50": 2076.418,
+              "p95": 2211.477,
+              "p99": 2232.039,
+              "max": 2232.039,
+              "mean": 2089.698,
+              "stdev": 37.423
+            },
+            "bytes_sent": 47,
+            "bytes_received": {
+              "n": 30,
+              "min": 353.0,
+              "p50": 353.0,
+              "p95": 353.0,
+              "p99": 353.0,
+              "max": 353.0,
+              "mean": 353.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 353.0,
+              "p50": 353.0,
+              "p95": 353.0,
+              "p99": 353.0,
+              "max": 353.0,
+              "mean": 353.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+            ],
+            "sha256_raw": [
+              "2375c2e0e186221898a894d4945e2234305fae789b398f403a30baa2634b498f",
+              "2c9aeffc1fa2817a7b652dc3ef96be9232ec789bf8c7e06d47513816fc606f51",
+              "349fda2b9c7824060143aceecc13f53b140bf78016af5cfb74e2189f7ae348ba",
+              "3ea8b1f43403e82b137d42dcffd887e99acdf0f977b01bbdffb0a771036b24db",
+              "4181b3fb7376000f066ef359cf2076f6bd3048af0a9ab8224ff99f59893d6339",
+              "4c62fe8bc58c0793f3f15df6264b45d8686139477abc98ecb96094f9eec5689b",
+              "4e8462dfb366cf5521f94bdf490b56e560c4774065faa668aba9dddfcbb9dd32",
+              "60ef7eb263ff484c4f31528466d0551f01b19e4592c683895317290d7da6e8b1",
+              "63c3333b9459a570e291a2be9a2cfcb6e3125d3da5eb729424c9bbc14aaacd40",
+              "76ea261e957d8ded46289d8fe9c77d6701d1e27a9de16defd17b79bf120d3285",
+              "7b4f44b1217ac547f37a6e1efeff6bc25044f842817c24b34899aab728ab737d",
+              "7b789f2b2c6da6ad13edabe62a449499ec73a7baf70c609dc84cfa652237d454",
+              "7c03f2f762f241f30322cb97b2e80523bdc75c0a2b1978a1f059d8fcbef53433",
+              "88af3bbca3af33e5ce83e7d775ba55fec77d213afb9b2ae02dba67be42cc5e81",
+              "8a7c7eb3051fe90bdfa3742e56ca7963caec97ede8a93f66ad915e021adfb3ae",
+              "927385da5757a4c3beabbe7c99f8bfb6b108bc23f8a3b79e5e55f2072d1bf260",
+              "9ed66a32870559954863792b2c3c42edbff608b3d06c1496f3eefb7724180313",
+              "9efc910a49e1e3e42b3662c65d730fa4d83a15066ccd164109472d543ecb1092",
+              "a1472a01343882d381f9177396330c4dbc129bfbe50497022a8d2b4a2cd504c7",
+              "a666b10b03777551f2a7712f0a9dd8fa5decfec4f58923a6f0f26d7eda8793dc",
+              "abda7e853c694d8c267cbc5d729e8ff5a94f42e500c6cd5476d42c0f695dac76",
+              "b8283e188108530eb69768c055bf143ad8e83d40e058ae73d6cd8fb18b833cd5",
+              "be865113fe65c27852c044af417b03220682a4bd978e50ee2aaa463db11d2448",
+              "da0ecaf3de5fd3e68122889bfbb7e49b4c2e778d46efcb1429f076562e469d10",
+              "e71ab949a9671245584be24ee3edea697c9edc9ddd34dc7f500ae51157acfec7",
+              "e82a76f00228371e06f528364087b4d4d4898c47bd83d054669bd792eb33720b",
+              "ec0c43ff3439a28d6fa5287b6aa078a190b88131fa3e391a4228fb8d7990b052",
+              "ecffafa0c175132d6c83dbec60368a7e9dbf5a47b8be5c4c673458c109ed96cd",
+              "f28f6c292add9b98cff77ca3e68dd364263e62d25e996fd660bf45225f930876",
+              "fd7dba5142a818928bd7f1b35008a5769cab76ceb793ca3861ab89ab4a786348"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "handoff_pending": {
+            "ms": {
+              "n": 30,
+              "min": 2093.959,
+              "p50": 2125.268,
+              "p95": 2255.323,
+              "p99": 2280.742,
+              "max": 2280.742,
+              "mean": 2133.685,
+              "stdev": 38.874
+            },
+            "bytes_sent": 79,
+            "bytes_received": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_100": {
+            "ms": {
+              "n": 30,
+              "min": 2263.365,
+              "p50": 2291.584,
+              "p95": 2359.81,
+              "p99": 2436.929,
+              "max": 2436.929,
+              "mean": 2301.743,
+              "stdev": 33.016
+            },
+            "bytes_sent": 90,
+            "bytes_received": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "stale": {
+            "ms": {
+              "n": 30,
+              "min": 2099.472,
+              "p50": 2129.925,
+              "p95": 2252.403,
+              "p99": 2313.987,
+              "max": 2313.987,
+              "mean": 2138.945,
+              "stdev": 43.537
+            },
+            "bytes_sent": 55,
+            "bytes_received": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_500": {
+            "ms": {
+              "n": 30,
+              "min": 2255.559,
+              "p50": 2303.268,
+              "p95": 2387.421,
+              "p99": 2452.274,
+              "max": 2452.274,
+              "mean": 2311.068,
+              "stdev": 38.088
+            },
+            "bytes_sent": 90,
+            "bytes_received": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_resolved_500": {
+            "ms": {
+              "n": 30,
+              "min": 3325.352,
+              "p50": 3368.733,
+              "p95": 6967.081,
+              "p99": 7454.933,
+              "max": 7454.933,
+              "mean": 3800.23,
+              "stdev": 1109.142
+            },
+            "bytes_sent": 94,
+            "bytes_received": {
+              "n": 30,
+              "min": 2937130.0,
+              "p50": 2937130.0,
+              "p95": 2937130.0,
+              "p99": 2937130.0,
+              "max": 2937130.0,
+              "mean": 2937130.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 2937130.0,
+              "p50": 2937130.0,
+              "p95": 2937130.0,
+              "p99": 2937130.0,
+              "max": 2937130.0,
+              "mean": 2937130.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+            ],
+            "sha256_raw": [
+              "3aad731cacfb5db12cb5029ac2cf12946927bdbec602ca99c74f8fddf205c2b4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "task_list": {
+            "ms": {
+              "n": 30,
+              "min": 2955.32,
+              "p50": 2981.644,
+              "p95": 3104.475,
+              "p99": 3117.938,
+              "max": 3117.938,
+              "mean": 2994.213,
+              "stdev": 37.698
+            },
+            "bytes_sent": 59,
+            "bytes_received": {
+              "n": 30,
+              "min": 586896.0,
+              "p50": 586896.0,
+              "p95": 586896.0,
+              "p99": 586896.0,
+              "max": 586896.0,
+              "mean": 586896.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 586896.0,
+              "p50": 586896.0,
+              "p95": 586896.0,
+              "p99": 586896.0,
+              "max": 586896.0,
+              "mean": 586896.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+            ],
+            "sha256_raw": [
+              "949d49d78feca4a5db58db5c8b13550b2949ba88247c61a7348f4f39a8a1fee5"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_1": {
+            "ms": {
+              "n": 30,
+              "min": 2091.09,
+              "p50": 2139.042,
+              "p95": 2170.189,
+              "p99": 2223.712,
+              "max": 2223.712,
+              "mean": 2139.512,
+              "stdev": 24.461
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 3409.0,
+              "p50": 3409.0,
+              "p95": 3409.0,
+              "p99": 3409.0,
+              "max": 3409.0,
+              "mean": 3409.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3409.0,
+              "p50": 3409.0,
+              "p95": 3409.0,
+              "p99": 3409.0,
+              "max": 3409.0,
+              "mean": 3409.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+            ],
+            "sha256_raw": [
+              "06a39fd383bcf23ad1a85e7c3651ac419de0029a1887ec28746da08f01b6bb5d",
+              "0fdb7626263afa6aabb70ee971f1d81d2c87031151e5d0b34fce77a84e83fc11",
+              "113591449a5e9e8cd051f6a978a6e075985ac4e6c7ea2fb012513394ba6cea1b",
+              "1834812e5a0b040fcedba2359f170c96779d94aea6bbf24a4366f90e1730e84c",
+              "20df83baed3c39fe6b33f710fc884794bbf2820ed2bae66ec61521a8e42158ba",
+              "227a3f1ebfcbeca250c0781065a822d1c4740393128f0e913333fd9190d32cc2",
+              "3016a1abb1cb2442d9175706c8e5dec729acd933176f6bf5cd028147bb0c6aba",
+              "328439387c4c37916783daba56f826340d70a8196f1b0c9eb7cb2ebf7ba7eff7",
+              "3844ee4e633b06239e64db4684ddac951238b007c334f8f791f7402cf24823a7",
+              "411921cbaa703280e12bad04680d51e2dd30f6309b06b25dc336b6dd170b74d3",
+              "488c673d902f9083046e71245ae37a08ac1a6b84a7c9d2629b0cbf6aec13dabd",
+              "4f38b27303005d564d65191504c6edd329c69cac1f91a6aed3468fb3fa52700e",
+              "55eb6d96f2f1f062fdfa4311260eaa8226060d0005415496d4dc391ba77d9f94",
+              "641a9ad02d1c3444beb5b3c80c2d080b09cb5d6daad4485a659c8df9282ec0d7",
+              "6853d2b62fe958b4ea95cb3e6ef6ab819c1988d86a37492e754c6cf2afa7d7b8",
+              "6a20cbb3ff42f63598aa832e02a44d42ebe307cd51c20a80691c91cb467f95ef",
+              "78faa6fae8a7157030c58ca80ed837ba68c59c43de061f486bd640804aee1e72",
+              "7a951ffd9a5f60d1324c5f8a653256e4b3878928a93153688e46a54695b92fab",
+              "80a563e5e5736d393a1b258a38cc12dc1b59581d95d359cadcf032119f560e25",
+              "85fd4647d7e64d6ceb9777ddd38dddc62368aadff437772b7142840db02ed191",
+              "901d2a0d1e6a0f3ba3da8de3eacac6e9afd8ef3ffb174bd8fd1d0e1bba508344",
+              "9589b1da181ce9373604c07b3a60c3e82c779911933d7e1d8a0bed624368c98d",
+              "9a3a4d202cefccdb89c50df95ea7c90c504544708a67491f1a98586c996ea61c",
+              "a712dec1e4105cffc7bfde5ca863dc3cdffc59edcd379bf48befecadc3fbab06",
+              "aed87dd9a2ca5b4cc638c308738ff3aaae10a0068f0359c71f8960654d72af56",
+              "bcd97f2a5fe493e95a183297855ab51f79a804318fb8678c4d52c7f258526dd2",
+              "c004af8de7a4323bbc70f0f897844820e9e878dcced646fcc2bca2c6ccaa76a5",
+              "cbd8735768b68ef2f1a6f6db890c7ce44d1cc7d7df34e2a66471742c2d4c81aa",
+              "e332b532a494200f368b7764fb11896117c3f39b6d99e9ee4e024564720ed1f2",
+              "f81eb78b86da237033a5c906fe9425c04fb6d3bc176c07799341ca95351e5068"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_2": {
+            "ms": {
+              "n": 30,
+              "min": 2094.517,
+              "p50": 2125.664,
+              "p95": 2259.93,
+              "p99": 2268.29,
+              "max": 2268.29,
+              "mean": 2137.274,
+              "stdev": 41.742
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 10992.0,
+              "p50": 10992.0,
+              "p95": 10992.0,
+              "p99": 10992.0,
+              "max": 10992.0,
+              "mean": 10992.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 10992.0,
+              "p50": 10992.0,
+              "p95": 10992.0,
+              "p99": 10992.0,
+              "max": 10992.0,
+              "mean": 10992.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+            ],
+            "sha256_raw": [
+              "00572bc0b39b84d856a0649a7e3469f37e85e907732d834442456a731e0ec55f",
+              "0aca0a0e25c86e3ab66cd66dfd94f9d9f5b8cc1b0ab36ec3ede088f786ea6f78",
+              "13475d13e18538d284cc3dd833c5954bf7e4320156a44803e90de44ebbe95677",
+              "141ce068b7a4d8d23caa7fe6605aa6b419f1e0a64378e65fd3ae9eeb27aa00cf",
+              "152ee532b6dda92b01294d38e46cc34a47949e629dc5c30d58c42c7c41d87c3e",
+              "215bdb9ff8407100e7207706b33d9edd839a3de76c0ca7fd9433ab8f710b1411",
+              "2194e9ecdc6a841574448ba45d94947473bb576871d83145f519ea54ec4fef7b",
+              "26004916dfba6c0cee72f51d259813839da8264abc144e29877362a65574b310",
+              "286eefcfd40a1a00deea90dc9bc2b28db3c06e1d547764bf79db3b786c158f66",
+              "29899e815cb7ea684c75cee265d335b9e2681082142aafb80620654990a36957",
+              "39586ffc07d7228bf196eb6fe96ff97d76c0ec254acb71ba5c2346acefdbb350",
+              "5b1f909ab5b157023287fedbd029e6e4c4b78d58c7ebdd5a9dc60c69398051b0",
+              "6a3d160e0a9fa297cc48a620efef94a159a50d9cbcfff8f1410a7678fbdf2321",
+              "6d2d8a4dfc91b4c8ff5eb2322d80bcd5ce93ef8533ab00c83ce8b11c2931f141",
+              "7180682eef2f7206f2afe50a02a2533c03b58119af11004f5a504d7f4c73986f",
+              "7a86989dad8b1cd58170d4a9a6d706b4f0fd34e21b9e1346d978be9e220d992f",
+              "81b571b58afc2ce2caaa9b9000e1541f44d7f1385c545bc6cfb8f6a0cfcd7f4e",
+              "86fc494b137bca01e7e1b73df12932509f15ef90f719cc10d860ea85b0676961",
+              "a40717e8544e9bb87a6301edab2472defdbfe6c4889b5511afad15b830f79e16",
+              "b3cf7080f734907dcf2ea75fcf8bfaa0787ca450fc929a8e271ead8d5c9b305e",
+              "b4892c32141f6f96470e0454c38ea26682ccd3d1de8251c541f268d984e12892",
+              "b94207d121abb9d5f0a506fe2f8aee3955bcfbd7e8efae67e6707f23fc36fa12",
+              "c56425b8034f519034669deff0abfb2019ec575e249563fe42c4633b7f50c171",
+              "c5a773f0c112a72e5e6cae7429cf042c21a08953100fb8a6c54e6cde119f74ac",
+              "da8efd7eda7c1df1a36680f9a3b2f027a587e7f787b2c9eaa55bada858d8e731",
+              "db302c29237930503a230d827fec83f6e1900c7d0b2df92fe7c019a5f65e7e7d",
+              "e8776e7eb41aa849d4277ce979d1d036dd2938cbdcf0cd46e6a65ae1877d00f7",
+              "ed878d65ffad353d1e4fc0d4aeee253f97372179f5aa8f18a1098ca10b83999a",
+              "fd70a081b59f7afc704687c845c136246f1f2730478b3796b5d09305e44a01b1",
+              "fe8a4bae3b1c2351726af314d4441abe416804077dd7c85b95db11de25e0d275"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "claim_candidates": {
+            "ms": {
+              "n": 30,
+              "min": 2068.667,
+              "p50": 2088.034,
+              "p95": 2112.102,
+              "p99": 2129.983,
+              "max": 2129.983,
+              "mean": 2090.893,
+              "stdev": 13.739
+            },
+            "bytes_sent": 112,
+            "bytes_received": {
+              "n": 30,
+              "min": 1545.0,
+              "p50": 1545.0,
+              "p95": 1545.0,
+              "p99": 1545.0,
+              "max": 1545.0,
+              "mean": 1545.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 1545.0,
+              "p50": 1545.0,
+              "p95": 1545.0,
+              "p99": 1545.0,
+              "max": 1545.0,
+              "mean": 1545.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+            ],
+            "sha256_raw": [
+              "cad93e6ab6c7e1bb2da26f0b866fc8e32166e69311599b123f234fd497d710a4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "sitrep_lane_20": {
+            "ms": {
+              "n": 30,
+              "min": 2267.459,
+              "p50": 2297.424,
+              "p95": 2386.985,
+              "p99": 2455.509,
+              "max": 2455.509,
+              "mean": 2304.969,
+              "stdev": 38.055
+            },
+            "bytes_sent": 86,
+            "bytes_received": {
+              "n": 30,
+              "min": 22439.0,
+              "p50": 22439.0,
+              "p95": 22439.0,
+              "p99": 22439.0,
+              "max": 22439.0,
+              "mean": 22439.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22439.0,
+              "p50": 22439.0,
+              "p95": 22439.0,
+              "p99": 22439.0,
+              "max": 22439.0,
+              "mean": 22439.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+            ],
+            "sha256_raw": [
+              "8ec41817e89fe177097921722007258a49ea54364d11e385efb10bfc336d360b"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_candidate": {
+            "ms": {
+              "n": 30,
+              "min": 2259.685,
+              "p50": 2293.977,
+              "p95": 2352.962,
+              "p99": 2379.686,
+              "max": 2379.686,
+              "mean": 2296.558,
+              "stdev": 23.732
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 26646.0,
+              "p50": 26646.0,
+              "p95": 26646.0,
+              "p99": 26646.0,
+              "max": 26646.0,
+              "mean": 26646.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 26646.0,
+              "p50": 26646.0,
+              "p95": 26646.0,
+              "p99": 26646.0,
+              "max": 26646.0,
+              "mean": 26646.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+            ],
+            "sha256_raw": [
+              "13edf7e9127c998e1c95d7dfea21fa120556e090e9740fc57b2127ff819705ad",
+              "1a32ff81d750b46a26572b8ea057f827f08831b1027acd1b0fa3af4433c15a61",
+              "273d80b945e67251d5429ebe13394e6513f1ffeb419f043268d31cc237d27ab7",
+              "2a2dff3ec098400d5d867bd6be5df9a62e00fa7bdac68791780948e7f37d82d1",
+              "3f921ccbd1000644edd7c986931cd2ce7abea76073660081a1794e917e770a3c",
+              "40eb26f837b0d95f0fb3c452ef950330aab10d443861e15c32899d436b2e5bf1",
+              "456e485a381110b5c32e41522c515a1587599fcd19aee493b3c892e43e7ce8f7",
+              "5c7125896ff3882363d04d9d175b57c540a322de9aee1ca1c27304b5c5dd2e86",
+              "675bf3d86a5d4991ec6d6004da3d34fb3b736fbc944ae847bde33f69487025e4",
+              "6f0a674024bbc16f788289806b2e28eaa6893c4e0061191ae0cfd28e5a91a1b2",
+              "7af202d2a69c0d1e39374a6cda788cf20ccb7cf3e98c6cec1483e8570d287ba4",
+              "804338b6139e3f3cd3292f70867acfc9818ffb4644c1f8e092543dcd695a96be",
+              "837790e547bcd596019a62de979303df9ca98027f65e34683cf6924c015f5617",
+              "87601049e48a12ab38aa7f5ce43ee8e2edea672c9e4d87bea465888ba7ff9b9e",
+              "8e0ca30b17abdafae05c28431c5bead18d08a94bec65f84b68171c6966f160c0",
+              "b0e8062b4e2858c9e314a5b9c0239e2f414689532d8149b65f649860290bc418",
+              "b86b5a20b556ef57bf30fdc9d904af550e88ee80e585ab6ef848ff961423cb57",
+              "c1f1eeafd40f3631394e1f6ab08058fdb9842516c23e393dfd08eb25814aef2f",
+              "c33dd4ed1e52264c8393b273fb0804ab9c5fad993e7ccbbd756642db2d78c8d2",
+              "c6f8bc28276d0a12dba54a499b955933abc03d27249dded00ba4449b4327e7eb",
+              "ce344dc0521deda96744b9f901749fd3a652fc725818fdbc9311daf3b10198bc",
+              "da2426e7de92dea9b68a188622674483a4b4f951c9868157116138383f10e75d",
+              "dc44855ada75131f30f9f39fc4229afe3122135308e1562c0d0e7aaeff539e0f",
+              "e1a1a3a5985c663b142d19b826ed86f123bc2b2b868ee69e42e8c81d3ae8a915",
+              "e3c23435ff5430f2de288777d22a3b6ba65b5fd6dfed33dbe47fb0da93c8f9b5",
+              "e41374faf898366ae0332ecb61cb6fdd100707dd5f2a1a83b8ea5245bf59839d",
+              "efb87405a80b3041bfb8787a16dd26d2a170c338ae41c2f11402fd2b4801c8aa",
+              "f189fbda5064482d589e35997618a88f6bf9eaed5c8811a03dd2db5a3f38e14b",
+              "f6236ff01275dc3ee89fe88a5a207e733e805aa779e0cd8b708f96483f5b19b0",
+              "f7e6b41a79a8e67fe12c3dd25c23b48869286e8606d4e68aa669b832d46458d7"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          }
+        }
+      },
+      "failure_detail": [],
+      "connection_reuse": {
+        "reused": false,
+        "fresh_connection_proven": true,
+        "how_proven": "every read spawns a new ssh with ControlMaster=no ControlPath=none; the -vv probes before and after authenticated exactly once per invocation and used no mux client",
+        "connections_per_loop": 12,
+        "evidence": [
+          {
+            "phase": "before",
+            "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+            "authenticated_lines": 1,
+            "mux_lines": 0
+          },
+          {
+            "phase": "after",
+            "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+            "authenticated_lines": 1,
+            "mux_lines": 0
+          }
+        ]
+      },
+      "host_load": {
+        "before": 0.71,
+        "after": 1.52
+      },
+      "client_load": {
+        "before": 3.12,
+        "after": 13.51
+      },
+      "compression": "no",
+      "valid": true
+    },
+    {
+      "arm": "ssh-controlmaster",
+      "description": "one ssh connection per logical read multiplexed over a per-invocation ControlMaster (flags only, no ~/.ssh/config change)",
+      "transport": {
+        "kind": "ssh-per-read-over-controlmaster",
+        "ssh_argv_prefix": [
+          "ssh",
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "Compression=no",
+          "-o",
+          "ControlMaster=auto",
+          "-o",
+          "ControlPath=/tmp/kb-bench-%C",
+          "-o",
+          "ControlPersist=60",
+          "--",
+          "hax"
+        ],
+        "compression": "no",
+        "note": "the deployed kb-remote wrapper additionally wraps every call in `bash -c` with a hostname guard (kb-remote:290); the bench checks the hostname once in setup and runs kb directly"
+      },
+      "started_at": "2026-09-06T18:28:14.718+00:00",
+      "requests_per_loop": 12,
+      "host_before": {
+        "at": "2026-09-06T18:28:17.117+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "1.52 1.16 1.07 1/12598 3700571",
+        "uptime": " 20:28:16 up 105 days, 20:17, 14 users,  load average: 1.52, 1.16, 1.07",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13520800 kB;Buffers: 13927652 kB;Cached: 56062520 kB;",
+        "load1": 1.52,
+        "load5": 1.16,
+        "load15": 1.07
+      },
+      "client_before": {
+        "at": "2026-09-06T18:28:17.141+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          13.63,
+          7.55,
+          6.1
+        ],
+        "build_processes": {
+          "count": 1,
+          "names": [
+            "cargo"
+          ]
+        }
+      },
+      "setup": {
+        "cold_probe_ms": 2074.741,
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "remote_hostname": "hax",
+        "master_pid": 26694
+      },
+      "reuse_before": {
+        "phase": "before",
+        "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+        "authenticated_lines": 0,
+        "mux_lines": 2,
+        "master_pid": 26694
+      },
+      "reuse_after": {
+        "phase": "after",
+        "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+        "authenticated_lines": 0,
+        "mux_lines": 2,
+        "master_pid": 26694
+      },
+      "host_after": {
+        "at": "2026-09-06T18:31:37.494+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "3.34 2.18 1.47 2/12594 3738836",
+        "uptime": " 20:31:37 up 105 days, 20:20, 15 users,  load average: 3.34, 2.18, 1.47",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13522404 kB;Buffers: 13927652 kB;Cached: 56062832 kB;",
+        "load1": 3.34,
+        "load5": 2.18,
+        "load15": 1.47
+      },
+      "client_after": {
+        "at": "2026-09-06T18:31:37.503+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          3.44,
+          5.67,
+          5.62
+        ],
+        "build_processes": {
+          "count": 1,
+          "names": [
+            "cargo"
+          ]
+        }
+      },
+      "teardown": {
+        "control_exit": "Exit request sent.",
+        "master_after_exit": null
+      },
+      "finished_at": "2026-09-06T18:31:37.792+00:00",
+      "warmups": {
+        "count": 5,
+        "loop_ms": [
+          5748.436,
+          7991.197,
+          8345.416,
+          6919.881,
+          8243.446
+        ],
+        "ok": 5
+      },
+      "measured": {
+        "iterations_requested": 30,
+        "iterations_run": 30,
+        "iterations_ok": 30,
+        "failures": 0,
+        "loop_ms": {
+          "n": 30,
+          "min": 5036.621,
+          "p50": 5245.49,
+          "p95": 5420.01,
+          "p99": 5427.75,
+          "max": 5427.75,
+          "mean": 5255.52,
+          "stdev": 100.579
+        },
+        "loop_ms_samples": [
+          5192.825,
+          5169.856,
+          5155.248,
+          5211.469,
+          5083.861,
+          5036.621,
+          5252.117,
+          5324.718,
+          5192.145,
+          5245.49,
+          5156.316,
+          5098.32,
+          5316.136,
+          5237.522,
+          5229.332,
+          5298.185,
+          5309.337,
+          5427.75,
+          5378.822,
+          5412.076,
+          5374.84,
+          5400.423,
+          5420.01,
+          5343.173,
+          5255.101,
+          5240.669,
+          5274.531,
+          5164.556,
+          5213.938,
+          5250.2
+        ],
+        "bytes_sent_per_loop": {
+          "n": 30,
+          "min": 916.0,
+          "p50": 916.0,
+          "p95": 916.0,
+          "p99": 916.0,
+          "max": 916.0,
+          "mean": 916.0,
+          "stdev": 0.0
+        },
+        "bytes_received_per_loop": {
+          "n": 30,
+          "min": 3633544.0,
+          "p50": 3633544.0,
+          "p95": 3633544.0,
+          "p99": 3633544.0,
+          "max": 3633544.0,
+          "mean": 3633544.0,
+          "stdev": 0.0
+        },
+        "body_bytes_per_loop": {
+          "n": 30,
+          "min": 3633544.0,
+          "p50": 3633544.0,
+          "p95": 3633544.0,
+          "p99": 3633544.0,
+          "max": 3633544.0,
+          "mean": 3633544.0,
+          "stdev": 0.0
+        },
+        "per_read": {
+          "workspace_list": {
+            "ms": {
+              "n": 30,
+              "min": 346.719,
+              "p50": 348.841,
+              "p95": 366.284,
+              "p99": 372.7,
+              "max": 372.7,
+              "mean": 350.052,
+              "stdev": 5.365
+            },
+            "bytes_sent": 47,
+            "bytes_received": {
+              "n": 30,
+              "min": 353.0,
+              "p50": 353.0,
+              "p95": 353.0,
+              "p99": 353.0,
+              "max": 353.0,
+              "mean": 353.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 353.0,
+              "p50": 353.0,
+              "p95": 353.0,
+              "p99": 353.0,
+              "max": 353.0,
+              "mean": 353.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+            ],
+            "sha256_raw": [
+              "03985ebe6ac19a5ba63d2c7eaaa7328dde49fe0de1e99edd153ac51b24e4eef4",
+              "08793b8b5d242ce6448b6297308e426a373cc02f1205c1cec1c14e1918c29a39",
+              "0bc0dbd5b8eebda6506c67f2b3f4e6fa8d536ec8e7f1055fd25ddbc6eab5285a",
+              "1619a28cbcaaa9156fdfa451a9150cfd0a2dd187a1d60aa98c0ffd5cd9cc31d0",
+              "22904e995c35128346d9be45713d8e214e68bbd6d0a193cfbbfb354ebc99ae38",
+              "2384a6ffb47a7bcd1ce6402dc429eaa82a4e22c2e6eb6d443345103ff9010784",
+              "291fd3dbb671f5062a500abf54f9a9ce72a757851ee5deb8ca61025efb79f645",
+              "39e373d697e29fdf5e55f6d2a21f401f3a524d0d5d03e2d345cadf314a5d7e9e",
+              "492e60f4489e8bd8f1d7dd08a2d80d11180fddcf586735862ed352911c75d395",
+              "4ba4c80f5827029ac6196f7ebe0d5818a371654ddb187577f02ac73b3a348631",
+              "4d47aafd1553d7405a5829b3a6d92402eafcf493ff0915d0fb705094a0ff8056",
+              "4dca484c70eaee57d80f4c1bd3458d062ea3b639a48b566baaaf8ecc56b8e4ad",
+              "5f655654532e4ac92c640172c6e0c236b729d328de9a64ea49ef3d888c57cb49",
+              "6337c8cd87b8a6bb9e3f82ab4d9d254c12d239844338a45bacb6c57e695822e5",
+              "63eae2ed9b1a51f068de0d9b97bfb70b84da11835d1042bc9cd3dd6c479435b5",
+              "79c4f5541b9d31b4c087fb94fbf0c79ccd6fc94462e49ee36e1c8a3c43122528",
+              "7f30e314081a7697df3e815cd6a033c7c3fc84c4bbc6ac59f0ed6124a94de44d",
+              "9db7a70753c815126fd5d39eb0c7ca7d835f8684612b7b21f201dd924ad9067d",
+              "9ebb022a0af96e80f382002902c3cbf847c51ac9862b8b4ecb5ae628feaafd4a",
+              "a62a9be9fbc02133ff717898365e9ce3e2f63465146d1e0ffba989ac3a85a3da",
+              "a900da10d6a702eb33782432154bc18aa78cb4bfd4b4ecb3d6cae339c5147460",
+              "bdb175529b151582349f38670cf2340c93af60b28acd6b896183417d694679ff",
+              "c3a6852fbd7c86d6089499be51cfd967f97ef31baadab59ab4aa06b47300c8f8",
+              "d5b2f933cf799be93a2ea539f89ac2a0b0d936cd6766b8f4333371fd7f460ad0",
+              "e1cd682a0584c16b20874ee64a853bfd913fdb6a51ba316a8956134278533a04",
+              "ec845431c7312a845dcf1dcef7fbdae0028207fcdcad32c4722e2981ab74f692",
+              "ed467ae2057b9ed92615363859f862cf6340684ae8848874d7203bdbe0035f17",
+              "ed7c5751871d06c24fe5a42ab8d92e35abd83a81ed9db2413bf1d9f1bef41708",
+              "f07fb1b366aeabdf016fdbe22d72bf66921a09c55b954146322bcdc484cfa945",
+              "f5817eed383f35eee61e1d7fc526637159d0117e4746c0492f470adf0118ebc7"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "handoff_pending": {
+            "ms": {
+              "n": 30,
+              "min": 374.388,
+              "p50": 391.563,
+              "p95": 404.366,
+              "p99": 404.898,
+              "max": 404.898,
+              "mean": 391.569,
+              "stdev": 8.324
+            },
+            "bytes_sent": 79,
+            "bytes_received": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_100": {
+            "ms": {
+              "n": 30,
+              "min": 377.686,
+              "p50": 389.902,
+              "p95": 417.233,
+              "p99": 422.96,
+              "max": 422.96,
+              "mean": 392.528,
+              "stdev": 9.774
+            },
+            "bytes_sent": 90,
+            "bytes_received": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "stale": {
+            "ms": {
+              "n": 30,
+              "min": 375.121,
+              "p50": 388.762,
+              "p95": 406.333,
+              "p99": 407.685,
+              "max": 407.685,
+              "mean": 390.074,
+              "stdev": 8.478
+            },
+            "bytes_sent": 55,
+            "bytes_received": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_500": {
+            "ms": {
+              "n": 30,
+              "min": 377.842,
+              "p50": 388.685,
+              "p95": 411.547,
+              "p99": 412.056,
+              "max": 412.056,
+              "mean": 391.472,
+              "stdev": 9.421
+            },
+            "bytes_sent": 90,
+            "bytes_received": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_resolved_500": {
+            "ms": {
+              "n": 30,
+              "min": 793.676,
+              "p50": 949.985,
+              "p95": 1124.489,
+              "p99": 1160.536,
+              "max": 1160.536,
+              "mean": 972.137,
+              "stdev": 90.124
+            },
+            "bytes_sent": 94,
+            "bytes_received": {
+              "n": 30,
+              "min": 2937130.0,
+              "p50": 2937130.0,
+              "p95": 2937130.0,
+              "p99": 2937130.0,
+              "max": 2937130.0,
+              "mean": 2937130.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 2937130.0,
+              "p50": 2937130.0,
+              "p95": 2937130.0,
+              "p99": 2937130.0,
+              "max": 2937130.0,
+              "mean": 2937130.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+            ],
+            "sha256_raw": [
+              "3aad731cacfb5db12cb5029ac2cf12946927bdbec602ca99c74f8fddf205c2b4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "task_list": {
+            "ms": {
+              "n": 30,
+              "min": 399.091,
+              "p50": 415.192,
+              "p95": 441.74,
+              "p99": 456.561,
+              "max": 456.561,
+              "mean": 415.586,
+              "stdev": 11.718
+            },
+            "bytes_sent": 59,
+            "bytes_received": {
+              "n": 30,
+              "min": 586896.0,
+              "p50": 586896.0,
+              "p95": 586896.0,
+              "p99": 586896.0,
+              "max": 586896.0,
+              "mean": 586896.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 586896.0,
+              "p50": 586896.0,
+              "p95": 586896.0,
+              "p99": 586896.0,
+              "max": 586896.0,
+              "mean": 586896.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+            ],
+            "sha256_raw": [
+              "949d49d78feca4a5db58db5c8b13550b2949ba88247c61a7348f4f39a8a1fee5"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_1": {
+            "ms": {
+              "n": 30,
+              "min": 376.358,
+              "p50": 388.654,
+              "p95": 419.39,
+              "p99": 424.787,
+              "max": 424.787,
+              "mean": 391.031,
+              "stdev": 10.295
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 3409.0,
+              "p50": 3409.0,
+              "p95": 3409.0,
+              "p99": 3409.0,
+              "max": 3409.0,
+              "mean": 3409.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3409.0,
+              "p50": 3409.0,
+              "p95": 3409.0,
+              "p99": 3409.0,
+              "max": 3409.0,
+              "mean": 3409.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+            ],
+            "sha256_raw": [
+              "0dffd0d7b1b5cdd6bc2c9c87cda62ba8b4277f3b3ff0b5dfe93b21ccab6b7600",
+              "0f888814ce059e1779d89bdfcda6fd40ab91a97ca81f0c40223d5c6c0ad1b46b",
+              "160500fb50d520f018b779a067b351d7e1624f2443d643249700a03d2d4d5ec2",
+              "1bc681a0abfdd66a0922b99b55dc73198cfc0db18b2b7bc5650f4efc882f2f99",
+              "27b94a617b48d8548cd8db1d84744541bc74070f1700eb3ab8b54239ac27489f",
+              "36655a0a708cbaa53f586b72e4a03299d0ae13a13a3844136e8813f6e7b354a6",
+              "39f455514b07edaa3de5af411c3b6983018b60a59bc1263756c6cb180b49608c",
+              "3cf4c9cd3ac598cfc6c546405572ea14fe26d003037fbf62d3eb018e703add73",
+              "3de1ba37739326a27790ef5b5d409181f915744b2a73acc5897e3f49019c14ac",
+              "404135af7734446e959cfcd7fa286c1934c75bf163d9f3c46cfe33074471378c",
+              "40bc289ac587edadb47035546d785cd228de0de6a4f3d5e1e62f96092d5c0923",
+              "4488502969934bdee96a2948b2cfcda9621300bb46bedac041af4a0a7fe525ab",
+              "453c4fa10591912da2079e7e6f241a0507d45372a4b57a1d03692763be8b5730",
+              "48462231aa3405b8706292688702c864acc0d4438b58b747bdb2f824e68e02e5",
+              "485eb05180666ccd24b22a500725d3fb77e56a5e7d403bcca8c574928ad43ef6",
+              "659a4f0bffe8192e24b8ab32a30bc9f36829572fbdcee1cfc8a57c66429c4cb2",
+              "708d0d8fae7b9add3963a4973631d767845522a84b3a4b9ab83eec25034485cb",
+              "776d0b4bf377f4015f5d883bdef2287ebe488ee25597732dc59a8776798deedb",
+              "81a48adb359812734d5dfb9e136d5ecc3c9956503fe22fb97255142d81e5ae49",
+              "8e665e453cf1d0a355040cf6908de6bd1b20e6498beb674322b0e65c0c1a37a6",
+              "9b096547c495ffe59c677bc65abc50ff2d48916a1693f8cc152e3b6a906d14c0",
+              "a7cd4b89ec64c484a9799741262351009ab44a841b66b1cf4c068fcfc0aabdae",
+              "a8a041286ac6e5dbc80950ef995d3af78c4fe9edc1735f4720d3833d6f0c464d",
+              "cf08fe13e291c92b88c7f94cb3cd4994a9b642c4879bf2639fcbb988ae5f6a20",
+              "dc87fc8808798e17f909e5fe5c10ad03fff23b0d6f4ceeeb5db6fa0514971f13",
+              "e02b41413b65f3095d1c723d94a730655750841512ca1f72366e8e2a7019b5bd",
+              "e6fae48e47b652f3a8715adcb3e1ca6aa428ecd8f0fac9c7ab09584bac6b90d8",
+              "e6ffd79439038426e9ebd16c17954da07d82e139819a1eb902b78bd8f5c2c78a",
+              "f3115bac2bf5d59c4c4514dda376e2ada149d57d752b18b22f718abf1877993d",
+              "f3c2bb3e40e96bed6424844b6d3d1c13599bbea4e7685c32f00babdba6a20d24"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_2": {
+            "ms": {
+              "n": 30,
+              "min": 379.193,
+              "p50": 394.262,
+              "p95": 411.387,
+              "p99": 449.404,
+              "max": 449.404,
+              "mean": 396.499,
+              "stdev": 12.32
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 10992.0,
+              "p50": 10992.0,
+              "p95": 10992.0,
+              "p99": 10992.0,
+              "max": 10992.0,
+              "mean": 10992.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 10992.0,
+              "p50": 10992.0,
+              "p95": 10992.0,
+              "p99": 10992.0,
+              "max": 10992.0,
+              "mean": 10992.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+            ],
+            "sha256_raw": [
+              "04b1f2a59951f3a7c614a586db1d5260d3c74403acb138e256b39b09cc6e100b",
+              "070e9eca8b2ccadbf292130cf73c92a3cd4816eaae235cb19b5b517a3aa2cdcd",
+              "083c031369ba1c2f4cce6ca0ca1dfac7c1c2831a638b5a622cb6d41333ae3a74",
+              "09b9795e08a30d858fc0e8379d9fff6af5663836c61c1a12392f83ad6d76f162",
+              "1b4e4cb85f397d41f8d39bee2800ecdc012b6c515aea82b86f640f1bba25fb81",
+              "1b638b823795024a5c434ef1e699064fdee01bc09d6af63d960807ea69349faa",
+              "27dd51df5c07eeefd1726bdff96e1225432f0b194d99fc3179ffe69f26f76187",
+              "2c12641f1338e1ff497b2b77d3d1f5a1e8ae9344818778f8ea7b8b353f3da8ab",
+              "2e1ba324228e4e88711682ab61e54a41bf7b1e1f44a9674ad852e6d414b81cf4",
+              "334e9b60701fca3b4ecf3f7f7fecbd93282d0f38e85e16812b22a2a550d75c59",
+              "36547c65fb63c5629773c96dda46c500b080d23067579eff19c616167a856655",
+              "4c94ed9c3c802f6f991ab9cef1f52f1a110c15a71bef528a163e0d798ae53e26",
+              "595e8c80bd642370b87f3aa5101525c9eaf25875c636c65e12d6284c2f5ec362",
+              "5b5e57c29b293e2832b42bdea19ed00d26c9551c8b6d63aa6a38b333e064bf1d",
+              "5d1c6ac192ac3c824337327bd670391a54db88c2b1b33b7306d7bfe2247abe99",
+              "662a86b3256d9a4e75739f397e0ca60a4f69cf7a89e73efaf6ec705f671894c1",
+              "662efbdd1d7d7e5d6bacd125128121bf0e06f26a70824d775dd61af96ed60787",
+              "79e455d4a1c59a83901e4e2790d6b841f53f357ff52dff411d380a399d7aed51",
+              "7e15dbe65e8d5ed1d151d0ad6d1ba3d6254d4e2421a4890c67a880b3683dc5d7",
+              "7f988b40a34b91b19b48568c6e7a4154f30ace4aaf8a04e97271b6762c89d116",
+              "80e769ea109a9209ac809c59fd26708f673d499bff4c5aeabc27930e0e14a758",
+              "822a77855b45b2d8340f69079e3101915f85fe1dbac1b49b84a6b406b725b30e",
+              "adf1a00c7b308a2cc6606312f0763baaf35634f637c9bc8e47054d26425650e5",
+              "b517ebeb0bac89cd95071aabf7d9b33b1ca1ea65fe8d36026892365703c61c32",
+              "b8c00a545ee8699d655d29b342d40dacf2458a17c262e17c5aaabd9739898b9f",
+              "b9dcddea2c9ac3ef171fa3ec9c16f1a176743631056eb705a3d706cbb8ae7943",
+              "d013a2778acb4b604d1b4d34417cc62d8e7b430b69349fad7e54f7b812e52e0d",
+              "e889387405038553801c1b7c6c2000d0b7be88e6a3dbd4c5ba5c76047f6bc889",
+              "ee96dfc23e70a39d85afa4557307c915e1a8cd937a77b803ee9d79fbe184b9cf",
+              "f1784c63239423741f956e592081b9c4f704bdbb3bb6c60e71d2fc2b18ab77a5"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "claim_candidates": {
+            "ms": {
+              "n": 30,
+              "min": 348.82,
+              "p50": 350.947,
+              "p95": 356.119,
+              "p99": 365.032,
+              "max": 365.032,
+              "mean": 351.731,
+              "stdev": 2.97
+            },
+            "bytes_sent": 112,
+            "bytes_received": {
+              "n": 30,
+              "min": 1545.0,
+              "p50": 1545.0,
+              "p95": 1545.0,
+              "p99": 1545.0,
+              "max": 1545.0,
+              "mean": 1545.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 1545.0,
+              "p50": 1545.0,
+              "p95": 1545.0,
+              "p99": 1545.0,
+              "max": 1545.0,
+              "mean": 1545.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+            ],
+            "sha256_raw": [
+              "cad93e6ab6c7e1bb2da26f0b866fc8e32166e69311599b123f234fd497d710a4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "sitrep_lane_20": {
+            "ms": {
+              "n": 30,
+              "min": 378.007,
+              "p50": 389.429,
+              "p95": 421.355,
+              "p99": 429.209,
+              "max": 429.209,
+              "mean": 392.749,
+              "stdev": 11.119
+            },
+            "bytes_sent": 86,
+            "bytes_received": {
+              "n": 30,
+              "min": 22439.0,
+              "p50": 22439.0,
+              "p95": 22439.0,
+              "p99": 22439.0,
+              "max": 22439.0,
+              "mean": 22439.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22439.0,
+              "p50": 22439.0,
+              "p95": 22439.0,
+              "p99": 22439.0,
+              "max": 22439.0,
+              "mean": 22439.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+            ],
+            "sha256_raw": [
+              "8ec41817e89fe177097921722007258a49ea54364d11e385efb10bfc336d360b"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_candidate": {
+            "ms": {
+              "n": 30,
+              "min": 380.535,
+              "p50": 395.41,
+              "p95": 414.469,
+              "p99": 416.788,
+              "max": 416.788,
+              "mean": 396.525,
+              "stdev": 8.22
+            },
+            "bytes_sent": 68,
+            "bytes_received": {
+              "n": 30,
+              "min": 26646.0,
+              "p50": 26646.0,
+              "p95": 26646.0,
+              "p99": 26646.0,
+              "max": 26646.0,
+              "mean": 26646.0,
+              "stdev": 0.0
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 26646.0,
+              "p50": 26646.0,
+              "p95": 26646.0,
+              "p99": 26646.0,
+              "max": 26646.0,
+              "mean": 26646.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+            ],
+            "sha256_raw": [
+              "04cefa7369996cc174ce639a45ff48920d83b940bc6369db29a03a56bcef7a2a",
+              "06d9d98930a13aad0a2336b641eb8abb6dc35a7fae52451a965422e77e769c62",
+              "0f77b46c68ebdd22d3929a4f28e33a0db76c0ea3909a172df202075dbf87d54e",
+              "1b0695eff3565ee3e3b6f4b282254dc1a2503eeff1dd9e5c20f09c3ce454db4a",
+              "1b57d9da0e398f3018960590c71404e27dc11e457e78c42aa0bc8859ed816aca",
+              "27230b7d2ee0fc4268bff92036a82396ab05fd02748478a7281b860cd36f7f96",
+              "33bb5df1ed4b86fff0c0bfb6d304052e2b6e3ef9fd375645fa279f91a57f5792",
+              "3872dfa93315f93c0d7057654a160fb889f57e930631515a6dd3cb74237d8d2a",
+              "3ccba365b3ab008c78109405ea7c0b50480d8c93f8e6e3e75427bf689b74dc33",
+              "41a0d5c087b8144a1d1dd5830b10edc3d15fa41089adb5c34d03414fed03d7cd",
+              "4ba3e205ba8c50a2a5de2d228e74325593f5a4a2cca188f46634db388ccd84ae",
+              "51f71fc69f27a689de0948a44bdecd9cf380c65b848733bd1e25e0da30e685bd",
+              "63789cde19b57f70df00bf82416bdfd9a2257242c2981fe9bd4c71d255cdc334",
+              "64ded8e649b17d9822ff680c4e2bd7045f887b38f790b6c1346616c5017226f6",
+              "71b62c795307e253399748510c3158ad183ba56d20a23077e753b2a80137032d",
+              "7cbe09c8cb3440fe021cce8187b2c78a02c77182b36e3019e62b24b706a3a545",
+              "867d243a9a9a1500c676d82001bf23f0ac3cbb88a45645dda9ef69cd961b050c",
+              "99211d146bc12a95e908759a4ff1779ad9df997786822e2baa6233a30c60ec90",
+              "9ae8740c51e7a594286f7649707168fdc2dfcff5aee26278c645a9b78edddb4d",
+              "a13b104d863cc84bb8316897f329c4017d31f78033d2721e34a6796fbac15503",
+              "aa3ed77181372d24b2b37518d6ee3076457582fa8dbd7b6d3dbda9164d06ffc4",
+              "ae191440657a9c3fde35f5c439b79bfa1a8e5af849a5d8d778d69761aa5b45b2",
+              "b16de464805c6d921a5f85a4d19317891e3e721f020cd0d6233257180653f35c",
+              "c4ba857438314a13627ab2ffd061109f93f5409ff45bbb76de3d3688221bb003",
+              "d51923b4f73a74d477a6e92d5f0e4b805150a6236b3e30f4b2cb034cf7eed7c2",
+              "d5fcf47aba244acac867228160aa2fd9a6d6a2b836c7d6014c5632d85ef5796e",
+              "dcfea381dda6f5b92312b22c32d807556cdf6e2c407ead5d038d41f5d4586428",
+              "e5adef8e0597eab4a28a60b3d26e41157a0f26954c8acb026eb41125106c3d7f",
+              "ee4791241db2f3188267735ac527772d416a1b2857e1e35289411d883d1e7fce",
+              "f142c2e526c32126a5c8514cc4c989f4ca72e72592087b76e353cd9d353ede91"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          }
+        }
+      },
+      "failure_detail": [],
+      "connection_reuse": {
+        "reused": true,
+        "how_proven": "`ssh -O check` reports the same master pid before and after the measured iterations, and a -vv read through it shows mux_client lines and zero `Authenticated to` lines",
+        "connections_per_loop": 0,
+        "master_connections": 1,
+        "evidence": [
+          {
+            "phase": "before",
+            "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+            "authenticated_lines": 0,
+            "mux_lines": 2,
+            "master_pid": 26694
+          },
+          {
+            "phase": "after",
+            "method": "ssh -vv on one fixture read; count `Authenticated to` lines and mux client lines",
+            "authenticated_lines": 0,
+            "mux_lines": 2,
+            "master_pid": 26694
+          }
+        ]
+      },
+      "host_load": {
+        "before": 1.52,
+        "after": 3.34
+      },
+      "client_load": {
+        "before": 13.63,
+        "after": 3.44
+      },
+      "compression": "no",
+      "valid": true
+    },
+    {
+      "arm": "mcp-over-ssh",
+      "description": "one persistent `ssh <target> kb mcp` child; every logical read is a tools/call on that stdio pipe",
+      "transport": {
+        "kind": "mcp-stdio-over-persistent-ssh",
+        "ssh_argv": [
+          "ssh",
+          "-v",
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "Compression=no",
+          "-o",
+          "ControlMaster=no",
+          "-o",
+          "ControlPath=none",
+          "--",
+          "hax",
+          "/root/.local/bin/kb-bench mcp"
+        ],
+        "compression": "no",
+        "protocol": "JSON-RPC 2.0, newline-delimited, MCP protocolVersion 2024-11-05 (rust/mcp.rs)",
+        "note": "the -v flag is on the one long-lived ssh so its stderr proves a single authentication; -v prints nothing per tools/call"
+      },
+      "started_at": "2026-09-06T18:31:37.794+00:00",
+      "requests_per_loop": 12,
+      "host_before": {
+        "at": "2026-09-06T18:31:40.195+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "3.15 2.16 1.47 1/12593 3739656",
+        "uptime": " 20:31:40 up 105 days, 20:20, 14 users,  load average: 3.15, 2.16, 1.47",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13520544 kB;Buffers: 13927652 kB;Cached: 56062876 kB;",
+        "load1": 3.15,
+        "load5": 2.16,
+        "load15": 1.47
+      },
+      "client_before": {
+        "at": "2026-09-06T18:31:40.204+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          3.44,
+          5.67,
+          5.62
+        ],
+        "build_processes": {
+          "count": 1,
+          "names": [
+            "cargo"
+          ]
+        }
+      },
+      "setup": {
+        "cold_probe_ms": 2228.751,
+        "server_info": {
+          "name": "kanban",
+          "version": "0.3.0"
+        },
+        "protocol_version": "2024-11-05",
+        "ssh_pid": 60175
+      },
+      "reuse_before": {
+        "phase": "before",
+        "method": "the ssh child pid and liveness, and the count of JSON-RPC requests answered on its pipe so far",
+        "ssh_pid": 60175,
+        "alive": true,
+        "requests_answered": 0
+      },
+      "reuse_after": {
+        "phase": "after",
+        "method": "the ssh child pid and liveness, and the count of JSON-RPC requests answered on its pipe so far",
+        "ssh_pid": 60175,
+        "alive": true,
+        "requests_answered": 420
+      },
+      "host_after": {
+        "at": "2026-09-06T18:33:41.152+00:00",
+        "exit": 0,
+        "hostname": "hax",
+        "loadavg": "1.11 1.80 1.43 1/12585 3763396",
+        "uptime": " 20:33:40 up 105 days, 20:22, 15 users,  load average: 1.11, 1.80, 1.43",
+        "nproc": "16",
+        "kb_version": "kanban 0.3.0 (board schema 24; registry schema 14)",
+        "kb_resolved": "/root/.local/bin/kb-bench",
+        "kb_sha256": "f3174a2123b3e2f610646839ec6ae3f569fed5ae5141aa4ea77ca6bb15b93af6",
+        "kb_mtime": "2026-09-06 17:19:14.221903097 +0200",
+        "ssh_server": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13 30 Jan 2024",
+        "os": "Ubuntu 24.04.4 LTS",
+        "board_path": "/root/bench-fixture/boards/b2ac0ae6-5268-4436-8906-664ce33ab332.db",
+        "board_bytes": "22020096",
+        "board_mtime": "2026-09-06 17:19:14.030898030 +0200",
+        "board_wal": "absent",
+        "meminfo": "MemTotal: 130962740 kB;MemFree: 13489936 kB;Buffers: 13927652 kB;Cached: 56064372 kB;",
+        "load1": 1.11,
+        "load5": 1.8,
+        "load15": 1.43
+      },
+      "client_after": {
+        "at": "2026-09-06T18:33:41.161+00:00",
+        "hostname": "geoywsMBP.local",
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "machine": "arm64",
+        "python": "3.14.7",
+        "ssh_client": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+        "loadavg": [
+          5.76,
+          6.66,
+          6.07
+        ],
+        "build_processes": {
+          "count": 1,
+          "names": [
+            "cargo"
+          ]
+        }
+      },
+      "teardown": {
+        "ssh_exit": 0,
+        "authenticated_lines": 1,
+        "total_requests": 420
+      },
+      "finished_at": "2026-09-06T18:33:41.431+00:00",
+      "warmups": {
+        "count": 5,
+        "loop_ms": [
+          3626.404,
+          2803.124,
+          2720.455,
+          2715.715,
+          2741.275
+        ],
+        "ok": 5
+      },
+      "measured": {
+        "iterations_requested": 30,
+        "iterations_run": 30,
+        "iterations_ok": 30,
+        "failures": 0,
+        "loop_ms": {
+          "n": 30,
+          "min": 2695.635,
+          "p50": 3057.361,
+          "p95": 6159.186,
+          "p99": 6909.868,
+          "max": 6909.868,
+          "mean": 3383.387,
+          "stdev": 986.003
+        },
+        "loop_ms_samples": [
+          2695.635,
+          2718.546,
+          6159.186,
+          2752.715,
+          2701.551,
+          2717.779,
+          2724.753,
+          2701.784,
+          2707.939,
+          2750.73,
+          3224.434,
+          6909.868,
+          3684.592,
+          4037.129,
+          3248.116,
+          3259.182,
+          2999.139,
+          3057.361,
+          3045.71,
+          3036.25,
+          3034.611,
+          4855.86,
+          3217.688,
+          3050.754,
+          3083.719,
+          3134.09,
+          3086.405,
+          4501.408,
+          3211.918,
+          3192.769
+        ],
+        "bytes_sent_per_loop": {
+          "n": 30,
+          "min": 1589.0,
+          "p50": 1601.0,
+          "p95": 1601.0,
+          "p99": 1601.0,
+          "max": 1601.0,
+          "mean": 1599.733,
+          "stdev": 3.596
+        },
+        "bytes_received_per_loop": {
+          "n": 30,
+          "min": 3680042.0,
+          "p50": 3680054.0,
+          "p95": 3680054.0,
+          "p99": 3680054.0,
+          "max": 3680054.0,
+          "mean": 3680052.733,
+          "stdev": 3.596
+        },
+        "body_bytes_per_loop": {
+          "n": 30,
+          "min": 3633544.0,
+          "p50": 3633544.0,
+          "p95": 3633544.0,
+          "p99": 3633544.0,
+          "max": 3633544.0,
+          "mean": 3633544.0,
+          "stdev": 0.0
+        },
+        "per_read": {
+          "workspace_list": {
+            "ms": {
+              "n": 30,
+              "min": 167.604,
+              "p50": 168.68,
+              "p95": 172.406,
+              "p99": 176.915,
+              "max": 176.915,
+              "mean": 169.144,
+              "stdev": 1.786
+            },
+            "bytes_sent": 98,
+            "bytes_received": {
+              "n": 30,
+              "min": 486.0,
+              "p50": 487.0,
+              "p95": 487.0,
+              "p99": 487.0,
+              "max": 487.0,
+              "mean": 486.867,
+              "stdev": 0.34
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 353.0,
+              "p50": 353.0,
+              "p95": 353.0,
+              "p99": 353.0,
+              "max": 353.0,
+              "mean": 353.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+            ],
+            "sha256_raw": [
+              "098b196b4837f25b409297feb8b6e67c01d247f2dc82f2f72f8edf5a27283185",
+              "23020ea81c3cf83c314238277f44c3858d6c8096e9598c68bdd3f038228efe8a",
+              "23c212d1aed6a96e474618d80dcb386ebb4cc51d7274657a7d91124a1826f7f9",
+              "270f93746e280af1d24ed29a22124aeed3fd7a41b323843edeb20f4437a42606",
+              "27a8a5dee602a7fcad93684833ad0d8db6e175d4ea88ad835b82a3a00763f979",
+              "424e212f70b378ad739935408cc3d30ab603282b96b1e559047af326832e45fd",
+              "4a6bc0d342ecc06925f3b0f5f5ff987c3f5d175c231afe9e3f25b268bb7e1132",
+              "5320f3da97fef31b06b66e68a96e5e080314516db42276cdddf3c697dd23d3f5",
+              "5a8fa8c9cff5d5a34b01f34b74f5ab76e404503216663f362731a7848cdb60f6",
+              "63427cae12835dbb4eb26d81ec977bdba2923f5cbd6988cd1c69f885d4570cd4",
+              "672ad99a8498ea90205b3397371771d56d88edadb523417306753acfc4ecdce4",
+              "6a20016279bffda00ef7bd922d617ec0ce3454bda5dbab9a46aec87e417ba704",
+              "744c77d1098d00669457edd9e88c8b356d65fe79bf83685af437f6b5897b88ea",
+              "7f4df28e04f12a403c1371332b4e69b3b88b118593bb18fade02bea6ae1a1c8d",
+              "81a1882ae440d3efff166649056df0b953f8ccef0cac222e8c57a80c38c6ed7f",
+              "8a5e1258429d59c42ea3bcbe86838a7e92ec6357cb4744849859f6ebe4b6078f",
+              "8f71fe3bbf1864f740144e004b2db442dddb03b9e3f2a9d79715ceab7849fde2",
+              "92143834c7ee90640555db7b0869a7cda5b2133f5ce2fdbc04dd43e6af44bec3",
+              "97bf03ee35d68dda18de101595e3c48780596781f05ad7f71703fa7d69ecf98d",
+              "9f85c91b02c20fe33fa6ebb67eec6a5e6eac7a46b41a9dd4a4312de326a2e255",
+              "a5fb2ffdc5ba5b0e324b681e6b1c07e756eeafc3b6145230971384c2810c07ae",
+              "b199cb175964f9191dba43790331c3a46b2766de0a13b2e29fd769fde5bc9981",
+              "bb403353e06939038a86f48cb484f352059b27806481973c52ff2b5f755f3468",
+              "bf54e118334a40bb473d6528aa931ab3f3a841a731e8c0ed846e3e5c29ad5982",
+              "c72195deb271eccfc44385f1534ed5c6729537023896f569b575a136a0d66ede",
+              "d0d4863b2d998de89fce7cff3932fa5270f029d560df2fc13d10d1daa6adf625",
+              "d77fce871745dd86db7092d9d723838fb59146e97e96973aff1eb0bb8f9a4b44",
+              "dd9873b7232c0989df8dfa76d99e673db700db214469de964201d3757bf520c1",
+              "e0329b6e221d249a1f5bd793bfaeae8e589f8a36e7592ac5406686b415f1264d",
+              "e593a12abea66827f24043d1be621b83fb057ec9d1a08ca044036d5a17372ca6"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "handoff_pending": {
+            "ms": {
+              "n": 30,
+              "min": 195.869,
+              "p50": 208.946,
+              "p95": 218.742,
+              "p99": 221.176,
+              "max": 221.176,
+              "mean": 210.267,
+              "stdev": 5.639
+            },
+            "bytes_sent": 133,
+            "bytes_received": {
+              "n": 30,
+              "min": 95.0,
+              "p50": 96.0,
+              "p95": 96.0,
+              "p99": 96.0,
+              "max": 96.0,
+              "mean": 95.867,
+              "stdev": 0.34
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_100": {
+            "ms": {
+              "n": 30,
+              "min": 199.098,
+              "p50": 208.706,
+              "p95": 223.357,
+              "p99": 224.126,
+              "max": 224.126,
+              "mean": 210.768,
+              "stdev": 5.591
+            },
+            "bytes_sent": 146,
+            "bytes_received": {
+              "n": 30,
+              "min": 22804.0,
+              "p50": 22805.0,
+              "p95": 22805.0,
+              "p99": 22805.0,
+              "max": 22805.0,
+              "mean": 22804.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "stale": {
+            "ms": {
+              "n": 30,
+              "min": 195.983,
+              "p50": 204.559,
+              "p95": 220.523,
+              "p99": 222.301,
+              "max": 222.301,
+              "mean": 205.94,
+              "stdev": 6.678
+            },
+            "bytes_sent": 107,
+            "bytes_received": {
+              "n": 30,
+              "min": 95.0,
+              "p50": 96.0,
+              "p95": 96.0,
+              "p99": 96.0,
+              "max": 96.0,
+              "mean": 95.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3.0,
+              "p50": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ],
+            "sha256_raw": [
+              "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_open_500": {
+            "ms": {
+              "n": 30,
+              "min": 197.372,
+              "p50": 207.468,
+              "p95": 218.492,
+              "p99": 230.325,
+              "max": 230.325,
+              "mean": 208.756,
+              "stdev": 5.994
+            },
+            "bytes_sent": 146,
+            "bytes_received": {
+              "n": 30,
+              "min": 22804.0,
+              "p50": 22805.0,
+              "p95": 22805.0,
+              "p99": 22805.0,
+              "max": 22805.0,
+              "mean": 22804.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22064.0,
+              "p50": 22064.0,
+              "p95": 22064.0,
+              "p99": 22064.0,
+              "max": 22064.0,
+              "mean": 22064.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+            ],
+            "sha256_raw": [
+              "d94a61ecc1439e58941486bd3938b362c586d2b46cf7d5a7bcb78c5305b77eb9"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "attention_resolved_500": {
+            "ms": {
+              "n": 30,
+              "min": 421.967,
+              "p50": 754.222,
+              "p95": 1780.2,
+              "p99": 2609.321,
+              "max": 2609.321,
+              "mean": 794.261,
+              "stdev": 449.148
+            },
+            "bytes_sent": 150,
+            "bytes_received": {
+              "n": 30,
+              "min": 2947745.0,
+              "p50": 2947746.0,
+              "p95": 2947746.0,
+              "p99": 2947746.0,
+              "max": 2947746.0,
+              "mean": 2947745.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 2937130.0,
+              "p50": 2937130.0,
+              "p95": 2937130.0,
+              "p99": 2937130.0,
+              "max": 2937130.0,
+              "mean": 2937130.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+            ],
+            "sha256_raw": [
+              "3aad731cacfb5db12cb5029ac2cf12946927bdbec602ca99c74f8fddf205c2b4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "task_list": {
+            "ms": {
+              "n": 30,
+              "min": 210.887,
+              "p50": 237.001,
+              "p95": 3653.845,
+              "p99": 4401.817,
+              "max": 4401.817,
+              "mean": 536.376,
+              "stdev": 969.997
+            },
+            "bytes_sent": 111,
+            "bytes_received": {
+              "n": 30,
+              "min": 618551.0,
+              "p50": 618552.0,
+              "p95": 618552.0,
+              "p99": 618552.0,
+              "max": 618552.0,
+              "mean": 618551.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 586896.0,
+              "p50": 586896.0,
+              "p95": 586896.0,
+              "p99": 586896.0,
+              "max": 586896.0,
+              "mean": 586896.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+            ],
+            "sha256_raw": [
+              "949d49d78feca4a5db58db5c8b13550b2949ba88247c61a7348f4f39a8a1fee5"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_1": {
+            "ms": {
+              "n": 30,
+              "min": 200.295,
+              "p50": 206.973,
+              "p95": 228.741,
+              "p99": 241.464,
+              "max": 241.464,
+              "mean": 211.477,
+              "stdev": 8.599
+            },
+            "bytes_sent": 127,
+            "bytes_received": {
+              "n": 30,
+              "min": 3725.0,
+              "p50": 3726.0,
+              "p95": 3726.0,
+              "p99": 3726.0,
+              "max": 3726.0,
+              "mean": 3725.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 3409.0,
+              "p50": 3409.0,
+              "p95": 3409.0,
+              "p99": 3409.0,
+              "max": 3409.0,
+              "mean": 3409.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+            ],
+            "sha256_raw": [
+              "0ed9cdd7e6405552591952e4c5556547e4b40663d9e8eae3fd5db7339801c03f",
+              "12e68b81dbc4a00bb1e8f241a764408b30aee653c0ca119760102592a03def66",
+              "176f45b35af61a7d7b450b880110622a5a032f62f58c6aecbeed318cde827b42",
+              "19427007c2f669e4b6dbea5f86e2e5ecbbbbfad95b423cd06d9179a73359c999",
+              "1c1e188344cbf5afec28b36e52bc4f0613da6e68ee2c547e89d4bc69f6c3220f",
+              "1ce32afaf8b58d3dd95e9c3d31dc33d181ee1310d03130ba5b38fcb584e47fe0",
+              "22f8e92dc17d8d80b700711e65469b6ae5cd60f9b7c92f80e5f421c32b402262",
+              "253bd97fbda4f7a1e4854912c773a613f7fa2493a6a7f02a249bea5a48e558dc",
+              "2567fecc22f8a2e17bdb0b8139816ffcb3c8f434592549cfcd5eb98175d52da1",
+              "2b1ec0bf3c5d6cd25ba02dc9dd7b64c210b2d34a8c9a1d4f9e0d639b0c992a95",
+              "35f2291f7ef7c11110804a155d0075fc51a54362c67cf3ead28fcfdaa8fffcff",
+              "3ab9463856d3aceb48a5f3c91ad52afd2c3ac9c1995d1c5cc363f170fa8f610e",
+              "489d9a5676495f1a69705df62fab10c990e1409d652c6928bec93e055d0a1e37",
+              "5bfa652583827b6d8c7e661d985b57a2b78e45e156f6545bb0231e64b222ed57",
+              "5e621fdfb63fae3d7907ff5422a0ed32ca4343907922b33cfdc124c268db8d73",
+              "67b7a1dddfef59d5afbcfb207bcdc49718ad5393e9690ae3c6a78b7207f4a859",
+              "6870848ac2b8f578e0296f0c33a08e778199f5f8469107d765b66f402771d43a",
+              "696eb94cf68229034bc14674815920af8621201776c3f2d69c8ecbd4480bd240",
+              "76c2e8f956e4d256b29bd367ddc492699de464ea0a5aee6485b5dba5791851cc",
+              "7823e70ca22294cf46fd193f7db57d67583427a4ca9fb201a21c7feca7460247",
+              "abc2a36cb8fa2e34c3e326eb147ff969f7f0e6b7bbd4dd72acaa473f5724c629",
+              "b88cfc0a69220a2f29e61de5db704e00cb8f0fc35a614d82214de0cbb4889d35",
+              "bb580a20b7ec6284295fe73fd6c0ad8241accc42fd648a20fa5df6be22a65cb6",
+              "c611f63cfa0fdfe350748661c7716ba0827910590743575a62a4b6c7cb8e592f",
+              "d5aba4b56994b1e3264099de0a7fab94343c30dd3ba0380def6b989006ae88bd",
+              "da24c462a5d7e20b4f8de817633fe8e9bff05e436c36f515d3a506d2a536e4c6",
+              "ddda28a946d402a9b036b2a6ddf3d6ada708eb7a3851e311f7eb34b3fd603cfa",
+              "ebfc6b53e2724e53a53e755c6c2ff65e8173432ebbd6620a556945e06b2eb9d7",
+              "fe6ba1ae8a00e53692b680120d8d0e3890cf3ff980d1c941ab75cdda56da229e",
+              "ff097b3781485289c5e6691ec305c2f580ed255f7d99dd113221cd067ab32e11"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_blocked_2": {
+            "ms": {
+              "n": 30,
+              "min": 199.165,
+              "p50": 208.977,
+              "p95": 220.017,
+              "p99": 238.947,
+              "max": 238.947,
+              "mean": 210.07,
+              "stdev": 8.055
+            },
+            "bytes_sent": 127,
+            "bytes_received": {
+              "n": 30,
+              "min": 11644.0,
+              "p50": 11645.0,
+              "p95": 11645.0,
+              "p99": 11645.0,
+              "max": 11645.0,
+              "mean": 11644.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 10992.0,
+              "p50": 10992.0,
+              "p95": 10992.0,
+              "p99": 10992.0,
+              "max": 10992.0,
+              "mean": 10992.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+            ],
+            "sha256_raw": [
+              "0963e8919ee94793132f37c869609610698b85de774e90298ec288e2c6f8bb93",
+              "13e6dff558dc79e30215dd0f4e0ed1aeab5e78bbdb6dc918ec3413185cada53a",
+              "1b54f3ba9f1f3e90852a1f042cc97094372e8b11f7281e175cd24cf83b55301d",
+              "1fd24a88f1434e577d26b3580e3fdd6fabf4f486277c866efcac9f119870f20a",
+              "29b9fb28210490ac4e53a38491ea9a25d4c9a337134afe16f529eb98f381b0b1",
+              "3b67cce086d0748d4037ddffab8e014f083aed9226a39d78e5ba7f5ee07b70bb",
+              "502108942de0a0a190b24df5084184e09b44af81e5659d931a3fa3f2843efd2b",
+              "506cfe5ed16538d78f4c1498c882f2ef91d9fb48ce531764b7ce736e1f21e9d1",
+              "55ad230518b09bc0c6bd90784ed87645db9f9a389b02e8fb0e412ac3395e9e2e",
+              "592964595ed82aab1fe98ce2ed4220d32e446f7606f266c7b17abd7c0b60090a",
+              "603a2afe433ad99f4967eed0145a91f3c5cbb3705ffe41c7e195b1f4f63cd8e0",
+              "76279b54d0e4efebd5d8b0b09488535a298a9c48d90f3c8042b027d98692b926",
+              "763e40449e2ba82ce5b2c3f2d759e2e6b4da04759c286b5fa308a8ae90fca680",
+              "78ea2162bbcf354af1104051096c022308e6e5ef8c71dffd1c1116a881ddb48d",
+              "84669b4277caa45d4ea5de2152b449f5a225889a64823f105243df004959e4d2",
+              "847e1114522f65a265e74bbe0033e1520b74bba924d1fb9ce945947052af683e",
+              "88e6b461979ba24c596e79208822ca4cc6845eee57c1304f37178677ae006b6a",
+              "95833e7fb026fc76ff0654bb9c9decff7f316ea28cf0eff6529e9ed183655581",
+              "9aacae85b60f923793477c483565f641bde03f76efc8d169af08de954a7dfd11",
+              "a34ba421f0e0e5641d2e32c05ae2260958c9d6e4b22a6f07bd50e35f1ea0d59c",
+              "a61b6dac4c3d4f7389b034e616af1fb7abb41e680041573ff7e37f8e38b030d0",
+              "b00aa95e7b485ebbe2296647746b998c7490562ceb4c6aee23b24cf13e12315d",
+              "bbfefc5475cb79f611e4795c2d184fd01629356bbec490a5caa95e4b2752ec6e",
+              "c3db61dabe2a33926d846eceb5cb199828f4bb76eb8131edb52f77052093dfdb",
+              "c7e75898c5213c549a9b5347fb6ffb6bf3c0233c6e13a7c17604263795e626d8",
+              "cb757ae72a09b6b790f5ff354f31a535aefa365c99b4b51a8abb99e5e0e7bd82",
+              "d27c0af3a7af3bfe03c8190acf6fbd350091875113fa76408d73765a7fb22072",
+              "d70ba12cb0b1220849e0809e46be57bd29db6412e2426885b85883951af32f32",
+              "dfb8eee65bd9ef6108b5241f02a3c9759c46253adee99ad4e36de7826937e225",
+              "eefddf7b94d00e48fe96f5ccedb18db6de2a263388d1171ab6bad4193a07c533"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "claim_candidates": {
+            "ms": {
+              "n": 30,
+              "min": 170.578,
+              "p50": 171.503,
+              "p95": 190.072,
+              "p99": 204.412,
+              "max": 204.412,
+              "mean": 173.221,
+              "stdev": 6.711
+            },
+            "bytes_sent": 175,
+            "bytes_received": {
+              "n": 30,
+              "min": 1727.0,
+              "p50": 1728.0,
+              "p95": 1728.0,
+              "p99": 1728.0,
+              "max": 1728.0,
+              "mean": 1727.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 1545.0,
+              "p50": 1545.0,
+              "p95": 1545.0,
+              "p99": 1545.0,
+              "max": 1545.0,
+              "mean": 1545.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+            ],
+            "sha256_raw": [
+              "cad93e6ab6c7e1bb2da26f0b866fc8e32166e69311599b123f234fd497d710a4"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "sitrep_lane_20": {
+            "ms": {
+              "n": 30,
+              "min": 198.531,
+              "p50": 209.283,
+              "p95": 229.971,
+              "p99": 235.966,
+              "max": 235.966,
+              "mean": 210.447,
+              "stdev": 8.471
+            },
+            "bytes_sent": 142,
+            "bytes_received": {
+              "n": 30,
+              "min": 23076.0,
+              "p50": 23077.0,
+              "p95": 23077.0,
+              "p99": 23077.0,
+              "max": 23077.0,
+              "mean": 23076.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 22439.0,
+              "p50": 22439.0,
+              "p95": 22439.0,
+              "p99": 22439.0,
+              "max": 22439.0,
+              "mean": 22439.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+            ],
+            "sha256_raw": [
+              "8ec41817e89fe177097921722007258a49ea54364d11e385efb10bfc336d360b"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          },
+          "context_candidate": {
+            "ms": {
+              "n": 30,
+              "min": 200.485,
+              "p50": 209.324,
+              "p95": 224.167,
+              "p99": 250.515,
+              "max": 250.515,
+              "mean": 211.985,
+              "stdev": 9.283
+            },
+            "bytes_sent": 127,
+            "bytes_received": {
+              "n": 30,
+              "min": 27290.0,
+              "p50": 27291.0,
+              "p95": 27291.0,
+              "p99": 27291.0,
+              "max": 27291.0,
+              "mean": 27290.9,
+              "stdev": 0.3
+            },
+            "body_bytes": {
+              "n": 30,
+              "min": 26646.0,
+              "p50": 26646.0,
+              "p95": 26646.0,
+              "p99": 26646.0,
+              "max": 26646.0,
+              "mean": 26646.0,
+              "stdev": 0.0
+            },
+            "sha256_normalized": [
+              "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+            ],
+            "sha256_raw": [
+              "12c0150e2b4c967883164a85c77294769570b2f096a449952361ead5a7f9ef31",
+              "1bbfae978336d7f2c4e0aa90f4c9e2285b283560379d5da8dedc4f45bdb9f517",
+              "2b5faade52f85122f1006cadda2f005432e0480fe8ead851516f98a58ebee516",
+              "321e15c8a841682d86f78e8be1a4df5fa4f2095070274ca70a9afa0ac12c9f27",
+              "42313d2495ebd1d2fd6959ddaaf452763499f43a8921153a9e22af4814b3d3c7",
+              "5756dc7b3e962c0f84fb57ddce8c3e29811ae6191b9f1a5748cce6109612a1cb",
+              "58909ac0b59382e33b253e592f7c417b31b8c2baf4494e725fcc515656594634",
+              "5b517e3177f79471172631f2220276b3b2ab8891724406bd8ba520948b404988",
+              "6e5c3b46fbf6ef80eee8023c0fece7422504cc34702f220ac142da92f47d1c90",
+              "788c5696bb88e01731d167af106d76431e1f7af2b531a87f43813ea7e1ebebb6",
+              "7be6048af9e81c8e8930326c9fa5cd1e3e3768b0e82e1dbadf64d7729c9bfbc4",
+              "7ed2cc48ab91051cf05d57e007aea47f794c00c586ab0b1667ba889462ca0ac8",
+              "8de91fb11c2b02877072b34a67c77409e7c3bf979e8e599e0111bffad4bcc138",
+              "8e6a7290e8191b0838076fcfa1a728fa496adbca307423fad3067eac4ed543c4",
+              "91a94d00fe9ba72993ee575db4a06fb79c81b0fbb1c014be396d04bf0fa93b96",
+              "a0ef83bbe4e0e41aa289e9868022bd1a4a65508a1feee17872e02dc33b01ab58",
+              "a62d5a1440742a8bea5f657c1f29735838386f886da9e9ad11377ad4ec2250bd",
+              "af81daa61f35862607a418958ff673a5f0029bf5c9272f16f4189aa58c243294",
+              "c01a095c7f9c0d669ba9096f32d38de2b88c665d5ca6f02f2725baccbe4b877a",
+              "c0868c037611ee2b55c4c6dfe6a5fd354585ed6969af42f9bc9874f599819611",
+              "c365969943d8ff32bdd9872d06bf323a77674911424b0c1a304c10ea9cf0da53",
+              "cab0d0a8c6186d077bc65f07aef2eccafbf725171457b0fc1815adcc052281fa",
+              "cc42c5850caaafe33d55942158eddca3a223ce382163961848699d8c4f820e19",
+              "cee49ef4540419453dd79c78541a88181a5051690544f270c2e42c70c13a2a63",
+              "d1276ce333f6ab4e1a50bac5cc308f9b20e9fa74dc531c044dac7d408b40b33d",
+              "d5eda9b7bb613f75808583c22c1f41ee7b9ec8c28e43529ad68201f51c5f02e2",
+              "db31d98e01627a16be77028ee1c1f29b06ce1e35b4123f05dd5146f3fc588f3f",
+              "eacb7b25afa704c885263872f114624afec5bdb2560a745de061a1bd4a88e018",
+              "ecb57386f6bb9682f722a6648b08ec65083a900710fedf55235e89c4f556afe1",
+              "fa98091c2c7a7e073cb10e03df0cf09ba44a6ce1d0b8e3e4527686c424bebc97"
+            ],
+            "drift": {
+              "distinct_digests": 1,
+              "first_changed_iteration": null
+            }
+          }
+        }
+      },
+      "failure_detail": [],
+      "connection_reuse": {
+        "reused": false,
+        "how_proven": "same ssh child pid alive before and after, every measured read answered on that one pipe, and the child's -v stderr contains exactly one `Authenticated to` line (checked at teardown)",
+        "connections_per_loop": 0,
+        "persistent_connections": 1,
+        "evidence": [
+          {
+            "phase": "before",
+            "method": "the ssh child pid and liveness, and the count of JSON-RPC requests answered on its pipe so far",
+            "ssh_pid": 60175,
+            "alive": true,
+            "requests_answered": 0
+          },
+          {
+            "phase": "after",
+            "method": "the ssh child pid and liveness, and the count of JSON-RPC requests answered on its pipe so far",
+            "ssh_pid": 60175,
+            "alive": true,
+            "requests_answered": 420
+          }
+        ]
+      },
+      "host_load": {
+        "before": 3.15,
+        "after": 1.11
+      },
+      "client_load": {
+        "before": 3.44,
+        "after": 5.76
+      },
+      "compression": "no",
+      "valid": true
+    }
+  ],
+  "equivalence": {
+    "per_read": [
+      {
+        "id": "workspace_list",
+        "digests_by_arm": {
+          "ssh": [
+            "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+          ],
+          "ssh-controlmaster": [
+            "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+          ],
+          "mcp-over-ssh": [
+            "cb026f1f7d811424217c9c2322d4589450b3a86b71a140106cc3499969b9c851"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "handoff_pending",
+        "digests_by_arm": {
+          "ssh": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ],
+          "ssh-controlmaster": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ],
+          "mcp-over-ssh": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "attention_open_100",
+        "digests_by_arm": {
+          "ssh": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ],
+          "ssh-controlmaster": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ],
+          "mcp-over-ssh": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "stale",
+        "digests_by_arm": {
+          "ssh": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ],
+          "ssh-controlmaster": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ],
+          "mcp-over-ssh": [
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "attention_open_500",
+        "digests_by_arm": {
+          "ssh": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ],
+          "ssh-controlmaster": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ],
+          "mcp-over-ssh": [
+            "1b2054918b3324441437654dbea81e6a071728fd3e75105639c41528af5bf8cf"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "attention_resolved_500",
+        "digests_by_arm": {
+          "ssh": [
+            "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+          ],
+          "ssh-controlmaster": [
+            "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+          ],
+          "mcp-over-ssh": [
+            "e203d9e355f4b7061141ab5d3ef87c3e543c49970a03dc24b9c22a6afc2d997c"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "task_list",
+        "digests_by_arm": {
+          "ssh": [
+            "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+          ],
+          "ssh-controlmaster": [
+            "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+          ],
+          "mcp-over-ssh": [
+            "88df4f05f9556f8cff633971fed7ef55433c8a4f0c8d7a730f228e2e43d34f5e"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "context_blocked_1",
+        "digests_by_arm": {
+          "ssh": [
+            "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+          ],
+          "ssh-controlmaster": [
+            "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+          ],
+          "mcp-over-ssh": [
+            "9f1c253505edb284e188e9e5f37937414638d2ff8f7bae5fdbeac070a48dcd9d"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "context_blocked_2",
+        "digests_by_arm": {
+          "ssh": [
+            "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+          ],
+          "ssh-controlmaster": [
+            "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+          ],
+          "mcp-over-ssh": [
+            "dd6700bb2fc05b2bfc0bd0283b8e046e08e7aff8c27c6a6955d328ef914719cc"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "claim_candidates",
+        "digests_by_arm": {
+          "ssh": [
+            "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+          ],
+          "ssh-controlmaster": [
+            "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+          ],
+          "mcp-over-ssh": [
+            "6a2d1363280e209520518c8cbf1bc5db4610e81c93066796cfe2815130810016"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "sitrep_lane_20",
+        "digests_by_arm": {
+          "ssh": [
+            "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+          ],
+          "ssh-controlmaster": [
+            "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+          ],
+          "mcp-over-ssh": [
+            "d8b1d93ed1e77c1e97ed2d03aec05199f4d993bb46b8185bb08f24c8a5ecf356"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      },
+      {
+        "id": "context_candidate",
+        "digests_by_arm": {
+          "ssh": [
+            "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+          ],
+          "ssh-controlmaster": [
+            "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+          ],
+          "mcp-over-ssh": [
+            "9a4e29913640d2e0058ae2f1664b665d3331c5db7ec7c02b4e35ba8d753d7f68"
+          ]
+        },
+        "equivalent": true,
+        "drift_within_an_arm": false
+      }
+    ],
+    "all_equivalent": true
+  },
+  "verdict": {
+    "comparable": true,
+    "reasons": []
+  }
+}

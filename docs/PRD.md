@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-08-31
+**Updated:** 2026-09-20
 
 ## Product statement
 
@@ -10,6 +10,15 @@ Kanban is George's private, stateful representation of the projects he is
 working on. It gives humans and compatible agent harnesses one durable place to
 discover work, coordinate atomic ownership, report progress, preserve evidence,
 and transfer work to a replacement agent when context or tokens run low.
+
+The operator reads that state through the CLI, the generated MCP surface, and `kb watch` /
+`kb events`. The former single-page operator application — a React and TypeScript client
+shipped inside the one executable, reading the board through a browser-facing JSON projection —
+is retired ([ADR-053](adr/ADR-053-the-web-view-is-retired.md)); its decision
+[ADR-048](adr/ADR-048-the-operator-ui-is-a-typescript-spa-embedded-in-the-binary.md) and its
+contracts [the SPA specification](specs/spa.md) are withdrawn and retained as history. What
+belongs here is only what the operator gets now: the CLI, the harness surfaces, and one work
+state beneath them.
 
 ## Goals
 
@@ -25,8 +34,8 @@ and transfer work to a replacement agent when context or tokens run low.
    this portable work-state engine.
 8. Expose a cursor-native `kb watch` process over the append-only ledgers,
    with additive protocol-v1 event payloads and fail-closed cursor semantics,
-   while keeping `kb events` as the newest-first snapshot reader and `/live`
-   as compatibility invalidation for the served UI.
+   while keeping `kb events` as the newest-first snapshot reader. (`/live` was compatibility
+   invalidation for the served UI and retired with it: ADR-053.)
 9. Persist board-local declarative subscriptions with immutable identity,
    fail-closed predicates, bounded consumer policy, and secret references only;
    execute them only through the separate capability-gated compiled dispatcher,
@@ -40,6 +49,10 @@ and transfer work to a replacement agent when context or tokens run low.
 - Arbitrary SQL access for agents.
 - Cross-host replication in the first release.
 - Replacing Git, source documentation, or external customer issue systems.
+- A no-script fallback for the operator UI (moot: the UI itself is retired — [ADR-053](adr/ADR-053-the-web-view-is-retired.md) — and this row is retained as the record of the accepted cost). When it lived, every decision form posted
+  without JavaScript and the page degraded cleanly; once the UI became one mounted
+  application it did not, and no equivalent was planned. George decided the
+  single-page shape on 2026-09-17 and accepted that loss with it.
 
 ## Primary workflows
 
@@ -70,6 +83,31 @@ its worktree roots, active task counts, blocked work, pending handoffs, and
 recent progress. Reads occur across project databases without merging their
 write domains.
 
+### Ship a sprint to a served version
+
+The operator opens the board's one current sprint against a target version,
+attaches the work that version ships, and lanes claim inside that boundary.
+When the work is finished, a deployment attempt is started against that sprint,
+the served commit and version are observed independently, and that observation
+is recorded on the attempt. Closing the sprint reads that succeeded
+verification attempt and refuses anything weaker; work still open moves to a
+named carry-over sprint with a written note.
+
+### Decide in one click
+
+The operator opens the decision room and sees one card: the question as the
+headline, the recommendation leading on its own fill, the rest of the card
+beneath it. He takes a choice with a click or a digit, or writes his own answer
+and picks an outcome. The deck advances to the next card, a one-line receipt
+naming the decision lands in the session history with Undo one key away, the
+count of what is left drops, and the lane that raised the item reads a
+machine-readable verdict instead of a paragraph.
+
+He does this from the phone as readily as from the Mac — a decision answered
+standing up is the point of the surface — and one deck answers for every board
+at once, so seeing what is waiting across the whole portfolio is the same act as
+working through it.
+
 ## Functional requirements
 
 ### Retrieval and agent context
@@ -77,8 +115,7 @@ write domains.
 - Search every durable work-knowledge source without requiring the caller to
   know its project first.
 - Fuse exact identifier/text retrieval, SQLite full-text ranking, and private
-  local semantic similarity through one implementation shared by CLI, MCP, and
-  the served UI.
+  local semantic similarity through one implementation shared by CLI and MCP.
 - Stream append-only board and registry ledger changes through `kb watch` with
   one scope per invocation, opaque cursor resume, additive protocol-v1
   payloads, a `--task` subject selector, repeatable `--kind`, `--relation`,
@@ -111,6 +148,180 @@ write domains.
   directly for the exact version and `codex queue --help`, fails closed on
   drift, starts with an empty environment, and passes only that fixed
   `CODEX_HOME` to child Codex processes.
+- For the second experimental and opt-in bridge, host-local `dispatchers.json`
+  binds consumer `codex.app-server`, action `start-readonly-turn`, and
+  capability `start` to the checked-in `kanban-codex-app-server-adapter`.
+  The host allow-list binding is installed, but this rollout enables no active
+  declarative subscription. When the dispatcher invokes it, the adapter still
+  accepts a structured `AdapterRequest` and returns `AdapterResponse`; that is
+  the normal dispatcher path, not a general subscription bypass. Private host
+  config pins the canonical Codex path, private `CODEX_HOME`, private
+  empty cwd, exact Codex CLI `0.150.1`, the
+  `ClientRequest` hash
+  `efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, the
+  combined v2 schema hash
+  `8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`, and
+  the protocol timeout. Each invocation clears child environment except
+  `CODEX_HOME`, probes version/help, generates the schema with experimental
+  API disabled in its own identity-pinned 0700 temp dir, verifies both hashes,
+  and removes only that directory. The turn is read-only (`{type:readOnly,
+  networkAccess:false}`), approval is never requested, the instruction set
+  forbids tools/files/network/commands and terminal/tmux/send-keys, and seven
+  ambient/reasoning notification classes are explicitly opted out. Server
+  requests, unconsumed notifications, tool-ish items, policy/identity/status/
+  schema/size drift, malformed output, stderr, timeout, wrong/extra/duplicate
+  ack, errors, and post-completion output fail closed. Success stdout is only
+  `AdapterResponse` after exactly one `{accepted:true,idempotencyKey:<subscriptionID:eventID>}`
+  completion. Delivery remains at-least-once. Installed-Codex support is
+  established by a separately named 2026-09-05 HAX live smoke receipt, not by
+  the fake-Codex contract test: the host's own binding accepted one structured
+  request against installed `codex-cli 0.150.1`, exited `0`, emitted only
+  `AdapterResponse`, wrote nothing to stderr, left the private cwd and the
+  host's tmux panes unchanged, and removed its schema temp dir. The bridge
+  stays experimental and opt-in after that receipt. See README.
+- For the third opt-in bridge, host-local `dispatchers.json` binds consumer
+  `claude.print`, action `start-readonly-turn`, and capability `start` to
+  `kanban-claude-print-adapter`; no active declarative subscription ships.
+  Private configuration pins canonical Claude, private `HOME`, private cwd,
+  and an exact required version (HAX stable: `2.1.236`). The adapter validates
+  each identity and ancestor chain before every spawn, probes exact
+  `claude --version` and required help markers, and starts a fresh worker
+  rather than resuming a foreground session. Child argv is fixed to safe print
+  mode with JSON output, no tools or MCP, no session persistence, and
+  `dontAsk`; child environment is exactly `HOME` plus `PATH=/usr/bin:/bin`,
+  cwd is fixed, and stdin is empty. The prompt contains only bounded
+  subscription/event IDs and static acknowledgement text. Success requires a
+  strict JSON object or array whose final result object has the exact
+  acknowledgement and no error or tool-use evidence. Nonzero status, stderr,
+  API/auth errors, overflow, trailing JSON, and mismatches fail closed.
+  Success stdout is only `AdapterResponse`. Compiled adapter-contract tests
+  against the dependency-free fake Claude do not establish installed-Claude
+  support; that requires a distinct live smoke.
+  Live authentication is currently blocked by revoked OAuth attention
+  `a-347ff24c`; the adapter must not work around authentication.
+- Beyond the Codex and Claude bridges, offer checked-in harness adapters for
+  the OpenCode server (`opencode.server`/`enqueue-turn` over a configured
+  loopback HTTP endpoint), Kimi over ACP stdio (`kimi.acp`/`enqueue-turn`),
+  the Cursor worker (`cursor.worker`/`start-turn`, serialized through one
+  state-directory slot), and notify-only ZCode (`zcode.notify`/
+  `post-notification`, which has no response channel). Each must read one
+  delivery document from stdin and refuse a wrong protocol version, attempt,
+  event identity, or secret-shaped payload key before its peer is contacted;
+  each must pin its own consumer/action pair so a subscription cannot re-point
+  it at another binary; each must refuse unknown, repeated, and positional
+  arguments by name, probe the peer or executable identity it was configured
+  with, and accept only an acknowledgement naming that exact delivery.
+- Notification must reach a harness through that harness's own documented
+  ingress — a queue, an HTTP request, an RPC frame, a worker turn, or a
+  notification sink. Writing into a terminal, a human's session, or any
+  `send-keys`-style keystroke injection is never a delivery mechanism, and the
+  live receipts are held to the same rule.
+
+### Sprint release boundaries
+
+- Represent a sprint as its own typed row with an `sp-` identifier, a required
+  semver-shaped target version, planned start and end dates, and the closed
+  status set planned/current/closed/abandoned. A sprint is not work: it must
+  never be claimable, gated, or handed off.
+- Offer new, plan, start, close, and abandon over that row plus read-only list
+  and show, and allow at most one current sprint per board. Planning must record a
+  deliberate scope — explicit candidates, a parent epic, already attached
+  scope, or an explicit empty-scope decision — and starting must additionally
+  require a non-empty goal body. Attaching an epic attaches its subtree;
+  detaching stays explicit and non-recursive. A closed sprint's card cannot be
+  rewritten.
+- Scope claim candidates, `claim --next`, and handoff acceptance to the current
+  sprint whenever one exists, offering neither another sprint's rows nor
+  unattached rows. A board with no current sprint must behave exactly as
+  before. Crossing the boundary must require an explicit named-sprint or
+  any-sprint override, and that override must be recorded on the claim event.
+- Close a sprint only on a succeeded verification-phase deployment bound to
+  that sprint whose target version and independently observed served version
+  match it. A receipt is never parsed and is not version proof. If any attached
+  row is still outside done or cancelled, close must additionally require a
+  named carry-to sprint and a non-empty carry note, and the carry and close
+  must commit atomically.
+- Project the current sprint in the dashboard and the attached sprint in task
+  context only when the task is attached. (The read-only `/sprints`, `/sprints/BOARD`,
+  and `/sprint/BOARD/ID` web views retired with the served UI: ADR-053.)
+- Scope a rule to a sprint as `SPRINT:sp-ID` with exactly one board selector
+  and optional intersecting subsystem tags; setting and clearing that scope are
+  mutually exclusive. Claim, handoff acceptance, and task context must evaluate
+  it against the task's authoritative attachment, so unattached work and work
+  in another sprint do not receive it.
+- Index sprint title, body, and target version as a first-class search source,
+  refresh that document on every lifecycle change, and cite results as
+  `kanban://BOARD/sprint/ID`.
+- Deliberately out of scope: estimation, velocity, burndown, draft sprints,
+  automatic rollover, and automatic sprint archival.
+
+### The decision room
+
+> **Withdrawn by [ADR-053](adr/ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`):** this
+> section specified the retired served UI. It is retained as the record of what the deck was,
+> not as an obligation on any live surface.
+
+- Render the open attention items on the served "Needs you" page as a deck of
+  decision cards showing one card at a time, in the order they are decided: the
+  eyebrow naming who asked, where and when in one sentence, the question as the
+  headline, the context, the authored choices with the recommendation first and
+  each choice's consequence beneath its button, the card's one reply field, the
+  free-text answer folded until it is asked for, the body folded beneath, then
+  the meta line. The bar reads how many are left. The same cards read as one
+  continuous list when the operator wants the whole queue rather than only the
+  next question.
+- Settle an item in one click as the operator. Reply text, when written, rides
+  with whichever choice is clicked and is recorded as that decision's note; the
+  free-text answer must carry both a note and an explicit outcome or be
+  refused. A choice key the row no longer carries must be refused by name
+  rather than mapped onto whatever now sits in that position, so a card left
+  open in a tab stays safe to click.
+- Answer the current card from the keyboard: `1`-`4` select its choices in the
+  order it lists them, so the first is always the recommendation, `s` sends the
+  card to the back of the deck without recording anything, `u` undoes the
+  decision just made, and `c` opens the operator's own answer. A typed reply
+  must not disarm the digits — it rides with whichever choice is clicked — but
+  they must stay inert when no card has focus, while the free-text textarea has
+  focus, and on a card whose free-text verdict is already picked, so an
+  authored key can never drop a chosen verdict.
+- Settle without navigating. The card leaves the deck and a one-line receipt
+  naming the choice lands in the session history, carrying its outcome as a
+  left rule and an Undo control; the count of what is left drops and the
+  receipt survives the live refresh. A refusal — the board's own sentence, or
+  the composer's own when an answer arrives with only one of its two halves —
+  is rendered inline beside what it refused and tied to the focused control
+  with `aria-describedby`, not announced as an alert. Recent decisions must be
+  browsable with the same undo, and undoing must reopen the item through the
+  audited reopen operation with a fixed note rather than asking for words.
+- Serve a row whose raiser authored no card as the default approve/reject pair
+  with its first body line as the question and nothing marked recommended.
+- Render long board text as markdown, and answer every reference link with a
+  read-only hover preview of the task, attention item, deployment, or board it
+  points at; previews nest and are bounded excerpts, never whole documents.
+- Keep the rest of the served surface read-only. Resolving an attention item,
+  undoing that decision by reopening it from the web, opening a draft plan,
+  and pausing or resuming a subscription are the only writes the browser may
+  perform.
+- Say what happened in exactly two channels: one live line carrying only the
+  connection's own words, and one log region holding the toasts. A toast stays
+  at least 20 seconds, holds while the pointer or focus is on it, dismisses on
+  a click or `Esc`, and at most three are on screen at once, newest first.
+- Read every other page as rows, not boxes: the title first, one sentence of
+  meta beneath it, one pill style for status, the priority as plain mono text,
+  and tables with no border but the row hairline.
+- Serve the whole UI as one designed system per
+  [the web UI specification](specs/web-ui.md) and
+  [ADR-046](adr/ADR-046-the-web-ui-is-one-designed-system.md): the question is
+  the only serif and the largest thing on the page, one motion, a colour means
+  an outcome, nothing is boxed, and the deck and the full queue are one client
+  wearing that system. ADR-046 was Accepted (2026-09-20, George, attention a-e02c9116) and is
+  now Superseded by ADR-053: he reviewed the responsive deck on phone and Mac after sending
+  the first version back in a-dd7be9ba.
+- Requirements trace: `docs/specs/web-ui.md` §3 stated WEB-01..WEB-59 with a
+  strength and one evidence layer each, §8 named the test per requirement, and
+  [the compiled Rust E2E matrix](testing/compiled-rust-e2e-matrix.md) mapped each
+  one to the test that existed. (Specification and matrix rows withdrawn, retained as
+  history: ADR-053.)
 
 ### P0 — first usable slice
 
@@ -136,7 +347,7 @@ write domains.
   explicit atomic reconcile mode for stopped-writer cutover refreshes.
 - Compatibility adapter followed by the verified removal of duplicate atmux
   Kanban storage and repository code.
-- Operator-oriented terminal or web board over the same APIs.
+- Operator-oriented terminal board over the same APIs.
 - Search/filter by project, worktree, status, priority, assignee, and recency.
 - Safe project/worktree detach and rename operations.
 - Backup, restore, integrity-check, and retention commands.
@@ -200,6 +411,13 @@ A handoff is valid only when:
   ingress, and one received queued message.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
+- The landing view loads only what it shows: a phone on mobile data must not
+  refetch a megabyte to see one new item. That obligation exists because it was
+  measured rather than assumed — on 2026-09-17 on `hax` the landing page
+  answered in 55 ms carrying 1.32 MB while the attention queue answered in
+  0.35 ms carrying 46 KB, and every live refresh re-sent the whole landing
+  payload. No byte or latency figure is adopted as a target here; `t-bf255880`
+  records the before and after it actually measured.
 
 ## Delivery slices
 
@@ -217,6 +435,12 @@ A handoff is valid only when:
    capability-gated dispatcher, the Codex queue compiled-process
    adapter-contract coverage, and the separately named HAX live smoke receipt
    for installed Codex support.
+8. **Decision room** (retired with the served UI: ADR-053): decision cards with authored choices, one-click
+   settlement with reply and undo, keyboard answering, hover previews, and
+   markdown across the served views.
+9. **Sprint release boundaries:** typed sprint rows, sprint-scoped claims and
+   handoff acceptance, the served-version close gate,
+   sprint-scoped rules, and first-class sprint search.
 
 ## Current delivery status
 
@@ -230,7 +454,30 @@ period.
 
 The production runtime is Rust per ADR-006. A release is ready only when the
 compiled executable passes the current process-boundary E2E matrix and the
-focused atmux CLI adapter contract suite against current data. TypeScript and
-Bun are not production or development dependencies of Kanban.
+focused atmux CLI adapter contract suite against current data. Since the SPA
+decision, TypeScript and Bun are build-time dependencies of the operator UI on
+the build host (ADR-048 records the boundary); the served product still runs
+Rust alone, and nothing Node-shaped runs on a server.
+
+What is shipped is not what is served. The decision room, the pub/sub
+dispatcher, and the harness adapters are shipped and served: the host serves
+commit `8e771ee` at board schema 28, so the sprint surface — typed rows, the
+close gate, the sprint web projections, sprint-scoped rules, and sprint search
+— is released and its per-board migration has run. Being served is not the same
+as being proven against a real peer — every adapter smoke receipt outside the
+Codex bridges drives a dependency-free fake, and the Claude print bridge's live
+receipt was dropped with its authentication attention `a-347ff24c`. The web
+design system is half served: the deck, its shell and its accessibility
+contract are in that served commit, while commit `b98e81e` — every read page as
+rows with one pill, sentence meta and borderless tables — is shipped on its
+branch and pending its deploy. ADR-046 is Accepted (2026-09-20, George, attention a-e02c9116)
+regardless; what is pending here is the deploy, not the decision.
+
+On 2026-09-17 George decided that the operator UI becomes a single-page
+application, recorded as ADR-048 on 2026-09-19 and specified before it was
+built. The rebuild is in delivery: the landing view and the queue are mounted
+and read the JSON projection, the no-script fallback is gone as accepted above,
+and the deck's behaviour is being re-proven on the new client rather than
+assumed to carry over.
 
 See [the historical 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).

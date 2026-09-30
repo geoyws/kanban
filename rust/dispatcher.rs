@@ -7,8 +7,8 @@ use crate::dispatch::{
 };
 use crate::lock::{self, DataRootLock};
 use crate::model::{SubscriptionDeliveryCandidate, SubscriptionDeliveryClaim};
-use crate::registry::Registry;
 use crate::registry::now_ms;
+use crate::registry::{BoardPathState, Registry, retired_board_message};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -301,8 +301,16 @@ pub(crate) fn resolve_context(args: DispatcherArgs) -> Result<DispatcherContext>
                     path.display()
                 );
             }
+            if let Some(BoardPathState::Retired { name, note }) =
+                Registry::board_path_state_if_available(&canonical)?
+            {
+                bail!(
+                    "{}",
+                    retired_board_message(&name, note.as_deref(), "addressing it")
+                );
+            }
             existing_board(&canonical)?;
-            let store = Store::open_readonly(&canonical)?;
+            let store = Store::open_readonly_as_caller(&canonical)?;
             (canonical, store.board_name()?)
         }
         BoardSelector::Project(name) => {
@@ -310,10 +318,29 @@ pub(crate) fn resolve_context(args: DispatcherArgs) -> Result<DispatcherContext>
             let projects = registry.by_name(name)?;
             let project = match projects.as_slice() {
                 [project] => project,
-                [] => bail!("no Kanban project named {name}"),
+                [] => {
+                    let retired = registry.by_name_all(name)?;
+                    match retired.as_slice() {
+                        [] => bail!("no Kanban project named {name}"),
+                        [project] => bail!(
+                            "{}",
+                            retired_board_message(
+                                &project.name,
+                                project.archived_note.as_deref(),
+                                "addressing it"
+                            )
+                        ),
+                        many => bail!(
+                            "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                            many.len(),
+                            crate::project_candidates(many)
+                        ),
+                    }
+                }
                 many => bail!(
-                    "{} Kanban projects are named {name}; select one with --workspace",
-                    many.len()
+                    "{} Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                    many.len(),
+                    crate::project_candidates(many)
                 ),
             };
             let path = PathBuf::from(&project.board_path);
@@ -1096,8 +1123,13 @@ mod tests {
         reset_cancellation();
     }
 
+    // Direct `--db` resolution still opens the ambient registry read-only for
+    // the ADR-035 retired-board check, so these fixtures own a private data
+    // root instead of inheriting the operator's registry.
     #[test]
     fn direct_external_database_resolution_holds_no_data_root_lock() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let dir = env::temp_dir().join(format!(
             "kanban-dispatcher-board-{}-{}",
             std::process::id(),
@@ -1123,6 +1155,8 @@ mod tests {
 
     #[test]
     fn direct_symlink_resolution_uses_the_stable_canonical_board() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let dir = env::temp_dir().join(format!(
             "kanban-dispatcher-symlink-{}-{}",
             std::process::id(),

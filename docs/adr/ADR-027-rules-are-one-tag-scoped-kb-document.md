@@ -39,6 +39,22 @@ subsystem tags continue to be validated against the union of active board tag
 masters. `ALL` cannot coexist with `ONLY:*`; `EXCEPT:*` requires `ALL`; duplicate,
 unknown, or ambiguous selectors fail closed.
 
+Every named selector on an active rule is a live host-registry reference:
+`ONLY:<board>` and `EXCEPT:<board>` each require exactly one active board with
+that name. Add, active update, and transfer import validate against the registry
+inside their immediate write transaction. Workspace retirement is also an
+invariant transition: it refuses while any active rule names the retiring board,
+lists the blocking rule IDs, and tells the operator to update or retire those
+rules before retrying. It never silently rewrites or retires a rule.
+
+The invariant applies only to active rows. Retired rule bodies, tags, and events
+remain explicit historical evidence after their named board retires. A stale
+active selector introduced by legacy state or direct database mutation does not
+make the registry impossible to open: `doctor --json` reports it under
+`activeRuleSelectors` and fails top-level health, while `rule list --all`,
+`rule show`, rule events, and `doctor --all` remain available for inspection
+and recovery.
+
 The public model exposes `tags`, not separate `boardTags`, `taskTags`, or
 `scope`. Existing `g-*` identifiers remain valid historical identifiers but no
 longer imply global scope; newly created rules use `r-*`.
@@ -79,6 +95,37 @@ dotfiles; this ADR does not make plaintext board state suitable for credentials.
 Historical board rule tables remain in old board schemas so audit history stays
 readable and older backups remain restorable. They are compatibility history,
 not an active rule source after consolidation.
+
+## Addendum: 2026-09-20 — applicability is the authorization test for rule text
+
+The `t-bf255880` wave-1 security review asked whether a rule's `tags` array is
+also an authorization tag set, of the ADR-033 kind a `tag:<name>` grant names.
+It is not, and this ADR's Decision already answers it: the array expresses
+applicability, and nothing else. There is no second meaning for the same
+field. A caller who may read a board may read the rules that apply to that
+board, because those rules are part of what the board means; a caller who may
+not read the board never reaches them, since every rule read is reached
+through a board-scoped read in the first place. Board read is the whole test.
+
+Two surfaces serve rule text, and both are scoped by applicability: the board
+page's folded rule bodies (`projection::board`, through
+`applicable_rules`/`applicable_rule_summaries`), and a search hit on the rules
+document. The search surfaces were not scoped before 2026-09-20 — the served
+`/api/v1/search` receipt and the CLI's `--all-boards` pass handed
+`search_rules` the whole registry, so a search of board A could return the body
+of a rule whose selectors name ONLY board B. Since `t-e68bb2b9` both read the
+boards they actually searched and scope the candidate rules to the union of
+what applies to them (`Registry::rules_targeting_any`, the multi-board twin of
+the single-board path's `rules_targeting_board`). A search that read no board
+returns no rule text: an empty board set is not a wildcard.
+
+## Addendum: 2026-09-23 — subsystem selectors are `<estate>/<subsystem>`
+
+The bare `aix` mention in Context and the lowercase-subsystem selector family in
+Decision predate the slash-namespace rule: subsystem tags are
+`<estate>/<subsystem>` (`geoyws/<subsystem>` where no estate applies; map rule
+`r-98ff7ad2`). Historical rows and prose above keep their original spelling. A
+mistyped tag is migrated with `tag rename`.
 
 ## References
 

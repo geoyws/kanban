@@ -1,34 +1,60 @@
 mod adapter_process;
 mod adapter_protocol;
 mod audit;
+#[allow(dead_code)]
+mod authz;
+#[allow(dead_code)]
+mod broker;
+#[allow(dead_code)]
+mod claude_print_adapter;
+#[allow(dead_code)]
+mod codex_app_server_adapter;
+#[allow(dead_code)]
+mod codex_app_server_messages;
+#[allow(dead_code)]
+mod codex_app_server_state;
 mod codex_queue_adapter;
 mod context;
+mod cursor_worker_adapter;
 mod db;
 mod dispatch;
 mod dispatcher;
 mod gitctx;
 mod import;
+mod kimi_acp_adapter;
 mod lock;
 mod mcp;
 mod model;
+mod opencode_adapter;
+#[allow(dead_code)]
+mod policy;
 mod registry;
+mod routing;
 mod search;
-mod serve;
 mod store;
 mod watch;
+mod zcode_notify_adapter;
 
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
-use crate::store::{ClaimOptions, Store, UpdateTask};
+use crate::policy::{
+    AuditFilterSpec, CAPABILITIES, Capability, DeniedAttempt, PolicyActor, PolicyContext,
+    ScopeTuple,
+};
+use crate::registry::{
+    BoardPathState, PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
+    preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
+    retired_board_message, run_workspace_adopt_helper, spawn_workspace_adopt_helper,
+};
+use crate::store::{AcceptHandoffOptions, ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -39,100 +65,241 @@ Usage:
   kanban init --name NAME [--workspace PATH] [--rootless] [--force] [--as ACTOR]
   kanban workspace list [--all] [--json]
   kanban workspace attach --to NAME|REGISTERED_PATH [--workspace PATH] [--as ACTOR]
+  kanban workspace adopt --from-board PATH --name NAME (--workspace PATH | --rootless)
+             --as ACTOR [--json]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
+  kanban workspace retire NAME --as ACTOR --note TEXT
+  kanban workspace unretire NAME --as ACTOR
   kanban workspace repoint [--root PATH] [--as ACTOR] [--json]
-  kanban dashboard [--json]
-  kanban doctor [--json]
+  kanban dashboard [--all] [--json]
+  kanban doctor [--all] [--json]
   kanban audit verify [--against MANIFEST] [--json]
-  kanban search QUERY [--source KIND] [--status STATUS] [--tag NAME] [--lane LANE]
+  kanban search QUERY [--source task|note|checkpoint|handoff|attention|sitrep|rule|event|sprint]
+             [--status STATUS] [--tag NAME] [--lane LANE]
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
-  kanban serve [--port N]
   kanban events [--task ID | --rule ID | --registry] [--kind KIND]
              [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
-             [--relation KIND:ID ...] [--prior-status STATUS ...]
-             [--current-status STATUS ...] [--tag NAME ...]
+             [--relation parent:ID|ancestor:ID|depends-on:ID ...] [--prior-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...]
+             [--current-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...] [--tag NAME ...]
              [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
   kanban subscription add --consumer NAME --action NAME --timeout-ms N
              --max-retries N --rate-per-minute N --max-concurrency N --as ACTOR
-             [--id ID] [--subject task:ID] [--relation KIND:ID ...]
-             [--kind KIND ...] [--prior-status STATUS ...]
-             [--current-status STATUS ...] [--tag NAME ...] [--secret-ref NAME] [--json]
+             [--id ID] [--subject task:ID] [--relation parent:ID|ancestor:ID|depends-on:ID ...]
+             [--kind KIND ...] [--prior-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...]
+             [--current-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...] [--tag NAME ...] [--secret-ref NAME] [--json]
   kanban subscription list [--status active|paused] [--consumer NAME] [--all] [--json]
   kanban subscription show ID [--json]
   kanban subscription pause|resume ID --as ACTOR [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
-  kanban deploy start --repo REPO --commit FULL_SHA --tier TIER --environment NAME
+  kanban deploy start --repo REPO --commit FULL_SHA --tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p --environment NAME
              --host HOST --url URL --as ACTOR [--task ID] [--branch NAME]
              [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
-  kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled --as ACTOR
+             [--deployer-checkout FULL_SHA] [--sprint sp-…]
+  kanban deploy start --repo REPO --artifact ROLE=KIND:VALUE ... --build-commit unknown
+             --tier TIER --environment NAME --host HOST --url URL --as ACTOR
+             [--deployer-checkout FULL_SHA] [--task ID] [--branch NAME]
+             [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
+             (the recovery path for an artifact whose build commit is genuinely
+             unknown. ROLE names one component, KIND is docker-image-id or
+             oci-manifest-digest and the two are never compared to each other,
+             and the literal unknown is required so the absence is stated. One
+             mode per attempt: --commit is refused here and --artifact is
+             refused on the Git line above.)
+  kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled|abandoned --as ACTOR
              --phase build|publish|start|verification --receipt TEXT
-             [--served-commit FULL_SHA] [--artifact-uri URI]
+             [--served-commit FULL_SHA] [--served-version X.Y.Z] [--artifact-uri URI]
+  kanban deploy finish ID --token TOKEN --result succeeded --phase verification
+             --receipt TEXT --observed ROLE=KIND:VALUE ... --as ACTOR
+             (an artifact-identity attempt: one --observed per expected role,
+             matched exactly per role and per kind. --served-commit is refused
+             here and --observed is refused on a Git attempt, so a digest-only
+             success is never recorded as a verified Git commit.)
   kanban deploy abandon ID --as ACTOR --note TEXT [--token TOKEN | --force]
-  kanban deploy show ID | list [--status STATUS] [--tier TIER] [--limit N] [--all]
+  kanban deploy show ID | list [--status started|succeeded|failed|cancelled|abandoned] [--tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p] [--limit N] [--all]
   kanban deploy current
   kanban restore --from DIRECTORY --force [--as ACTOR] [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
-             [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
-             [--priority P0|P1|P2|0-9] [--depends-on ID ...]
+             [--body TEXT | --body-file PATH] [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled]
+             [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
-             [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--all] [--json]
-  kanban task show ID [--json]
-  kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
+             [--stale-minutes N] [--driver-only] [--sprint sp-…] [--allowed-model NAME ...]
+  kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--allowed-model NAME] [--all]
+             [--with-claims] [--with-relations]
+             [--fields id,title,status,... | --no-body] [--json]
+  kanban task show ID [--limit N] [--json]
+             (every listed row carries claimed; --with-claims and task show
+             carry claim, whose holder is claim.agentID. assignee is intent,
+             never the lease: an assigned task can be free, a held one
+             assigned to someone else. --with-relations and task show carry
+             dependencies and blockingGates — the unfinished prerequisites
+             this row inherits from itself and from every ancestor)
+  kanban task move ID draft|backlog|todo|in_progress|blocked|review|done|cancelled --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
+  kanban task verdict add ID --reviewer ACTOR --sha SHA [--sha ...] --evidence ATTENTION-ID [--evidence ...] --attest-published --as WRITER [--json]
+             (with the gate on, a done-move needs this planner-written
+             foreign-actor pass covering the row's current head)
+  kanban task verdict gate on|off --as ACTOR [--json]
+             (only geoyws may toggle; every change is an audited event)
+  kanban task verdict list ID [--json]
   kanban task remove ID --as ACTOR [--force]
-  kanban task update ID --as ACTOR [task fields, incl. --body-file PATH]
+  kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
+             [--priority P0|P1|P2|0-9] [--parent ID | --clear-parent]
+             [--tag NAME ... | --clear-tags] [--depends-on ID ... | --clear-dependencies]
+             [--assignee AGENT | --unassign] [--lane LANE | --clear-lane]
+             [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
+             [--driver-only | --no-driver-only] [--sprint sp-… | --clear-sprint]
+             [--allowed-model NAME ... | --clear-allowed-models] [--json]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
-  kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
+  kanban story advance ID --as ACTOR [--to planning|ready|in-progress|testing|review|merging|done] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
-  kanban claim [ID | --next] --as AGENT [claim options] [--json]
+  kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
+             [--lane LANE] [--role ROLE] [--caller-scope driver]
+             [--no-cross-lane] [--allow-reassign]
+             [--sprint sp-… | --any-sprint] [--model NAME] [--json]
+             (a task restricted to models refuses a claim whose --model is
+             missing or outside its list, and the refusal prints the list)
+             (when a current sprint exists, claims are scoped to it; the
+             override is recorded on the task_claim event; unattached rows
+             are NOT offered — outside the boundary, not inside it)
   kanban claim --candidates --as AGENT [--tag NAME] [--lane LANE] [--role ROLE]
              [--caller-scope driver] [--no-cross-lane] [--allow-reassign]
-             [--limit N] [--json]
+             [--limit N] [--model NAME] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
-  kanban note ID TEXT --as AGENT [--kind KIND]
-  kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
+  kanban note ID TEXT --as AGENT [--kind plan|progress|blocker|decision|evidence|done]
+  kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT
+             --next-action TEXT [--session ID] [--model NAME] [--state continue|blocked|done]
+             [--blocker TEXT ...] [--validation TEXT ...]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
   kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
-             --next-action TEXT [--priority P0|P1|P2|0-9]
+             --next-action TEXT [--priority P0|P1|P2|0-9] [--to AGENT]
+             [--reason token_pressure|provider_limit|session_end|manual] [--session ID] [--model NAME]
+             [--blocker TEXT ...] [--validation TEXT ...]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
              (without ID: a session handoff, about no one task)
-  kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--json]
-  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
+             (--repo, --branch, --head and --dirty are captured from the cwd's
+             git checkout when omitted; an explicit flag overrides the capture)
+  kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
+  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
+             [--caller-scope driver] [--sprint sp-… | --any-sprint] [--model NAME] [--json]
+  kanban handoff retire ID --as AGENT --note TEXT [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
   kanban tag list [--json]
+  kanban tag rename OLD NEW --as ACTOR [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
   kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR
-             [--board NAME ... | --except-board NAME ...] [--tag NAME ...] [--json]
+             [--board NAME ... | --except-board NAME ...] [--sprint sp-ID]
+             [--tag NAME ...] [--json]
+             (--sprint requires exactly one named --board and matches only tasks attached to that sprint)
   kanban rule list [--all] [--full] [--json]
   kanban rule show ID [--json]
   kanban rule update ID [--body TEXT | --body-file PATH]
-             [--board NAME ... | --except-board NAME ...] [--tag NAME ... | --clear-tags]
-             --as ACTOR [--json]
+             [--board NAME ... | --except-board NAME ...] [--sprint sp-ID | --clear-sprint]
+             [--tag NAME ... | --clear-tags] --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
+  kanban rule export --board NAME ... --as ACTOR [--output PATH] [--json]
+  kanban rule import PATH --as ACTOR [--json]
   kanban rule consolidate --as ACTOR [--json]
-  kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
+  kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk|complaint]
              [--priority P0|P1|P2|0-9]
-             [--task ID] [--tag NAME ...] [--json]
-  kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--tag NAME]
-             [--limit N] [--json]
+             [--task ID] [--lane LANE] [--tag NAME ...] [--json]
+             [--question TEXT --context TEXT]
+             [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
+             [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
+             [--check-explain TEXT --check-about SUBJECT]
+             (a card is 2-4 choices, one --consequence each, exactly one
+             --recommend; OUTCOME is approve|reject|defer|other; a row with no
+             choices reads as the Approve/Reject pair)
+  kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk|complaint] [--task ID] [--tag NAME]
+             [--lane LANE] [--all] [--limit N]
+             [--fields id,kind,status,... | --no-body] [--json]
+  kanban attention list --check-report [--kind blocking|decision|approval|review|risk|complaint] [--task ID] [--tag NAME]
+             [--lane LANE] [--all] [--all-boards] [--limit N] [--json]
+             (resolved answered checks grouped by --check-about subject, worst
+             first; --status, --fields and --no-body are refused beside it)
+  kanban attention show ID [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
-  kanban attention resolve ID --as ACTOR --note TEXT [--json]
+             [--question TEXT --context TEXT]
+             [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
+             [--clear-card]
+             [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
+             [--check-explain TEXT --check-about SUBJECT]
+  kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--check-answered KEY]
+             [--return-trigger date:YYYY-MM-DD|task:ID|event:KIND] [--json]
+  kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
+             --note TEXT [--return-trigger date:YYYY-MM-DD|task:ID|event:KIND] [--json]
+             (--return-trigger on a defer snoozes the card instead of settling it: it
+             stays open with its decision, out of the open queue and its counts until
+             the trigger fires on read; attention list --all and show still name it)
+  kanban attention check ID --as ACTOR --key KEY [--json]
+             (answer the row's comprehension check once, open or resolved;
+             prints the verdict, the correct key and label, and why)
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
-  kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
+  kanban sprint new TITLE --target-version X.Y.Z --start EPOCH_MS --end EPOCH_MS --as ACTOR [--id sp-…] [--body TEXT | --body-file PATH] [--json]
+  kanban sprint plan ID --body TEXT|--body-file PATH --as ACTOR [--candidate ID ... | --parent-epic ID | --empty-scope] [--json]
+  kanban sprint start ID --as ACTOR [--json]       (refused while another sprint is current)
+  kanban sprint close ID --deployment d-… --as ACTOR [--carry-to sp-… --carry-note TEXT] [--json]
+             (proof must be a succeeded verification deployment bound to this sprint/version)
+  kanban sprint abandon ID --note TEXT --as ACTOR [--json]
+  kanban sprint list [--status planned|current|closed|abandoned] [--all] [--limit N]
+             [--fields id,title,… | --no-body] [--json]   (default hides closed/abandoned)
+  kanban sprint show ID [--json]                     (the row, its rows, its deployment)
+  kanban sitrep post TEXT --as AGENT --lane LANE [--task ID]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
+             (--repo, --branch, --head and --dirty are captured from the cwd's
+             git checkout when omitted; a write outside any checkout is refused
+             rather than stored blank, and kb-board supplies them for you)
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
+  kanban access bootstrap --username NAME --uid UID --as ACTOR --reason TEXT
+             --confirm empty-policy [--json]
+  kanban access principal bind --username NAME --uid UID [--replaces ID ...]
+             --as ACTOR --reason TEXT [--json]
+  kanban access principal prove-rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --as ACTOR --reason TEXT [--json]
+  kanban access principal rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --source-proof PROOF --as ACTOR --reason TEXT [--json]
+  kanban access principal disable --principal ID --as ACTOR --reason TEXT [--json]
+  kanban access principal show --principal ID [--json]
+  kanban access principal list [--disabled] [--json]
+  kanban access grant --principal ID --capability read|write|admin
+             [--scope SCOPE ...] --as ACTOR --reason TEXT [--json]
+  kanban access revoke --principal ID --capability read|write|admin
+             [--scope SCOPE ...] --as ACTOR --reason TEXT [--json]
+  kanban access sso map-sso --provider google --subject SUB --subject-proof PROOF
+             --principal ID --as ACTOR --reason TEXT [--json]
+  kanban access sso unmap-sso --provider google --subject SUB --as ACTOR --reason TEXT [--json]
+  kanban access explain --principal ID --capability read|write|admin
+             [--scope SCOPE ...] [--json]
+  kanban access audit [--principal ID] [--actor-principal ID] [--kind KIND]
+             [--capability read|write|admin] [--scope SCOPE ...] [--after-epoch EPOCH]
+             [--limit N] [--json]
+  kanban access breakglass principal-rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --as ACTOR --reason TEXT --confirm root-breakglass [--json]
+  kanban access breakglass map-sso --provider google --subject SUB --principal ID
+             --as ACTOR --reason TEXT --confirm root-breakglass [--json]
+  kanban access breakglass registry-admin --principal ID --as ACTOR --reason TEXT
+             --confirm root-breakglass [--json]
+  kanban access enforcement show [--json]
+  kanban access enforcement prepare --expected-epoch EPOCH --as ACTOR --reason TEXT
+             --confirm prepared [--json]
+  kanban access enforcement activate --expected-epoch EPOCH --prepare-receipt RECEIPT
+             --as ACTOR --reason TEXT --confirm no-direct-fallback [--json]
+  kanban transact (--items JSON_ARRAY | --items-file PATH) [--json]
   kanban schema [--json]
   kanban mcp
 
-Global options (accepted by every board command):
+Global options (accepted by every board command; a command that addresses the
+registry instead — doctor, dashboard, backup, restore, audit verify,
+schema, mcp, workspace, rule — refuses the ones it would discard):
   --project NAME     address a registered project by name, from any directory
   --workspace PATH   use the project containing PATH instead of the cwd
   --db PATH          operate on a board file directly
@@ -147,27 +314,52 @@ Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
   ctx=context  ev=events  dash=dashboard  rel=release  n=note  r=rule  sr=sitrep  v=version
   att/attn=attention
-  task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
-  story:     adv=advance
-  handoff:   ls=list  new=create  acc=accept
-  workspace: ls=list  att=attach  det=detach
-  rule:      ls=list  new=add  up=update  cat=show
+  task:          ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
+  story:         adv=advance
+  handoff:       ls=list  new=create  acc=accept
+  workspace:     ls=list  att=attach  det=detach
+  attention:     ls=list  up=update  new=raise
+  tag:           ls=list  new=add  rm=remove
+  rule:          ls=list  new=add  up=update  cat=show
+  sitrep:        ls=list  new=post
+  deploy:        ls=list  cat=show
+  subscription:  ls=list  new=add  cat=show
+  sprint:        ls=list  cat=show
              repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
 --force is required to override a live lease (task move/remove) or to nest a
-second board inside a registered project tree (init). Unknown flags are errors.
+second board inside a registered project tree (init). claim has no --force, and
+--allow-reassign only filters claim --candidates: to take a task off an agent
+that died holding the lease, task move ID todo --as ACTOR --force, then claim it
+again for a fresh token. Unknown flags are errors.
+
+--limit N is honoured exactly, up to 1000000 -- effectively unbounded for any
+board this tool holds, and a ceiling only so a mistyped value is refused rather
+than answered. It applies to every surface that takes the flag: events, search,
+watch, attention list, sitrep list, deploy list, handoff list, sprint
+list, claim --candidates and task show. Without it a listing is capped -- events 50, watch
+50, sitrep list 20, search 10, attention list, deploy list, handoff list,
+sprint list and claim --candidates 100, task show 100 notes, 20 checkpoints and 100 handoffs --
+and one that would exceed its cap refuses and names --limit rather than passing
+the first page off as the whole. events goes one step further: an explicit
+--limit that cut the page is named on stderr, because a page of history that
+stops at the limit reads as the whole history. stdout and the exit status are
+unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 26] = [
+pub(crate) const BOOLEAN: [&str; 37] = [
     "help",
     "json",
     "version",
+    "disabled",
     "force",
+    "rootless",
     "next",
     "candidates",
     "keep-status",
+    "attest-published",
     "driver-only",
     "no-driver-only",
     "unassign",
@@ -176,17 +368,25 @@ pub(crate) const BOOLEAN: [&str; 26] = [
     "no-cross-lane",
     "allow-reassign",
     "with-relations",
+    "with-claims",
     "clear-parent",
     "clear-dependencies",
     "clear-tags",
+    "clear-allowed-models",
     "reconcile",
     "dry-run",
     "verify",
     "all",
     "full",
     "all-boards",
+    "check-report",
     "registry",
     "follow",
+    "no-body",
+    "clear-card",
+    "any-sprint",
+    "clear-sprint",
+    "empty-scope",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -217,30 +417,445 @@ pub(crate) const WATCH_REPEATABLE: [&str; 4] =
 pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
     ["kind", "relation", "prior-status", "current-status"];
 
+/// Access-only list-valued flags (ADR-038 clause 12): `--scope` and
+/// `--replaces` are repeatable, every other `access` flag is single-valued.
+/// Kept apart from [`REPEATABLE`] for the same reason watch and subscription
+/// are: those flags are scalar everywhere else, and the access command's
+/// collection code is a separate slice.
+pub(crate) const ACCESS_REPEATABLE: [&str; 2] = ["scope", "replaces"];
+
+/// Attention's authored list flags. Decision-card choices and consequences,
+/// plus non-decisional check choices, repeat only on raise/update.
+pub(crate) const CARD_REPEATABLE: [&str; 3] = ["choice", "consequence", "check-choice"];
+
+/// The artifact-identity flags, list-valued on the one subcommand each
+/// belongs to: a `deploy start` expects one identity per component role and a
+/// `deploy finish` observes one per role (ADR-043 §2). Neither flag exists on
+/// List-valued identity and sprint planning flags.
+pub(crate) const ARTIFACT_EXPECTED_REPEATABLE: [&str; 1] = ["artifact"];
+pub(crate) const ARTIFACT_OBSERVED_REPEATABLE: [&str; 1] = ["observed"];
+pub(crate) const SPRINT_PLAN_REPEATABLE: [&str; 1] = ["candidate"];
+
+/// The model allow-list flag, list-valued where it AUTHORS a set — `task add`
+/// and `task update` — and scalar on `task list`, `claim` and
+/// `handoff accept`, where one name is asked about or declared. Kept out of
+/// [`REPEATABLE`] for exactly that split: a second `--allowed-model` on
+/// `task list` would be two filters for one listing.
+pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
+
+/// The verdict-write flags, list-valued on the one subcommand they belong
+/// to: a `task verdict add` cites every reviewed SHA and every checked
+/// decision. Kept out of [`REPEATABLE`] because both flags are scalar
+/// everywhere else they appear — which is nowhere today, and that split is
+/// the reason this stays per-operation like the rest of [`LIST_VALUED`].
+pub(crate) const VERDICT_ADD_REPEATABLE: [&str; 2] = ["sha", "evidence"];
+struct ListValued {
+    command: &'static str,
+    sub: Option<&'static str>,
+    flags: &'static [&'static str],
+}
+
+const LIST_VALUED: [ListValued; 11] = [
+    ListValued {
+        command: "watch",
+        sub: None,
+        flags: &WATCH_REPEATABLE,
+    },
+    ListValued {
+        command: "subscription",
+        sub: None,
+        flags: &SUBSCRIPTION_REPEATABLE,
+    },
+    ListValued {
+        command: "access",
+        sub: None,
+        flags: &ACCESS_REPEATABLE,
+    },
+    ListValued {
+        command: "attention",
+        sub: Some("raise"),
+        flags: &CARD_REPEATABLE,
+    },
+    ListValued {
+        command: "attention",
+        sub: Some("update"),
+        flags: &CARD_REPEATABLE,
+    },
+    ListValued {
+        command: "deploy",
+        sub: Some("start"),
+        flags: &ARTIFACT_EXPECTED_REPEATABLE,
+    },
+    ListValued {
+        command: "deploy",
+        sub: Some("finish"),
+        flags: &ARTIFACT_OBSERVED_REPEATABLE,
+    },
+    ListValued {
+        command: "sprint",
+        sub: Some("plan"),
+        flags: &SPRINT_PLAN_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("add"),
+        flags: &ALLOWED_MODEL_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("update"),
+        flags: &ALLOWED_MODEL_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("verdict add"),
+        flags: &VERDICT_ADD_REPEATABLE,
+    },
+];
+
+/// Whether this operation takes this flag more than once.
+///
+/// One predicate, read by the parser's refusal, by `schema --json`'s flag
+/// kind and by the MCP layer's array coercion, so the three cannot disagree
+/// about whether a flag is a list.
+pub(crate) fn repeatable(command: &str, sub: Option<&str>, flag: &str) -> bool {
+    REPEATABLE.contains(&flag)
+        || LIST_VALUED.iter().any(|entry| {
+            entry.command == command
+                && (entry.sub.is_none() || entry.sub == sub)
+                && entry.flags.contains(&flag)
+        })
+}
+
 /// Commands that are processes rather than operations.
 ///
-/// `mcp` and `serve` block until killed. That makes them meaningless as tool
+/// `mcp` and `watch` block until killed. That makes them meaningless as tool
 /// calls — the MCP layer spawns the binary and reads its result, so a tool that
 /// never returns hangs the caller — and impossible to exercise the way the
 /// read-only guard exercises everything else, which runs each operation and
 /// compares the board before and after.
 ///
-/// This was a bare `!= "mcp"` inside the tool builder until `serve` arrived and
-/// the filter named only the first of two. It is a set with a guard now,
-/// because the next one will be the same mistake.
-pub(crate) const LONG_RUNNING: [&str; 3] = ["mcp", "serve", "watch"];
+/// This was a bare `!= "mcp"` inside the tool builder until a second
+/// long-running command arrived and the filter named only the first of two.
+/// It is a set with a guard now, because the next one will be the same mistake.
+pub(crate) const LONG_RUNNING: [&str; 2] = ["mcp", "watch"];
 
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
-/// Upper bound for a watch replay batch.
+/// The upper bound every `--limit` is held to, on every surface.
 ///
-/// The reader can ask for nothing or a small bounded batch, but a caller
-/// cannot request an unbounded `Vec` through `--limit`.
-pub(crate) const WATCH_BATCH_LIMIT: i64 = 1_000;
+/// A million rows is more than any board this tool holds, so the ceiling is
+/// not a page-size policy — `Args::limit` is where a mistyped `--limit
+/// 100000000` is caught before SQLite is asked to materialise it, and where
+/// the caller learns that from a refusal rather than from a stall. The bound
+/// used to be a thousand and lived only on `watch`; a thousand is a real page
+/// on a board with a year of events, and every other listing had no ceiling
+/// at all.
+///
+/// One constant, read by `Args::limit` and by the store-layer floors that
+/// guard the event reads, so the number cannot drift between the CLI and the
+/// query it turns into.
+pub(crate) const LIMIT_CEILING: i64 = 1_000_000;
 
 /// The flags that each select a board. At most one may be given explicitly.
 const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
+
+/// One command, and the board selectors it never consults.
+///
+/// Name, subcommand, the selectors it discards, and what it addresses instead.
+pub(crate) type IgnoredSelectorRow = (
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    &'static str,
+);
+
+/// The commands that survey the registry instead of resolving one board.
+///
+/// `--db`, `--project` and `--workspace` are in [`GLOBAL_FLAGS`], so every
+/// command parses them and `reject_unknown` exempts them. A command that never
+/// asks the resolver for a board therefore accepted a selector and threw it
+/// away. `doctor --db /nowhere/absent.db --json` answered
+/// `{"healthy": true, ...}` — computed over every registered board, about a
+/// file that was not there — and a health check that returns green about a
+/// different subject is worse than one that refuses. `backup --db` was the
+/// same shape, and both skipped the data-root lock on the way, because
+/// `lock::touches_data_root` reads the very `--db` path the command then
+/// ignored: `restore --db /tmp/elsewhere.db` replaced the whole data root
+/// without the exclusive lock that exists to keep a concurrent reader off it.
+///
+/// Refusing is the whole fix. None of these grows a per-board mode here; they
+/// say the flag does not apply and name what they do address, the way `rule`
+/// and `watch --registry` already do.
+///
+/// Listed per command, and only the selectors actually discarded: `init` and
+/// `workspace attach` both honour `--workspace` and ignore the other two, so a
+/// blanket rule would break the two uses that work.
+///
+/// Every row here is unconditional — the command discards the selector on every
+/// invocation, so the manifest and the MCP tool builder can read it and be
+/// right every time. Three refusals elsewhere are deliberately *not* rows and
+/// must stay inline, because they depend on another flag rather than on the
+/// command: `events --registry` / `events --rule` and `watch --registry` /
+/// `watch --rule` read the registry trail only when that flag is present
+/// (`events --db` addresses a board and is honoured), and
+/// `search --all-boards` / `search-rebuild --all-boards` refuse a selector only
+/// in their all-boards mode. Tabling any of those would refuse a selector the
+/// command honours the rest of the time, which is the mirror image of the
+/// defect this table exists to fix.
+pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
+    (
+        "init",
+        None,
+        &["db", "project"],
+        "creates its own board under the data root, with --workspace naming the tree it belongs to",
+    ),
+    (
+        "workspace",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "lists every registered project",
+    ),
+    (
+        "workspace",
+        Some("attach"),
+        &["db", "project"],
+        "attaches the tree named by --workspace to the project named by --to",
+    ),
+    (
+        "workspace",
+        Some("adopt"),
+        &["db", "project"],
+        "copies a source board into registry-owned storage under --name",
+    ),
+    (
+        "workspace",
+        Some("detach"),
+        &["db", "project", "workspace"],
+        "detaches the registered root named by --root",
+    ),
+    (
+        "workspace",
+        Some("retire"),
+        &["db", "project", "workspace"],
+        "retires one named board, not a board selector",
+    ),
+    (
+        "workspace",
+        Some("unretire"),
+        &["db", "project", "workspace"],
+        "restores one named board, not a board selector",
+    ),
+    (
+        "workspace",
+        Some("repoint"),
+        &["db", "project", "workspace"],
+        "repairs registered roots, named by --root or taken from the registry",
+    ),
+    (
+        "dashboard",
+        None,
+        &["db", "project", "workspace"],
+        "summarizes every registered board",
+    ),
+    (
+        "doctor",
+        None,
+        &["db", "project", "workspace"],
+        "checks the registry and every board in it",
+    ),
+    (
+        "audit",
+        Some("verify"),
+        &["db", "project", "workspace"],
+        "verifies the registry and every board in it",
+    ),
+    (
+        "backup",
+        None,
+        &["db", "project", "workspace"],
+        "snapshots the registry and every board in it",
+    ),
+    (
+        "restore",
+        None,
+        &["db", "project", "workspace"],
+        "replaces the whole data root from the snapshot named by --from",
+    ),
+    (
+        "schema",
+        None,
+        &["db", "project", "workspace"],
+        "describes this binary, not a board",
+    ),
+    (
+        "mcp",
+        None,
+        &["db", "project", "workspace"],
+        "resolves a board per tool call, not once for the server",
+    ),
+    // Rules refused these before this table existed, from two inline loops in
+    // the dispatcher. Refusing there and declaring nothing here left the rest
+    // of the surface reading the wrong answer: `schema --json` published
+    // `ignoredSelectors: []` for all six rows, and the MCP tool builder — which
+    // withholds exactly what this table names — went on advertising `project`
+    // on `rule_list`, so an agent could read the schema, send the argument it
+    // was offered, and get back "--project does not select a rule collection".
+    // The refusal is unconditional, so it belongs here and the loops are gone.
+    (
+        "rule",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "reads the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("update"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("retire"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("consolidate"),
+        &["db", "project", "workspace"],
+        "migrates every registered board, so naming one would imply a partial migration",
+    ),
+    // Every `access` operation acts on the policy registry (ADR-038 clause 12),
+    // never on a board, so all three selectors are discarded on every row.
+    (
+        "access",
+        Some("bootstrap"),
+        &["db", "project", "workspace"],
+        "seeds the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal bind"),
+        &["db", "project", "workspace"],
+        "binds a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal prove-rebind"),
+        &["db", "project", "workspace"],
+        "mints a rebind proof in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal rebind"),
+        &["db", "project", "workspace"],
+        "rebinds a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal disable"),
+        &["db", "project", "workspace"],
+        "disables a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal show"),
+        &["db", "project", "workspace"],
+        "reads a principal from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal list"),
+        &["db", "project", "workspace"],
+        "lists the policy registry's principals, never a board",
+    ),
+    (
+        "access",
+        Some("grant"),
+        &["db", "project", "workspace"],
+        "grants capability in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("revoke"),
+        &["db", "project", "workspace"],
+        "revokes capability in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("sso map-sso"),
+        &["db", "project", "workspace"],
+        "maps an SSO subject in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("sso unmap-sso"),
+        &["db", "project", "workspace"],
+        "unmaps an SSO subject in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("explain"),
+        &["db", "project", "workspace"],
+        "explains authority from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("audit"),
+        &["db", "project", "workspace"],
+        "reads the policy registry's audit journals, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass principal-rebind"),
+        &["db", "project", "workspace"],
+        "rebinds a principal by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass map-sso"),
+        &["db", "project", "workspace"],
+        "maps an SSO subject by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass registry-admin"),
+        &["db", "project", "workspace"],
+        "grants registry admin by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement show"),
+        &["db", "project", "workspace"],
+        "reads enforcement state from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement prepare"),
+        &["db", "project", "workspace"],
+        "prepares the enforcement cutover in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement activate"),
+        &["db", "project", "workspace"],
+        "activates enforcement in the policy registry, never a board",
+    ),
+];
 
 /// Every command, and every flag it accepts.
 ///
@@ -274,10 +889,25 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to", "as"], &[], false),
+    (
+        "workspace",
+        Some("adopt"),
+        &["from-board", "name", "rootless", "as"],
+        &[],
+        false,
+    ),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
+    (
+        "workspace",
+        Some("retire"),
+        &["as", "note"],
+        &["name"],
+        false,
+    ),
+    ("workspace", Some("unretire"), &["as"], &["name"], false),
     ("workspace", Some("repoint"), &["root", "as"], &[], false),
-    ("dashboard", None, &[], &[], true),
-    ("doctor", None, &[], &[], true),
+    ("dashboard", None, &["all"], &[], true),
+    ("doctor", None, &["all"], &[], true),
     ("audit", Some("verify"), &["against"], &[], true),
     (
         "search",
@@ -298,7 +928,6 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("search-rebuild", None, &["as", "all-boards"], &[], false),
-    ("serve", None, &["port"], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
     (
         "archive",
@@ -314,6 +943,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "task",
             "repo",
             "commit",
+            "artifact",
+            "build-commit",
+            "deployer-checkout",
             "branch",
             "tier",
             "environment",
@@ -324,6 +956,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "retry-of",
             "as",
             "lane",
+            "sprint",
         ],
         &[],
         false,
@@ -336,8 +969,10 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "result",
             "phase",
             "served-commit",
+            "observed",
             "receipt",
             "artifact-uri",
+            "served-version",
             "as",
         ],
         &["id"],
@@ -412,6 +1047,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "deliverable",
             "stale-minutes",
             "driver-only",
+            "sprint",
+            "allowed-model",
         ],
         &["title"],
         false,
@@ -419,11 +1056,21 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "task",
         Some("list"),
-        &["status", "with-relations", "tag", "all"],
+        &[
+            "status",
+            "with-relations",
+            "with-claims",
+            "tag",
+            "lane",
+            "allowed-model",
+            "fields",
+            "no-body",
+            "all",
+        ],
         &[],
         true,
     ),
-    ("task", Some("show"), &[], &["id"], true),
+    ("task", Some("show"), &["limit"], &["id"], true),
     (
         "task",
         Some("move"),
@@ -431,6 +1078,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id", "status"],
         false,
     ),
+    (
+        "task",
+        Some("verdict add"),
+        &["reviewer", "sha", "evidence", "as", "attest-published"],
+        &["id"],
+        false,
+    ),
+    ("task", Some("verdict gate"), &["as"], &["state"], false),
+    ("task", Some("verdict list"), &[], &["id"], true),
     ("task", Some("remove"), &["as", "force"], &["id"], false),
     (
         "task",
@@ -463,6 +1119,10 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "priority",
             "depends-on",
             "clear-dependencies",
+            "sprint",
+            "clear-sprint",
+            "allowed-model",
+            "clear-allowed-models",
         ],
         &["id"],
         false,
@@ -492,6 +1152,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "candidates",
             "tag",
             "limit",
+            "model",
+            "sprint",
+            "any-sprint",
         ],
         &["?id"],
         false,
@@ -554,17 +1217,26 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "handoff",
         Some("list"),
-        &["task", "status", "to", "all"],
+        &["task", "status", "to", "limit", "all"],
         &[],
         true,
     ),
     (
         "handoff",
         Some("accept"),
-        &["as", "session", "lease-minutes", "caller-scope"],
+        &[
+            "as",
+            "session",
+            "lease-minutes",
+            "caller-scope",
+            "sprint",
+            "any-sprint",
+            "model",
+        ],
         &["id"],
         false,
     ),
+    ("handoff", Some("retire"), &["as", "note"], &["id"], false),
     (
         "import",
         Some("atmux-json"),
@@ -579,15 +1251,34 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["path"],
         false,
     ),
+    // ADR-041 §11. Its input is a list of operations rather than a set of
+    // flags, and the row is what makes every generated surface follow:
+    // `schema --json` publishes it as a writing operation, and
+    // `mcp::listed_read_only` answers `Some(false)`, which is what makes the
+    // read-only `batch` refuse `transact` as an entry with no new code.
+    ("transact", None, &["items", "items-file"], &[], false),
     ("schema", None, &[], &[], true),
     ("mcp", None, &[], &[], false),
     ("tag", Some("add"), &["as", "description"], &["name"], false),
     ("tag", Some("list"), &[], &[], true),
+    // Two positionals, in the order the sentence has: the name that exists,
+    // then the name it becomes. `--as` is required rather than defaulted
+    // because a rename rewrites rows nobody asked about, and the ledger entry
+    // is the only record of who decided that.
+    ("tag", Some("rename"), &["as"], &["old", "new"], false),
     ("tag", Some("remove"), &["as", "force"], &["name"], false),
     (
         "rule",
         Some("add"),
-        &["as", "body", "body-file", "board", "except-board", "tag"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "board",
+            "except-board",
+            "sprint",
+            "tag",
+        ],
         &["?body"],
         false,
     ),
@@ -602,6 +1293,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "body-file",
             "board",
             "except-board",
+            "sprint",
+            "clear-sprint",
             "tag",
             "clear-tags",
         ],
@@ -609,40 +1302,149 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("rule", Some("retire"), &["as"], &["id"], false),
+    (
+        "rule",
+        Some("export"),
+        &["as", "board", "output"],
+        &[],
+        false,
+    ),
+    ("rule", Some("import"), &["as"], &["path"], false),
     ("rule", Some("consolidate"), &["as"], &[], false),
     (
         "attention",
         Some("raise"),
-        &["as", "kind", "task", "priority", "tag"],
+        &[
+            "as",
+            "kind",
+            "task",
+            "lane",
+            "priority",
+            "tag",
+            "question",
+            "context",
+            "choice",
+            "consequence",
+            "recommend",
+            "check",
+            "check-choice",
+            "check-answer",
+            "check-explain",
+            "check-about",
+        ],
         &["text"],
         false,
     ),
     (
         "attention",
         Some("list"),
-        &["status", "kind", "task", "tag", "limit", "all"],
+        &[
+            "status",
+            "kind",
+            "task",
+            "tag",
+            "lane",
+            "limit",
+            "fields",
+            "no-body",
+            "all",
+            "check-report",
+            "all-boards",
+        ],
         &[],
         true,
     ),
+    ("attention", Some("show"), &[], &["id"], true),
     (
         "attention",
         Some("update"),
-        &["as", "body", "body-file", "tag", "clear-tags"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "tag",
+            "clear-tags",
+            "question",
+            "context",
+            "choice",
+            "consequence",
+            "recommend",
+            "clear-card",
+            "check",
+            "check-choice",
+            "check-answer",
+            "check-explain",
+            "check-about",
+        ],
         &["id"],
         false,
     ),
     (
         "attention",
         Some("resolve"),
-        &["as", "note"],
+        &[
+            "as",
+            "note",
+            "choice",
+            "outcome",
+            "check-answered",
+            "return-trigger",
+        ],
         &["id"],
         false,
     ),
+    ("attention", Some("check"), &["as", "key"], &["id"], false),
     ("attention", Some("reopen"), &["as", "note"], &["id"], false),
+    (
+        "sprint",
+        Some("new"),
+        &[
+            "as",
+            "target-version",
+            "start",
+            "end",
+            "id",
+            "body",
+            "body-file",
+        ],
+        &["title"],
+        false,
+    ),
+    (
+        "sprint",
+        Some("plan"),
+        &[
+            "as",
+            "body",
+            "body-file",
+            "candidate",
+            "parent-epic",
+            "empty-scope",
+        ],
+        &["id"],
+        false,
+    ),
+    ("sprint", Some("start"), &["as"], &["id"], false),
+    (
+        "sprint",
+        Some("close"),
+        &["as", "deployment", "carry-to", "carry-note"],
+        &["id"],
+        false,
+    ),
+    ("sprint", Some("abandon"), &["as", "note"], &["id"], false),
+    (
+        "sprint",
+        Some("list"),
+        &["status", "all", "limit", "fields", "no-body"],
+        &[],
+        true,
+    ),
+    ("sprint", Some("show"), &[], &["id"], true),
     (
         "sitrep",
         Some("post"),
-        &["as", "lane", "task"],
+        &["as", "lane", "task", "repo", "branch", "head", "dirty"],
         &["text"],
         false,
     ),
@@ -685,6 +1487,411 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("context", None, &["max-chars"], &["id"], true),
     ("todo", None, &["output"], &[], false),
+    // The `access` surface (ADR-038 clause 12). Every operation addresses the
+    // policy registry and refuses the three board selectors; nothing here is a
+    // board command. Read-only is exactly what clause 12 lists: `principal
+    // show`, `principal list`, `explain`, `audit`, and `enforcement show` read
+    // authority without writing anything, so they are `true`.
+    (
+        "access",
+        Some("bootstrap"),
+        &["username", "uid", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal bind"),
+        &["username", "uid", "replaces", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal prove-rebind"),
+        &["principal", "username", "uid", "replaces", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal rebind"),
+        &[
+            "principal",
+            "username",
+            "uid",
+            "replaces",
+            "source-proof",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal disable"),
+        &["principal", "as", "reason"],
+        &[],
+        false,
+    ),
+    ("access", Some("principal show"), &["principal"], &[], true),
+    ("access", Some("principal list"), &["disabled"], &[], true),
+    (
+        "access",
+        Some("grant"),
+        &["principal", "capability", "scope", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("revoke"),
+        &["principal", "capability", "scope", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("sso map-sso"),
+        &[
+            "provider",
+            "subject",
+            "subject-proof",
+            "principal",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("sso unmap-sso"),
+        &["provider", "subject", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("explain"),
+        &["principal", "capability", "scope"],
+        &[],
+        true,
+    ),
+    (
+        "access",
+        Some("audit"),
+        &[
+            "principal",
+            "actor-principal",
+            "kind",
+            "capability",
+            "scope",
+            "after-epoch",
+            "limit",
+        ],
+        &[],
+        true,
+    ),
+    (
+        "access",
+        Some("breakglass principal-rebind"),
+        &[
+            "principal",
+            "username",
+            "uid",
+            "replaces",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("breakglass map-sso"),
+        &[
+            "provider",
+            "subject",
+            "principal",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("breakglass registry-admin"),
+        &["principal", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    ("access", Some("enforcement show"), &[], &[], true),
+    (
+        "access",
+        Some("enforcement prepare"),
+        &["expected-epoch", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("enforcement activate"),
+        &[
+            "expected-epoch",
+            "prepare-receipt",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
+];
+
+/// Whether an enum-valued argument is a flag or a positional.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgSlot {
+    Flag,
+    Positional,
+}
+
+/// One enum-valued argument on the command surface: which operation it belongs
+/// to, whether it is a flag or a positional, its name, and the closed set of
+/// values it accepts.
+///
+/// This is the single description of every vocabulary the CLI refuses a bad
+/// value from, and it names the same sets `store::validate` refuses against.
+/// [`schema`] projects `values` from it so an adapter can validate before
+/// dispatch (ADR-010), and the e2e enumerates it back out of `schema --json`
+/// so a new enum-valued argument must join here or fail the gate — the same
+/// shape `CAPPED_LISTINGS` uses for ADR-037. Open vocabularies (watch/event
+/// `--kind`, which accept built-ins plus any kind a board has already emitted)
+/// and the numeric `--priority` band are deliberately absent: they are not a
+/// closed set.
+pub(crate) struct EnumArgument {
+    pub command: &'static str,
+    pub sub: Option<&'static str>,
+    pub slot: ArgSlot,
+    pub name: &'static str,
+    pub values: &'static [&'static str],
+}
+
+pub(crate) const ENUM_ARGUMENTS: &[EnumArgument] = &[
+    EnumArgument {
+        command: "checkpoint",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "state",
+        values: &CHECKPOINT_STATES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "type",
+        values: &TASK_TYPES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("move"),
+        slot: ArgSlot::Positional,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "note",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &NOTE_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("raise"),
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &ATTENTION_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &ATTENTION_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &ATTENTION_STATUSES,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("resolve"),
+        slot: ArgSlot::Flag,
+        name: "outcome",
+        values: &ATTENTION_OUTCOMES,
+    },
+    EnumArgument {
+        command: "sprint",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &SPRINT_STATUSES,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("start"),
+        slot: ArgSlot::Flag,
+        name: "tier",
+        values: &DEPLOYMENT_TIERS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "tier",
+        values: &DEPLOYMENT_TIERS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &DEPLOYMENT_STATUSES,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("finish"),
+        slot: ArgSlot::Flag,
+        name: "result",
+        values: &DEPLOYMENT_RESULTS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("finish"),
+        slot: ArgSlot::Flag,
+        name: "phase",
+        values: &DEPLOYMENT_PHASES,
+    },
+    EnumArgument {
+        command: "handoff",
+        sub: Some("create"),
+        slot: ArgSlot::Flag,
+        name: "reason",
+        values: &HANDOFF_REASONS,
+    },
+    EnumArgument {
+        command: "handoff",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &HANDOFF_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "relation",
+        values: &RELATION_KINDS,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "prior-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "current-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &SUBSCRIPTION_STATUSES,
+    },
+    EnumArgument {
+        command: "story",
+        sub: Some("advance"),
+        slot: ArgSlot::Flag,
+        name: "to",
+        values: &STORY_FLOW,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "relation",
+        values: &RELATION_KINDS,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "prior-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "current-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("grant"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("revoke"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("explain"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("audit"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
 ];
 
 /// The flags a command accepts, and the positionals it takes after its own
@@ -704,12 +1911,16 @@ fn command_spec(
 }
 
 /// The most positionals an invocation may hold, counting the words that name it.
+///
+/// A subcommand is counted by its words, not by presence: the `access` surface
+/// names subcommands in two words ("principal show"), so one `Some` there is
+/// two name words (ADR-038 clause 12).
 fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
-    1 + usize::from(sub.is_some()) + positionals.len()
+    1 + sub.map(|s| s.split(' ').count()).unwrap_or(0) + positionals.len()
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 12] = [
+const SUBCOMMAND_GROUPS: [&str; 14] = [
     "task",
     "story",
     "handoff",
@@ -722,10 +1933,11 @@ const SUBCOMMAND_GROUPS: [&str; 12] = [
     "audit",
     "deploy",
     "subscription",
+    "access",
+    "sprint",
 ];
 
 /// Short names for commands, resolved by exact match only.
-///
 /// Never prefix inference: every alias is written down, so adding a command
 /// later cannot silently retarget one that already exists (ADR-008). An alias
 /// that is not listed stays an unknown command.
@@ -750,44 +1962,90 @@ fn canonical_command(value: &str) -> &str {
     }
 }
 
+/// Each group's creating verb: the long subcommand `new` stands for.
+///
+/// A property of the group's vocabulary, not derivable from its command names:
+/// `task`, `tag` and `rule` call creating `add`, `handoff` calls it `create`,
+/// `sitrep` calls it `post`, and `attention` calls it `raise`. Groups whose
+/// creating verb is ambiguous — `deploy start` reads as beginning an operation
+/// rather than creating one, and `workspace attach`/`adopt` as moving a board
+/// rather than making one — are deliberately left out, so `new` stays an
+/// unknown subcommand there rather than guessing.
+const CREATING_VERBS: &[(&str, &str)] = &[
+    ("task", "add"),
+    ("handoff", "create"),
+    ("tag", "add"),
+    ("rule", "add"),
+    ("sitrep", "post"),
+    ("subscription", "add"),
+    ("attention", "raise"),
+];
+
+/// Mechanical subcommand shortforms, applied to every [`SUBCOMMAND_GROUPS`]
+/// entry that declares the long subcommand on [`COMMANDS`].
+///
+/// The lookup is what makes these compose: a group gains `ls` exactly when it
+/// declares `list`, so a group that adds a `list` later gets `ls` for free and
+/// a group whose surface already has `list` cannot silently lack it — the
+/// defect that left `attention ls` unknown while the hand-written match listed
+/// task, story, handoff, workspace, tag, rule, sitrep, deploy and subscription.
+const MECHANICAL_SUBS: &[(&str, &str)] = &[
+    ("ls", "list"),
+    ("up", "update"),
+    ("cat", "show"),
+    ("rm", "remove"),
+];
+
+/// Whether a command declares the given subcommand on the [`COMMANDS`] surface.
+fn has_subcommand(command: &str, sub: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|(name, expected, ..)| *name == command && *expected == Some(sub))
+}
+
 /// Short names for subcommands, scoped to their group so `ls` can mean the
 /// obvious thing under each without ever being ambiguous.
 ///
 /// Only applied to [`SUBCOMMAND_GROUPS`]: for `claim`, `note` or `checkpoint`
 /// the second positional is a task id, and a task genuinely called `rm` must
-/// not be rewritten.
+/// not be rewritten. That holds by construction here — [`has_subcommand`] only
+/// ever answers true for a command that declares the long subcommand, and
+/// `claim`/`note`/`checkpoint` declare none — so a task id is never rewritten.
+///
+/// The mechanical shortforms come from [`MECHANICAL_SUBS`] against [`COMMANDS`],
+/// `new` from [`CREATING_VERBS`], and only the idiosyncratic stems that neither
+/// table can derive are written down in the match below.
 fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
+    // Stems that are not derivable from the long subcommand's name.
     match (command, value) {
-        ("task", "ls") => "list",
-        ("task", "mv") => "move",
-        ("task", "rm") => "remove",
-        ("task", "new") => "add",
-        ("task", "up") => "update",
-        ("task", "meta") => "metadata",
-        ("task", "cat") => "show",
-        ("story", "adv") => "advance",
-        ("handoff", "ls") => "list",
-        ("handoff", "new") => "create",
-        ("handoff", "acc") => "accept",
-        ("workspace", "ls") => "list",
-        ("workspace", "att") => "attach",
-        ("workspace", "det") => "detach",
-        ("tag", "ls") => "list",
-        ("tag", "new") => "add",
-        ("tag", "rm") => "remove",
-        ("rule", "ls") => "list",
-        ("rule", "new") => "add",
-        ("rule", "up") => "update",
-        ("rule", "cat") => "show",
-        ("sitrep", "ls") => "list",
-        ("sitrep", "new") => "post",
-        ("deploy", "ls") => "list",
-        ("deploy", "cat") => "show",
-        ("subscription", "ls") => "list",
-        ("subscription", "new") => "add",
-        ("subscription", "cat") => "show",
-        (_, other) => other,
+        ("task", "mv") => return "move",
+        ("task", "meta") => return "metadata",
+        ("story", "adv") => return "advance",
+        ("handoff", "acc") => return "accept",
+        ("workspace", "att") => return "attach",
+        ("workspace", "det") => return "detach",
+        _ => {}
     }
+
+    // `new` resolves to the group's creating verb, where it has one.
+    if value == "new"
+        && let Some(full) = CREATING_VERBS
+            .iter()
+            .find(|(group, _)| *group == command)
+            .map(|(_, full)| *full)
+    {
+        return full;
+    }
+
+    // Mechanical shortforms, resolved against COMMANDS so a group only gains
+    // one it actually declares.
+    for (short, full) in MECHANICAL_SUBS {
+        if *short == value && has_subcommand(command, full) {
+            return full;
+        }
+    }
+
+    value
 }
 
 struct Args {
@@ -910,6 +2168,33 @@ impl Args {
         }
     }
 
+    /// The decision card these flags describe, parsed and refused as one
+    /// (ADR-042 §4).
+    ///
+    /// The tokens go to one validator so `attention raise`, `attention
+    /// update` and every generated adapter read the same refusal for the
+    /// same mistake.
+    fn decision_card(&self) -> Result<DecisionCard> {
+        DecisionCard::parse(
+            self.one("question"),
+            self.one("context"),
+            &self.many("choice"),
+            &self.many("consequence"),
+            self.one("recommend"),
+        )
+    }
+    /// Raw native comprehension-check flags. Update defers validation until
+    /// the Store has checked that the caller is the row's raiser.
+    fn attention_check_input(&self) -> AttentionCheckInput {
+        AttentionCheckInput {
+            question: option_string(self, "check"),
+            choices: self.many("check-choice"),
+            answer: option_string(self, "check-answer"),
+            explanation: option_string(self, "check-explain"),
+            about: option_string(self, "check-about"),
+        }
+    }
+
     /// `--limit`, refusing a value SQL would read as the opposite of a bound.
     ///
     /// `LIMIT -1` means *no limit* in SQLite, so `--limit -1` returned every
@@ -926,6 +2211,13 @@ impl Args {
     /// Zero is allowed. It asks for nothing and returns nothing, which is
     /// exactly what it says; a script computing a limit that comes out zero is
     /// not making a mistake the way a negative one is.
+    ///
+    /// [`LIMIT_CEILING`] is the other end, and it is a typo guard rather than
+    /// a page-size opinion: a million rows is past every board this tool
+    /// holds, so a value above it is a slipped keystroke or a bad
+    /// multiplication, and answering it means building a `Vec` nobody asked
+    /// for. Enforced here, once, so the ceiling reaches every surface that
+    /// takes the flag instead of the one that was patched first.
     fn limit(&self, fallback: i64) -> Result<i64> {
         let value = self.integer("limit", fallback)?;
         if value < 0 {
@@ -933,28 +2225,87 @@ impl Args {
                 "--limit must be zero or more, got {value}: a negative limit reads as no limit at all"
             );
         }
+        if value > LIMIT_CEILING {
+            bail!(
+                "--limit must be between 0 and {LIMIT_CEILING}, got {value}; the ceiling exists \
+                 so a mistyped value is refused, not to imply a page this size is wise"
+            );
+        }
         Ok(value)
     }
 
-    /// The TCP port `serve` listens on, bounded to the real range.
+    /// A capped listing that refuses to pass its default off as the whole
+    /// (ADR-037).
     ///
-    /// A port outside 1-65535 cannot be bound, and 0 asks the kernel to choose
-    /// one — which for a server nginx reaches by number means listening
-    /// somewhere nobody can find. Both are refused here rather than turning
-    /// into an opaque bind failure, or worse a server that starts and is
-    /// unreachable. Privileged ports are allowed: this binds loopback and the
-    /// operator may have reason to.
-    fn port(&self, fallback: u16) -> Result<u16> {
-        let value = self.integer("port", fallback as i64)?;
-        u16::try_from(value)
-            .ok()
-            .filter(|port| *port != 0)
-            .with_context(|| {
-                format!(
-                    "--port must be between 1 and 65535, got {value}: port 0 asks the \
-                     kernel to pick one, and nginx reaches this server by number"
-                )
-            })
+    /// `fetch` is asked for one row more than the default; if that row comes
+    /// back and the caller never said `--limit`, the listing refuses and
+    /// names the flag, because fifty rows and fifty-of-nine-hundred look the
+    /// same in a bare array. Exactly the default with no extra row is complete
+    /// and returned as such -- the extra row is looked for, not inferred from
+    /// the count, so a board holding exactly the default does not refuse. An
+    /// explicit `--limit N` is honoured as-is: the caller stated a bound and
+    /// gets exactly it, silently.
+    ///
+    /// Every capped listing routes through here so the property holds for
+    /// listings rather than for whichever command was patched first.
+    /// `what` names the rows for the refusal ("events", "checkpoints").
+    fn bounded_page<T>(
+        &self,
+        fallback: i64,
+        what: &str,
+        fetch: impl FnOnce(i64) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let limit = self.limit(fallback)?;
+        if self.one("limit").is_some() {
+            return fetch(limit);
+        }
+        // No flag, so `limit` is the small non-negative default: `+ 1` and
+        // the cast cannot overflow.
+        let rows = fetch(limit + 1)?;
+        if rows.len() > limit as usize {
+            bail!(
+                "found more than {limit} {what} and no --limit was given — a page cut at the \
+                 default would read as the whole; pass --limit N, above {limit} to see more \
+                 or exactly {limit} to take the first {limit} knowingly"
+            );
+        }
+        Ok(rows)
+    }
+
+    /// [`Args::bounded_page`], plus one stderr line when an EXPLICIT
+    /// `--limit` was the thing that cut the page (ADR-037 addendum,
+    /// 2026-09-08).
+    ///
+    /// ADR-037 §3 stands: stdout is exactly the N rows asked for, in the same
+    /// shape, and the exit status stays zero — a consumer parses what it
+    /// always parsed. The notice goes to stderr because a page of history
+    /// that stops at the limit reads as the whole history, and `events` is
+    /// the surface an agent reaches for when it wants to know what happened
+    /// rather than to page through a list.
+    ///
+    /// The cut is observed, not inferred: `fetch` is asked for `limit + 1`
+    /// and the notice fires only if that row came back, so exactly N rows
+    /// with nothing behind them says nothing. `limit` is at most
+    /// [`LIMIT_CEILING`], so `+ 1` and the cast cannot overflow.
+    fn bounded_page_naming_explicit_cuts<T>(
+        &self,
+        fallback: i64,
+        what: &str,
+        fetch: impl FnOnce(i64) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        if self.one("limit").is_none() {
+            return self.bounded_page(fallback, what, fetch);
+        }
+        let limit = self.limit(fallback)?;
+        let mut rows = fetch(limit + 1)?;
+        if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            eprintln!(
+                "{what}: showing {limit} of more than {limit}; pass --limit above {limit} \
+                 for the rest (ceiling {LIMIT_CEILING})"
+            );
+        }
+        Ok(rows)
     }
 
     /// Fail on an argument this command was never going to read.
@@ -982,20 +2333,55 @@ impl Args {
         );
     }
 
+    /// Fail when a command was not given a positional it cannot work without.
+    ///
+    /// This has to run in the parse phase, not where the value is read. Every
+    /// command that takes a positional read it *after* `open_store`, so
+    /// `task add --db /new/board.db` with no title created and migrated a
+    /// 372736-byte board — and every parent directory above it — and only then
+    /// reported that the title was missing. A command that fails must leave
+    /// nothing behind, and the only way to guarantee that is to refuse before
+    /// anything is opened.
+    ///
+    /// The names come from `COMMANDS`, the same row the arity check reads, so a
+    /// command cannot declare a positional here and forget to require it.
+    fn reject_missing_positionals(&self, words: &[&str], positionals: &[&str]) -> Result<()> {
+        let supplied = self.positionals.len().saturating_sub(words.len());
+        let missing = positionals
+            .iter()
+            .enumerate()
+            .filter(|(index, name)| *index >= supplied && !name.starts_with('?'))
+            .map(|(_, name)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let usage = positionals
+            .iter()
+            .map(|name| match name.strip_prefix('?') {
+                Some(optional) => format!("[{}]", optional.to_uppercase()),
+                None => name.to_uppercase(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!(
+            "{} is required.\nusage: kanban {} {usage}",
+            missing.join(" and "),
+            words.join(" ")
+        );
+    }
+
     /// Fail on a single-valued flag given more than once.
     ///
     /// Taking the last occurrence is a common convention and the wrong one
     /// here: the values disagree, only one of them is what the caller meant,
     /// and nothing in the receipt says which was used.
-    fn reject_repeated_for(&self, command: Option<&str>) -> Result<()> {
+    fn reject_repeated_for(&self, command: Option<&str>, sub: Option<&str>) -> Result<()> {
         let mut repeated = self
             .flags
             .iter()
             .filter(|(name, values)| {
-                let repeatable = REPEATABLE.contains(&name.as_str())
-                    || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()))
-                    || (command == Some("subscription")
-                        && SUBSCRIPTION_REPEATABLE.contains(&name.as_str()));
+                let repeatable = repeatable(command.unwrap_or_default(), sub, name.as_str());
                 values.len() > 1 && !repeatable
             })
             .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
@@ -1045,12 +2431,21 @@ impl Args {
     }
 
     /// Fail on any flag this command does not define, naming the nearest match.
-    fn reject_unknown(&self, allowed: &[&str]) -> Result<()> {
+    ///
+    /// `ignored` is the board selectors this command discards, from
+    /// [`IGNORED_SELECTORS`]. They are global flags, so the exemption above
+    /// would otherwise wave them through and — worse — the "accepted here" line
+    /// would advertise `--db` on a `doctor` that refuses it.
+    /// `reject_ignored_selectors` reaches them first with the better message;
+    /// subtracting them here is the second lock, so a selector cannot be
+    /// refused by one guard and offered by the other.
+    fn reject_unknown(&self, allowed: &[&str], ignored: &[&str]) -> Result<()> {
         let mut unknown = self
             .flags
             .keys()
             .filter(|name| {
-                !allowed.contains(&name.as_str()) && !GLOBAL_FLAGS.contains(&name.as_str())
+                !allowed.contains(&name.as_str())
+                    && (!GLOBAL_FLAGS.contains(&name.as_str()) || ignored.contains(&name.as_str()))
             })
             .map(String::as_str)
             .collect::<Vec<_>>();
@@ -1062,6 +2457,7 @@ impl Args {
             .iter()
             .chain(GLOBAL_FLAGS.iter())
             .copied()
+            .filter(|name| !ignored.contains(name))
             .collect::<Vec<_>>();
         known.sort_unstable();
         let suggestion = nearest(unknown[0], &known)
@@ -1134,6 +2530,22 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// The `--sprint`/`--any-sprint` pair on `claim`, as the store's
+/// `sprint_override` (ADR-045 §3). Two answers to one question are refused
+/// here, once, for `claim --next` and `claim --candidates` alike.
+fn claim_sprint_override(args: &Args) -> Result<Option<String>> {
+    if args.has("sprint") && args.has("any-sprint") {
+        bail!(
+            "--sprint and --any-sprint both answer which sprint boundary this claim crosses; \
+             pass one — --sprint names the boundary, --any-sprint says any"
+        );
+    }
+    if args.has("any-sprint") {
+        return Ok(Some("any".to_owned()));
+    }
+    Ok(option_string(args, "sprint"))
+}
+
 /// Minutes to milliseconds, refusing values that would overflow or expire
 /// instantly. `--lease-minutes 999999999999999` used to panic on the multiply.
 fn lease_ms(args: &Args) -> Result<i64> {
@@ -1149,6 +2561,13 @@ fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
     emit(&serde_json::to_string_pretty(value)?)
 }
 
+/// Set once anything has reached stdout. `doctor` and `audit verify` print
+/// their report and then return `Err` so the exit status says "unhealthy";
+/// for them the report *is* the answer, and appending a second JSON document
+/// after it would make stdout unparseable. [`entrypoint`] consults this before
+/// writing a refusal object.
+static STDOUT_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Write one line to stdout, and let a closed pipe be a normal ending.
 ///
 /// `println!` panics when the reader has gone — `kb task list --json | head`
@@ -1157,12 +2576,28 @@ fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
 /// pipe from a real failure. Every Unix tool ends quietly when its reader
 /// leaves; the error is returned here and recognised in [`entrypoint`].
 fn emit(text: &str) -> Result<()> {
+    // A transacted item's answer belongs in that item's `result` inside the
+    // envelope, not on stdout beside it: `transact` prints one document.
+    // Collected here rather than at each `print` call site so an item reaches
+    // it through the same dispatch it takes when it arrives alone, which is
+    // the property `transact` rests on (ADR-041 §2). `STDOUT_WRITTEN` stays
+    // where it is, because nothing was written there.
+    if CAPTURED.with_borrow_mut(|slot| {
+        slot.as_mut().map(|buffer| {
+            buffer.push_str(text);
+            buffer.push('\n');
+        })
+    }) == Some(())
+    {
+        return Ok(());
+    }
     use std::io::Write as _;
     let mut out = io::stdout().lock();
     writeln!(out, "{text}")?;
     // Explicit, because a buffered line lost at exit is output that was
     // reported as written and never arrived.
     out.flush()?;
+    STDOUT_WRITTEN.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -1174,6 +2609,19 @@ fn reader_left(error: &anyhow::Error) -> bool {
         .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
 }
 
+/// Whether the command line asked for `--json`.
+///
+/// Read from the raw arguments rather than from [`Args`], because the error
+/// this decides the shape of may be the parse itself failing. Recognises the
+/// two spellings [`Args::parse`] does -- `--json` and `--json=VALUE` -- and
+/// nothing looser, so an abbreviation the parser would refuse is not treated
+/// as a request here.
+fn json_requested() -> bool {
+    env::args()
+        .skip(1)
+        .any(|argument| argument == "--json" || argument.starts_with("--json="))
+}
+
 fn cwd() -> Result<PathBuf> {
     env::current_dir().context("read current directory")
 }
@@ -1182,7 +2630,7 @@ fn cwd() -> Result<PathBuf> {
 /// empty, so a first-run error is not padded with a pointless "known projects:".
 fn known_projects(registry: &Registry) -> Result<String> {
     let names = registry
-        .projects()?
+        .projects_active()?
         .into_iter()
         .map(|project| project.name)
         .collect::<Vec<_>>();
@@ -1193,14 +2641,31 @@ fn known_projects(registry: &Registry) -> Result<String> {
     })
 }
 
-fn project_candidates(projects: &[ProjectRecord]) -> String {
+pub(crate) fn project_candidates(projects: &[ProjectRecord]) -> String {
     projects
         .iter()
         .map(|project| {
-            if project.workspace_roots.is_empty() {
-                format!("{} (rootless)", project.name)
+            let retired = if project.archived {
+                match project
+                    .archived_note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                {
+                    Some(note) => format!(" (retired: {note})"),
+                    None => " (retired)".to_owned(),
+                }
             } else {
-                format!("{} [{}]", project.name, project.workspace_roots.join(", "))
+                String::new()
+            };
+            if project.workspace_roots.is_empty() {
+                format!("{} (rootless){retired}", project.name)
+            } else {
+                format!(
+                    "{} [{}]{retired}",
+                    project.name,
+                    project.workspace_roots.join(", ")
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -1217,32 +2682,36 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
             registry.touch_board(&project.board_path)?;
             Ok(PathBuf::from(&project.board_path))
         }
-        [] => bail!(
-            "no Kanban project named {name}{}",
-            known_projects(registry)?
-        ),
+        [] => {
+            let retired = registry.by_name_all(name)?;
+            match retired.as_slice() {
+                [] => bail!(
+                    "no Kanban project named {name}{}",
+                    known_projects(registry)?
+                ),
+                [project] => bail!(
+                    "{}",
+                    retired_board_message(
+                        &project.name,
+                        project.archived_note.as_deref(),
+                        "addressing it"
+                    )
+                ),
+                many => bail!(
+                    "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                    many.len(),
+                    project_candidates(many)
+                ),
+            }
+        }
         many => bail!(
-            "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+            "{} Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
             many.len(),
             project_candidates(many)
         ),
     }
 }
 
-/// Board selection, most explicit first:
-///   1. `--db` / `KANBAN_DB`        — a board file directly
-///   2. `--project` / `KANBAN_PROJECT` — a registered project by name, from anywhere
-///   3. `--workspace PATH`          — the project containing PATH
-///   4. the current directory       — the project containing it
-///
-/// The order resolves a flag against its environment default, and a flag
-/// against the working directory. It never resolves two flags against each
-/// other: `reject_conflicting_board_selectors` refuses that command line before
-/// this runs, so at most one of (1)-(3) is ever present as a flag here.
-///
-/// (2) and (3) are what make the CLI usable outside a registered tree: an agent
-/// in an unrelated cage, a cron line, or any shell in $HOME can address a board
-/// without cd-ing into it.
 /// The operation surface, as data a harness can generate an adapter from.
 ///
 /// [ADR-001](../docs/adr/ADR-001-durable-agent-work-ledger.md) §6 says
@@ -1268,22 +2737,41 @@ pub(crate) fn schema() -> Value {
                 Some(sub) => format!("{command} {sub}"),
                 None => (*command).to_owned(),
             };
+            let enum_arg = |slot: ArgSlot, name: &str| {
+                ENUM_ARGUMENTS.iter().find(|arg| {
+                    arg.command == *command
+                        && arg.sub == *sub
+                        && arg.slot == slot
+                        && arg.name == name
+                })
+            };
             let flags = flags
                 .iter()
                 .map(|flag| {
-                    let kind = if REPEATABLE.contains(flag)
-                        || (*command == "watch" && WATCH_REPEATABLE.contains(flag))
-                        || (*command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag))
-                    {
+                    let kind = if repeatable(command, *sub, flag) {
                         "list"
                     } else if BOOLEAN.contains(flag) {
                         "boolean"
                     } else {
                         "value"
                     };
-                    json!({ "name": flag, "kind": kind })
+                    match enum_arg(ArgSlot::Flag, flag) {
+                        Some(arg) => json!({ "name": flag, "kind": kind, "values": arg.values }),
+                        None => json!({ "name": flag, "kind": kind }),
+                    }
                 })
                 .collect::<Vec<_>>();
+            // A positional's accepted set, when it has one (`task move`'s
+            // `status`). Sibling to `positionals` rather than a change to its
+            // shape, so consumers that read the slot names stay intact.
+            let positional_values: Map<String, Value> = positionals
+                .iter()
+                .filter_map(|positional| {
+                    let positional = positional.trim_start_matches('?');
+                    enum_arg(ArgSlot::Positional, positional)
+                        .map(|arg| ((*positional).to_owned(), json!(arg.values)))
+                })
+                .collect();
             json!({
                 "name": name,
                 "command": command,
@@ -1294,7 +2782,19 @@ pub(crate) fn schema() -> Value {
                 // list rather than guess at what the slots mean. A leading
                 // `?` marks one the command can do without.
                 "positionals": positionals,
+                // The accepted values of any enum-valued positional, keyed by
+                // the positional's name. Absent for operations with none.
+                "positionalValues": positional_values,
                 "readOnly": read_only,
+                // Distinct from `readOnly`, which asks whether the operation
+                // writes anything anywhere. This asks the narrower question the
+                // board resolver actually needs: may naming a `--db` path that
+                // is not there bring one into existence.
+                "createsBoard": board_creation(command, *sub) == BoardCreation::Permitted,
+                // The board selectors this operation refuses. Every other
+                // command honours all three, so an adapter can offer them
+                // everywhere this list is empty and nowhere it is not.
+                "ignoredSelectors": ignored_selectors(command, *sub).0,
             })
         })
         .collect::<Vec<_>>();
@@ -1316,107 +2816,728 @@ fn here() -> Option<gitctx::GitContext> {
     gitctx::resolve(&cwd().ok()?)
 }
 
+/// Whether this invocation may bring a board file into existence.
+///
+/// Deliberately not derived from `readOnly`. That bit answers a different
+/// question — whether an operation writes *anything, anywhere* — which is why
+/// `backup` and `todo` are not read-only despite changing no work state. Ask it
+/// about board creation and it answers about file writes, and the two diverge
+/// exactly where it hurts: `todo` and `archive --dry-run` are both `readOnly:
+/// false`, both accept `--db`, and both stood a 372736-byte board up at a
+/// mistyped path and exited 0 — `archive` from a flag whose whole promise is to
+/// change nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoardCreation {
+    /// The command's purpose is to put work state into the board it names, so
+    /// naming a path that is not there is a request to start one.
+    Permitted,
+    /// A board file that is not there is reported, never conjured.
+    Refused,
+}
+
+/// The only commands that may bring a board file into existence.
+///
+/// An allowlist rather than a sixth column on [`CommandRow`], because the two
+/// shapes fail differently. A per-row bit is forty-five bits of which
+/// forty-four must be `false`, and the way it breaks is someone copying a
+/// neighbouring row and inheriting a `true` — silently, in the dangerous
+/// direction. Absence from a list cannot be got wrong that way: a command
+/// that is not written here cannot create anything, including a command that
+/// does not exist yet, and including one whose author never read this file.
+///
+/// `task add` is the entry because it is the only command whose point is to put
+/// the first work state into a board. Everything else addresses rows that would
+/// have to be there already — you cannot usefully `claim`, `move`,
+/// `checkpoint`, `archive` or `todo` a board into being. `init` is absent
+/// because it never consults `--db` at all; it creates through the registry.
+///
+/// Widening this is a deliberate act, and `the_only_board_creator_is_declared`
+/// fails until the new entry is written down in the test too.
+const BOARD_CREATORS: [(&str, Option<&str>); 1] = [("task", Some("add"))];
+
+/// The commands that answer about ONE addressed board and only ever read it.
+///
+/// Each takes [`Store::open_readonly_as_caller`] instead of the writable
+/// constructor, so a board the caller cannot write is still a board the caller
+/// can query: a backup directory, a read-only mount, or a board handed to a
+/// reviewer. Measured on 2026-09-07 with the board and `registry.db` at mode
+/// 0400: eleven of the twelve reads in `docs/testing/bench/fixture-frozen.json`
+/// died with `attempt to write a readonly database` — not from reading
+/// anything, but from the recency stamp on the way in and the claim sweep on
+/// the way through. `claim --candidates` was the twelfth and the only one that
+/// answered, because it already opened this way.
+///
+/// An allowlist, and for the same reason as [`BOARD_CREATORS`]: absence is the
+/// safe answer. A command not written here keeps the writable open it has
+/// always had, so a new mutating command cannot inherit read-only access by
+/// sitting next to one of these — it would fail loudly on its first write
+/// instead, and only under a mode this table is about.
+///
+/// Every entry is exercised against a board and a registry at mode 0400 by
+/// `read_only_commands_answer_from_a_board_and_registry_at_mode_0400`, so
+/// removing one from this table fails that test rather than quietly costing an
+/// operator a read.
+///
+/// This table covers only the commands that resolve ONE board through the
+/// dispatch's single open site. The whole-estate reads — `dashboard`,
+/// `doctor`, `backup` and `search` — open each registered board themselves,
+/// and each of those call sites takes [`Store::open_for_read_as_caller`]
+/// directly for the same reason. `search-rebuild` is absent from both: it
+/// writes the index.
+const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 16] = [
+    ("attention", Some("list")),
+    ("sprint", Some("list")),
+    ("sprint", Some("show")),
+    ("deploy", Some("current")),
+    ("deploy", Some("list")),
+    ("deploy", Some("show")),
+    ("handoff", Some("list")),
+    ("sitrep", Some("list")),
+    ("tag", Some("list")),
+    ("task", Some("list")),
+    ("task", Some("show")),
+    ("task", Some("verdict list")),
+    // Four commands that take no subcommand. `context` spells its task id
+    // where a subcommand would go (`kanban context t-1234`), so matching on
+    // `sub` would miss every invocation; the other three are bare verbs.
+    ("context", None),
+    ("events", None),
+    ("stale", None),
+    ("todo", None),
+];
+
+/// Whether this invocation is one of [`READ_ONLY_BOARD_COMMANDS`].
+///
+/// A command listed with `None` is read-only whatever follows it, because what
+/// follows is an argument rather than a subcommand. A command listed with a
+/// `Some` matches that subcommand exactly, so `task list` is read-only and
+/// `task move` is not.
+fn reads_only_one_board(command: &str, sub: Option<&str>) -> bool {
+    READ_ONLY_BOARD_COMMANDS
+        .iter()
+        .any(|(name, wanted)| *name == command && (wanted.is_none() || *wanted == sub))
+}
+
+/// Which of the selectors this invocation addresses a board with.
+///
+/// Resolved in exactly one place so the store, the read-only store, the
+/// board-name lookup and the data-root lock can never disagree about what was
+/// addressed.
+///
+/// Every flag the caller typed outranks every environment default. A default is
+/// what applies when nothing was asked for, so reading one ahead of a flag lets
+/// the environment silently outvote the command line: with `KANBAN_DB` set,
+/// `task list --project alpha` read the environment's file, reported `[]`, and
+/// created that file on the way. Two typed flags never reach here —
+/// `reject_conflicting_board_selectors` refuses that command line first — so
+/// this order only ever resolves a flag against a default, or a flag against the
+/// working directory, and neither of those is a second request.
+enum BoardSelection {
+    /// A board file named straight by path, bypassing the registry entirely.
+    ///
+    /// `explicit` separates `--db PATH`, which is how a board outside the
+    /// registry is made, from `KANBAN_DB`, which is only a default for it.
+    Db { path: PathBuf, explicit: bool },
+    /// A registered project by name, addressable from anywhere.
+    Project(String),
+    /// `--workspace PATH`, or the working directory when nothing named a board.
+    Workspace(Option<PathBuf>),
+}
+
+fn board_selection(args: &Args) -> BoardSelection {
+    if let Some(path) = args.one("db") {
+        return BoardSelection::Db {
+            path: PathBuf::from(path),
+            explicit: true,
+        };
+    }
+    if let Some(name) = args.one("project") {
+        return BoardSelection::Project(name.to_owned());
+    }
+    if let Some(workspace) = args.one("workspace") {
+        return BoardSelection::Workspace(Some(PathBuf::from(workspace)));
+    }
+    if let Some(path) = env::var_os("KANBAN_DB") {
+        return BoardSelection::Db {
+            path: PathBuf::from(path),
+            explicit: false,
+        };
+    }
+    if let Some(name) = env::var("KANBAN_PROJECT")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return BoardSelection::Project(name);
+    }
+    BoardSelection::Workspace(None)
+}
+
 /// A board named straight by path, bypassing the registry entirely.
 ///
 /// Read by both the board resolver and the data-root lock, so the two can
 /// never disagree about whether an invocation is registry-addressed.
 fn direct_db(args: &Args) -> Option<PathBuf> {
-    args.one("db")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("KANBAN_DB").map(PathBuf::from))
+    direct_board(args).map(|(path, _)| path)
 }
 
-fn store_path(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = direct_db(args) {
-        return Ok(path);
+/// The same board, with whether the caller named it or the environment did.
+///
+/// `watch` needs both halves: it opens the path itself rather than going
+/// through `store_path_readonly`, so without the origin it cannot tell a
+/// mistyped `KANBAN_DB` from a `--db` the caller typed.
+fn direct_board(args: &Args) -> Option<(PathBuf, bool)> {
+    match board_selection(args) {
+        BoardSelection::Db { path, explicit } => Some((path, explicit)),
+        BoardSelection::Project(_) | BoardSelection::Workspace(_) => None,
     }
-    let mut registry = Registry::open()?;
-    let named = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
-    if let Some(name) = named {
-        let path = board_by_name(&registry, &name)?;
-        if !board_is_present(&path.to_string_lossy()) {
-            return Err(missing_board_error(&path.to_string_lossy()));
+}
+
+/// The commands from [`BOARD_CREATORS`], for an error that names the way out.
+fn board_creator_names() -> String {
+    BOARD_CREATORS
+        .iter()
+        .map(|(command, sub)| match sub {
+            Some(sub) => format!("{command} {sub}"),
+            None => (*command).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether this command may create the board it names.
+///
+/// Fails closed twice over: a command absent from [`BOARD_CREATORS`] cannot
+/// create, and so cannot a command absent from `COMMANDS` entirely. That second
+/// case is unreachable today — `command_spec` refuses an unknown command a few
+/// lines after this is called — but it is guaranteed here rather than left to
+/// the order two statements happen to be in.
+fn board_creation(command: &str, sub: Option<&str>) -> BoardCreation {
+    if BOARD_CREATORS.contains(&(command, sub)) {
+        BoardCreation::Permitted
+    } else {
+        BoardCreation::Refused
+    }
+}
+
+/// Refuse to conjure a board file nobody asked for.
+///
+/// Opening a board creates it, and ADR-008 records that as the aggravating half
+/// of the wrong-board defect, not as a feature: a `--db` path that did not exist
+/// was "conjured empty and answered from", so the caller got a board with
+/// nothing in it and an exit status of zero. Creation therefore needs all three
+/// of: the file is absent, the caller named the path themselves, and the command
+/// is one whose purpose is to put work state there.
+///
+/// Each missing condition is its own defect. A command that only reports
+/// creating its subject answers from the file it just made — `doctor` did that
+/// to a registered board and certified the result healthy, and `todo` and
+/// `archive --dry-run` did it to a path. And `KANBAN_DB` is a default, not a
+/// request: one inherited from a parent process or mistyped in a profile
+/// standing a board up as a side effect is the wrong-board write ADR-007 exists
+/// to prevent, reached without anyone naming the file on the command line.
+fn require_board_file(path: &Path, explicit: bool, creation: BoardCreation) -> Result<()> {
+    match board_file(&path.to_string_lossy()) {
+        BoardFile::Board => return Ok(()),
+        // Refused for every command, `task add` included. Permission to start a
+        // board where there is nothing is not permission to overwrite a file
+        // that is already there.
+        BoardFile::Foreign => return Err(foreign_board_error(&path.to_string_lossy())),
+        BoardFile::Unreadable(reason) => {
+            return Err(unreadable_board_error(&path.to_string_lossy(), &reason));
         }
-        return Ok(path);
-    }
-    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-    if let Some(record) = registry.resolve(&workspace)? {
-        if !board_is_present(&record.board_path) {
-            return Err(missing_board_error(&record.board_path));
+        // An interrupted creation left a database with nothing in it. Finishing
+        // the job is the recovery, and it needs the same two conditions
+        // creating one does: the caller typed the path, and the command is one
+        // whose purpose is to put work state there. Anything else reports,
+        // because otherwise a stale `KANBAN_DB` silently adopts the wreckage.
+        BoardFile::Unfinished => {
+            return match (creation, explicit) {
+                (BoardCreation::Permitted, true) => Ok(()),
+                _ => Err(unfinished_board_error(&path.to_string_lossy())),
+            };
         }
-        return Ok(PathBuf::from(record.board_path));
+        BoardFile::Absent => {}
     }
-    bail!(
-        "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
-        workspace.display(),
-        known_projects(&registry)?
-    )
+    // The environment case first: when both apply, the actionable half is that
+    // nobody typed this path.
+    if !explicit {
+        bail!(
+            "KANBAN_DB names {}, which does not exist, and an environment default is not a \
+             request to create a board.\n\
+             Create it deliberately:  kanban {} ... --db {}\n\
+             Or address another one:  --project NAME, or unset KANBAN_DB.",
+            path.display(),
+            board_creator_names(),
+            path.display()
+        );
+    }
+    match creation {
+        BoardCreation::Permitted => Ok(()),
+        BoardCreation::Refused => bail!(
+            "board file {} does not exist, and this command never creates one: it would answer \
+             from a board it had just made, which is indistinguishable from the empty board you \
+             meant.\n\
+             Address an existing board with --project NAME, or start this one with: kanban {} \
+             ... --db {}",
+            path.display(),
+            board_creator_names(),
+            path.display()
+        ),
+    }
+}
+
+/// The five selector bypasses present on this invocation, most deliberate
+/// first: a typed flag outranks an environment default (see [`BoardSelection`]
+/// for why), so the first refusal names the caller's most specific request.
+fn present_bypasses(args: &Args) -> Vec<routing::SelectorBypass> {
+    use routing::SelectorBypass;
+    let mut bypasses = Vec::new();
+    // Order matters: only the FIRST present bypass is named, and the caller
+    // should be told about the thing they just typed. An exported
+    // KANBAN_DATA_DIR is ambient -- often set once in a shell profile -- so
+    // naming it when the command line said `--workspace` sends the operator
+    // looking in the wrong place. Explicit flags first, then the environment.
+    if args.has("db") {
+        bypasses.push(SelectorBypass::DirectDb);
+    }
+    if args.has("workspace") {
+        bypasses.push(SelectorBypass::Workspace);
+    }
+    if args.has("project") {
+        bypasses.push(SelectorBypass::Project);
+    }
+    if env::var_os("KANBAN_DATA_DIR").is_some() {
+        bypasses.push(SelectorBypass::RootPath);
+    }
+    if env::var_os("KANBAN_DB").is_some() || env::var_os("KANBAN_PROJECT").is_some() {
+        bypasses.push(SelectorBypass::EnvironmentSelector);
+    }
+    bypasses
+}
+
+/// Refuse the five selector bypasses, by name, when the registry is under
+/// managed enforcement (ADR-038 clause 9, ADR-033).
+///
+/// In managed mode the broker owns board data and the data root, so every
+/// route around it — a direct `--db` file, a repointed `KANBAN_DATA_DIR`, a
+/// `--workspace` path, a `--project` name, or a `KANBAN_DB`/`KANBAN_PROJECT`
+/// default — is a bypass and is refused with a specific message and a non-zero
+/// exit. There is no silent downgrade to direct (unmanaged) access. Under
+/// `direct` and `prepared` enforcement every selector is still honoured, so
+/// existing single-user behaviour is unchanged.
+fn refuse_managed_bypasses(args: &Args) -> Result<()> {
+    let bypasses = present_bypasses(args);
+    // Nothing to refuse: skip the enforcement read entirely, so an ordinary
+    // no-selector command (the working directory) never opens the registry and
+    // single-user behaviour is untouched.
+    if bypasses.is_empty() {
+        return Ok(());
+    }
+    let state = routing::enforcement_state()?;
+    if let Some(message) = routing::refusal(state, &bypasses) {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+/// Board selection, most explicit first:
+///   1. `--db PATH`           — a board file directly
+///   2. `--project NAME`      — a registered project by name, from anywhere
+///   3. `--workspace PATH`    — the project containing PATH
+///   4. `KANBAN_DB`           — the default for (1)
+///   5. `KANBAN_PROJECT`      — the default for (2)
+///   6. the current directory — the project containing it
+///
+/// Flags come before defaults, not interleaved with them: see [`BoardSelection`]
+/// for why an environment default must never outrank a typed flag.
+///
+/// (2) and (3) are what make the CLI usable outside a registered tree: an agent
+/// in an unrelated cage, a cron line, or any shell in $HOME can address a board
+/// without cd-ing into it.
+fn store_path(args: &Args, creation: BoardCreation) -> Result<PathBuf> {
+    match board_selection(args) {
+        BoardSelection::Db { path, explicit } => {
+            require_board_file(&path, explicit, creation)?;
+            if path.exists()
+                && let Some(BoardPathState::Retired { name, note }) =
+                    Registry::board_path_state_if_available(&path)?
+            {
+                bail!(
+                    "{}",
+                    retired_board_message(&name, note.as_deref(), "addressing it")
+                );
+            }
+            Ok(path)
+        }
+        BoardSelection::Project(name) => {
+            let registry = Registry::open()?;
+            let path = board_by_name(&registry, &name)?;
+            require_registered_board(&path.to_string_lossy())?;
+            Ok(path)
+        }
+        BoardSelection::Workspace(workspace) => {
+            let mut registry = Registry::open()?;
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            if let Some(record) = registry.resolve(&workspace)? {
+                require_registered_board(&record.board_path)?;
+                return Ok(PathBuf::from(record.board_path));
+            }
+            bail!(
+                "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
+                workspace.display(),
+                known_projects(&registry)?
+            )
+        }
+    }
 }
 
 /// Resolve a board without updating registry recency or migrating either DB.
 fn store_path_readonly(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = direct_db(args) {
-        return Ok(path);
-    }
-    let registry = Registry::open_readonly()?;
-    let named = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
-    let path = if let Some(name) = named {
-        let matches = registry.by_name(&name)?;
-        match matches.as_slice() {
-            [project] => PathBuf::from(&project.board_path),
-            [] => bail!(
-                "no Kanban project named {name}{}",
-                known_projects(&registry)?
-            ),
-            many => bail!(
-                "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
-                many.len(),
-                project_candidates(many)
-            ),
+    let path = match board_selection(args) {
+        BoardSelection::Db { path, explicit } => {
+            // Nothing reached through here writes, so a missing file is
+            // reported whichever selector named it.
+            require_board_file(&path, explicit, BoardCreation::Refused)?;
+            if path.exists()
+                && let Some(BoardPathState::Retired { name, note }) =
+                    Registry::board_path_state_if_available(&path)?
+            {
+                bail!(
+                    "{}",
+                    retired_board_message(&name, note.as_deref(), "addressing it")
+                );
+            }
+            return Ok(path);
         }
-    } else {
-        let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-        registry
-            .resolve_readonly(&workspace)?
-            .map(|record| PathBuf::from(record.board_path))
-            .with_context(|| {
-                format!(
-                    "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT{}",
-                    workspace.display(),
-                    known_projects(&registry).unwrap_or_default()
-                )
-            })?
+        BoardSelection::Project(name) => {
+            let registry = Registry::open_for_read()?;
+            let matches = registry.by_name(&name)?;
+            match matches.as_slice() {
+                [project] => PathBuf::from(&project.board_path),
+                [] => {
+                    let retired = registry.by_name_all(&name)?;
+                    match retired.as_slice() {
+                        [] => bail!(
+                            "no Kanban project named {name}{}",
+                            known_projects(&registry)?
+                        ),
+                        [project] => bail!(
+                            "{}",
+                            retired_board_message(
+                                &project.name,
+                                project.archived_note.as_deref(),
+                                "addressing it"
+                            )
+                        ),
+                        many => bail!(
+                            "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                            many.len(),
+                            project_candidates(many)
+                        ),
+                    }
+                }
+                many => bail!(
+                    "{} Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                    many.len(),
+                    project_candidates(many)
+                ),
+            }
+        }
+        BoardSelection::Workspace(workspace) => {
+            let registry = Registry::open_for_read()?;
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            registry
+                .resolve_readonly(&workspace)?
+                .map(|record| PathBuf::from(record.board_path))
+                .with_context(|| {
+                    format!(
+                        "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT{}",
+                        workspace.display(),
+                        known_projects(&registry).unwrap_or_default()
+                    )
+                })?
+        }
     };
-    if !board_is_present(&path.to_string_lossy()) {
-        return Err(missing_board_error(&path.to_string_lossy()));
-    }
+    require_registered_board(&path.to_string_lossy())?;
     Ok(path)
 }
 
-/// Whether a registered board's file is still on disk.
+/// The 16 bytes every SQLite database begins with.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// What is actually at a board path.
 ///
-/// Opening a board creates it, which is right for `--db` — that is how a board
-/// is made — and wrong for one the registry already knows about. A registered
-/// board file that has gone missing was destroyed, and standing an empty one
-/// up in its place turns recoverable data loss into a board that reports
-/// itself fine. `doctor` did exactly that: it recreated the file it was asked
-/// to inspect, then certified the result healthy.
+/// Existence was the wrong question. `is_file` says yes to any file, and
+/// opening a board *migrates* it, so a path that named something else was
+/// rewritten into a database: `task list --db notes.txt` against a 0-byte file
+/// answered `[]` and left 372736 bytes of SQLite where the operator's file had
+/// been. Two harms in one command — a plausible wrong answer, and a file
+/// destroyed — and no way to tell it from the empty board they meant.
+///
+/// "Is this SQLite" was not enough either, and the gap was worse than the one
+/// it closed. `migrate` starts from the file's own `PRAGMA user_version`, so a
+/// stranger's database at version 0 gets the whole ladder run into it: an
+/// 8192-byte browser database came back at 376832 bytes, `user_version` 23,
+/// with 26 kanban tables grafted alongside its own. The question has to be "is
+/// this *our* board", so the last step looks for the schema.
+///
+/// The order is three widening steps, each cheaper than the next, so the common
+/// answers cost the least: stat, sixteen bytes, then SQLite.
+enum BoardFile {
+    /// Nothing there. For a `--db` path on a creating command this is the
+    /// ordinary way a new board starts, so it is not by itself an error.
+    Absent,
+    /// Something there that is not a Kanban board — a zero-length file, a
+    /// directory, a text file, or another application's database.
+    /// Never opened, never migrated, never overwritten.
+    Foreign,
+    /// Something there that cannot be read, carrying the reason.
+    ///
+    /// Distinct from `Foreign` because saying "this is not a Kanban board"
+    /// about an intact board at mode 000 — or about one whose WAL is being
+    /// checkpointed by another agent's exiting command — is simply a false
+    /// statement, and it points the operator at the wrong problem.
+    Unreadable(String),
+    /// A database with no tables: an interrupted board creation, and nothing
+    /// else. Safe to finish, because there is nothing in it to lose.
+    Unfinished,
+    /// A Kanban board.
+    Board,
+}
+
+fn board_file(board_path: &str) -> BoardFile {
+    let path = Path::new(board_path);
+    // stat before open. `open(O_RDONLY)` on a FIFO blocks until a writer
+    // appears and Rust passes no `O_NONBLOCK`, so one FIFO among the registered
+    // boards would hang `doctor`, `backup` and every other survey partway
+    // through, with no output and no timeout. `is_file` is false for a FIFO, a
+    // directory and a socket alike, and answers in microseconds.
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return BoardFile::Foreign,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return BoardFile::Absent,
+        Err(error) => return BoardFile::Unreadable(error.to_string()),
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return BoardFile::Unreadable(error.to_string()),
+    };
+    let mut header = [0u8; SQLITE_MAGIC.len()];
+    // A file shorter than the header cannot be a database, so an empty one is
+    // rejected here without a special case.
+    if file.read_exact(&mut header).is_err() || &header != SQLITE_MAGIC {
+        return BoardFile::Foreign;
+    }
+    match db::probe_board_schema(path) {
+        Ok(db::BoardSchema::Board) => BoardFile::Board,
+        Ok(db::BoardSchema::Unwritten) => BoardFile::Unfinished,
+        Ok(db::BoardSchema::Other) => BoardFile::Foreign,
+        // A SQLite failure is not evidence about what the file holds. Saying
+        // "not a board" here would be the `Unreadable` lie again, arriving
+        // through a lock rather than a permission bit — and transient, so it
+        // would read as a flake rather than as the false refusal it is.
+        Err(error) => BoardFile::Unreadable(error.to_string()),
+    }
+}
+
+/// What a survey should say about one registered board.
+///
+/// Opening a board creates it, which is right for `--db` on a creating command
+/// — that is how a board outside the registry is made — and wrong for one the
+/// registry already knows about. A registered board file that has gone missing
+/// was destroyed, and standing an empty one up in its place turns recoverable
+/// data loss into a board that reports itself fine. This check exists because
+/// `doctor` did exactly that: it recreated the file it was asked to inspect,
+/// then certified the result healthy.
 ///
 /// Commands that do work on one board refuse. Commands that survey every board
 /// — `doctor`, `dashboard`, `backup` — report the gap and carry on, because
 /// dying on the first missing board is no use to whoever has to fix it, and
 /// `restore` would otherwise be unable to repair the very thing that stops it
-/// from running.
-fn board_is_present(board_path: &str) -> bool {
-    Path::new(board_path).is_file()
+/// from running. A registered path holding something that is not a database
+/// counts as a gap for them too, which is the honest answer: it is not a board
+/// they can read, and a survey that dies on it helps nobody.
+///
+/// The answer is three-way because the boolean this replaced could not tell
+/// "the data is gone" from "this process could not open it". Measured on the
+/// same board and the same command, a board at mode 000 with its data intact
+/// and a board that had been deleted produced byte-identical receipts. The move
+/// an operator makes after reading `missing` is to restore a snapshot over the
+/// path — so on the unreadable board, the receipt was the cause of the data
+/// loss. Boards are created `0600`, which makes one written by another user
+/// unreadable and perfectly healthy at once.
+///
+/// This reads [`board_file`], the same classifier the single-board resolvers
+/// use, rather than a second one beside it: two classifiers of the same
+/// question drift, and the drift is what produced this.
+enum SurveyBoard {
+    /// Opened, and it holds a board. The survey reads it.
+    Readable,
+    /// There, and this process could not look inside it. The reason travels
+    /// with it, because `Permission denied` and a locked database are different
+    /// problems with different fixes. Never reported as missing: nothing here
+    /// is evidence that anything is wrong with the data.
+    Unreadable(String),
+    /// Nothing at the path, or something there that is not a board.
+    Missing,
+}
+
+fn survey_board(board_path: &str) -> SurveyBoard {
+    match board_file(board_path) {
+        BoardFile::Board => SurveyBoard::Readable,
+        BoardFile::Unreadable(reason) => SurveyBoard::Unreadable(reason),
+        // `Foreign` and `Unfinished` keep the bucket they have always had.
+        // Neither is a board a survey can read, and separating them is a
+        // different question from this one.
+        BoardFile::Absent | BoardFile::Foreign | BoardFile::Unfinished => SurveyBoard::Missing,
+    }
+}
+
+/// One row of the `unreadableBoards` list the surveys carry.
+fn unreadable_board(project: &ProjectRecord, reason: String) -> UnreadableBoard {
+    UnreadableBoard {
+        name: project.name.clone(),
+        board_path: project.board_path.clone(),
+        reason,
+    }
+}
+
+/// Resolve a path as far as the filesystem allows, so two spellings of one file
+/// compare equal. A path that does not exist yet cannot be canonicalized and
+/// compares by its literal form, which is the right answer for a destination.
+fn resolved(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
+/// What `restore` will find at one path it is about to rename over.
+///
+/// The question is "can this file be copied out of the way", not "is this a
+/// healthy board". Those come apart exactly where it matters: a board with
+/// corrupt pages, or a damaged 16-byte header, is the disaster `restore` exists
+/// to recover from, and refusing to run because SQLite cannot parse it blocks
+/// the one command that would fix it. That refusal was measured — `database
+/// disk image is malformed`, followed by advice to check permissions that were
+/// never wrong.
+///
+/// So the split is by what a copy needs. Anything readable can be moved out of
+/// the way, so the restore proceeds; only a file this process cannot read at
+/// all is genuinely unrescuable. That also makes the refusal's "very likely
+/// intact — could not open it to look" a true sentence for every case that
+/// still reaches it, rather than a guess that was wrong for corruption.
+enum RestoreTarget {
+    /// Nothing to lose. Either no file, or a database with no tables in it —
+    /// an interrupted board creation, which holds no rows by definition.
+    Vacant,
+    /// A board SQLite can open. Copied with the online backup API, which is
+    /// WAL-correct: a byte copy of the `.db` alone would drop commits still
+    /// sitting in the write-ahead log, and those are exactly the recent work
+    /// the rescue copy exists to keep.
+    Rescue,
+    /// Readable bytes SQLite will not open as a board — corrupt pages, a
+    /// damaged header, or a file that was never a board. Copied verbatim,
+    /// carrying why it would not open.
+    Copy(String),
+    /// The bytes cannot be read, so nothing can copy it. The one case left that
+    /// has to stop the restore.
+    Blocked(String),
+}
+
+fn restore_target(path: &Path) -> RestoreTarget {
+    match board_file(&path.to_string_lossy()) {
+        BoardFile::Absent | BoardFile::Unfinished => RestoreTarget::Vacant,
+        BoardFile::Board => RestoreTarget::Rescue,
+        // `BoardFile::Foreign`'s contract is "Never opened, never migrated,
+        // never overwritten", and it exists because `task list --db notes.txt`
+        // once left 372736 bytes of SQLite where an operator's file had been.
+        // Copying it verbatim keeps that promise where it counts — the file is
+        // still there afterwards, in the rescue snapshot — without blocking the
+        // restore. Blocking would be worse than it sounds: a board whose header
+        // is damaged classifies as foreign too, so refusing here would refuse
+        // the recovery of the very thing that broke. It is never replaced
+        // silently; the receipt and the rescue manifest both name it.
+        BoardFile::Foreign => RestoreTarget::Copy("not a Kanban board".to_owned()),
+        BoardFile::Unreadable(reason) => match fs::File::open(path) {
+            // SQLite would not open it, but the bytes are there to copy. A
+            // rescue copy needs the file read, not parsed.
+            Ok(_) => RestoreTarget::Copy(reason),
+            Err(error) => RestoreTarget::Blocked(error.to_string()),
+        },
+    }
+}
+
+/// A registered board that is gone, no longer a board, or unreadable.
+fn require_registered_board(board_path: &str) -> Result<()> {
+    match board_file(board_path) {
+        BoardFile::Board => Ok(()),
+        // `init` commits the registry row before `Store::open` runs the
+        // migrations, so an interrupt in that window leaves a *registered*
+        // board with no tables in it. Refusing would strand it permanently, in
+        // the registry, with no command able to open it. The next ordinary
+        // command finishes the migrations, which is the recovery the registry
+        // is already assuming; `store_path_readonly` still declines, and says
+        // to run one ordinary command first.
+        BoardFile::Unfinished => Ok(()),
+        BoardFile::Absent => Err(missing_board_error(board_path)),
+        BoardFile::Foreign => Err(foreign_board_error(board_path)),
+        BoardFile::Unreadable(reason) => Err(unreadable_board_error(board_path, &reason)),
+    }
+}
+
+/// Report what was observed, and both things that produce it.
+///
+/// The earlier wording called this "what an interrupted board creation leaves
+/// behind" and offered "deleting it loses no work". Both sentences are false
+/// while another process is inside `migrate`'s first transaction: under WAL
+/// this probe sees last-committed state, so a creation happening right now
+/// presents exactly as one abandoned an hour ago. Nothing distinguishes them
+/// from here — not the table count, not the schema version, not a second look —
+/// and the second sentence is destructive advice stated as fact.
+///
+/// So this says what it saw and names both causes. Deleting is mentioned only
+/// with the condition that makes it safe, because the operator is the one who
+/// can check it and this process cannot.
+fn unfinished_board_error(board_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "board file {board_path} is a database with no tables in it.\n\
+         A board looks like this while it is being created, between the file appearing and its \
+         first migration committing — so this is either a creation that was interrupted, or one \
+         running in another process right now. From here the two are identical.\n\
+         If one is in progress:  it will finish on its own; run the command again.\n\
+         To finish it yourself:  kanban {} ... --db {board_path}\n\
+         Before removing the file, confirm no other process is creating it.",
+        board_creator_names()
+    )
+}
+
+fn foreign_board_error(board_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{board_path} exists but is not a Kanban board: it is not a SQLite database, or it is one \
+         that does not carry a board's tables.\n\
+         Opening it would migrate it into a board and leave its own contents inside the result, so \
+         this refuses instead.\n\
+         Name an existing board with --db, or a path that does not exist yet. (An empty file can \
+         also be a board creation caught before it wrote anything — if you remove it, confirm \
+         first that no other process is creating it.)"
+    )
+}
+
+/// Say the file cannot be read, rather than something false about what it holds.
+///
+/// A board at mode 000 is still a board. Reporting it as "not a Kanban board"
+/// is a false statement about intact data, and it sends the operator to look
+/// for a corrupt file instead of a permission bit.
+fn unreadable_board_error(board_path: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "board file {board_path} cannot be read: {reason}.\n\
+         Nothing is wrong with the file as far as this can tell — it could not be opened to look. \
+         Check its permissions and the directories above it."
+    )
 }
 
 fn missing_board_error(board_path: &str) -> anyhow::Error {
@@ -1427,8 +3548,148 @@ fn missing_board_error(board_path: &str) -> anyhow::Error {
     )
 }
 
-fn open_store(args: &Args) -> Result<Store> {
-    Store::open(&store_path(args)?)
+thread_local! {
+    /// The board `kanban transact` opened, on loan to whichever item is
+    /// running.
+    ///
+    /// ADR-041 §3.4: one `Store` per `transact`, opened once, because a
+    /// process per item is a connection per item and two connections cannot
+    /// share a transaction. The dispatch opens the addressed board in exactly
+    /// two places — [`open_store`] and [`open_store_for_read`] — and both
+    /// consult this first, so an item reaches the batch's connection, and
+    /// therefore the batch's uncommitted writes (§5), through the same code
+    /// path it takes when it arrives alone.
+    static LENT_BOARD: std::cell::RefCell<Option<Store>> = const { std::cell::RefCell::new(None) };
+    /// Where [`emit`] writes while a transacted item is running.
+    static CAPTURED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A board open for one command: its own, or the batch's on loan.
+///
+/// The loan is returned on drop rather than at each dispatch arm's end, so an
+/// item that refuses part way through — every refusal does — still hands the
+/// board back for the item after it and for the rollback.
+struct BoardLease {
+    store: Option<Store>,
+    lent: bool,
+}
+
+impl BoardLease {
+    fn own(store: Store) -> Self {
+        Self {
+            store: Some(store),
+            lent: false,
+        }
+    }
+
+    /// The batch's board, when this invocation is one of its items.
+    fn lent() -> Option<Self> {
+        LENT_BOARD.with_borrow_mut(Option::take).map(|store| Self {
+            store: Some(store),
+            lent: true,
+        })
+    }
+}
+
+impl std::ops::Deref for BoardLease {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        self.store.as_ref().expect("a lease holds its board")
+    }
+}
+
+impl std::ops::DerefMut for BoardLease {
+    fn deref_mut(&mut self) -> &mut Store {
+        self.store.as_mut().expect("a lease holds its board")
+    }
+}
+
+impl Drop for BoardLease {
+    fn drop(&mut self) {
+        if !self.lent {
+            return;
+        }
+        if let Some(store) = self.store.take() {
+            LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+        }
+    }
+}
+
+fn open_store(args: &Args, creation: BoardCreation) -> Result<BoardLease> {
+    if let Some(lease) = BoardLease::lent() {
+        return Ok(lease);
+    }
+    Ok(BoardLease::own(Store::open_as_caller(&store_path(
+        args, creation,
+    )?)?))
+}
+
+/// The read-only open for a command that answers about ONE addressed board.
+///
+/// Inside a `transact` this hands back the batch's writable board instead,
+/// which is what makes ADR-041 §5 true: a read item observes the items before
+/// it, because within one transaction on one connection a statement sees that
+/// transaction's own uncommitted writes. A second, read-only connection would
+/// answer from the pre-batch snapshot and say nothing about it.
+fn open_store_for_read(args: &Args) -> Result<BoardLease> {
+    if let Some(lease) = BoardLease::lent() {
+        return Ok(lease);
+    }
+    Ok(BoardLease::own(Store::open_for_read_as_caller(
+        &store_path_readonly(args)?,
+    )?))
+}
+
+/// The board selectors this command discards, and what it addresses instead.
+///
+/// Empty for every command that resolves a board, which is the whole rest of
+/// the surface. Read from one table by the refusal, by `reject_unknown`, by the
+/// manifest and by the MCP tool builder, so a flag cannot be refused by the CLI
+/// and advertised by an adapter.
+pub(crate) fn ignored_selectors(
+    command: &str,
+    sub: Option<&str>,
+) -> (&'static [&'static str], &'static str) {
+    IGNORED_SELECTORS
+        .iter()
+        .find(|(name, expected, ..)| *name == command && *expected == sub)
+        .map(|(_, _, ignored, subject)| (*ignored, *subject))
+        .unwrap_or((&[], ""))
+}
+
+/// Fail when a command line names a board the command will never look at.
+///
+/// `reject_unknown` already refuses a flag a command does not define. This is
+/// the same refusal for one it defines and cannot honour: inapplicable rather
+/// than unknown, and silently discarded rather than reported, which is the
+/// worse of the two because the command then answers about something else and
+/// exits zero. See [`IGNORED_SELECTORS`] for the measured `doctor` case.
+///
+/// Runs before the `version`, `schema` and `mcp` early returns and before the
+/// data-root lock, because two of those answer without validating anything and
+/// the lock itself reads the `--db` path being refused.
+fn reject_ignored_selectors(args: &Args, command: &str, sub: Option<&str>) -> Result<()> {
+    let (ignored, subject) = ignored_selectors(command, sub);
+    let given = ignored
+        .iter()
+        .filter(|flag| args.flags.contains_key(**flag))
+        .map(|flag| format!("--{flag}"))
+        .collect::<Vec<_>>();
+    if given.is_empty() {
+        return Ok(());
+    }
+    let words = match sub {
+        Some(sub) => format!("{command} {sub}"),
+        None => command.to_owned(),
+    };
+    bail!(
+        "{} {} a board, and `{words}` {subject}; remove it rather than have it \
+         discarded, because a receipt computed about something else is read as an \
+         answer about the board you named",
+        given.join(" and "),
+        if given.len() == 1 { "names" } else { "name" }
+    )
 }
 
 fn reject_all_boards_selector(args: &Args) -> Result<()> {
@@ -1453,11 +3714,159 @@ fn reject_all_boards_selector(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// `attention list --check-report` (ACC-18): resolved answered checks grouped
+/// by `about`, worst first, through the shared [`Store::aggregate_check_report`]
+/// the `/decided` block reads from the same method.
+///
+/// The report fixes its rows to resolved: `--status` is refused naming the
+/// conflict, and the row-shape flags (`--fields`, `--no-body`) are refused
+/// naming the report's fixed columns. The remaining row filters (`--kind`,
+/// `--task`, `--tag`, `--lane`) still narrow the resolved set, `--all`
+/// keeps its listing meaning of including archived rows, and `--all-boards`
+/// fans out through the registry exactly as the search listing does.
+fn attention_check_report(args: &Args, store: &Store) -> Result<()> {
+    if args.one("status").is_some() {
+        bail!(
+            "--status cannot be combined with --check-report: the report reads only resolved rows"
+        );
+    }
+    if args.one("fields").is_some() {
+        bail!(
+            "--fields cannot be combined with --check-report: the report prints the fixed \
+             columns about, answered, correct, missed, miss-rate"
+        );
+    }
+    if args.has("no-body") {
+        bail!(
+            "--no-body cannot be combined with --check-report: the report prints the fixed \
+             columns about, answered, correct, missed, miss-rate"
+        );
+    }
+    let mut items = Vec::new();
+    if args.has("all-boards") {
+        reject_all_boards_selector(args)?;
+        let registry = Registry::open_readonly()?;
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
+        let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
+        for project in &projects {
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(format!("{} ({reason})", project.name));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.name.clone());
+                    continue;
+                }
+            }
+            let board = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
+            items.extend(check_report_rows(&board, args)?);
+        }
+        // Reported rather than silently skipped, as the search listing
+        // carries them in its receipt: stdout stays the report's fixed
+        // shape, so the notice goes to stderr.
+        for name in &missing {
+            eprintln!("check-report: board {name} is missing and was not read");
+        }
+        for entry in &unreadable {
+            eprintln!("check-report: board {entry} could not be read and was skipped");
+        }
+    } else {
+        items.extend(check_report_rows(store, args)?);
+    }
+    // The cap is on groups, as every listing's cap is on its own rows
+    // (ADR-037): one group past the default is fetched, and an explicit
+    // `--limit` returns the first N groups in worst-first order silently
+    // with exit zero. The existing limit law refuses a negative or
+    // over-ceiling `--limit` before the fetch runs.
+    let groups = args.bounded_page(100, "check subjects", |fetch| {
+        Ok(Store::aggregate_check_report(&items)
+            .into_iter()
+            .take(usize::try_from(fetch).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>())
+    })?;
+    if args.has("json") {
+        return print(&groups, true);
+    }
+    emit(&render_check_report(&groups))
+}
+
+/// The resolved rows one board contributes to `--check-report`: status fixed
+/// to resolved, the remaining row filters and the archived meaning of
+/// `--all` inherited from `attention list`. Read whole — groups, not rows,
+/// are the capped unit, and a capped row read would silently shrink them.
+fn check_report_rows(store: &Store, args: &Args) -> Result<Vec<Attention>> {
+    store.attention(
+        Some("resolved"),
+        args.one("kind"),
+        args.one("task"),
+        args.one("tag"),
+        args.one("lane"),
+        LIMIT_CEILING,
+        args.has("all"),
+    )
+}
+
+/// The human `--check-report` table: the five fixed columns in spec order,
+/// header included, so a board with no resolved checked rows still prints
+/// its header with zero groups.
+fn render_check_report(groups: &[CheckReportGroup]) -> String {
+    let mut out = String::from("about answered correct missed miss-rate");
+    for group in groups {
+        out.push_str(&format!(
+            "\n{} {} {} {} {}",
+            group.about, group.answered, group.correct, group.missed, group.miss_rate
+        ));
+    }
+    out
+}
+
+/// The human `attention check` receipt (ACC-21): the verdict line agreeing
+/// with the stored result (ACC-07), then the correct key with its label,
+/// then the explanation — for a pass as much as a miss.
+fn render_check_answer(item: &Attention) -> Result<String> {
+    let check = item
+        .check
+        .as_ref()
+        .with_context(|| format!("attention {} carries no comprehension check", item.id))?;
+    let (Some(answered), Some(correct), Some(answer), Some(explanation)) = (
+        check.answered.as_deref(),
+        check.correct,
+        check.answer.as_deref(),
+        check.explanation.as_deref(),
+    ) else {
+        bail!("attention {}: the check answer was not recorded", item.id);
+    };
+    let verdict = if correct {
+        "ACC: pass".to_owned()
+    } else {
+        format!("ACC: miss on {answered}")
+    };
+    let label = check
+        .choices
+        .iter()
+        .find(|choice| choice.key == answer)
+        .map_or("", |choice| choice.label.as_str());
+    Ok(format!(
+        "{verdict}\nanswer: {answer} — {label}\nwhy: {explanation}"
+    ))
+}
+
 fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
     let limit = args.limit(10)?;
     let max_chars = args.integer("max-chars", 12_000)?;
-    if !(1..=100).contains(&limit) {
-        bail!("--limit must be between 1 and 100, got {limit}");
+    // `Args::limit` has already refused anything above the ceiling with the
+    // one shared wording; what is left here is `search`'s own floor of one,
+    // which is not shared: a search for nothing is a mistake, where an
+    // `attention list --limit 0` is a legitimate "just tell me it worked".
+    if !(1..=LIMIT_CEILING).contains(&limit) {
+        bail!("--limit must be between 1 and {LIMIT_CEILING}, got {limit}");
     }
     if !(256..=100_000).contains(&max_chars) {
         bail!("--max-chars must be between 256 and 100000, got {max_chars}");
@@ -1471,7 +3880,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
         bail!("--after must not be later than --before");
     }
     if let Some(source) = args.one("source") {
-        const SOURCES: [&str; 8] = [
+        const SOURCES: [&str; 9] = [
             "task",
             "note",
             "checkpoint",
@@ -1480,6 +3889,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
             "sitrep",
             "rule",
             "event",
+            "sprint",
         ];
         if !SOURCES.contains(&source) {
             bail!("invalid --source {source}; expected {}", SOURCES.join(", "));
@@ -1499,138 +3909,290 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
     })
 }
 
+/// Search reads the board and the registry and writes to neither, so both take
+/// the read-for-read opens. It takes no `BoardCreation`: it is not a board
+/// creator, and answering from a board it had just made is the defect
+/// `store_path_readonly`'s refusal exists to prevent.
 fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
-    let options = search_options(args, query)?;
+    let mut options = search_options(args, query)?;
+    // The stated bound -- the default or the caller's --limit -- is what the
+    // receipt is cut to. `bounded_page` decides how many to fetch (ADR-037),
+    // and the closure writes that into `options` for the stores to read.
+    let (limit, max_chars) = (options.limit, options.max_chars);
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
         let registry = Registry::open_readonly()?;
-        let mut results = Vec::new();
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut boards = Vec::new();
         let mut missing = Vec::new();
-        for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                missing.push(project.name);
-                continue;
+        let mut unreadable = Vec::new();
+        let results = args.bounded_page(limit as i64, "search results", |fetch| {
+            options.limit = fetch as usize;
+            let mut results = Vec::new();
+            for project in projects {
+                match survey_board(&project.board_path) {
+                    SurveyBoard::Readable => {}
+                    SurveyBoard::Unreadable(reason) => {
+                        unreadable.push(unreadable_board(&project, reason));
+                        continue;
+                    }
+                    SurveyBoard::Missing => {
+                        missing.push(project.name);
+                        continue;
+                    }
+                }
+                let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
+                results.extend(store.search(&project.name, &options)?);
+                boards.push(project.name);
             }
-            let store = Store::open(Path::new(&project.board_path))?;
-            results.extend(store.search(&project.name, &options)?);
-            boards.push(project.name);
-        }
-        results.extend(search::search_rules(
-            &registry.rules(options.include_archived)?,
-            &options,
-        ));
-        let mut seen = HashSet::new();
-        results.retain(|result| seen.insert(result.citation.clone()));
+            // Scoped to the boards this pass actually read, for the reason
+            // the single-board path below is scoped: a rule applies to a
+            // board or it does not (ADR-027), and an unreadable or absent
+            // board's rules are not this caller's to read.
+            results.extend(search::search_rules(
+                &registry.rules_targeting_any(&boards, options.include_archived)?,
+                &options,
+            ));
+            let mut seen = HashSet::new();
+            results.retain(|result| seen.insert(result.citation.clone()));
+            Ok(results)
+        })?;
         return Ok(search::bound_receipt(
-            query,
-            boards,
-            missing,
-            results,
-            options.limit,
-            options.max_chars,
+            query, boards, missing, unreadable, results, limit, max_chars,
         ));
     }
 
-    let registry = Registry::open()?;
+    let registry = Registry::open_for_read()?;
     let board_name = selected_board_name(args)?;
-    let store = open_store(args)?;
+    let store = open_store_for_read(args)?;
     let board = board_name
         .clone()
         .or(store.board_name()?)
         .unwrap_or_else(|| "unregistered".to_owned());
-    let mut results = store.search(&board, &options)?;
-    results.extend(search::search_rules(
-        &registry.rules_targeting_board(board_name.as_deref(), options.include_archived)?,
-        &options,
-    ));
+    let results = args.bounded_page(limit as i64, "search results", |fetch| {
+        options.limit = fetch as usize;
+        let mut results = store.search(&board, &options)?;
+        results.extend(search::search_rules(
+            &registry.rules_targeting_board(board_name.as_deref(), options.include_archived)?,
+            &options,
+        ));
+        Ok(results)
+    })?;
     Ok(search::bound_receipt(
         query,
         vec![board],
         Vec::new(),
+        // One named board, already resolved: an unreadable one refused before
+        // reaching here.
+        Vec::new(),
         results,
-        options.limit,
-        options.max_chars,
+        limit,
+        max_chars,
     ))
 }
 
-fn rebuild_search_command(args: &Args) -> Result<Value> {
+fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value> {
     let actor = args.require("as")?;
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
         let registry = Registry::open()?;
         let mut reports = Vec::new();
         let mut missing = Vec::new();
-        for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                missing.push(project.name);
-                continue;
+        let mut unreadable = Vec::new();
+        for project in registry.projects_active()? {
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.name);
+                    continue;
+                }
             }
-            let mut store = Store::open(Path::new(&project.board_path))?;
+            let mut store = Store::open_as_caller(Path::new(&project.board_path))?;
             reports.push(store.rebuild_search(&project.name, actor)?);
         }
-        return Ok(json!({"reports":reports,"missingBoards":missing}));
+        // An index left unrebuilt because the file would not open is not the
+        // same as one whose board is gone: the first is retried after a chmod.
+        return Ok(
+            json!({"reports":reports,"missingBoards":missing,"unreadableBoards":unreadable}),
+        );
     }
-    let mut store = open_store(args)?;
+    let mut store = open_store(args, creation)?;
     let board = selected_board_name(args)?
         .or(store.board_name()?)
         .unwrap_or_else(|| "unregistered".to_owned());
     Ok(serde_json::to_value(store.rebuild_search(&board, actor)?)?)
 }
 
-/// Rules are one registry-owned document. Bodies remain lazy; this is only the
-/// applicable table of contents for the addressed board and optional task.
+/// The registered NAME of the addressed board, or `None` for a board the
+/// registry does not know.
+///
+/// Read-only throughout, including the workspace walk: a name lookup is not a
+/// selection, so it has no business stamping recency or re-permissioning
+/// `registry.db`. The writable callers below (`search`, `search-rebuild`) each
+/// open the registry or the store writably before reaching here, so nothing
+/// depends on this call to create or migrate it — and `context`, which is
+/// read-only, must be able to answer against a registry it cannot write.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
-    let mut registry = Registry::open()?;
-    if let Some(path) = direct_db(args) {
-        let resolved = path.canonicalize().unwrap_or(path);
-        let matches = registry
-            .projects()?
-            .into_iter()
-            .filter(|project| {
-                Path::new(&project.board_path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(&project.board_path))
-                    == resolved
-            })
-            .collect::<Vec<_>>();
-        return Ok(match matches.as_slice() {
-            [project] => Some(project.name.clone()),
-            _ => None,
-        });
+    match board_selection(args) {
+        BoardSelection::Db { path, .. } => match Registry::board_path_state_if_available(&path)? {
+            Some(BoardPathState::Active(name)) => Ok(Some(name)),
+            Some(BoardPathState::Retired { name, note }) => bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            ),
+            Some(BoardPathState::External) | None => Ok(None),
+        },
+        BoardSelection::Project(name) => Ok(Some(name)),
+        BoardSelection::Workspace(workspace) => {
+            let registry = Registry::open_for_read()?;
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            Ok(registry
+                .resolve_readonly(&workspace)?
+                .map(|record| record.name))
+        }
     }
-    if let Some(name) = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    }) {
-        return Ok(Some(name));
-    }
-    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-    Ok(registry.resolve(&workspace)?.map(|record| record.name))
 }
 
+/// Rules are one registry-owned document. Bodies remain lazy; this is only the
+/// applicable table of contents for the addressed board and optional task —
+/// a read, so it takes [`Registry::open_for_read`].
 fn effective_rule_summaries(
     args: &Args,
     store: &Store,
     task_id: Option<&str>,
+    known_task_tags: Option<&[String]>,
+    known_sprint: Option<&str>,
 ) -> Result<Vec<RuleSummary>> {
     let board_name = selected_board_name(args)?;
-    let task_tags = task_id
-        .map(|id| store.require_task(id).map(|task| task.tags))
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    Registry::open()?.applicable_rule_summaries(
+    let loaded = if known_task_tags.is_none() {
+        task_id
+            .map(|id| store.task_rule_selectors(id))
+            .transpose()?
+    } else {
+        None
+    };
+    let known_tags = known_task_tags.map(|tags| tags.iter().cloned().collect());
+    let task_tags = known_tags
+        .as_ref()
+        .or_else(|| loaded.as_ref().map(|(tags, _)| tags));
+    let task_sprint = if known_task_tags.is_some() {
+        known_sprint
+    } else {
+        loaded.as_ref().and_then(|(_, sprint)| sprint.as_deref())
+    };
+    Registry::open_for_read()?.applicable_rule_summaries(
         board_name.as_deref(),
-        task_id.map(|_| &task_tags),
+        task_tags,
+        task_sprint,
         false,
     )
 }
 
 fn option_string(args: &Args, name: &str) -> Option<String> {
     args.one(name).map(str::to_owned)
+}
+
+/// Git provenance a checkpoint, handoff or sitrep must carry before it may be
+/// written. ADR-008: a field that says something and holds nothing is the
+/// defect this project refuses, so a write that would leave one of these blank
+/// is refused rather than stored. `root_head` is capture-only — there is no
+/// `--root-head` flag — and stays absent for a checkout with no superproject.
+pub(crate) struct Provenance {
+    pub(crate) repo_path: String,
+    pub(crate) branch: String,
+    pub(crate) head_sha: String,
+    pub(crate) dirty_summary: String,
+    pub(crate) root_head: Option<String>,
+}
+
+/// A HEAD id: the full 40 hex characters, or at least a 7-character
+/// abbreviation. Anything else is a made-up id wearing a SHA's shape.
+fn looks_like_head_sha(value: &str) -> bool {
+    value.len() >= 7 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The exact wording [`gitctx::dirty_summary`] writes, so an explicit flag
+/// cannot smuggle a different vocabulary into the column.
+fn looks_like_dirty_summary(value: &str) -> bool {
+    if value == "clean" || value == "1 file changed" {
+        return true;
+    }
+    match value.strip_suffix(" files changed") {
+        Some(count) => count.parse::<u32>().is_ok_and(|n| n >= 2),
+        None => false,
+    }
+}
+
+/// Merge the explicit `--repo/--branch/--head/--dirty` flags over what `here()`
+/// captured, and refuse rather than store a blank field. An explicit flag wins
+/// over capture, but a garbage one is refused by its shape rather than trusted.
+fn required_provenance(args: &Args, git: Option<&gitctx::GitContext>) -> Result<Provenance> {
+    let repo_path = option_string(args, "repo").or_else(|| git.map(|g| g.worktree.clone()));
+    let branch = option_string(args, "branch").or_else(|| git.and_then(|g| g.branch.clone()));
+    let head_sha = option_string(args, "head").or_else(|| git.map(|g| g.head.clone()));
+    let dirty_summary = option_string(args, "dirty").or_else(|| git.map(gitctx::dirty_summary));
+
+    if let Some(head) = &head_sha
+        && !looks_like_head_sha(head)
+    {
+        bail!(
+            "--head must be a 40-hex SHA (or at least a 7-hex abbreviation), got {head:?}; \
+             pass `git rev-parse HEAD`, or let kb-board supply it from the caller's checkout"
+        );
+    }
+    if let Some(dirty) = &dirty_summary
+        && !looks_like_dirty_summary(dirty)
+    {
+        bail!(
+            "--dirty must read like git status — \"clean\", \"1 file changed\", or \
+             \"N files changed\" — got {dirty:?}; kb-board writes exactly this wording"
+        );
+    }
+
+    let mut missing = Vec::new();
+    if repo_path.is_none() {
+        missing.push("repo_path");
+    }
+    if branch.is_none() {
+        missing.push("branch");
+    }
+    if head_sha.is_none() {
+        missing.push("head_sha");
+    }
+    if dirty_summary.is_none() {
+        missing.push("dirty_summary");
+    }
+    if !missing.is_empty() {
+        let cwd = cwd()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        bail!(
+            "refusing to record a row with blank provenance: {} missing. This CLI is running \
+             outside a git checkout (cwd {cwd}), so there is no checkout to capture and none \
+             was passed. Pass --repo PATH --branch NAME --head SHA --dirty TEXT, or let \
+             kb-board supply them from the caller's checkout.",
+            missing.join(", ")
+        );
+    }
+
+    Ok(Provenance {
+        repo_path: repo_path.unwrap(),
+        branch: branch.unwrap(),
+        head_sha: head_sha.unwrap(),
+        dirty_summary: dirty_summary.unwrap(),
+        root_head: git.and_then(|g| g.root_head.clone()),
+    })
 }
 
 fn subscription_values(args: &Args, name: &str) -> Vec<String> {
@@ -1645,33 +4207,262 @@ fn object_of<T: Serialize>(value: &T) -> Result<Map<String, Value>> {
     }
 }
 
+/// What narrows one `task list`, as one value.
+///
+/// A struct rather than four more positionals: the filters travel together to
+/// exactly one reader, and a call site passing four bare `Option<&str>` in a
+/// row is one transposition away from filtering by lane on the tag column.
+struct TaskListQuery<'a> {
+    status: Option<&'a str>,
+    tag: Option<&'a str>,
+    lane: Option<&'a str>,
+    allowed_model: Option<&'a str>,
+    include_archived: bool,
+}
+
 fn list_json(
     store: &Store,
-    status: Option<&str>,
-    tag: Option<&str>,
+    query: TaskListQuery<'_>,
+    claims: bool,
     relations: bool,
-    include_archived: bool,
 ) -> Result<Value> {
-    let tasks = store.list_tasks(status, tag, include_archived)?;
-    if !relations {
-        return Ok(serde_json::to_value(tasks)?);
+    let listed = store.list_tasks_with_claims(
+        query.status,
+        query.tag,
+        query.lane,
+        query.allowed_model,
+        query.include_archived,
+    )?;
+    // Every row's gate in one read, because the lapsed-lease projection it
+    // applies is board-wide: asking row by row put that read on the listing
+    // once per row.
+    let mut gates = if relations {
+        store.blocking_gates_for(
+            &listed
+                .iter()
+                .map(|(task, _)| task.id.clone())
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        Vec::new()
     }
-    let mut out = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let mut value = object_of(&task)?;
-        value.insert(
-            "dependencies".into(),
-            json!(
+    .into_iter();
+    let mut out = Vec::with_capacity(listed.len());
+    for (task, claim) in listed {
+        let related = if relations {
+            Some((
                 store
                     .dependencies(&task.id)?
                     .into_iter()
                     .map(|dependency| dependency.id)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        out.push(Value::Object(value));
+                    .collect(),
+                gates.next().context("one gate list per listed row")?,
+            ))
+        } else {
+            None
+        };
+        out.push(task_list_row(&task, claim, claims, related)?);
     }
     Ok(Value::Array(out))
+}
+
+/// One `task list` row: the task's own keys, whether it is held, and what
+/// the flags add.
+///
+/// `claimed` is on every row because the population that needs it is the one
+/// that never reads the docs: a listing that structurally could not show a
+/// lease rendered 32 held tasks across eight boards as free on 2026-09-04,
+/// and "no such claim exists anywhere" was reported off it. The full summary
+/// is opt-in through `--with-claims`, in the shape `task show` emits; the
+/// holder is `agentID`, and `assignee` is a separate field that records
+/// intent, never possession.
+fn task_list_row(
+    task: &Task,
+    claim: Option<ClaimSummary>,
+    with_claims: bool,
+    relations: Option<(Vec<String>, Vec<GateBlocker>)>,
+) -> Result<Value> {
+    let mut value = object_of(task)?;
+    value.insert("claimed".into(), Value::Bool(claim.is_some()));
+    if with_claims {
+        value.insert(TASK_CLAIM_FIELD.into(), serde_json::to_value(claim)?);
+    }
+    if let Some((dependencies, blocking_gates)) = relations {
+        value.insert(TASK_RELATION_FIELD.into(), json!(dependencies));
+        value.insert(
+            TASK_GATE_FIELD.into(),
+            serde_json::to_value(blocking_gates)?,
+        );
+    }
+    Ok(Value::Object(value))
+}
+
+/// The keys of one `task list` row, exactly as a caller sees them.
+///
+/// `--fields` is checked against this list rather than against the rows that
+/// came back, so an empty listing refuses a misspelt key the same way a full
+/// one does. The test module builds a row and compares, so the list cannot
+/// drift from what [`task_list_row`] emits.
+const TASK_FIELDS: [&str; 22] = [
+    "id",
+    "type",
+    "parentID",
+    "title",
+    "body",
+    "assignee",
+    "lane",
+    "deliverable",
+    "staleMinutes",
+    "driverOnly",
+    "status",
+    "priority",
+    "priorityLevel",
+    "createdAt",
+    "updatedAt",
+    "completedAt",
+    "archived",
+    "archivedAt",
+    "metadata",
+    "tags",
+    "allowedModels",
+    "claimed",
+];
+
+/// The one key `task list --with-claims` adds to every row: the live lease's
+/// summary, or null.
+const TASK_CLAIM_FIELD: &str = "claim";
+
+/// The keys `task list --with-relations` adds to every row.
+///
+/// Both come from the one flag because neither answers the question alone:
+/// `dependencies` is what this row itself declared, and `blockingGates` is
+/// what is actually unfinished anywhere in its ancestry. A row carrying the
+/// first without the second reads as unblocked while the epic above it holds
+/// the gate — which is the state a leaf is usually in.
+const TASK_RELATION_FIELD: &str = "dependencies";
+const TASK_GATE_FIELD: &str = "blockingGates";
+
+/// Keys a `task list` row carries only under a flag, with the flag that adds
+/// each, so `--fields claim` without `--with-claims` is refused naming the
+/// flag rather than a key list that omits it (ADR-008).
+const TASK_GATED_FIELDS: [(&str, &str); 3] = [
+    (TASK_CLAIM_FIELD, "with-claims"),
+    (TASK_RELATION_FIELD, "with-relations"),
+    (TASK_GATE_FIELD, "with-relations"),
+];
+
+/// The keys of one `attention list` row, exactly as a caller sees them.
+const ATTENTION_FIELDS: [&str; 24] = [
+    "id",
+    "taskID",
+    "kind",
+    "body",
+    "question",
+    "context",
+    "choices",
+    "check",
+    "raisedBy",
+    "lane",
+    "returnTrigger",
+    "createdAt",
+    "status",
+    "priority",
+    "priorityLevel",
+    "resolvedAt",
+    "resolvedBy",
+    "resolution",
+    "decision",
+    "reopenedAt",
+    "reopenedBy",
+    "reopenNote",
+    "archived",
+    "tags",
+];
+
+/// The keys of one `sprint list` row, exactly as a caller sees them
+/// (ADR-045 §2). Joins the same drift guard as [`ATTENTION_FIELDS`].
+const SPRINT_FIELDS: [&str; 13] = [
+    "id",
+    "title",
+    "body",
+    "status",
+    "targetVersion",
+    "scheduledStart",
+    "scheduledEnd",
+    "startsAt",
+    "endsAt",
+    "closedByDeployment",
+    "createdAt",
+    "updatedAt",
+    "archived",
+];
+
+/// The keys `--fields` or `--no-body` keep of every row in a listing, or
+/// `None` for the default of the whole row.
+///
+/// A listing carrying every body is the bulk of what crosses the wire from a
+/// remote caller — measured at 1 MB for 702 tasks — and a caller choosing
+/// what to read is the only projection that shrinks it without lying about
+/// what is on the board. Bodies stay reachable per row through `task show`
+/// and `context`.
+///
+/// `--fields` and `--no-body` together are two answers to one question, and
+/// are refused rather than ranked (ADR-008). A key in `gated` is one the row
+/// carries only under the named flag; asking for it without the flag is
+/// refused naming the flag, not a key list that omits it.
+fn projection(args: &Args, fields: &[&str], gated: &[(&str, &str)]) -> Result<Option<Vec<String>>> {
+    match (args.one("fields"), args.has("no-body")) {
+        (Some(_), true) => bail!(
+            "--fields and --no-body both choose the keys of every row; pass one: \
+             --fields names the keys to keep, --no-body keeps every key but body"
+        ),
+        (None, false) => Ok(None),
+        (None, true) => Ok(Some(
+            fields
+                .iter()
+                .filter(|field| **field != "body")
+                .map(|field| (*field).to_owned())
+                .collect(),
+        )),
+        (Some(raw), false) => {
+            let mut keep = Vec::new();
+            for name in raw.split(',').map(str::trim) {
+                if name.is_empty() {
+                    bail!(
+                        "--fields {raw:?} has an empty entry; pass a comma list of row keys \
+                         such as --fields id,title,status, or drop --fields for whole rows"
+                    );
+                }
+                if !fields.contains(&name) {
+                    if let Some((_, flag)) = gated.iter().find(|(key, _)| *key == name) {
+                        bail!(
+                            "--fields names {name}, which these rows carry only under \
+                             --{flag}; pass --{flag} as well"
+                        );
+                    }
+                    bail!(
+                        "--fields names {name}, which is not a key of these rows; \
+                         the keys are {}",
+                        fields.join(", ")
+                    );
+                }
+                keep.push(name.to_owned());
+            }
+            Ok(Some(keep))
+        }
+    }
+}
+
+/// Drop every key of every row that `keep` does not name.
+fn project(rows: &mut Value, keep: &[String]) {
+    let Value::Array(rows) = rows else {
+        return;
+    };
+    for row in rows {
+        if let Value::Object(row) = row {
+            row.retain(|key, _| keep.iter().any(|kept| kept == key));
+        }
+    }
 }
 
 /// Delete all but the newest `keep` snapshots under the managed backups root.
@@ -1723,6 +4514,26 @@ struct SnapshotFile {
     audit: crate::audit::AuditReport,
 }
 
+/// A file copied out of the way byte for byte, because SQLite would not open it
+/// as a database.
+///
+/// Deliberately outside `files` and outside the `boards` directory. Every entry
+/// in `files` carries a schema version and an audit head, and both can only be
+/// read from a database that opens; `verify_snapshot_manifest` also enumerates
+/// `boards/*.db` and demands that set match `files` exactly, so a copy that
+/// cannot be described that way would make its own rescue snapshot fail
+/// verification. These sit under `unparsed/` and are described by what can
+/// actually be known of them: size, digest, and why they would not open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnparsedFile {
+    path: String,
+    original_path: String,
+    bytes: u64,
+    sha256: String,
+    reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotManifest {
@@ -1730,6 +4541,23 @@ struct SnapshotManifest {
     created_at: i64,
     files: Vec<SnapshotFile>,
     missing_boards: Vec<String>,
+    /// Registered boards that exist and would not open, so are absent from
+    /// `files` while their data is very likely intact. A snapshot missing one
+    /// of these is incomplete in a way a later restore must not silently paper
+    /// over.
+    ///
+    /// `default` rather than a format bump: every manifest written before this
+    /// field existed recorded no unreadable boards, which an empty list states
+    /// exactly, and bumping the version would make those snapshots unrestorable
+    /// to buy nothing. Unknown fields are ignored on the way in, so an older
+    /// binary still reads a manifest written by this one.
+    #[serde(default)]
+    unreadable_boards: Vec<UnreadableBoard>,
+    /// Files copied verbatim because they would not open as databases. Same
+    /// `default` reasoning as above: a manifest written before this field
+    /// existed recorded none, which an empty list states exactly.
+    #[serde(default)]
+    unparsed_files: Vec<UnparsedFile>,
 }
 
 fn load_snapshot_manifest(path: &Path) -> Result<SnapshotManifest> {
@@ -1832,17 +4660,17 @@ fn snapshot_file(
 fn write_snapshot_manifest(
     directory: &Path,
     registry_path: &Path,
-    boards: &[(String, PathBuf)],
+    // The project name is optional because a file the restore is about to
+    // overwrite need not be registered at all, and inventing a name for one
+    // would put a fiction in the manifest.
+    boards: &[(Option<String>, PathBuf)],
     missing_boards: &[String],
+    unreadable_boards: &[UnreadableBoard],
+    unparsed_files: &[UnparsedFile],
 ) -> Result<(PathBuf, String)> {
     let mut files = vec![snapshot_file(directory, registry_path, "registry", None)?];
     for (project, path) in boards {
-        files.push(snapshot_file(
-            directory,
-            path,
-            "board",
-            Some(project.clone()),
-        )?);
+        files.push(snapshot_file(directory, path, "board", project.clone())?);
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = SnapshotManifest {
@@ -1850,6 +4678,8 @@ fn write_snapshot_manifest(
         created_at: now_ms(),
         files,
         missing_boards: missing_boards.to_vec(),
+        unreadable_boards: unreadable_boards.to_vec(),
+        unparsed_files: unparsed_files.to_vec(),
     };
     let path = directory.join("manifest.json");
     let mut output = fs::OpenOptions::new()
@@ -1991,42 +4821,276 @@ fn restore(args: &Args) -> Result<()> {
     // Snapshot what is about to be overwritten, so a mistaken restore is itself
     // recoverable.
     let root = data_root()?;
-    let rescue = root
-        .join("backups")
-        .join(format!("pre-restore-{}", now_ms()));
-    let registry = Registry::open()?;
-    let rescue_registry = rescue.join("registry.db");
-    registry.backup(&rescue_registry)?;
-    let mut rescue_boards = Vec::new();
-    let mut rescue_missing = Vec::new();
-    for project in registry.projects()? {
-        // A board that is already gone is what a restore is often for; it
-        // cannot be a precondition of running one.
-        if !board_is_present(&project.board_path) {
-            rescue_missing.push(project.name);
-            continue;
-        }
-        let file_name = Path::new(&project.board_path)
-            .file_name()
-            .with_context(|| format!("board path has no file name: {}", project.board_path))?;
-        let destination = rescue.join("boards").join(file_name);
-        Store::open(Path::new(&project.board_path))?.backup(&destination)?;
-        rescue_boards.push((project.name, destination));
-    }
-    let (rescue_manifest, rescue_manifest_sha256) =
-        write_snapshot_manifest(&rescue, &rescue_registry, &rescue_boards, &rescue_missing)?;
-    drop(registry);
 
-    let mut restored = Vec::new();
-    for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db"))).chain(
-        boards.iter().map(|path| {
+    // Every path this is about to rename over, derived once and used both to
+    // build the rescue copy and to do the replacing, so the two cannot come to
+    // disagree about which files are at risk.
+    //
+    // What gets destroyed is decided by the snapshot and the filesystem, never
+    // by the registry: the replacement below writes `<root>/boards/<file name>`
+    // for every board file in the snapshot, listed or not. Keying the rescue
+    // off `registry.projects()` protected the wrong set, and measurably so.
+    // Restoring an older snapshot drops a project from the registry while
+    // leaving its file on disk; restoring a newer one then renames over that
+    // file, which by then is registered nowhere, so nothing classified it and
+    // nothing copied it. Work committed after the snapshot went with it — and
+    // the unreadable-board refusal could not fire either, because it was keyed
+    // to the registry too.
+    let overwrites = boards
+        .iter()
+        .map(|path| {
             (
                 path.clone(),
                 root.join("boards")
                     .join(path.file_name().unwrap_or_default()),
             )
-        }),
-    ) {
+        })
+        .collect::<Vec<_>>();
+
+    // `Registry::open` can migrate the live registry and re-assert its mode, so
+    // this is not "before anything is written". What holds is narrower and is
+    // what the risk actually needs: no rescue directory is created and no board
+    // file is touched until every refusal below has had its say.
+    let registry = Registry::open()?;
+    let registered = registry.projects()?;
+    let name_at = |target: &Path| -> Option<String> {
+        let target = resolved(target);
+        registered
+            .iter()
+            .find(|project| resolved(Path::new(&project.board_path)) == target)
+            .map(|project| project.name.clone())
+    };
+
+    let mut rescue_sources: Vec<(Option<String>, PathBuf)> = Vec::new();
+    let mut verbatim = Vec::new();
+    let mut blocked = Vec::new();
+    for (_, target) in &overwrites {
+        match restore_target(target) {
+            RestoreTarget::Vacant => {}
+            RestoreTarget::Rescue => rescue_sources.push((name_at(target), target.clone())),
+            RestoreTarget::Copy(reason) => verbatim.push((target.clone(), reason)),
+            RestoreTarget::Blocked(reason) => {
+                blocked.push((name_at(target), target.clone(), reason));
+            }
+        }
+    }
+
+    // Registered boards outside the overwrite set keep the rescue copy they
+    // have always had: the registry row that reaches them is being replaced, so
+    // the copy is part of undoing a mistaken restore. Their files are not
+    // touched, though, so one that will not open is recorded in the manifest
+    // rather than refused — refusing there would block a restore that destroys
+    // nothing.
+    let targeted = overwrites
+        .iter()
+        .map(|(_, target)| resolved(target))
+        .collect::<HashSet<_>>();
+    let mut rescue_missing = Vec::new();
+    let mut rescue_unreadable = Vec::new();
+    for project in &registered {
+        if targeted.contains(&resolved(Path::new(&project.board_path))) {
+            continue;
+        }
+        match survey_board(&project.board_path) {
+            SurveyBoard::Readable => rescue_sources.push((
+                Some(project.name.clone()),
+                PathBuf::from(&project.board_path),
+            )),
+            // A board that is already gone is what a restore is often for; it
+            // cannot be a precondition of running one.
+            SurveyBoard::Missing => rescue_missing.push(project.name.clone()),
+            SurveyBoard::Unreadable(reason) => {
+                rescue_unreadable.push(unreadable_board(project, reason));
+            }
+        }
+    }
+
+    // Measured before this refusal existed: a live board at mode 000, holding
+    // work committed after the snapshot was taken, was skipped by the rescue
+    // copy as "missing", then replaced anyway — `replace_database` renames over
+    // the path, which needs the directory's permissions and not the file's. The
+    // command exited 0, the rescue snapshot had no `boards` directory at all,
+    // and the task added after the backup was gone with nothing to recover it
+    // from. The rescue copy is the only thing that makes `--force` reversible,
+    // so a file it cannot copy stops the restore rather than becoming a line in
+    // a manifest nobody reads until afterwards.
+    if !blocked.is_empty() {
+        let listed = blocked
+            .iter()
+            .map(|(name, path, reason)| {
+                format!(
+                    "  {} ({}): {reason}",
+                    name.as_deref().unwrap_or("not in the registry"),
+                    path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "restore would overwrite files it cannot copy into the rescue snapshot first.\n\
+             That snapshot is the only thing that makes --force reversible, so a file whose bytes \
+             cannot be read stops the restore:\n{listed}\n\
+             Nothing here says the data is damaged — this could not open the file to look, so it \
+             is very likely intact. Fix its permissions and run this again, or move it aside to \
+             discard what is in it.\n\
+             A corrupt or unrecognisable board does not reach this: it is copied out of the way \
+             byte for byte and the restore proceeds, which is what a restore is for."
+        );
+    }
+
+    // The same file can be both an overwrite target and a registered project;
+    // collapsing those is safe because it is one file either way.
+    let mut seen_source = HashSet::new();
+    rescue_sources.retain(|(_, path)| seen_source.insert(resolved(path)));
+
+    // Two *different* files sharing a base name would copy to the same path
+    // inside the rescue snapshot, and the second would land on the first: one
+    // board rescued, one silently not, which is the failure everything above
+    // exists to prevent. It also produces a manifest with a duplicate path,
+    // which `verify_snapshot_manifest` rejects — so the rescue snapshot would
+    // be unrestorable, discovered only after the live files were gone.
+    let mut seen_name = HashSet::new();
+    let collisions = rescue_sources
+        .iter()
+        .filter(|(_, path)| !seen_name.insert(path.file_name().unwrap_or_default().to_owned()))
+        .map(|(_, path)| format!("  {}", path.display()))
+        .collect::<Vec<_>>();
+    if !collisions.is_empty() {
+        bail!(
+            "restore cannot build a rescue snapshot: these board files share a file name with \
+             another board it is also rescuing, so one copy would overwrite the other:\n{}\n\
+             Move or rename one of them, then run this again.",
+            collisions.join("\n")
+        );
+    }
+
+    // Settle every rescue source's read authority before the rescue directory
+    // exists, so a denial can never become a verbatim copy below.
+    let rescue_sources = rescue_sources
+        .into_iter()
+        .map(|(name, path)| {
+            let prepared = Store::prepare_rescue_read(&path)?;
+            Ok((name, path, prepared))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let rescue = root
+        .join("backups")
+        .join(format!("pre-restore-{}", now_ms()));
+    let rescue_registry = rescue.join("registry.db");
+    registry.backup(&rescue_registry)?;
+    let mut rescue_boards = Vec::new();
+    for (name, path, prepared) in rescue_sources {
+        let file_name = path
+            .file_name()
+            .with_context(|| format!("board path has no file name: {}", path.display()))?;
+        let destination = rescue.join("boards").join(file_name);
+        // Read-only, because this is a copy and nothing else: opening writable
+        // runs migrations, and running a migration into a board that is about
+        // to be rescued for being damaged can only make the copy worse.
+        //
+        // The online backup is WAL-correct, so it is the first choice for any
+        // board that opens at all. It can still fail on a file the classifier
+        // accepted: `probe_board_schema` reads the schema out of the first
+        // page, so corruption further into the file is invisible to it and
+        // surfaces only here, when every page is read. Measured — a board with
+        // its header and schema intact and its later pages overwritten passed
+        // classification and then failed the backup with `database disk image
+        // is malformed`, aborting the restore that was recovering it. The
+        // fallback keeps the guarantee whole: whatever the damage turns out to
+        // be, the file is copied out of the way before anything replaces it.
+        //
+        // Describing the copy is part of making it. Every manifest entry
+        // carries a schema version and an audit head, both read back out of the
+        // copy, and that read walks rows the page-level backup never validated:
+        // a board whose corruption sits in free pages copied cleanly and then
+        // failed here, aborting the restore just the same. Anything that cannot
+        // be copied *and* described as a board becomes a verbatim copy instead.
+        let copied = match prepared {
+            store::PreparedRescueRead::Online(store) => store
+                .backup(&destination)
+                .and_then(|()| snapshot_file(&rescue, &destination, "board", name.clone())),
+            store::PreparedRescueRead::PhysicalFailure(error) => Err(error),
+        };
+        match copied {
+            Ok(_) => rescue_boards.push((name, destination)),
+            Err(error) => {
+                // Leave nothing half-described behind: an unmanifested `.db`
+                // under `boards/` is exactly what `verify_snapshot_manifest`
+                // rejects, so the failed copy goes before the verbatim one
+                // takes its place.
+                let _ = fs::remove_file(&destination);
+                for suffix in ["-wal", "-shm"] {
+                    let mut sidecar = destination.as_os_str().to_owned();
+                    sidecar.push(suffix);
+                    let _ = fs::remove_file(Path::new(&sidecar));
+                }
+                verbatim.push((path, format!("{error:#}")));
+            }
+        }
+    }
+    // Copied rather than exported, because SQLite will not open these. The
+    // sidecars go too: `replace_database` deletes the `-wal` and `-shm` beside
+    // the file it replaces, and for a corrupt main database the write-ahead log
+    // is often the part a recovery would still want.
+    let mut rescue_unparsed = Vec::new();
+    for (path, reason) in &verbatim {
+        let file_name = path
+            .file_name()
+            .with_context(|| format!("overwrite target has no file name: {}", path.display()))?;
+        let destination = rescue.join("unparsed").join(file_name);
+        db::create_private_dir_all(&rescue.join("unparsed"))?;
+        fs::copy(path, &destination)
+            .with_context(|| format!("copy {} to {}", path.display(), destination.display()))?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.is_file() {
+                let mut beside = destination.as_os_str().to_owned();
+                beside.push(suffix);
+                fs::copy(&sidecar, Path::new(&beside))
+                    .with_context(|| format!("copy {}", sidecar.display()))?;
+            }
+        }
+        rescue_unparsed.push(UnparsedFile {
+            path: format!("unparsed/{}", file_name.to_string_lossy()),
+            original_path: path.to_string_lossy().into_owned(),
+            bytes: fs::metadata(&destination)?.len(),
+            sha256: audit::file_sha256(&destination)?,
+            reason: reason.clone(),
+        });
+    }
+    let (rescue_manifest, rescue_manifest_sha256) = write_snapshot_manifest(
+        &rescue,
+        &rescue_registry,
+        &rescue_boards,
+        &rescue_missing,
+        &rescue_unreadable,
+        &rescue_unparsed,
+    )?;
+    drop(registry);
+
+    // Replacing a board file is the widest write there is: every row on it is
+    // discarded and every row of the snapshot takes its place, and
+    // `replace_database` is a rename, so no later per-row check will ever see
+    // it. Each destination that still exists is therefore gated on the caller
+    // being able to write the WHOLE board, checked before the first rename so
+    // a refusal leaves the estate untouched rather than half-restored. The
+    // rescue copy above went through `Store::backup`, which applies the
+    // matching bulk-READ gate.
+    for (_, destination) in &overwrites {
+        // Base write authority is independent of whether bytes can be opened.
+        // Readable boards additionally require the whole-board write gate.
+        if destination.exists() {
+            Store::require_restore_write(destination)?;
+        }
+    }
+
+    let mut restored = Vec::new();
+    for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db")))
+        .chain(overwrites.iter().cloned())
+    {
         db::replace_database(&from, &to)?;
         restored.push(to.to_string_lossy().into_owned());
     }
@@ -2043,11 +5107,8 @@ fn restore(args: &Args) -> Result<()> {
             "rescueManifestSha256":rescue_manifest_sha256,
         }),
     )?;
-    for path in &boards {
-        let destination = root
-            .join("boards")
-            .join(path.file_name().unwrap_or_default());
-        Store::open(&destination)?.record_system_event(
+    for (_, destination) in &overwrites {
+        Store::open_as_caller(destination)?.record_system_event(
             "snapshot_restored",
             actor,
             json!({
@@ -2071,6 +5132,11 @@ fn restore(args: &Args) -> Result<()> {
             "rescueSnapshot":rescue,
             "rescueManifest":rescue_manifest,
             "rescueManifestSha256":rescue_manifest_sha256,
+            // Replaced without ever being opened as a database. Named here so
+            // that overwriting a corrupt board, or a file that was never a
+            // board, is something the operator is told rather than something
+            // they find out later.
+            "rescuedUnparsed":rescue_unparsed,
         }),
         args.has("json"),
     )
@@ -2086,7 +5152,22 @@ pub fn entrypoint() -> ! {
         // did not cause.
         Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {
-            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            let message = format!("{error:#}");
+            let _ = writeln!(io::stderr(), "Error: {message}");
+            // A `--json` caller reads stdout and the exit status, and a
+            // pipeline such as `... --json | jq` never sees stderr at all.
+            // `claim --candidates --json` without `--as` left stdout empty,
+            // and an empty stdout piped into a parser reads as "no
+            // candidates" -- absence rendered identically to error. So the
+            // refusal reaches stdout too, as the object a parser will see, and
+            // stderr keeps the prose for the MCP layer and humans -- unless
+            // the command already answered on stdout (`doctor`, `audit
+            // verify` print their report and then fail to mark it unhealthy),
+            // where a second document would make the first unparseable.
+            if json_requested() && !STDOUT_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = print(&json!({ "error": message }), true);
+            }
+            // 1 for everything a retry might fix.
             std::process::exit(1)
         }
     }
@@ -2116,11 +5197,651 @@ pub fn codex_queue_adapter_entrypoint() -> ! {
     }
 }
 
+/// Entry point for the Codex app-server adapter binary.
+pub fn codex_app_server_adapter_entrypoint() -> ! {
+    match codex_app_server_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // This structured adapter must not apply the human CLI's reader-left
+        // exception: BrokenPipe can come from Codex child stdin, and a closed
+        // response pipe means the delivery acknowledgement did not arrive.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the Claude Code print adapter binary.
+pub fn claude_print_adapter_entrypoint() -> ! {
+    match claude_print_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the OpenCode local-server adapter binary.
+pub fn opencode_adapter_entrypoint() -> ! {
+    match opencode_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // This adapter POSTs the delivery to a local HTTP server, so a closed
+        // stdout is not the human CLI's harmless reader-left case: the
+        // acknowledgement never reached the dispatcher. The exit status also
+        // carries the failure classification, which a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(opencode_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the Kimi ACP adapter binary.
+pub fn kimi_acp_adapter_entrypoint() -> ! {
+    match kimi_acp_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // This adapter exchanges one framed delivery with an ACP peer, so a
+        // closed stdout is not the human CLI's harmless reader-left case: the
+        // acknowledgement never reached the dispatcher. The exit status also
+        // carries the failure classification, which a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(kimi_acp_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the serialized Cursor worker adapter binary.
+pub fn cursor_worker_adapter_entrypoint() -> ! {
+    match cursor_worker_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // Like the OpenCode bridge, a closed stdout here means the
+        // acknowledgement never reached the dispatcher rather than the human
+        // CLI's harmless reader-left case, and the exit status carries the
+        // failure classification a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(cursor_worker_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the notify-only ZCode adapter binary.
+pub fn zcode_notify_adapter_entrypoint() -> ! {
+    match zcode_notify_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // Notify-only, so a closed stdout is not the human CLI's harmless
+        // reader-left case: the acknowledgement never reached the dispatcher
+        // and the notification must be retried rather than recorded. The exit
+        // status also carries the failure classification, which a blanket `1`
+        // would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(zcode_notify_adapter::exit_code(&error))
+        }
+    }
+}
+
+fn read_transfer_bundle(path: &Path) -> Result<Vec<u8>> {
+    const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read rule transfer bundle {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("rule transfer bundle must be a regular file");
+    }
+    if metadata.len() > MAX_BUNDLE_BYTES {
+        bail!(
+            "rule transfer bundle is too large: {} bytes",
+            metadata.len()
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open rule transfer bundle {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("rule transfer bundle changed while reading");
+    }
+    Ok(bytes)
+}
+
+/// A registry rule rewrite owed to a board rename that has not committed yet.
+///
+/// `tag rename` is one operation over two SQLite databases, and two
+/// connections cannot share a transaction, so the rule rewrite is a second
+/// transaction ordered *after* the board's. Alone, the board write has
+/// committed by the time the dispatch arm returns and the rewrite runs
+/// immediately. Inside a `transact`, the board write is part of a batch that
+/// commits only after the last item, so the rewrite is queued here and run
+/// once — after `commit_batch` — and dropped unrun on a rollback. Without the
+/// queue, a rolled-back batch would leave the rules renamed and the board not:
+/// rules pointing at a tag no board has.
+struct PendingRuleTagRename {
+    old: String,
+    new: String,
+    board: Option<String>,
+    actor: String,
+}
+
+impl PendingRuleTagRename {
+    fn apply(&self) -> Result<i64> {
+        Registry::open()?.rename_rule_tag(&self.old, &self.new, self.board.as_deref(), &self.actor)
+    }
+}
+
+thread_local! {
+    static PENDING_RULE_TAG_RENAMES: std::cell::RefCell<Vec<PendingRuleTagRename>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The rewrites one batch owes, taken off the queue and owned by the stack.
+///
+/// Taken *before* the board's commit or rollback is attempted, which is the
+/// whole point of the type. The queue is a thread-local and an MCP thread is
+/// long-lived, so anything still on it when a batch leaves by an early `?` —
+/// a commit that failed, a rollback that failed, a board that was never handed
+/// back — would be applied by the *next* batch on that thread: registry rule
+/// rewrites, with their own chained events, for a board rename that never
+/// landed. Owning them on the stack instead means every exit takes them with
+/// it, including a panic, and only the one path that saw `commit_batch`
+/// succeed can run them.
+struct OwedRuleTagRenames(Vec<PendingRuleTagRename>);
+
+impl OwedRuleTagRenames {
+    fn take() -> Self {
+        Self(PENDING_RULE_TAG_RENAMES.with_borrow_mut(std::mem::take))
+    }
+
+    /// Run them once the board's write has landed, or drop them unrun.
+    ///
+    /// A failure here is reported rather than swallowed, and it is survivable
+    /// in one direction only: the board carries the new spelling and those
+    /// rules still carry the old one, so they match fewer rows than intended
+    /// until `kanban rule update ID --tag NEW` catches them up.
+    fn settle(self, committed: bool) -> Result<()> {
+        if !committed {
+            return Ok(());
+        }
+        for rename in &self.0 {
+            rename.apply().with_context(|| {
+                format!(
+                    "the board renamed tag {} to {}, but the registry rules still carry {}: \
+                     run `kanban rule update ID --tag {}` on each rule that scopes it",
+                    rename.old, rename.new, rename.old, rename.new
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The items of a `transact`, from `--items` or from a file.
+///
+/// The pair is modelled on `--body`/`--body-file`, refusing both at once
+/// included, and it exists for a measured reason: with `--items` the list
+/// travels as a single argv string, and one argv string is capped at 128 KiB
+/// on Linux (`MAX_ARG_STRLEN`), so a full batch carrying checkpoint bodies
+/// would die as `E2BIG` before the binary saw it (ADR-041 §8).
+fn transact_items(args: &Args) -> Result<Vec<Value>> {
+    let text = match (args.one("items"), args.one("items-file")) {
+        (Some(_), Some(_)) => bail!(
+            "--items and --items-file both give the item list; pass one, because picking \
+             between them is not something a receipt can explain"
+        ),
+        (Some(text), None) => text.to_owned(),
+        (None, Some(path)) => {
+            fs::read_to_string(path).with_context(|| format!("read transact items from {path}"))?
+        }
+        (None, None) => bail!(
+            "transact needs its item list: --items JSON_ARRAY, or --items-file PATH for a list \
+             too long for one argv string"
+        ),
+    };
+    let parsed: Value = serde_json::from_str(&text).context(
+        "transact items must be a JSON array of {\"name\": TOOL, \"arguments\": {…}} objects",
+    )?;
+    match parsed {
+        Value::Array(items) => Ok(items),
+        other => bail!("transact items must be a JSON array, not {other}; nothing in it ran"),
+    }
+}
+
+/// The two board operations that open a transaction of their own on the board
+/// connection instead of taking [`Store::begin_write`]: `import` (see
+/// `rust/import.rs:430`) and `search-rebuild` (through `rust/search.rs:776`).
+///
+/// SQLite refuses the nested `BEGIN`, so either one as an item would fail and
+/// roll the batch back — fail-closed, but reported in SQLite's words rather
+/// than in words that name the fix. Refused pre-flight instead. Both are
+/// whole-board bulk operations rather than the row writes a `/kb` loop
+/// batches, so nothing an agent wants to batch is lost; when their
+/// transactions move to the write-scope guard they compose and this table
+/// empties.
+const NOT_TRANSACTABLE: [(&str, Option<&str>); 3] = [
+    ("import", Some("atmux-json")),
+    ("import", Some("atmux-sqlite")),
+    ("search-rebuild", None),
+];
+
+/// Whether an item may name this operation, and why not when it may not.
+///
+/// Read off the same two tables `tools/list` and the CLI parser read, so what
+/// the surface offers and what a batch accepts cannot answer differently.
+///
+/// ADR-041 §1: a batch may not carry a batch, in either direction. Only
+/// `transact` needs saying here — the read-only `batch` has no `COMMANDS`
+/// row, so it already resolves to no operation below, exactly as it does for
+/// `batch`'s own validation (`rust/mcp.rs:451`).
+fn transactable(name: &str) -> Result<()> {
+    if name == "transact" {
+        bail!("names {name}, and a batch may not carry a batch");
+    }
+    let Some((command, sub, ..)) = COMMANDS
+        .iter()
+        .filter(|(command, ..)| !LONG_RUNNING.contains(command))
+        .find(|(command, sub, ..)| mcp::tool_name(command, *sub) == name)
+    else {
+        bail!("names no such operation {name}");
+    };
+    let (ignored, subject) = ignored_selectors(command, *sub);
+    if !ignored.is_empty() {
+        bail!(
+            "names {name}, which {subject} rather than addressing one board's rows, so its \
+             write would land outside the batch's transaction and could not be rolled back \
+             with it"
+        );
+    }
+    if NOT_TRANSACTABLE.contains(&(command, *sub)) {
+        bail!(
+            "names {name}, which opens a board-wide transaction of its own and so cannot run \
+             inside one; run it as its own command"
+        );
+    }
+    Ok(())
+}
+
+/// Why a `transact` was refused before any of it ran.
+///
+/// Distinct from an item that ran and refused, deliberately: nothing was
+/// attempted, so there is nothing to undo, and the envelope says so rather
+/// than leaving it to be inferred (ADR-041 §2, §3).
+#[derive(Debug)]
+struct TransactRefusal {
+    /// The item it is about, when it is about one.
+    index: Option<usize>,
+    message: String,
+}
+
+impl TransactRefusal {
+    fn at(index: usize, reason: &str) -> Self {
+        Self {
+            index: Some(index),
+            message: format!("transact item {index} {reason}; nothing in it ran"),
+        }
+    }
+
+    fn whole(message: String) -> Self {
+        Self {
+            index: None,
+            message,
+        }
+    }
+}
+
+/// Whether an item really passes this flag, by the same rule `arguments_for`
+/// coerces it with: `null` is absence, and so is `false` on a boolean flag,
+/// because a boolean flag is present or absent rather than valued.
+fn item_passes(arguments: &Value, flag: &str) -> bool {
+    !matches!(
+        arguments.get(flag),
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    )
+}
+
+/// Check the whole list before any of it runs, and answer with the operations
+/// to run in order.
+///
+/// Shape, names, the bound and every back-reference, which is exactly the set
+/// ADR-041 §2 calls pre-flight. An item's own arguments are NOT checked here:
+/// a `$ref` is not a value yet, and an argument a command refuses is that
+/// command's refusal, reported as that item's failure.
+fn plan_transact(items: &[Value]) -> std::result::Result<Vec<(&str, &Value)>, TransactRefusal> {
+    if items.len() > mcp::BATCH_LIMIT {
+        return Err(TransactRefusal::whole(format!(
+            "transact takes at most {} items and was given {}; nothing in it ran",
+            mcp::BATCH_LIMIT,
+            items.len()
+        )));
+    }
+    let mut planned = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Value::Object(fields) = item else {
+            return Err(TransactRefusal::at(
+                index,
+                &format!("must be an object, not {item}"),
+            ));
+        };
+        if let Some(unknown) = fields
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "arguments"))
+        {
+            return Err(TransactRefusal::at(
+                index,
+                &format!("has no field {unknown}"),
+            ));
+        }
+        let Some(name) = fields.get("name").and_then(Value::as_str) else {
+            return Err(TransactRefusal::at(index, "needs a name"));
+        };
+        transactable(name).map_err(|error| TransactRefusal::at(index, &format!("{error:#}")))?;
+        let arguments = fields.get("arguments").unwrap_or(&Value::Null);
+        match arguments {
+            Value::Object(_) | Value::Null => {}
+            other => {
+                return Err(TransactRefusal::at(
+                    index,
+                    &format!("has arguments that are not an object: {other}"),
+                ));
+            }
+        }
+        // A batch addresses one board -- the one `transact` itself resolved --
+        // and every item runs against it. An item naming a second one would
+        // have that selector silently discarded, which is the wrong-board
+        // defect ADR-007 exists to prevent. `--all-boards` is the same
+        // refusal for the same reason it is not a selector: `search
+        // --all-boards` opens every registered board on a connection of its
+        // own, so as an item it would answer about boards outside the batch
+        // and, for the batch's own board, from the pre-batch snapshot --
+        // silently contradicting ADR-041 §5.
+        if let Some(named) = BOARD_SELECTORS
+            .iter()
+            .chain(std::iter::once(&"all-boards"))
+            .find(|flag| item_passes(arguments, flag))
+        {
+            return Err(TransactRefusal::at(
+                index,
+                &format!(
+                    "names --{named}, and a batch addresses one board: pass the selector to \
+                     `transact` itself"
+                ),
+            ));
+        }
+        validate_refs(arguments, index)
+            .map_err(|error| TransactRefusal::at(index, &format!("{error:#}")))?;
+        planned.push((name, arguments));
+    }
+    Ok(planned)
+}
+
+/// Every `$ref` an item's arguments carry, checked for shape.
+///
+/// ADR-041 §4: the whole list is checked before any of it runs, and one
+/// unresolvable reference refuses the batch whole — the same fail-closed rule
+/// the read-only batch applies to a forbidden name. A reference may sit
+/// anywhere in the arguments, so the walk is the whole value.
+fn validate_refs(value: &Value, index: usize) -> Result<()> {
+    match value {
+        Value::Object(fields) => {
+            let Some(reference) = fields.get("$ref") else {
+                return fields
+                    .values()
+                    .try_for_each(|nested| validate_refs(nested, index));
+            };
+            if fields.len() != 1 {
+                bail!("holds a $ref beside other keys, so what the value should be is undecided");
+            }
+            validate_ref(reference, index)
+        }
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|nested| validate_refs(nested, index)),
+        _ => Ok(()),
+    }
+}
+
+fn validate_ref(reference: &Value, index: usize) -> Result<()> {
+    let Value::Object(fields) = reference else {
+        bail!("has a $ref that is not an object: {reference}");
+    };
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "item" | "path"))
+    {
+        bail!("has a $ref with no field {unknown}");
+    }
+    let item = fields
+        .get("item")
+        .context("has a $ref that names no item")?
+        .as_u64()
+        .context("has a $ref whose item is not a whole number of zero or more")?;
+    if item as usize >= index {
+        bail!(
+            "has a $ref to item {item}, but this is item {index} and a reference may only name \
+             an item that already ran"
+        );
+    }
+    let path = fields
+        .get("path")
+        .and_then(Value::as_str)
+        .context("has a $ref that names no path string")?;
+    valid_pointer(path)
+}
+
+/// RFC 6901: a pointer is empty or a run of `/`-prefixed tokens, and `~` only
+/// ever escapes as `~0` or `~1`.
+///
+/// Checked rather than left to `Value::pointer`, which answers `None` for a
+/// malformed pointer exactly as it does for one that finds nothing. Without
+/// this, a typo would surface as an execution failure at run time instead of
+/// the pre-flight refusal ADR-041 §4 requires.
+fn valid_pointer(path: &str) -> Result<()> {
+    if !path.is_empty() && !path.starts_with('/') {
+        bail!(
+            "has a $ref whose path {path:?} is not a JSON Pointer: one is empty or starts with /"
+        );
+    }
+    let mut characters = path.chars();
+    while let Some(character) = characters.next() {
+        if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
+            bail!(
+                "has a $ref whose path {path:?} is not a JSON Pointer: ~ escapes only as ~0 or ~1"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Replace every `$ref` in one item's arguments with the value it names.
+///
+/// Shape was settled pre-flight, so the only thing that can fail here is the
+/// pointer finding nothing in a result that did arrive — an execution failure
+/// at this item, which rolls the batch back like any other (ADR-041 §4).
+fn resolve_refs(value: &Value, results: &[Value]) -> Result<Value> {
+    match value {
+        Value::Object(fields) => {
+            let Some(Value::Object(reference)) = fields.get("$ref") else {
+                let mut resolved = Map::new();
+                for (key, nested) in fields {
+                    resolved.insert(key.clone(), resolve_refs(nested, results)?);
+                }
+                return Ok(Value::Object(resolved));
+            };
+            let item = reference["item"].as_u64().unwrap_or_default() as usize;
+            let path = reference["path"].as_str().unwrap_or_default();
+            let result = results
+                .get(item)
+                .with_context(|| format!("item {item} produced no result to refer to"))?;
+            result
+                .pointer(path)
+                .cloned()
+                .with_context(|| format!("item {item}'s result has nothing at {path}: {result}"))
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|nested| resolve_refs(nested, results))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        other => Ok(other.clone()),
+    }
+}
+
+/// One item, through the whole dispatch, with its answer collected instead of
+/// printed.
+fn run_transact_item(
+    name: &str,
+    arguments: &Value,
+    index: usize,
+    results: &[Value],
+    batch_id: &str,
+) -> Result<Value> {
+    let arguments = resolve_refs(arguments, results)?;
+    let argv = mcp::arguments_for(name, &arguments)?;
+    let _stamp = store::BatchStamp::set(batch_id, index);
+    CAPTURED.with_borrow_mut(|slot| *slot = Some(String::new()));
+    let outcome = run_argv(argv);
+    let captured = CAPTURED.with_borrow_mut(Option::take).unwrap_or_default();
+    outcome?;
+    if captured.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&captured)
+        .with_context(|| format!("{name} answered with something that is not JSON: {captured}"))
+}
+
+/// A pre-flight refusal: the envelope says nothing ran, and the exit status
+/// says the batch failed.
+fn refuse_transact(batch_id: &str, refusal: TransactRefusal) -> Result<()> {
+    print(
+        &json!({
+            "ok": false,
+            "batchId": batch_id,
+            "failedIndex": refusal.index,
+            // The one failure that reports `false`: nothing was attempted, so
+            // there is nothing to undo (ADR-041 §3).
+            "rolledBack": false,
+            // Empty rather than absent. ADR-041 §2 says a pre-flight refusal
+            // has no results because there are none; an empty array says
+            // exactly that in the field an agent already reads, and keeps one
+            // envelope shape for every answer.
+            "results": [],
+            "error": refusal.message,
+        }),
+        true,
+    )?;
+    Err(anyhow::anyhow!(refusal.message))
+}
+
+/// `kanban transact`: one ordered list of operations, all of which land or
+/// none of which do.
+///
+/// The shape of an item is the read-only batch's shape, `{"name": TOOL,
+/// "arguments": {…}}`, for the reason ADR-010 exists: two spellings of one
+/// concept means an agent that has learned to build a batched read cannot
+/// reuse the item it just built (ADR-041 §1).
+fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
+    let items = transact_items(args)?;
+    // Minted once, before the outer scope opens, in a lease token's format and
+    // by the same mint (ADR-041 §7). A rolled-back batch appends nothing, so a
+    // `batchId` in the ledger always means a batch that landed whole.
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let planned = match plan_transact(&items) {
+        Ok(planned) => planned,
+        // Before the board is even opened: a refused batch must not have swept
+        // a lease on its way to saying so.
+        Err(refusal) => return refuse_transact(&batch_id, refusal),
+    };
+
+    let store = Store::open_as_caller(&store_path(args, creation)?)?;
+    store.begin_batch()?;
+    LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+    // A batch that unwound inside the item loop (a panic caught by a
+    // long-lived MCP thread) never reached the take below, so this batch
+    // starts by dropping whatever it left, unrun: nothing on the queue can
+    // belong to a board write this batch will commit.
+    drop(OwedRuleTagRenames::take());
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut reported: Vec<Value> = Vec::new();
+    let mut failed = None;
+    for (index, (name, arguments)) in planned.iter().enumerate() {
+        match run_transact_item(name, arguments, index, &results, &batch_id) {
+            Ok(result) => {
+                reported.push(json!({ "index": index, "ok": true, "result": result }));
+                results.push(result);
+            }
+            Err(error) => {
+                reported
+                    .push(json!({ "index": index, "ok": false, "error": format!("{error:#}") }));
+                failed = Some(index);
+                break;
+            }
+        }
+    }
+    // `skipped` is its own field rather than an `error` string, so an agent
+    // can tell "refused" from "never tried" without parsing prose.
+    for index in reported.len()..planned.len() {
+        reported.push(json!({ "index": index, "ok": false, "skipped": true }));
+    }
+
+    // Off the thread-local first, so every way out of here from this point on
+    // — including a commit that fails and a board that was never handed back
+    // — takes them with it instead of leaving them for the next batch.
+    let owed = OwedRuleTagRenames::take();
+    let store = LENT_BOARD
+        .with_borrow_mut(Option::take)
+        .context("the batch's board was not handed back")?;
+    match failed {
+        Some(_) => store.rollback_batch()?,
+        None => store.commit_batch()?,
+    }
+    // Strictly after the board's commit, and only if there was one.
+    owed.settle(failed.is_none())?;
+    print(
+        &json!({
+            "ok": failed.is_none(),
+            "batchId": batch_id,
+            "failedIndex": failed,
+            "rolledBack": failed.is_some(),
+            "results": reported,
+        }),
+        true,
+    )?;
+    match failed {
+        None => Ok(()),
+        // The envelope is already on stdout, so this only sets the exit
+        // status and the stderr line -- `STDOUT_WRITTEN` keeps `entrypoint`
+        // from printing a second document over it.
+        Some(index) => Err(anyhow::anyhow!(
+            "transact rolled back: item {index} failed, so nothing in the batch landed"
+        )),
+    }
+}
+
 fn run() -> Result<()> {
-    let args = Args::parse(env::args().skip(1).collect())?;
+    run_argv(env::args().skip(1).collect())
+}
+
+/// The whole dispatch, from an argument list rather than from the process's.
+///
+/// `kanban transact` runs each of its items through here, which is what makes
+/// a transacted write byte-identical to the same command alone: same parse,
+/// same refusals, same authorization, same store method (ADR-041 §2). The
+/// only two things an item does not repeat are the board open and the
+/// stdout write, and both are intercepted below rather than bypassed.
+fn run_argv(argv: Vec<String>) -> Result<()> {
+    let args = Args::parse(argv)?;
     if args.has("version") {
         emit(&version_string())?;
         return Ok(());
+    }
+    if !args.positionals.is_empty()
+        && canonical_command(args.positionals[0].as_str()) == WORKSPACE_ADOPT_HELPER_COMMAND
+    {
+        return run_workspace_adopt_helper();
     }
     if args.positionals.is_empty() || args.has("help") {
         emit(HELP)?;
@@ -2133,6 +5854,37 @@ fn run() -> Result<()> {
         .map(String::as_str)
         .map(|value| canonical_sub(command, value));
     let rest = args.positionals.get(2..).unwrap_or(&[]);
+    // The `access` surface's subcommands are two words ("principal show",
+    // "sso map-sso", "breakglass registry-admin", "enforcement prepare"), so
+    // the full subcommand joins the first two words (ADR-038 clause 12), and
+    // so is `task verdict` ("verdict add", "verdict gate", "verdict list").
+    // Every other command's subcommand is one word.
+    let spec_sub: Option<String> =
+        if command == "access" || (command == "task" && sub == Some("verdict")) {
+            match (sub, args.positionals.get(2)) {
+                (Some(first), Some(second)) => Some(format!("{first} {second}")),
+                (Some(first), None) => Some(first.to_owned()),
+                (None, _) => None,
+            }
+        } else {
+            sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command))
+                .map(str::to_owned)
+        };
+
+    // Ahead of the selector refusal below, because a flag that no longer
+    // exists is the more actionable complaint about the same command line:
+    // `rule list --global --project ONE` must still say `--global` was
+    // superseded rather than start with the `--project` that is merely
+    // inapplicable.
+    if args.has("global") && (command == "rule" || command == "events") {
+        bail!("--global is superseded; all /kb rules are one tag-scoped collection");
+    }
+
+    // Ahead of everything else, including the three commands below that answer
+    // without validating anything and the data-root lock that reads `--db`
+    // itself: a selector this command cannot honour is a refusal, not
+    // something to discard on the way to a confident answer.
+    reject_ignored_selectors(&args, command, spec_sub.as_deref())?;
 
     if command == "version" {
         emit(&version_string())?;
@@ -2150,22 +5902,54 @@ fn run() -> Result<()> {
         return mcp::serve();
     }
 
-    if args.has("global") && (command == "rule" || command == "events") {
-        bail!("--global is superseded; all /kb rules are one tag-scoped collection");
-    }
+    // Before any board resolution, the data-root lock, or a store open: in
+    // managed multi-user mode, refuse the five selector bypasses by name
+    // (ADR-038 clause 9). A spawned MCP command process reaches this same gate
+    // through the ordinary CLI it runs, so it is refused the same way.
+    refuse_managed_bypasses(&args)?;
 
-    let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
-    match command_spec(command, spec_sub) {
+    let creation = board_creation(command, spec_sub.as_deref());
+    match command_spec(command, spec_sub.as_deref()) {
         Some((allowed, positionals)) => {
-            args.reject_unknown(allowed)?;
-            args.reject_repeated_for(Some(command))?;
-            args.reject_extra_positionals(arity(spec_sub, positionals))?;
+            args.reject_unknown(allowed, ignored_selectors(command, spec_sub.as_deref()).0)?;
+            args.reject_repeated_for(Some(command), spec_sub.as_deref())?;
+            args.reject_extra_positionals(arity(spec_sub.as_deref(), positionals))?;
+            // Before the data-root lock and before any store: a command that
+            // cannot run must not have created a board on its way to saying so.
+            let mut words = vec![command];
+            words.extend(spec_sub.as_deref());
+            args.reject_missing_positionals(&words, positionals)?;
             args.reject_conflicting_board_selectors()?;
         }
         None => bail!("unknown command; run kanban --help"),
     }
 
     require_sane_clock()?;
+
+    let adopt_request = if command == "workspace" && sub == Some("adopt") {
+        let source = PathBuf::from(args.require("from-board")?);
+        let name = args.require("name")?;
+        let actor = args.require("as")?.to_owned();
+        let rootless = args.has("rootless");
+        let workspace = args.one("workspace").map(PathBuf::from);
+        if rootless && workspace.is_some() {
+            bail!("--rootless cannot be combined with --workspace");
+        }
+        if !rootless && workspace.is_none() {
+            bail!("workspace adopt requires either --workspace PATH or --rootless");
+        }
+        Some((
+            PreparedAdoption::prepare(&source, name)?,
+            workspace,
+            rootless,
+            actor,
+        ))
+    } else {
+        None
+    };
+    if adopt_request.is_some() {
+        preflight_live_root_for_adoption()?;
+    }
 
     // Held until `run` returns. `restore` replaces database files behind
     // SQLite's back, so it needs the data root to itself; everything else
@@ -2174,15 +5958,55 @@ fn run() -> Result<()> {
     // itself calls to write its rescue snapshot — an flock conflicts with a
     // second descriptor in the same process, so a lower-level acquire would
     // deadlock restore against itself.
-    let _data_root = if lock::touches_data_root(direct_db(&args).as_deref()) {
-        Some(if command == "restore" {
-            lock::exclusive()?
-        } else {
-            lock::shared()?
-        })
+    // A command that discards `--db` must not have its locking decided by one.
+    // `touches_data_root` asks whether the board this invocation addresses lies
+    // outside the data root, and for these commands the answer is that they
+    // address the data root itself whatever any `--db` says. Reading the
+    // discarded selector anyway made the flag's *only* effect the suppression
+    // of the lock: `KANBAN_DB=/tmp/elsewhere.db kanban restore --from SNAP
+    // --force` replaced the entire data root with no exclusive lock, and
+    // `backup`, `init` and `doctor` skipped the shared one the same way.
+    //
+    // Refusing the flag cannot close this. `reject_ignored_selectors` counts
+    // typed flags only — correctly, because every agent cage exports
+    // `KANBAN_DB` and an exported default must not break `doctor` — so the
+    // environment reaches `board_selection` untouched. The lock decision is
+    // where it has to be fixed, and `None` is the fail-closed answer:
+    // `touches_data_root(None)` is true, so the lock is taken.
+    let addressed_board = match ignored_selectors(command, spec_sub.as_deref())
+        .0
+        .contains(&"db")
+    {
+        true => None,
+        false => direct_db(&args),
+    };
+    let _data_root = if lock::touches_data_root(addressed_board.as_deref()) {
+        Some(
+            if command == "restore" || (command == "workspace" && sub == Some("adopt")) {
+                lock::exclusive()?
+            } else {
+                lock::shared()?
+            },
+        )
     } else {
         None
     };
+
+    // Adoption validates and snapshots the source before any live write. Once
+    // the source is pinned, the exclusive data-root lock above stays in force
+    // across root preparation, helper execution, registry commit, and cleanup.
+    if let Some((prepared, workspace, rootless, actor)) = adopt_request {
+        if let Err(error) = prepare_live_root_for_adoption() {
+            return Err(prepared.abort(error));
+        }
+        let record =
+            match spawn_workspace_adopt_helper(&prepared, workspace.as_deref(), rootless, &actor) {
+                Ok(record) => record,
+                Err(error) => return Err(prepared.abort(error)),
+            };
+        prepared.cleanup()?;
+        return print(&record, args.has("json"));
+    }
 
     if command == "init" {
         if args.has("rootless") && args.one("workspace").is_some() {
@@ -2201,12 +6025,20 @@ fn run() -> Result<()> {
             args.has("force"),
             args.one("as").unwrap_or("system@cli"),
         )?;
-        let mut store = Store::open(Path::new(&record.board_path))?;
+        let mut store = Store::open_as_caller(Path::new(&record.board_path))?;
         store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("list") {
-        return print(&Registry::open()?.list(args.has("all"))?, args.has("json"));
+        // Read-only, like every other read: this is the FIRST call a resuming
+        // driver makes (`kb ws ls --json`, before it knows which project it is
+        // in), and it used to die on a `registry.db` the caller cannot write.
+        // The writable open would also re-permission the file to 0600 on the
+        // way past, which is a write to a registry nobody asked to change.
+        return print(
+            &Registry::open_for_read()?.list(args.has("all"))?,
+            args.has("json"),
+        );
     }
     if command == "workspace" && sub == Some("attach") {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
@@ -2221,6 +6053,18 @@ fn run() -> Result<()> {
     if command == "workspace" && sub == Some("detach") {
         let mut registry = Registry::open()?;
         let record = registry.detach(args.require("root")?, args.require("as")?)?;
+        return print(&record, args.has("json"));
+    }
+    if command == "workspace" && sub == Some("retire") {
+        let mut registry = Registry::open()?;
+        let name = rest.first().context("workspace name is required")?;
+        let record = registry.retire(name, args.require("as")?, args.require("note")?)?;
+        return print(&record, args.has("json"));
+    }
+    if command == "workspace" && sub == Some("unretire") {
+        let mut registry = Registry::open()?;
+        let name = rest.first().context("workspace name is required")?;
+        let record = registry.unretire(name, args.require("as")?)?;
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("repoint") {
@@ -2246,24 +6090,60 @@ fn run() -> Result<()> {
         return print(&repointed, args.has("json"));
     }
     if command == "dashboard" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut output = Vec::new();
-        for project in registry.projects()? {
+        for project in projects {
             let mut value = object_of(&project)?;
-            if !board_is_present(&project.board_path) {
-                value.insert("boardMissing".into(), json!(true));
-                output.push((
-                    i64::MAX,
-                    i64::MAX,
-                    project.name.clone(),
-                    Value::Object(value),
-                ));
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {
+                    value.insert("boardState".into(), json!("readable"));
+                }
+                SurveyBoard::Unreadable(reason) => {
+                    // Deliberately not `boardMissing`. That flag is the one a
+                    // reader acts on, and acting on it here means restoring a
+                    // snapshot over a file that is still there.
+                    value.insert("boardState".into(), json!("unreadable"));
+                    value.insert("boardUnreadableReason".into(), json!(reason));
+                    output.push((
+                        i64::MAX,
+                        i64::MAX,
+                        project.name.clone(),
+                        Value::Object(value),
+                    ));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    value.insert("boardState".into(), json!("missing"));
+                    value.insert("boardMissing".into(), json!(true));
+                    output.push((
+                        i64::MAX,
+                        i64::MAX,
+                        project.name.clone(),
+                        Value::Object(value),
+                    ));
+                    continue;
+                }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
-            let tasks = store.list_tasks(None, None, false)?;
-            let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
-            let attention = store.attention(Some("open"), None, None, None, 1000, false)?;
+            let Some(store) =
+                Store::open_for_estate_listing_as_caller(Path::new(&project.board_path))?
+            else {
+                continue;
+            };
+            let tasks = store.list_tasks(None, None, None, None, false)?;
+            // Counted, not fetched: a listing page passed off as a count told
+            // an operator 100 pending handoffs on a board holding 101, with
+            // nothing to say it had stopped. The ranking below needs only the
+            // most urgent row of each, which both listings put first.
+            let pending_handoffs = store.count_pending_handoffs()?;
+            let open_attention = store.count_open_attention()?;
+            let urgent_handoff = store.handoffs(None, Some("pending"), None, 1, false)?;
+            let urgent_attention =
+                store.attention(Some("open"), None, None, None, None, 1, false)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -2272,22 +6152,57 @@ fn run() -> Result<()> {
                 );
             }
             value.insert("taskCounts".into(), Value::Object(counts));
-            value.insert("pendingHandoffs".into(), json!(handoffs.len()));
+            value.insert("pendingHandoffs".into(), json!(pending_handoffs));
             // The count an operator most needs to see without being asked: a
             // record raised for them that nobody has settled.
-            value.insert("openAttention".into(), json!(attention.len()));
+            value.insert("openAttention".into(), json!(open_attention));
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
+            // Not folded into the status counts beside it: a gated row keeps
+            // whatever status it holds, and renaming `todo` to something
+            // narrower would leave the board's own totals not adding up.
+            value.insert("gatedTasks".into(), json!(store.count_gated_tasks()?));
+            if let Some(sprint) = store.current_sprint()? {
+                let (open_tasks, done_tasks) = store.sprint_task_counts(&sprint.id)?;
+                let day = 24 * 60 * 60 * 1000_i64;
+                let remaining = sprint.scheduled_end.saturating_sub(now_ms());
+                let days_remaining = if remaining <= 0 {
+                    0
+                } else {
+                    (remaining + day - 1) / day
+                };
+                let goal = crate::model::sprint_goal(sprint.body.as_deref());
+                value.insert(
+                    "currentSprint".into(),
+                    json!({
+                        "id": sprint.id,
+                        "title": sprint.title,
+                        "status": sprint.status,
+                        "targetVersion": sprint.target_version,
+                        "scheduledStart": sprint.scheduled_start,
+                        "scheduledEnd": sprint.scheduled_end,
+                        "daysRemaining": days_remaining,
+                        "open": open_tasks,
+                        "done": done_tasks,
+                        "goal": goal,
+                        "body": sprint.body,
+                    }),
+                );
+            }
             let queued = tasks
                 .iter()
                 .filter(|task| task.status == "todo")
                 .map(|task| (task.priority, task.created_at))
                 .chain(
-                    attention
+                    urgent_attention
                         .iter()
                         .map(|item| (item.priority, item.created_at)),
                 )
-                .chain(handoffs.iter().map(|item| (item.priority, item.created_at)))
+                .chain(
+                    urgent_handoff
+                        .iter()
+                        .map(|item| (item.priority, item.created_at)),
+                )
                 .collect::<Vec<_>>();
             let highest = queued.iter().map(|(priority, _)| *priority).min();
             let oldest_at_highest = highest
@@ -2341,13 +6256,25 @@ fn run() -> Result<()> {
         let mut healthy = registry_audit.healthy;
         let mut boards = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                healthy = false;
-                missing.push(project.name);
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    // Not healthy: an unopened ledger has had nothing verified
+                    // about it, and this command's whole output is a claim
+                    // about ledgers it verified.
+                    healthy = false;
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    healthy = false;
+                    missing.push(project.name);
+                    continue;
+                }
             }
-            let store = Store::open_readonly(Path::new(&project.board_path))?;
+            let store = Store::open_readonly_as_caller(Path::new(&project.board_path))?;
             let mut audit = store.audit()?;
             if let Some(record) = anchor.as_ref().and_then(|manifest| {
                 let current_name = Path::new(&project.board_path).file_name()?;
@@ -2365,6 +6292,7 @@ fn run() -> Result<()> {
             "registry": registry_audit,
             "boards": boards,
             "missingBoards": missing,
+            "unreadableBoards": unreadable,
         });
         print(&receipt, args.has("json"))?;
         if !healthy {
@@ -2373,27 +6301,62 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if command == "doctor" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
         let registry_check = registry.integrity()?;
         let registry_audit = registry.audit()?;
+        let active_rule_selectors = registry.active_rule_selector_health()?;
         let registry_schema = db::schema_version(&registry.connection)?;
+        let registry_projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut projects = Vec::new();
         // Roots are discovery hints, not board identity (ADR-028). Keep stale
         // hints visible so an operator can repoint or retire them, but do not
         // fail an otherwise healthy board that remains reachable by name.
         let unreachable = registry.unreachable_roots()?;
-        let mut healthy = registry_check == vec!["ok"] && registry_audit.healthy;
-        for project in registry.projects()? {
+        let mut healthy =
+            registry_check == vec!["ok"] && registry_audit.healthy && active_rule_selectors.healthy;
+        for project in registry_projects {
             // Checked before opening, because opening would create it.
-            if !board_is_present(&project.board_path) {
-                healthy = false;
-                let mut value = object_of(&project)?;
-                value.insert("present".into(), json!(false));
-                value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
-                projects.push(Value::Object(value));
-                continue;
+            //
+            // `present` keeps the value it has always carried: true exactly
+            // when this run opened the path and found a board, false otherwise.
+            // That is unchanged for both a healthy board and a deleted one, so
+            // no adapter reading it sees a different answer than before. What
+            // was missing is a way to tell the two `false` cases apart, and
+            // `boardState` is that field — read it rather than `present` to
+            // decide whether anything needs recovering.
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    // Unhealthy, and not because anything is known to be wrong
+                    // with the board. Nothing about it was checked at all:
+                    // integrity, orphans, future dating, the search index and
+                    // the audit chain each need the file open. Reporting
+                    // healthy here would be certifying a file this process
+                    // never read.
+                    healthy = false;
+                    let mut value = object_of(&project)?;
+                    value.insert("present".into(), json!(false));
+                    value.insert("boardState".into(), json!("unreadable"));
+                    value.insert("unreadableReason".into(), json!(reason));
+                    value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+                    projects.push(Value::Object(value));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    healthy = false;
+                    let mut value = object_of(&project)?;
+                    value.insert("present".into(), json!(false));
+                    value.insert("boardState".into(), json!("missing"));
+                    value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+                    projects.push(Value::Object(value));
+                    continue;
+                }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
+            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
             let board_schema = db::schema_version(&store.connection)?;
             let check = store.integrity()?;
             // `integrity_check` validates the b-tree and nothing about what
@@ -2401,16 +6364,26 @@ fn run() -> Result<()> {
             // note on a task that is gone, or work stamped in the future whose
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
+            let task_links = store.orphaned_task_links()?;
+            let reused_links = store.reused_task_links()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
+            // `reusedTaskLinks` is advisory and stays out of `healthy`: it
+            // names a known historical residual — a NULL-linked row whose
+            // creation event names a removed-but-live-again id, left by
+            // ordinary pre-V34 product behaviour — that no verb can clear, so
+            // failing on it would hold every such board red permanently.
+            // `orphanedTaskLinks` still fails: a dangling link is corruption.
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
+                && task_links.is_empty()
                 && future.is_empty()
                 && search_index.healthy
                 && audit.healthy;
             let mut value = object_of(&project)?;
             value.insert("present".into(), json!(true));
+            value.insert("boardState".into(), json!("readable"));
             value.insert("schemaVersion".into(), json!(board_schema));
             value.insert(
                 "supportedSchemaVersion".into(),
@@ -2418,20 +6391,30 @@ fn run() -> Result<()> {
             );
             value.insert("integrity".into(), json!(check));
             value.insert("orphanedRows".into(), json!(orphans));
+            value.insert("orphanedTaskLinks".into(), json!(task_links));
+            value.insert("reusedTaskLinks".into(), json!(reused_links));
             value.insert("futureDatedTasks".into(), json!(future));
             value.insert("searchIndex".into(), json!(search_index));
             value.insert("audit".into(), json!(audit));
             value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
             projects.push(Value::Object(value));
         }
+        let policy_epoch = registry.policy_epoch()?;
+        let policy_head = policy_journal_head(&registry)?;
         let result = json!({
             "healthy": healthy,
             "registry": registry_check,
             "registryAudit": registry_audit,
+            "activeRuleSelectors": active_rule_selectors,
             "registrySchemaVersion": registry_schema,
             "supportedRegistrySchemaVersion": db::REGISTRY_SCHEMA_VERSION,
             "supportedBoardSchemaVersion": db::BOARD_SCHEMA_VERSION,
             "unreachableRoots": unreachable,
+            "policy": {
+                "epoch": policy_epoch,
+                "enforcementState": registry.enforcement_state()?,
+                "journalHead": policy_head,
+            },
             "projects": projects,
         });
         print(&result, args.has("json"))?;
@@ -2440,14 +6423,11 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
-    if command == "serve" {
-        return serve::serve(args.port(serve::DEFAULT_PORT)?);
-    }
     if command == "watch" {
         return watch::run(&args);
     }
     if command == "backup" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
         let directory = args
             .one("output")
             .map(PathBuf::from)
@@ -2456,23 +6436,43 @@ fn run() -> Result<()> {
         registry.backup(&registry_path)?;
         let mut board_files = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
             // A snapshot of what is still here beats refusing to snapshot
-            // anything, but it has to say what it could not include.
-            if !board_is_present(&project.board_path) {
-                missing.push(project.board_path.clone());
-                continue;
+            // anything, but it has to say what it could not include — and
+            // "missing", about a file that is sitting right there, is not
+            // saying it. Backup stays permissive because refusing to snapshot
+            // eight healthy boards over a ninth's permission bit throws away
+            // the recovery this command exists to provide; `restore` is where
+            // the refusal belongs, because `restore` is the destructive half.
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.board_path.clone());
+                    continue;
+                }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
+            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
             let file_name = Path::new(&project.board_path)
                 .file_name()
                 .with_context(|| format!("board path has no file name: {}", project.board_path))?;
             let destination = directory.join("boards").join(file_name);
             store.backup(&destination)?;
-            board_files.push((project.name, destination));
+            board_files.push((Some(project.name), destination));
         }
-        let (manifest, manifest_sha256) =
-            write_snapshot_manifest(&directory, &registry_path, &board_files, &missing)?;
+        let (manifest, manifest_sha256) = write_snapshot_manifest(
+            &directory,
+            &registry_path,
+            &board_files,
+            &missing,
+            &unreadable,
+            // `backup` opens every board it copies, so it never produces one.
+            &[],
+        )?;
         let boards = board_files
             .iter()
             .map(|(_, path)| path.to_string_lossy().into_owned())
@@ -2487,6 +6487,7 @@ fn run() -> Result<()> {
                 "registry":registry_path,
                 "boards":boards,
                 "missingBoards":missing,
+                "unreadableBoards":unreadable,
                 "manifest":manifest,
                 "manifestSha256":manifest_sha256,
                 "pruned":pruned,
@@ -2498,14 +6499,47 @@ fn run() -> Result<()> {
         return restore(&args);
     }
 
-    if command == "rule" && sub == Some("consolidate") {
-        for flag in ["project", "workspace", "db", "global"] {
-            if args.has(flag) {
-                bail!(
-                    "rule consolidate addresses every registered board; --{flag} would imply a partial migration"
-                );
-            }
+    if command == "rule" && sub == Some("export") {
+        let boards = args.many("board");
+        if boards.is_empty() {
+            bail!("rule export requires at least one --board");
         }
+        let bundle = Registry::open_readonly()?.export_rules(args.require("as")?, &boards)?;
+        if let Some(output) = args.one("output") {
+            let source_boards = bundle.source_boards.clone();
+            let rules_exported = bundle.rules.len();
+            let source_registry_audit_head = bundle.source_registry_audit.head.clone();
+            fs::write(output, serde_json::to_vec_pretty(&bundle)?)?;
+            return print(
+                &json!({
+                    "written": output,
+                    "sourceBoards": source_boards,
+                    "rulesExported": rules_exported,
+                    "sourceRegistryAuditHead": source_registry_audit_head,
+                }),
+                args.has("json"),
+            );
+        }
+        return print(&bundle, args.has("json"));
+    }
+
+    if command == "rule" && sub == Some("import") {
+        let path = rest
+            .first()
+            .context("rule transfer bundle path is required")?;
+        let bundle: crate::model::RuleTransferBundle =
+            serde_json::from_slice(&read_transfer_bundle(Path::new(path))?)?;
+        return print(
+            &Registry::open()?.import_rules(args.require("as")?, bundle)?,
+            args.has("json"),
+        );
+    }
+
+    if command == "rule" && sub == Some("consolidate") {
+        // The board selectors are refused by `reject_ignored_selectors` from
+        // the table, before this branch is reached. `--global` needs no loop
+        // here either: it is refused for every `rule` and `events` invocation
+        // above, as superseded rather than inapplicable.
         return print(
             &Registry::open()?.consolidate_board_rules(args.require("as")?)?,
             args.has("json"),
@@ -2519,24 +6553,42 @@ fn run() -> Result<()> {
         if args.has("after") || args.has("before") {
             bail!("--after and --before only apply to board events");
         }
+        // `watch --registry` has refused these since it was written; `events`
+        // read the same registry trail and accepted them, so the two disagreed
+        // about the same command line.
+        if args.has("project") || args.has("workspace") || args.has("db") {
+            bail!(
+                "--project, --workspace and --db address boards; --registry and --rule read the registry trail"
+            );
+        }
+        let registry = Registry::open_readonly()?;
         return print(
-            &Registry::open_readonly()?.rule_events(
-                args.one("rule"),
-                args.one("kind"),
-                args.limit(50)?,
-            )?,
+            &args.bounded_page_naming_explicit_cuts(50, "events", |limit| {
+                registry.rule_events(args.one("rule"), args.one("kind"), limit)
+            })?,
             args.has("json"),
         );
     }
 
-    if command == "rule" {
-        for flag in ["project", "workspace", "db"] {
-            if args.has(flag) {
-                bail!(
-                    "rules are registry-owned and tag-scoped; --{flag} does not select a rule collection"
-                );
-            }
+    // The two rule reads, ahead of the writable block below: `rule export`
+    // already opened read-only, and these two are the same kind of answer.
+    // Board selectors are refused from the table, before dispatch.
+    if command == "rule" && (sub == Some("list") || sub == Some("show")) {
+        let registry = Registry::open_for_read()?;
+        if sub == Some("show") {
+            return print(
+                &registry.rule(rest.first().context("rule id is required")?)?,
+                args.has("json"),
+            );
         }
+        if args.has("full") {
+            return print(&registry.rules(args.has("all"))?, args.has("json"));
+        }
+        return print(&registry.rule_summaries(args.has("all"))?, args.has("json"));
+    }
+
+    if command == "rule" {
+        // Board selectors are refused from the table, before dispatch.
         let mut registry = Registry::open()?;
         if sub == Some("add") {
             let flagged = args.body()?;
@@ -2552,6 +6604,7 @@ fn run() -> Result<()> {
             let tags = registry.canonical_rule_tags(
                 &args.many("board"),
                 &args.many("except-board"),
+                args.one("sprint"),
                 &args.many("tag"),
             )?;
             return print(
@@ -2559,21 +6612,11 @@ fn run() -> Result<()> {
                 args.has("json"),
             );
         }
-        if sub == Some("list") {
-            if args.has("full") {
-                return print(&registry.rules(args.has("all"))?, args.has("json"));
-            }
-            return print(&registry.rule_summaries(args.has("all"))?, args.has("json"));
-        }
-        if sub == Some("show") {
-            return print(
-                &registry.rule(rest.first().context("rule id is required")?)?,
-                args.has("json"),
-            );
-        }
         if sub == Some("update") {
-            if args.has("tag") && args.has("clear-tags") {
-                bail!("--tag and --clear-tags are mutually exclusive");
+            for (left, right) in [("tag", "clear-tags"), ("sprint", "clear-sprint")] {
+                if args.has(left) && args.has(right) {
+                    bail!("--{left} and --{right} are mutually exclusive");
+                }
             }
             let id = rest.first().context("rule id is required")?;
             let body = args.body()?;
@@ -2590,11 +6633,19 @@ fn run() -> Result<()> {
             } else {
                 None
             };
+            let sprint = if let Some(value) = args.one("sprint") {
+                Some(Some(value))
+            } else if args.has("clear-sprint") {
+                Some(None)
+            } else {
+                None
+            };
             return print(
                 &registry.update_rule(
                     id,
                     body.as_deref(),
                     selector_tags.as_deref(),
+                    sprint,
                     subsystem_tags.as_deref(),
                     args.require("as")?,
                 )?,
@@ -2620,7 +6671,7 @@ fn run() -> Result<()> {
         return print(&search_command(&args, query)?, args.has("json"));
     }
     if command == "search-rebuild" {
-        return print(&rebuild_search_command(&args)?, args.has("json"));
+        return print(&rebuild_search_command(&args, creation)?, args.has("json"));
     }
 
     if command == "claim" && args.has("candidates") {
@@ -2634,7 +6685,7 @@ fn run() -> Result<()> {
                 "claim --candidates creates no lease; --session and --lease-minutes do not apply"
             );
         }
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         let options = ClaimOptions {
             git: None,
             agent_id: args.require("as")?.into(),
@@ -2645,31 +6696,59 @@ fn run() -> Result<()> {
             caller_scope: option_string(&args, "caller-scope"),
             cross_lane: !args.has("no-cross-lane"),
             allow_reassign: args.has("allow-reassign"),
+            sprint_override: claim_sprint_override(&args)?,
+            model: option_string(&args, "model"),
         };
-        let limit =
-            usize::try_from(args.limit(100)?).context("--limit is too large for this platform")?;
         return print(
-            &store.claim_candidates(&options, args.one("tag"), limit)?,
+            &args.bounded_page(100, "claim candidates", |limit| {
+                let limit =
+                    usize::try_from(limit).context("--limit is too large for this platform")?;
+                store.claim_candidates(&options, args.one("tag"), limit)
+            })?,
             args.has("json"),
         );
     }
 
     if command == "subscription" && sub == Some("list") {
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         return print(
             &store.subscriptions(args.one("status"), args.one("consumer"), args.has("all"))?,
             args.has("json"),
         );
     }
     if command == "subscription" && sub == Some("show") {
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         return print(
             &store.require_subscription(rest.first().context("subscription id is required")?)?,
             args.has("json"),
         );
     }
 
-    let mut store = open_store(&args)?;
+    // The `access` surface (ADR-038 clause 12) addresses the policy registry,
+    // never a board, so it is dispatched before the board store opens and never
+    // opens one. It is also the only surface that mints a policy actor.
+    if command == "access" {
+        return run_access(&args, spec_sub.as_deref());
+    }
+
+    // Before the single open site, because a batch opens the board itself and
+    // lends it to every item (ADR-041 §3.4), and after the data-root lock,
+    // because the batch holds that lock for the whole list rather than once
+    // per item.
+    if command == "transact" {
+        return run_transact(&args, creation);
+    }
+
+    // One open site for the whole rest of the surface, and the only place that
+    // decides between reading and writing the board. `mut` is for the writing
+    // arms below; a read-only connection carries `PRAGMA query_only`, so a
+    // command mis-filed in `READ_ONLY_BOARD_COMMANDS` fails loudly on its
+    // first write rather than silently dropping it.
+    let mut store = if reads_only_one_board(command, spec_sub.as_deref().or(sub)) {
+        open_store_for_read(&args)?
+    } else {
+        open_store(&args, creation)?
+    };
     if command == "subscription" && sub == Some("add") {
         for required in [
             "consumer",
@@ -2736,7 +6815,12 @@ fn run() -> Result<()> {
             &store.start_deployment(StartDeployment {
                 task_id: option_string(&args, "task"),
                 repo: args.require("repo")?.to_owned(),
-                commit_sha: args.require("commit")?.to_owned(),
+                identity: DeployIdentity::parse(
+                    args.one("commit"),
+                    args.one("build-commit"),
+                    &args.many("artifact"),
+                )?,
+                deployer_checkout: option_string(&args, "deployer-checkout"),
                 branch: option_string(&args, "branch"),
                 tier: args.require("tier")?.to_owned(),
                 environment: args.require("environment")?.to_owned(),
@@ -2747,6 +6831,7 @@ fn run() -> Result<()> {
                 retry_of: option_string(&args, "retry-of"),
                 actor: args.require("as")?.to_owned(),
                 lane: option_string(&args, "lane"),
+                sprint_id: option_string(&args, "sprint"),
             })?,
             args.has("json"),
         );
@@ -2761,7 +6846,9 @@ fn run() -> Result<()> {
                 receipt: option_string(&args, "receipt"),
                 artifact_uri: option_string(&args, "artifact-uri"),
                 served_commit: option_string(&args, "served-commit"),
+                observed: ArtifactIdentity::parse(&args.many("observed"), "--observed")?,
                 actor: args.require("as")?.to_owned(),
+                served_version: option_string(&args, "served-version"),
             })?,
             args.has("json"),
         );
@@ -2786,12 +6873,9 @@ fn run() -> Result<()> {
     }
     if command == "deploy" && sub == Some("list") {
         return print(
-            &store.deployments(
-                args.one("status"),
-                args.one("tier"),
-                args.has("all"),
-                args.limit(100)?,
-            )?,
+            &args.bounded_page(100, "deployments", |limit| {
+                store.deployments(args.one("status"), args.one("tier"), args.has("all"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -2813,37 +6897,60 @@ fn run() -> Result<()> {
     }
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
-        let task = store.add_task(crate::model::AddTask {
-            tags: args.many("tag"),
-            id: option_string(&args, "id"),
-            task_type: args.one("type").unwrap_or("task").into(),
-            parent_id: option_string(&args, "parent"),
-            title,
-            actor: Some(args.one("as").unwrap_or("system@cli").to_owned()),
-            body: args.body()?,
-            assignee: option_string(&args, "assignee"),
-            lane: option_string(&args, "lane"),
-            deliverable: option_string(&args, "deliverable"),
-            stale_minutes: args.optional_integer("stale-minutes")?,
-            driver_only: args.has("driver-only"),
-            status: args.one("status").unwrap_or("todo").into(),
-            priority: args.priority(6)?,
-            dependencies: args.many("depends-on"),
-            metadata: json!({}),
-        })?;
+        let task = store.add_task_in_sprint(
+            crate::model::AddTask {
+                tags: args.many("tag"),
+                allowed_models: args.many("allowed-model"),
+                id: option_string(&args, "id"),
+                task_type: args.one("type").unwrap_or("task").into(),
+                parent_id: option_string(&args, "parent"),
+                title,
+                actor: Some(args.one("as").unwrap_or("system@cli").to_owned()),
+                body: args.body()?,
+                assignee: option_string(&args, "assignee"),
+                lane: option_string(&args, "lane"),
+                deliverable: option_string(&args, "deliverable"),
+                stale_minutes: args.optional_integer("stale-minutes")?,
+                driver_only: args.has("driver-only"),
+                status: args.one("status").unwrap_or("todo").into(),
+                priority: args.priority(6)?,
+                dependencies: args.many("depends-on"),
+                metadata: json!({}),
+            },
+            args.one("sprint"),
+        )?;
         return print(&task, args.has("json"));
     }
     if command == "task" && sub == Some("list") {
-        return print(
-            &list_json(
-                &store,
-                args.one("status"),
-                args.one("tag"),
-                args.has("with-relations"),
-                args.has("all"),
-            )?,
-            args.has("json"),
-        );
+        let claims = args.has("with-claims");
+        let relations = args.has("with-relations");
+        let mut fields = TASK_FIELDS.to_vec();
+        if claims {
+            fields.push(TASK_CLAIM_FIELD);
+        }
+        if relations {
+            fields.push(TASK_RELATION_FIELD);
+            fields.push(TASK_GATE_FIELD);
+        }
+        // Checked before the query, so a misspelt key is refused without
+        // reading the board.
+        let keep = projection(&args, &fields, &TASK_GATED_FIELDS)?;
+        let mut rows = list_json(
+            &store,
+            TaskListQuery {
+                status: args.one("status"),
+                tag: args.one("tag"),
+                lane: args.one("lane"),
+                allowed_model: args.one("allowed-model"),
+                include_archived: args.has("all"),
+            },
+            claims,
+            relations,
+        )?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
     }
     if command == "task" && sub == Some("show") {
         let id = rest.first().context("task id is required")?;
@@ -2854,15 +6961,29 @@ fn run() -> Result<()> {
             "dependencies".into(),
             serde_json::to_value(store.dependencies(id)?)?,
         );
+        value.insert(
+            "blockingGates".into(),
+            serde_json::to_value(store.blocking_gates(id)?)?,
+        );
         value.insert("claim".into(), serde_json::to_value(claim)?);
-        value.insert("notes".into(), serde_json::to_value(store.notes(id, 100)?)?);
+        // One --limit bounds all three histories: a task's record is read as
+        // one thing, and a caller raising it wants the whole of it. Each keeps
+        // its own default, and each refuses on its own past it (ADR-037).
+        value.insert(
+            "notes".into(),
+            serde_json::to_value(args.bounded_page(100, "notes", |limit| store.notes(id, limit))?)?,
+        );
         value.insert(
             "checkpoints".into(),
-            serde_json::to_value(store.checkpoints(id, 20)?)?,
+            serde_json::to_value(
+                args.bounded_page(20, "checkpoints", |limit| store.checkpoints(id, limit))?,
+            )?,
         );
         value.insert(
             "handoffs".into(),
-            serde_json::to_value(store.handoffs(Some(id), None, None, 100, true)?)?,
+            serde_json::to_value(args.bounded_page(100, "handoffs", |limit| {
+                store.handoffs(Some(id), None, None, limit, true)
+            })?)?,
         );
         return print(&Value::Object(value), args.has("json"));
     }
@@ -2876,6 +6997,37 @@ fn run() -> Result<()> {
             .unwrap_or_else(|| json!({}));
         let task = store.move_task(id, status, args.require("as")?, patch, args.has("force"))?;
         return print(&task, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict add") {
+        // `rest` still counts the joined subcommand word: [verdict, add, ID].
+        let id = rest.get(1).context("task id is required")?.clone();
+        let shas = args.many("sha");
+        if shas.is_empty() {
+            bail!("--sha is required");
+        }
+        let verdict = store.add_verdict(crate::model::VerdictInput {
+            task_id: id,
+            reviewer: args.require("reviewer")?.to_owned(),
+            shas,
+            evidence: args.many("evidence"),
+            writer: args.require("as")?.to_owned(),
+            attest_published: args.has("attest-published"),
+        })?;
+        return print(&verdict, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict gate") {
+        let state = rest.get(1).context("state is required")?;
+        let on = match state.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => bail!("task verdict gate takes on or off, got {state:?}"),
+        };
+        let receipt = store.set_done_gate(on, args.require("as")?)?;
+        return print(&receipt, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict list") {
+        let id = rest.get(1).context("task id is required")?;
+        return print(&store.list_verdicts(id)?, args.has("json"));
     }
     if command == "task" && sub == Some("remove") {
         let id = rest.first().context("task id is required")?;
@@ -2898,6 +7050,8 @@ fn run() -> Result<()> {
             ("parent", "clear-parent"),
             ("depends-on", "clear-dependencies"),
             ("tag", "clear-tags"),
+            ("sprint", "clear-sprint"),
+            ("allowed-model", "clear-allowed-models"),
         ] {
             if args.has(a) && args.has(b) {
                 bail!("--{a} and --{b} are mutually exclusive");
@@ -2908,6 +7062,13 @@ fn run() -> Result<()> {
                 Some(Vec::new())
             } else if args.flags.contains_key("tag") {
                 Some(args.many("tag"))
+            } else {
+                None
+            },
+            allowed_models: if args.has("clear-allowed-models") {
+                Some(Vec::new())
+            } else if args.flags.contains_key("allowed-model") {
+                Some(args.many("allowed-model"))
             } else {
                 None
             },
@@ -2954,6 +7115,13 @@ fn run() -> Result<()> {
                 Some(vec![])
             } else if args.has("depends-on") {
                 Some(args.many("depends-on"))
+            } else {
+                None
+            },
+            sprint: if let Some(value) = args.one("sprint") {
+                Some(Some(value.to_owned()))
+            } else if args.has("clear-sprint") {
+                Some(None)
             } else {
                 None
             },
@@ -3011,9 +7179,12 @@ fn run() -> Result<()> {
                 caller_scope: option_string(&args, "caller-scope"),
                 cross_lane: !args.has("no-cross-lane"),
                 allow_reassign: args.has("allow-reassign"),
+                sprint_override: claim_sprint_override(&args)?,
+                model: option_string(&args, "model"),
             },
         )?;
-        value.rules = effective_rule_summaries(&args, &store, Some(&value.claim.task_id))?;
+        value.rules =
+            effective_rule_summaries(&args, &store, Some(&value.claim.task_id), None, None)?;
         return print(&value, args.has("json"));
     }
     if command == "heartbeat" {
@@ -3048,9 +7219,9 @@ fn run() -> Result<()> {
     }
     if command == "checkpoint" {
         let id = sub.context("task id is required")?;
-        // Captured, not asked for: these columns were 100% empty because they
-        // depended on the caller passing them. An explicit flag still wins.
-        let git = here();
+        // Provenance is refused rather than stored blank (ADR-008): an explicit
+        // flag still wins, but a write that would leave one field empty bails.
+        let provenance = required_provenance(&args, here().as_ref())?;
         let value = store.checkpoint(CheckpointInput {
             task_id: id.into(),
             lease_token: args.require("lease")?.into(),
@@ -3063,14 +7234,11 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo")
-                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
-            branch: option_string(&args, "branch")
-                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
-            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
-            dirty_summary: option_string(&args, "dirty")
-                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
-            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
+            repo_path: Some(provenance.repo_path),
+            branch: Some(provenance.branch),
+            head_sha: Some(provenance.head_sha),
+            dirty_summary: Some(provenance.dirty_summary),
+            root_head: provenance.root_head,
         })?;
         return print(&value, args.has("json"));
     }
@@ -3078,7 +7246,7 @@ fn run() -> Result<()> {
         // No task id makes it a session handoff: about the work as a whole
         // rather than one row of it. The store refuses an id without its lease
         // and a lease without its id, since neither half means anything alone.
-        let git = here();
+        let provenance = required_provenance(&args, here().as_ref())?;
         let value = store.create_handoff(HandoffInput {
             task_id: rest.first().map(|id| (*id).to_owned()),
             lease_token: args.one("lease").map(str::to_owned),
@@ -3093,50 +7261,71 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo")
-                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
-            branch: option_string(&args, "branch")
-                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
-            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
-            dirty_summary: option_string(&args, "dirty")
-                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
-            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
+            repo_path: Some(provenance.repo_path),
+            branch: Some(provenance.branch),
+            head_sha: Some(provenance.head_sha),
+            dirty_summary: Some(provenance.dirty_summary),
+            root_head: provenance.root_head,
         })?;
         return print(&value, args.has("json"));
     }
     if command == "handoff" && sub == Some("list") {
         return print(
-            &store.handoffs(
-                args.one("task"),
-                args.one("status"),
-                args.one("to"),
-                100,
-                args.has("all"),
-            )?,
+            &args.bounded_page(100, "handoffs", |limit| {
+                store.handoffs(
+                    args.one("task"),
+                    args.one("status"),
+                    args.one("to"),
+                    limit,
+                    args.has("all"),
+                )
+            })?,
             args.has("json"),
         );
     }
     if command == "handoff" && sub == Some("accept") {
         let id = rest.first().context("handoff id is required")?;
+        // Best-effort, not refused: accept writes the acceptor's provenance to
+        // the claim row, and nothing gates on it (the dashboard renders it
+        // only when present), so a claim taken from outside a checkout is
+        // legitimate — unlike a checkpoint/handoff/sitrep, whose blank
+        // provenance would defeat the /session acceptance gate.
         let git = here();
         let (handoff, claim) = store.accept_handoff(
             id,
-            args.require("as")?,
-            option_string(&args, "session"),
-            lease_ms(&args)?,
-            args.one("caller-scope"),
-            git,
+            AcceptHandoffOptions {
+                agent: args.require("as")?.to_owned(),
+                session: option_string(&args, "session"),
+                lease_ms: lease_ms(&args)?,
+                caller_scope: option_string(&args, "caller-scope"),
+                sprint_override: claim_sprint_override(&args)?,
+                model: option_string(&args, "model"),
+                git,
+            },
         )?;
-        let rules = effective_rule_summaries(
-            &args,
-            &store,
-            claim
-                .as_ref()
-                .map(|claim| claim.task_id.as_str())
-                .or(handoff.task_id.as_deref()),
-        )?;
+        // An orphaned handoff names a removed task: rule summaries fall back
+        // to board scope exactly like a session acknowledgement, instead of
+        // refusing on the missing row. Only a task with no row at all takes
+        // the fallback — a live task keeps its selectors — and a lookup
+        // failure keeps the old refusal by resolving to `true`.
+        let rule_task = claim
+            .as_ref()
+            .map(|claim| claim.task_id.as_str())
+            .or(handoff.task_id.as_deref())
+            .filter(|id| store.task_row_exists(id).unwrap_or(true));
+        let rules = effective_rule_summaries(&args, &store, rule_task, None, None)?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
+            args.has("json"),
+        );
+    }
+    if command == "handoff" && sub == Some("retire") {
+        return print(
+            &store.retire_handoff(
+                rest.first().context("handoff id is required")?,
+                args.require("as")?,
+                args.require("note")?,
+            )?,
             args.has("json"),
         );
     }
@@ -3179,9 +7368,25 @@ fn run() -> Result<()> {
     }
     if command == "tag" && sub == Some("add") {
         let name = rest.first().context("tag name is required")?;
+        // The shape first, so a malformed name keeps `validate_tag_name`'s
+        // sentence; then the namespace, built from the board's own estate.
+        let name = crate::store::validate_tag_name(name)?;
+        // Inside a batch the board is the one transact opened: an item argv
+        // carries no board selector (`plan_transact` refuses one), so the
+        // registry selection would fall through to the cwd's workspace and
+        // name the wrong estate — or bail on a retired cwd board that has
+        // nothing to do with the batch.
+        let board = if store.in_batch() {
+            store.board_name()?.unwrap_or_default()
+        } else {
+            selected_board_name(&args)?
+                .or(store.board_name()?)
+                .unwrap_or_default()
+        };
+        crate::store::refuse_bare_tag_name(&board, &name)?;
         return print(
             &store.add_tag(
-                name,
+                &name,
                 args.one("description"),
                 Some(args.one("as").unwrap_or("system@cli")),
             )?,
@@ -3190,6 +7395,30 @@ fn run() -> Result<()> {
     }
     if command == "tag" && sub == Some("list") {
         return print(&store.tags()?, args.has("json"));
+    }
+    if command == "tag" && sub == Some("rename") {
+        let old = rest.first().context("the tag to rename is required")?;
+        let new = rest.get(1).context("the new tag name is required")?;
+        let actor = args.require("as")?.to_owned();
+        let board = selected_board_name(&args)?;
+        // The board first, always: `rename_tag` documents why, and the queue
+        // below is what keeps that order true inside a `transact` batch, whose
+        // board write does not land until every item has run.
+        let mut renamed = store.rename_tag(old, new, Some(&actor))?;
+        let pending = PendingRuleTagRename {
+            old: old.clone(),
+            new: new.clone(),
+            board,
+            actor,
+        };
+        renamed.rules = if store.in_batch() {
+            let uses = Registry::open()?.rule_tag_uses(&pending.old, pending.board.as_deref())?;
+            PENDING_RULE_TAG_RENAMES.with_borrow_mut(|queue| queue.push(pending));
+            uses
+        } else {
+            pending.apply()?
+        };
+        return print(&renamed, args.has("json"));
     }
     if command == "tag" && sub == Some("remove") {
         let name = rest.first().context("tag name is required")?;
@@ -3213,6 +7442,7 @@ fn run() -> Result<()> {
     }
     if command == "attention" && sub == Some("raise") {
         let text = rest.first().context("attention text is required")?;
+        let check_input = args.attention_check_input();
         return print(
             &store.raise_attention(
                 text,
@@ -3221,27 +7451,58 @@ fn run() -> Result<()> {
                 args.one("task"),
                 args.priority(6)?,
                 &args.many("tag"),
+                &args.decision_card()?,
+                Some(&check_input),
+                args.one("lane"),
             )?,
             args.has("json"),
         );
+    }
+    if command == "attention" && sub == Some("list") && args.has("check-report") {
+        return attention_check_report(&args, &store);
     }
     if command == "attention" && sub == Some("list") {
-        return print(
-            &store.attention(
-                args.one("status"),
-                args.one("kind"),
-                args.one("task"),
-                args.one("tag"),
-                args.limit(100)?,
-                args.has("all"),
-            )?,
-            args.has("json"),
-        );
+        let keep = projection(&args, &ATTENTION_FIELDS, &[])?;
+        let mut rows =
+            serde_json::to_value(args.bounded_page(100, "attention items", |limit| {
+                store.attention(
+                    args.one("status"),
+                    args.one("kind"),
+                    args.one("task"),
+                    args.one("tag"),
+                    args.one("lane"),
+                    limit,
+                    args.has("all"),
+                )
+            })?)?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
+    }
+    if command == "attention" && sub == Some("show") {
+        let id = rest.first().context("attention id is required")?;
+        return print(&store.show_attention(id)?, args.has("json"));
     }
     if command == "attention" && sub == Some("update") {
-        if args.has("tag") && args.has("clear-tags") {
-            bail!("--tag and --clear-tags are mutually exclusive");
+        // Each clearing flag is refused beside the flag it undoes: two
+        // answers to one question, and the receipt would not say which was
+        // stored. `--clear-card` undoes the whole card, so it contradicts
+        // every card flag.
+        for (a, b) in [
+            ("tag", "clear-tags"),
+            ("question", "clear-card"),
+            ("context", "clear-card"),
+            ("choice", "clear-card"),
+            ("consequence", "clear-card"),
+            ("recommend", "clear-card"),
+        ] {
+            if args.has(a) && args.has(b) {
+                bail!("--{a} and --{b} are mutually exclusive");
+            }
         }
+        let check = args.attention_check_input();
+        let card = args.decision_card()?;
         let id = rest.first().context("attention id is required")?;
         let body = args.body()?;
         let tags = if args.has("clear-tags") {
@@ -3252,16 +7513,41 @@ fn run() -> Result<()> {
             None
         };
         return print(
-            &store.update_attention(id, body.as_deref(), tags.as_deref(), args.require("as")?)?,
+            &store.update_attention(
+                id,
+                body.as_deref(),
+                tags.as_deref(),
+                Some(&card),
+                (!check.is_empty()).then_some(&check),
+                args.has("clear-card"),
+                args.require("as")?,
+            )?,
             args.has("json"),
         );
     }
     if command == "attention" && sub == Some("resolve") {
         let id = rest.first().context("attention id is required")?;
-        return print(
-            &store.resolve_attention(id, args.require("as")?, args.one("note"))?,
-            args.has("json"),
-        );
+        let actor = args.require("as")?;
+        let answer = AttentionAnswer {
+            choice: args.one("choice"),
+            outcome: args.one("outcome"),
+            note: args.one("note"),
+        };
+        let check_answered = args.one("check-answered");
+        let row = match args.one("return-trigger") {
+            Some(trigger) => store.defer_attention(id, actor, &answer, check_answered, trigger)?,
+            None => store.resolve_attention(id, actor, &answer, check_answered)?,
+        };
+        return print(&row, args.has("json"));
+    }
+    if command == "attention" && sub == Some("check") {
+        let id = rest.first().context("attention id is required")?;
+        let answered =
+            store.answer_attention_check(id, args.require("as")?, args.require("key")?)?;
+        if args.has("json") {
+            return print(&answered, true);
+        }
+        return emit(&render_check_answer(&answered)?);
     }
     if command == "attention" && sub == Some("reopen") {
         let id = rest.first().context("attention id is required")?;
@@ -3270,27 +7556,123 @@ fn run() -> Result<()> {
             args.has("json"),
         );
     }
+    if command == "sprint" && sub == Some("new") {
+        let title = rest.first().context("sprint title is required")?.clone();
+        return print(
+            &store.create_sprint(NewSprint {
+                id: option_string(&args, "id"),
+                title,
+                body: args.body()?,
+                target_version: args.require("target-version")?.to_owned(),
+                scheduled_start: args
+                    .require("start")?
+                    .parse()
+                    .context("--start must be an epoch-millisecond integer")?,
+                scheduled_end: args
+                    .require("end")?
+                    .parse()
+                    .context("--end must be an epoch-millisecond integer")?,
+                actor: args.require("as")?.to_owned(),
+            })?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("plan") {
+        let id = rest.first().context("sprint id is required")?;
+        // Planning IS writing the goal, so a plan without a body is the
+        // no-op the refusal names rather than an empty card.
+        let body = args.body()?.context(
+            "sprint plan requires --body or --body-file: the goal and success criteria are \
+             the plan — without them the sprint is a title and a version",
+        )?;
+        return print(
+            &store.plan_sprint(
+                id,
+                &body,
+                &args.many("candidate"),
+                args.one("parent-epic"),
+                args.has("empty-scope"),
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("start") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.start_sprint(id, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("close") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.close_sprint(
+                id,
+                args.one("deployment"),
+                args.one("carry-to"),
+                args.one("carry-note"),
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("abandon") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.abandon_sprint(id, args.require("note")?, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("list") {
+        let keep = projection(&args, &SPRINT_FIELDS, &[])?;
+        let mut rows = serde_json::to_value(args.bounded_page(100, "sprints", |limit| {
+            store.sprints(args.one("status"), args.has("all"), limit)
+        })?)?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
+    }
+    if command == "sprint" && sub == Some("show") {
+        let id = rest.first().context("sprint id is required")?;
+        let sprint = store.require_sprint(id)?;
+        // The close gate's proof, resolved for the reader: the row, its
+        // rows, and the deployment that ended it (ADR-045 §2).
+        let deployment = match &sprint.closed_by_deployment {
+            Some(deployment_id) => serde_json::to_value(store.require_deployment(deployment_id)?)?,
+            None => Value::Null,
+        };
+        return print(
+            &json!({
+                "sprint": sprint,
+                "tasks": store.sprint_tasks(id)?,
+                "deployment": deployment,
+            }),
+            args.has("json"),
+        );
+    }
     if command == "sitrep" && sub == Some("post") {
         let text = rest.first().context("sitrep text is required")?;
+        // A sitrep is the low-ceremony sibling of a checkpoint, not a lesser
+        // record: it carries the same provenance, refused rather than blank.
+        let provenance = required_provenance(&args, here().as_ref())?;
         return print(
             &store.post_sitrep(
                 args.require("lane")?,
                 text,
                 args.require("as")?,
                 args.one("task"),
-                here().as_ref(),
+                Some(&provenance),
             )?,
             args.has("json"),
         );
     }
     if command == "sitrep" && sub == Some("list") {
         return print(
-            &store.sitreps(
-                args.one("lane"),
-                args.has("all"),
-                args.one("task"),
-                args.limit(20)?,
-            )?,
+            &args.bounded_page(20, "sitreps", |limit| {
+                store.sitreps(args.one("lane"), args.has("all"), args.one("task"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -3310,21 +7692,28 @@ fn run() -> Result<()> {
             bail!("--after must not be later than --before");
         }
         return print(
-            &store.events_with_bounds(
-                args.one("task"),
-                args.one("kind"),
-                after,
-                before,
-                args.limit(50)?,
-                args.has("all"),
-            )?,
+            &args.bounded_page_naming_explicit_cuts(50, "events", |limit| {
+                store.events_with_bounds(
+                    args.one("task"),
+                    args.one("kind"),
+                    after,
+                    before,
+                    limit,
+                    args.has("all"),
+                )
+            })?,
             args.has("json"),
         );
     }
     if command == "context" {
         let id = sub.context("task id is required")?;
         let mut packet = store.context_packet(id)?;
-        packet.rules = effective_rule_summaries(&args, &store, Some(id))?;
+        let task_tags = &packet.task.tags;
+        let sprint = packet
+            .sprint
+            .as_ref()
+            .map(|sprint| sprint.sprint_id.as_str());
+        packet.rules = effective_rule_summaries(&args, &store, Some(id), Some(task_tags), sprint)?;
         if args.has("json") {
             // --max-chars bounds the rendered text and has never had any
             // effect here, so accepting it silently handed back an unbounded
@@ -3357,12 +7746,449 @@ fn run() -> Result<()> {
     bail!("unknown command; run kanban --help")
 }
 
+/// Mint the policy actor for the local trusted caller. The broker's
+/// `SO_PEERCRED` socket hop is not built (ADR-038 clause 2); in its place the
+/// CLI process's own effective UID is the principal evidence, resolved through
+/// the same two-way passwd check and frozen-principal lookup the broker would
+/// apply. A UID that resolves to no enabled principal (including root) fails
+/// closed with `denied or not found`.
+fn local_actor(
+    registry: &Registry,
+    claimed_actor: Option<String>,
+    reason: Option<String>,
+) -> Result<PolicyActor> {
+    let uid = unsafe { libc::geteuid() };
+    // Each of these three refusals is RECORDED, not just returned. They run
+    // before a principal exists, so the store's own `deny` never sees them,
+    // and a bare `bail!` here left the most interesting attempts -- a root
+    // caller reaching for a policy mutation above all -- with no audit row.
+    if uid == 0 {
+        return Err(registry.record_denied_attempt(DeniedAttempt {
+            operation: "access identity",
+            stage: "principal",
+            code: "root_is_not_a_policy_principal",
+            username: "root",
+            uid,
+            claimed_actor,
+            reason,
+        }));
+    }
+    let username = match broker::PasswdDatabase::name_for_uid(&broker::SystemPasswd, uid)? {
+        Some(name) => name,
+        None => {
+            return Err(registry.record_denied_attempt(DeniedAttempt {
+                operation: "access identity",
+                stage: "principal",
+                code: "uid_has_no_passwd_entry",
+                username: "",
+                uid,
+                claimed_actor,
+                reason,
+            }));
+        }
+    };
+    if !broker::two_way_passwd_check(&broker::SystemPasswd, &username, uid)? {
+        return Err(registry.record_denied_attempt(DeniedAttempt {
+            operation: "access identity",
+            stage: "principal",
+            code: "passwd_pair_diverged",
+            username: &username,
+            uid,
+            claimed_actor,
+            reason,
+        }));
+    }
+    let principal = registry.resolve_principal(&username, uid)?;
+    let (epoch, state_hash) = registry.live_policy_state()?;
+    Ok(PolicyActor {
+        principal_id: principal.map(|p| p.row.id),
+        username,
+        uid,
+        epoch,
+        state_hash,
+        context: PolicyContext {
+            authn_kind: "socket_peer".to_owned(),
+            peer_uid: uid,
+            real_uid: None,
+            effective_uid: None,
+            client_kind: "cli".to_owned(),
+            request_id: policy::short_id("rq"),
+            claimed_actor,
+            reason,
+            provider: None,
+            subject: None,
+        },
+    })
+}
+
+/// The root actor for bootstrap and break-glass (clauses 6 and 7). Root's
+/// authority is the host's, never a policy row, so its `principal_id` is null;
+/// the `--as`/`--reason` pair is recorded as a claim, never identity.
+fn root_actor(
+    registry: &Registry,
+    authn_kind: &str,
+    claimed_actor: Option<String>,
+    reason: Option<String>,
+) -> PolicyActor {
+    let (epoch, state_hash) = registry.live_policy_state().unwrap_or((0, String::new()));
+    PolicyActor {
+        principal_id: None,
+        username: "root".to_owned(),
+        uid: 0,
+        epoch,
+        state_hash,
+        context: PolicyContext {
+            authn_kind: authn_kind.to_owned(),
+            peer_uid: 0,
+            real_uid: None,
+            effective_uid: None,
+            client_kind: "cli".to_owned(),
+            request_id: policy::short_id("rq"),
+            claimed_actor,
+            reason,
+            provider: None,
+            subject: None,
+        },
+    }
+}
+
+/// The `--confirm LITERAL` gate for the root and enforcement commands. A
+/// wrong literal is refused rather than treated as absent (ADR-008).
+fn require_confirm(args: &Args, literal: &str) -> Result<()> {
+    let got = args.require("confirm")?;
+    if got != literal {
+        bail!("--confirm must be {literal:?}, got {got:?}");
+    }
+    Ok(())
+}
+
+/// Require the caller to be root (UID 0), the only authority bootstrap and
+/// break-glass honour (clauses 6 and 7). Refused generically otherwise.
+fn require_root() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("denied or not found");
+    }
+    Ok(())
+}
+
+fn access_capability(args: &Args) -> Result<Capability> {
+    let value = args.require("capability")?;
+    Capability::from_str(value)
+        .with_context(|| format!("unknown capability {value:?}; expected read, write, or admin"))
+}
+
+fn access_scope(args: &Args) -> Result<ScopeTuple> {
+    ScopeTuple::from_atoms(&args.many("scope"))
+}
+
+/// The `--as`/`--reason` pair, claimed not authenticated (ADR-038: `--as` is a
+/// claim; only the kernel UID is identity).
+fn access_claimed(args: &Args) -> (Option<String>, Option<String>) {
+    (
+        args.one("as").map(str::to_owned),
+        args.one("reason").map(str::to_owned),
+    )
+}
+
+/// The head of the policy-events journal, or null before any policy event.
+fn policy_journal_head(registry: &Registry) -> Result<Option<String>> {
+    let mut statement = registry
+        .connection
+        .prepare("SELECT event_hash FROM policy_events ORDER BY seq DESC LIMIT 1")?;
+    let mut rows = statement.query([])?;
+    match rows.next()? {
+        Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+        None => Ok(None),
+    }
+}
+
+/// Dispatch the `access` command grammar (ADR-038 clause 12). Reads address a
+/// read-only registry open and write nothing; mutations address a writable
+/// registry and route through the policy store, minting a local actor for the
+/// trusted CLI caller (or root for bootstrap/break-glass).
+fn run_access(args: &Args, sub: Option<&str>) -> Result<()> {
+    let json = args.has("json");
+    match sub {
+        // -- five reads (readOnly: true; they write nothing anywhere) --------
+        //
+        // A fresh install has no registry, which `routing::enforcement_state_at`
+        // already rules is an unmanaged `direct` estate. These reads answer the
+        // same way -- an empty projection -- instead of leaking SQLite's
+        // "unable to open database file" from the first command an operator runs.
+        Some("principal show") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::Value::Null, json);
+            };
+            let id = args.require("principal")?;
+            match registry.principal(id)? {
+                Some(principal) => print(&principal, json),
+                None => print(&serde_json::Value::Null, json),
+            }
+        }
+        Some("principal list") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::json!([]), json);
+            };
+            print(&registry.principals(args.has("disabled"))?, json)
+        }
+        Some("explain") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                // No registry means no grant can match; the denial reason stays
+                // the same generic string every other denial uses.
+                return print(
+                    &serde_json::json!({
+                        "outcome": "denied",
+                        "matchedGrantIDs": [],
+                        "denialReason": "denied or not found",
+                    }),
+                    json,
+                );
+            };
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            print(&registry.explain(id, &tuple, capability)?, json)
+        }
+        Some("audit") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::json!([]), json);
+            };
+            let capability = args
+                .one("capability")
+                .map(|v| {
+                    Capability::from_str(v).with_context(|| {
+                        format!("unknown capability {v:?}; expected read, write, or admin")
+                    })
+                })
+                .transpose()?;
+            let scope = if args.has("scope") {
+                Some(access_scope(args)?)
+            } else {
+                None
+            };
+            let after_epoch = args.optional_integer("after-epoch")?;
+            if after_epoch.is_some_and(|v| v < 0) {
+                bail!("--after-epoch must be non-negative");
+            }
+            let filter = AuditFilterSpec {
+                principal: args.one("principal"),
+                actor_principal: args.one("actor-principal"),
+                kind: args.one("kind"),
+                capability,
+                scope: scope.as_ref(),
+                after_epoch,
+            };
+            let rows = args.bounded_page(50, "audit events", |limit| {
+                registry.audit_events(&filter, limit)
+            })?;
+            print(&rows, json)
+        }
+        Some("enforcement show") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(
+                    &serde_json::json!({
+                        "epoch": 0,
+                        "enforcementState": "direct",
+                        "journalHead": serde_json::Value::Null,
+                    }),
+                    json,
+                );
+            };
+            let (epoch, _) = registry.live_policy_state()?;
+            let journal_head = policy_journal_head(&registry)?;
+            print(
+                &serde_json::json!({
+                    "epoch": epoch,
+                    "enforcementState": registry.enforcement_state()?,
+                    "journalHead": journal_head,
+                }),
+                json,
+            )
+        }
+        // -- fourteen mutations ---------------------------------------------
+        Some("bootstrap") => {
+            require_confirm(args, "empty-policy")?;
+            require_root()?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_bootstrap", claimed_actor, reason);
+            let principal = registry.policy_bootstrap(username, uid, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal bind") => {
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.bind_principal(username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal prove-rebind") => {
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let proof_id = registry.prove_rebind(source, username, uid, &actor)?;
+            print(&serde_json::json!({ "proofID": proof_id }), json)
+        }
+        Some("principal rebind") => {
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            if let Some(proof) = args.one("source-proof") {
+                registry.verify_source_proof(proof, source, username, uid)?;
+            }
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.rebind_principal(source, username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal disable") => {
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.disable_principal(id, &actor)?;
+            print(&principal, json)
+        }
+        Some("grant") => {
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let grant = registry.grant(id, &tuple, capability, &actor)?;
+            print(&grant, json)
+        }
+        Some("revoke") => {
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let grant = registry.revoke(id, &tuple, capability, &actor)?;
+            print(&grant, json)
+        }
+        Some("sso map-sso") => {
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            if let Some(proof) = args.one("subject-proof") {
+                registry.verify_subject_proof(proof, provider, subject)?;
+            }
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let mapping = registry.map_sso(id, provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("sso unmap-sso") => {
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let mapping = registry.unmap_sso(provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("breakglass principal-rebind") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let principal =
+                registry.breakglass_principal_rebind(source, username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("breakglass map-sso") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let mapping = registry.breakglass_map_sso(id, provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("breakglass registry-admin") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let grant = registry.breakglass_grant_registry_admin(id, &actor)?;
+            print(&grant, json)
+        }
+        Some("enforcement prepare") => {
+            require_confirm(args, "prepared")?;
+            let expected_epoch = args
+                .require("expected-epoch")?
+                .parse::<i64>()
+                .context("--expected-epoch must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let receipt = registry.enforcement_prepare(expected_epoch, &actor)?;
+            print(&receipt, json)
+        }
+        Some("enforcement activate") => {
+            require_confirm(args, "no-direct-fallback")?;
+            let expected_epoch = args
+                .require("expected-epoch")?
+                .parse::<i64>()
+                .context("--expected-epoch must be a non-negative integer")?;
+            let receipt = args.require("prepare-receipt")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let result = registry.enforcement_activate(expected_epoch, receipt, &actor)?;
+            print(&result, json)
+        }
+        _ => bail!("unknown command; run kanban --help"),
+    }
+}
+
+/// The version banner: the program, its version and the two schema versions
+/// it speaks, on one line.
 fn version_string() -> String {
     format!(
         "kanban {} (board schema {}; registry schema {})",
         env!("CARGO_PKG_VERSION"),
         db::BOARD_SCHEMA_VERSION,
-        db::REGISTRY_SCHEMA_VERSION
+        db::REGISTRY_SCHEMA_VERSION,
     )
 }
 
@@ -3442,7 +8268,37 @@ mod tests {
                 .to_string();
             assert!(error.contains("--limit"), "{error}");
             assert!(error.contains(bad), "{error}");
+            assert!(
+                error.contains("negative limit reads as no limit at all"),
+                "the negative refusal changed wording: {error}"
+            );
         }
+    }
+
+    /// The ceiling is a typo guard, so the boundary is the whole behaviour:
+    /// the millionth row is a legal page and the one past it is not.
+    #[test]
+    fn a_limit_above_the_ceiling_is_refused_and_the_ceiling_itself_is_not() {
+        assert_eq!(
+            args(&["--limit", "1000000"]).limit(9).unwrap(),
+            LIMIT_CEILING
+        );
+        let error = args(&["--limit", "1000001"])
+            .limit(9)
+            .expect_err("a limit past the ceiling must be refused")
+            .to_string();
+        assert_eq!(
+            error,
+            "--limit must be between 0 and 1000000, got 1000001; the ceiling exists so a \
+             mistyped value is refused, not to imply a page this size is wise"
+        );
+        // A slipped keystroke is the case this exists for, and it is refused
+        // rather than turned into a query.
+        assert!(
+            args(&["--limit", "100000000"]).limit(9).is_err(),
+            "a mistyped limit was accepted"
+        );
+        assert!(args(&["--limit", &i64::MAX.to_string()]).limit(9).is_err());
     }
 
     #[test]
@@ -3511,21 +8367,469 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected_and_globals_are_not() {
         let allowed = ["status", "with-relations"];
-        assert!(args(&["--status", "todo"]).reject_unknown(&allowed).is_ok());
+        assert!(
+            args(&["--status", "todo"])
+                .reject_unknown(&allowed, &[])
+                .is_ok()
+        );
         for global in GLOBAL_FLAGS {
             assert!(
                 args(&[&format!("--{global}"), "x"])
-                    .reject_unknown(&allowed)
+                    .reject_unknown(&allowed, &[])
                     .is_ok(),
                 "--{global} must be accepted everywhere"
             );
         }
         let error = args(&["--projct", "x"])
-            .reject_unknown(&allowed)
+            .reject_unknown(&allowed, &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown flag --projct"), "{error}");
         assert!(error.contains("did you mean --project?"), "{error}");
+    }
+
+    #[test]
+    fn a_selector_a_command_ignores_is_neither_exempt_nor_advertised() {
+        // Second lock behind `reject_ignored_selectors`, which reaches these
+        // command lines first with a better message. If it is ever bypassed,
+        // an ignored selector must still not be waved through as a global.
+        let allowed: [&str; 0] = [];
+        let error = args(&["--db", "/tmp/somewhere.db"])
+            .reject_unknown(&allowed, &["db", "project", "workspace"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown flag --db"), "{error}");
+        // And the "accepted here" line must not offer what was just refused.
+        for selector in BOARD_SELECTORS {
+            assert!(
+                !error.contains(&format!("--{selector},")),
+                "the refusal still advertises --{selector}: {error}"
+            );
+        }
+        assert!(error.contains("--help"), "{error}");
+        assert!(error.contains("--json"), "{error}");
+        // A selector this command does honour stays exempt.
+        assert!(
+            args(&["--project", "Alpha"])
+                .reject_unknown(&allowed, &["db"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_ignored_selector_row_names_a_real_command_and_a_real_selector() {
+        for (command, sub, ignored, subject) in IGNORED_SELECTORS {
+            assert!(
+                command_spec(command, *sub).is_some(),
+                "{command} {sub:?} is declared selector-blind but is not a command"
+            );
+            assert!(
+                !ignored.is_empty(),
+                "{command} {sub:?} declares an empty ignored-selector list"
+            );
+            assert!(
+                !subject.is_empty(),
+                "{command} {sub:?} does not say what it addresses instead"
+            );
+            let mut seen = ignored.to_vec();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(
+                before,
+                seen.len(),
+                "{command} {sub:?} lists a selector twice"
+            );
+            for flag in *ignored {
+                assert!(
+                    BOARD_SELECTORS.contains(flag),
+                    "{command} {sub:?} ignores --{flag}, which is not a board selector"
+                );
+            }
+        }
+        // No row is declared twice, which would make the second one dead.
+        let mut keys = IGNORED_SELECTORS
+            .iter()
+            .map(|(command, sub, ..)| (*command, *sub))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(
+            unique,
+            keys.len(),
+            "a command is declared twice in IGNORED_SELECTORS"
+        );
+        // The two commands that honour one selector and discard the others are
+        // the reason this is a per-command list rather than a set of names.
+        assert_eq!(ignored_selectors("init", None).0, ["db", "project"]);
+        assert_eq!(
+            ignored_selectors("workspace", Some("attach")).0,
+            ["db", "project"]
+        );
+        // And a command that resolves a board declares nothing.
+        assert_eq!(ignored_selectors("task", Some("list")).0, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn an_ignored_selector_is_refused_by_name() {
+        let error = reject_ignored_selectors(&args(&["--db", "/tmp/somewhere.db"]), "doctor", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--db"), "{error}");
+        assert!(error.contains("doctor"), "{error}");
+        assert!(
+            error.contains("checks the registry and every board in it"),
+            "the refusal does not say what doctor addresses instead: {error}"
+        );
+        // Both, when both were given. `reject_conflicting_board_selectors`
+        // refuses that pair too, but this guard runs first and must not name
+        // only half of what it is refusing.
+        let error = reject_ignored_selectors(
+            &args(&["--db", "/tmp/somewhere.db", "--project", "Alpha"]),
+            "doctor",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--db and --project"), "{error}");
+        // The selector it honours is not refused.
+        assert!(
+            reject_ignored_selectors(&args(&["--workspace", "/tmp/tree"]), "init", None).is_ok()
+        );
+        assert!(reject_ignored_selectors(&args(&["--db", "/tmp/b.db"]), "init", None).is_err());
+        // A command with no row is untouched.
+        assert!(
+            reject_ignored_selectors(&args(&["--db", "/tmp/b.db"]), "task", Some("list")).is_ok()
+        );
+    }
+
+    /// Every way the item list can arrive, and every way it can be wrong.
+    #[test]
+    fn a_transact_takes_its_items_from_one_place_or_refuses() {
+        assert_eq!(
+            transact_items(&args(&["--items", "[]"])).unwrap(),
+            Vec::<Value>::new()
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "kanban-transact-items-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, r#"[{"name":"stale"}]"#).unwrap();
+        let from_file = transact_items(&args(&["--items-file", path.to_str().unwrap()])).unwrap();
+        assert_eq!(from_file, vec![json!({ "name": "stale" })]);
+        fs::remove_file(&path).unwrap();
+
+        for (label, arguments, expected) in [
+            (
+                "both",
+                vec!["--items", "[]", "--items-file", "/tmp/nope.json"],
+                "pass one",
+            ),
+            ("neither", vec![], "transact needs its item list"),
+            (
+                "unreadable file",
+                vec!["--items-file", "/tmp/kanban-no-such-item-list.json"],
+                "read transact items from",
+            ),
+            ("not JSON", vec!["--items", "{oops"], "must be a JSON array"),
+            (
+                "not an array",
+                vec!["--items", "{\"name\":\"stale\"}"],
+                "not {\"name\":\"stale\"}",
+            ),
+        ] {
+            let error = format!("{:#}", transact_items(&args(&arguments)).expect_err(label));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    /// The names an item may carry are read off `COMMANDS`, so what the
+    /// surface offers and what a batch accepts cannot disagree.
+    #[test]
+    fn a_transact_item_may_only_name_a_row_operation_on_the_addressed_board() {
+        for name in ["task_add", "claim", "note", "checkpoint", "task_show"] {
+            transactable(name).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
+        for (name, expected) in [
+            // Its own name: the one nesting refusal that needs stating.
+            ("transact", "may not carry a batch"),
+            // The read-only batch has no row, so it resolves to nothing.
+            ("batch", "names no such operation batch"),
+            ("frobnicate", "names no such operation frobnicate"),
+            // Withheld from `tools/list`, and withheld here for the same
+            // reason: an unbounded follow inside a write scope is not an item.
+            ("watch", "names no such operation watch"),
+            // Addresses the registry or the data root, so its write would
+            // land outside the batch's transaction.
+            ("doctor", "rather than addressing one board's rows"),
+            ("rule_add", "rather than addressing one board's rows"),
+            ("restore", "rather than addressing one board's rows"),
+            (
+                "workspace_retire",
+                "rather than addressing one board's rows",
+            ),
+            // Addresses one board, but opens its own transaction on it.
+            ("import_atmux_json", "board-wide transaction of its own"),
+            ("search_rebuild", "board-wide transaction of its own"),
+        ] {
+            let error = format!("{:#}", transactable(name).expect_err(name));
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_transact_is_planned_whole_before_any_of_it_runs() {
+        let good = vec![
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "a" } }),
+            json!({ "name": "note", "arguments": {
+                "id": "t-1", "text": "x", "as": "a",
+                "kind": { "$ref": { "item": 0, "path": "/leaseToken" } },
+            }}),
+            // Arguments may be absent entirely.
+            json!({ "name": "stale" }),
+            // `false` and `null` are absence, not a flag this refuses: they
+            // are exactly what `arguments_for` drops.
+            json!({ "name": "search", "arguments": {
+                "query": "x", "all-boards": false, "db": null,
+            }}),
+        ];
+        let planned = plan_transact(&good).expect("a well-formed list plans");
+        assert_eq!(
+            planned.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["claim", "note", "stale", "search"]
+        );
+        assert_eq!(planned[2].1, &Value::Null);
+
+        // The bound is the bound, not one short of it.
+        let at_bound = vec![json!({ "name": "stale" }); mcp::BATCH_LIMIT];
+        assert_eq!(plan_transact(&at_bound).unwrap().len(), mcp::BATCH_LIMIT);
+        let over = vec![json!({ "name": "stale" }); mcp::BATCH_LIMIT + 1];
+        let refusal = plan_transact(&over).expect_err("33 is over the bound");
+        assert_eq!(refusal.index, None);
+        assert!(
+            refusal.message.contains("at most 32"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("33"), "{}", refusal.message);
+        assert!(
+            refusal.message.contains("nothing in it ran"),
+            "{}",
+            refusal.message
+        );
+
+        for (label, items, expected) in [
+            (
+                "not an object",
+                vec![json!({ "name": "stale" }), json!(7)],
+                "item 1 must be an object, not 7",
+            ),
+            (
+                "stray field",
+                vec![json!({ "name": "stale", "tool": "stale" })],
+                "item 0 has no field tool",
+            ),
+            (
+                "no name",
+                vec![json!({ "arguments": {} })],
+                "item 0 needs a name",
+            ),
+            (
+                "name is not a string",
+                vec![json!({ "name": 3 })],
+                "item 0 needs a name",
+            ),
+            (
+                "forbidden name",
+                vec![json!({ "name": "stale" }), json!({ "name": "transact" })],
+                "item 1 names transact",
+            ),
+            (
+                "arguments are not an object",
+                vec![json!({ "name": "stale", "arguments": [1] })],
+                "item 0 has arguments that are not an object: [1]",
+            ),
+            (
+                "names a second board",
+                vec![json!({ "name": "task_list", "arguments": { "db": "/tmp/other.db" } })],
+                "item 0 names --db",
+            ),
+            (
+                "reads every board",
+                vec![
+                    json!({ "name": "search", "arguments": { "query": "x", "all-boards": true } }),
+                ],
+                "item 0 names --all-boards",
+            ),
+        ] {
+            let refusal = plan_transact(&items).expect_err(label);
+            assert!(
+                refusal.message.contains(expected),
+                "{label}: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.ends_with("nothing in it ran"),
+                "{label}: {}",
+                refusal.message
+            );
+        }
+    }
+
+    /// Every reference in the list is checked for shape before any item runs,
+    /// and one that cannot be resolved refuses the batch whole (ADR-041 §4).
+    #[test]
+    fn a_back_reference_is_checked_for_shape_before_anything_runs() {
+        // Found wherever it sits: at the top, nested in an object, and inside
+        // an array.
+        for arguments in [
+            json!({ "lease": { "$ref": { "item": 0, "path": "/leaseToken" } } }),
+            json!({ "outer": { "inner": { "$ref": { "item": 0, "path": "" } } } }),
+            json!({ "list": [1, { "$ref": { "item": 1, "path": "/0/taskID" } }] }),
+            json!({ "plain": "no reference here" }),
+            json!({}),
+        ] {
+            validate_refs(&arguments, 2).unwrap_or_else(|error| panic!("{arguments}: {error:#}"));
+        }
+        // A pointer's escapes are the only two RFC 6901 defines.
+        valid_pointer("/a~0b/c~1d").unwrap();
+
+        for (label, arguments, expected) in [
+            (
+                "beside other keys",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/x" }, "or": "this" } }),
+                "beside other keys",
+            ),
+            (
+                "not an object",
+                json!({ "lease": { "$ref": "/leaseToken" } }),
+                "$ref that is not an object",
+            ),
+            (
+                "stray field",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/x", "from": "0" } } }),
+                "$ref with no field from",
+            ),
+            (
+                "no item",
+                json!({ "lease": { "$ref": { "path": "/x" } } }),
+                "names no item",
+            ),
+            (
+                "item is not a number",
+                json!({ "lease": { "$ref": { "item": "0", "path": "/x" } } }),
+                "not a whole number",
+            ),
+            (
+                "item is negative",
+                json!({ "lease": { "$ref": { "item": -1, "path": "/x" } } }),
+                "not a whole number",
+            ),
+            (
+                "forward reference",
+                json!({ "lease": { "$ref": { "item": 3, "path": "/x" } } }),
+                "$ref to item 3, but this is item 2",
+            ),
+            (
+                "self reference",
+                json!({ "lease": { "$ref": { "item": 2, "path": "/x" } } }),
+                "$ref to item 2, but this is item 2",
+            ),
+            (
+                "no path",
+                json!({ "lease": { "$ref": { "item": 0 } } }),
+                "names no path string",
+            ),
+            (
+                "path is not a string",
+                json!({ "lease": { "$ref": { "item": 0, "path": 1 } } }),
+                "names no path string",
+            ),
+            (
+                "not a pointer",
+                json!({ "lease": { "$ref": { "item": 0, "path": "leaseToken" } } }),
+                "is empty or starts with /",
+            ),
+            (
+                "dangling escape",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/a~" } } }),
+                "escapes only as ~0 or ~1",
+            ),
+            (
+                "unknown escape",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/a~2b" } } }),
+                "escapes only as ~0 or ~1",
+            ),
+            (
+                "nested inside an array",
+                json!({ "list": [{ "$ref": { "item": 9, "path": "/x" } }] }),
+                "$ref to item 9",
+            ),
+        ] {
+            let error = format!("{:#}", validate_refs(&arguments, 2).expect_err(label));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    /// Resolution reaches every value shape, and a pointer that finds nothing
+    /// is this item's failure rather than a silent absence.
+    #[test]
+    fn a_back_reference_resolves_to_the_value_the_earlier_item_returned() {
+        let results = vec![
+            json!({ "leaseToken": "tok", "nested": { "deep": [1, 2] } }),
+            json!([{ "taskID": "t-1" }]),
+        ];
+        assert_eq!(
+            resolve_refs(
+                &json!({
+                    "lease": { "$ref": { "item": 0, "path": "/leaseToken" } },
+                    "deep": { "$ref": { "item": 0, "path": "/nested/deep/1" } },
+                    "first": { "$ref": { "item": 1, "path": "/0/taskID" } },
+                    "whole": { "$ref": { "item": 1, "path": "" } },
+                    "kept": "plain",
+                    "list": [7, { "$ref": { "item": 0, "path": "/leaseToken" } }],
+                }),
+                &results
+            )
+            .unwrap(),
+            json!({
+                "lease": "tok",
+                "deep": 2,
+                "first": "t-1",
+                "whole": [{ "taskID": "t-1" }],
+                "kept": "plain",
+                "list": [7, "tok"],
+            })
+        );
+        // Nothing to resolve is the value itself, whatever shape it is.
+        for value in [json!("text"), json!(3), json!(null), json!(true)] {
+            assert_eq!(resolve_refs(&value, &results).unwrap(), value);
+        }
+
+        let missing = resolve_refs(
+            &json!({ "lease": { "$ref": { "item": 0, "path": "/notThere" } } }),
+            &results,
+        )
+        .expect_err("a pointer that finds nothing fails the item");
+        assert!(
+            format!("{missing:#}").contains("has nothing at /notThere"),
+            "{missing:#}"
+        );
+
+        // Pre-flight makes this unreachable through the CLI; it is still the
+        // fail-closed answer rather than a silent `null`.
+        let absent = resolve_refs(
+            &json!({ "lease": { "$ref": { "item": 4, "path": "/x" } } }),
+            &results,
+        )
+        .expect_err("a result that is not there cannot be referred to");
+        assert!(
+            format!("{absent:#}").contains("item 4 produced no result"),
+            "{absent:#}"
+        );
     }
 
     #[test]
@@ -3587,6 +8891,76 @@ mod tests {
     }
 
     #[test]
+    fn every_enum_argument_names_a_real_command_flag_or_positional_and_a_closed_set() {
+        // The ENUM_ARGUMENTS table is the single source for the `values` the
+        // manifest publishes, so a stale row that names a command, flag or
+        // positional that does not exist (or a set that is empty or repeats a
+        // value) fails here rather than advertising a fiction to an adapter.
+        for (command, sub, flags, positionals, _) in COMMANDS {
+            let named = ENUM_ARGUMENTS
+                .iter()
+                .filter(|arg| arg.command == *command && arg.sub == *sub)
+                .collect::<Vec<_>>();
+            let mut keys = named
+                .iter()
+                .map(|arg| (arg.slot, arg.name))
+                .collect::<Vec<_>>();
+            keys.sort_unstable_by_key(|(slot, name)| {
+                (u8::from(*slot == ArgSlot::Positional), *name)
+            });
+            let before = keys.len();
+            keys.dedup_by_key(|(slot, name)| (*slot, *name));
+            assert_eq!(
+                before,
+                keys.len(),
+                "{command} {sub:?} declares the same enum argument twice"
+            );
+            for arg in named {
+                assert!(
+                    !arg.values.is_empty(),
+                    "{command} {sub:?} --{} declares an empty set",
+                    arg.name
+                );
+                let mut values = arg.values.to_vec();
+                values.sort_unstable();
+                let before = values.len();
+                values.dedup();
+                assert_eq!(
+                    before,
+                    values.len(),
+                    "{command} {sub:?} --{} repeats a value",
+                    arg.name
+                );
+                match arg.slot {
+                    ArgSlot::Flag => assert!(
+                        flags.contains(&arg.name),
+                        "{command} {sub:?}: --{} is enum-valued but not a flag of the command",
+                        arg.name
+                    ),
+                    ArgSlot::Positional => assert!(
+                        positionals
+                            .iter()
+                            .any(|p| p.trim_start_matches('?') == arg.name),
+                        "{command} {sub:?}: {arg} is enum-valued but not a positional of the command",
+                        arg = arg.name
+                    ),
+                }
+            }
+        }
+        // Every row belongs to a real command.
+        for arg in ENUM_ARGUMENTS {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(name, expected, ..)| *name == arg.command && *expected == arg.sub),
+                "{} {:?} is enum-valued but not a command",
+                arg.command,
+                arg.sub
+            );
+        }
+    }
+
+    #[test]
     fn every_clearing_flag_is_refused_alongside_the_flag_it_clears() {
         // `--tag infra --clear-tags` is two answers to one question, and the
         // receipt would not say which was stored (ADR-008). Every clearing flag
@@ -3618,6 +8992,200 @@ mod tests {
                  pair, so passing both silently prefers one"
             );
         }
+    }
+
+    /// One `  kanban …` usage entry from `--help`: the command word, the form
+    /// words that name it, and the lines of its syntax.
+    ///
+    /// A line documents every subcommand its form words name -- so `deploy
+    /// show ID | list […]` documents `deploy show` and `deploy list`, `story
+    /// signoff|unsignoff ID` documents both signoffs, and each `claim` line
+    /// documents `claim`. The form words are the words after the command up to
+    /// the first flag or bracket, split on `|`. Continuation lines are the
+    /// indented ones beneath the heading; a parenthetical note is prose about
+    /// the command, not its syntax, and is left out.
+    struct UsageEntry {
+        command: &'static str,
+        names: Vec<&'static str>,
+        lines: Vec<&'static str>,
+    }
+
+    impl UsageEntry {
+        fn documents(&self, command: &str, sub: Option<&str>) -> bool {
+            if self.command != command {
+                return false;
+            }
+            let Some(sub) = sub else { return true };
+            if self.names.contains(&sub) {
+                return true;
+            }
+            // A multi-word subcommand ("principal bind"): the sub's words must
+            // appear as a consecutive run of the entry's form words.
+            let sub_words: Vec<&str> = sub.split_whitespace().collect();
+            if sub_words.len() < 2 {
+                return false;
+            }
+            self.names
+                .windows(sub_words.len())
+                .any(|window| window == sub_words.as_slice())
+        }
+
+        /// Every `--flag` in the syntax, as whole tokens: `--head` here does
+        /// not vouch for `--header`, and `--body-file` is not `--body`.
+        fn flags(&self) -> HashSet<&'static str> {
+            self.lines
+                .iter()
+                .flat_map(|line| line.split(|c: char| c.is_whitespace() || "[]()|,;".contains(c)))
+                .filter_map(|token| token.strip_prefix("--"))
+                .collect()
+        }
+
+        fn heading(&self) -> &'static str {
+            self.lines[0].trim()
+        }
+    }
+
+    fn usage_entries() -> Vec<UsageEntry> {
+        const CONTINUATION: &str = "             ";
+        let mut entries = Vec::new();
+        let mut lines = HELP.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.strip_prefix("  kanban ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let command = words.next().unwrap();
+            let names = words
+                .take_while(|word| !word.starts_with(['[', '(', '-']))
+                .flat_map(|word| word.split('|'))
+                .collect();
+            let mut entry = UsageEntry {
+                command,
+                names,
+                lines: vec![line],
+            };
+            let mut in_note = false;
+            while let Some(next) = lines.next_if(|next| next.starts_with(CONTINUATION)) {
+                let text = next.trim();
+                in_note |= text.starts_with('(');
+                if !in_note {
+                    entry.lines.push(next);
+                }
+                in_note &= !text.ends_with(')');
+            }
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[test]
+    fn help_documents_every_flag_every_command_accepts() {
+        // The parser's flag row is the surface, and a flag --help does not
+        // name is one nobody finds: the /session skill guessed checkpoint's
+        // --repo and --branch wrong when --help named neither, and `task add
+        // --tag`, `handoff accept --caller-scope` and `attention list --all`
+        // went unfound for as long as the check covered three commands. This
+        // reads every flag on every row back out of that command's usage
+        // lines, then every --flag in the usage back against the rows the
+        // line names, so the two cannot drift in either direction; every
+        // disagreement is reported, not just the first.
+        //
+        // Global flags are never on a row (the duplicates test above) and are
+        // documented once under "Global options" rather than on every line;
+        // --json rides on the lines where it helps. Any of them may appear on
+        // any line.
+        let entries = usage_entries();
+        let mut drift = Vec::new();
+        for (command, sub, flags, ..) in COMMANDS {
+            let name = match sub {
+                Some(sub) => format!("{command} {sub}"),
+                None => (*command).to_owned(),
+            };
+            let mine = entries
+                .iter()
+                .filter(|entry| entry.documents(command, *sub))
+                .collect::<Vec<_>>();
+            assert!(!mine.is_empty(), "--help has no usage line for `{name}`");
+            let documented = mine
+                .iter()
+                .flat_map(|entry| entry.flags())
+                .collect::<HashSet<_>>();
+            for flag in *flags {
+                if !documented.contains(flag) {
+                    drift.push(format!(
+                        "`{name}` accepts --{flag} but its --help usage does not name it"
+                    ));
+                }
+            }
+        }
+        for entry in &entries {
+            let accepted = COMMANDS
+                .iter()
+                .filter(|(command, sub, ..)| entry.documents(command, *sub))
+                .flat_map(|(_, _, flags, ..)| flags.iter().copied())
+                .chain(GLOBAL_FLAGS)
+                .collect::<HashSet<_>>();
+            for flag in entry.flags() {
+                if !accepted.contains(flag) {
+                    drift.push(format!(
+                        "--help names --{flag} on `{}`, which no command on that line accepts",
+                        entry.heading()
+                    ));
+                }
+            }
+        }
+        drift.sort_unstable();
+        assert!(
+            drift.is_empty(),
+            "--help and the parser disagree:\n{}",
+            drift.join("\n")
+        );
+        // The selectors are the once-documented globals.
+        let globals = HELP.split_once("Global options").unwrap().1;
+        for flag in ["project", "workspace", "db"] {
+            assert!(
+                globals.contains(&format!("  --{flag} ")),
+                "--{flag} is not documented under Global options"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_that_never_committed_owes_the_next_batch_nothing() {
+        // The queue is a thread-local and an MCP thread serves batch after
+        // batch. Taking it only after `commit_batch` succeeded would leave a
+        // rename owed on the thread whenever the commit or the rollback
+        // returned Err, and the NEXT batch would then rewrite registry rules,
+        // with chained events, for a board rename that never landed.
+        PENDING_RULE_TAG_RENAMES.with_borrow_mut(|queue| {
+            queue.push(PendingRuleTagRename {
+                old: "infra".to_owned(),
+                new: "ifca/infra".to_owned(),
+                board: Some("BOARD".to_owned()),
+                actor: "geoyws".to_owned(),
+            });
+        });
+
+        // Taken before the commit is attempted, so the thread-local is already
+        // empty while the outcome is still unknown.
+        let owed = OwedRuleTagRenames::take();
+        assert_eq!(owed.0.len(), 1, "the queued rename must move to the stack");
+        assert!(
+            PENDING_RULE_TAG_RENAMES.with_borrow(Vec::is_empty),
+            "the queue must be empty from the moment the batch owns it"
+        );
+
+        // A commit that failed leaves by `?`, which drops the owner unrun.
+        drop(owed);
+
+        // So the next batch on this thread owes nothing, and settling a
+        // committed batch touches no registry at all -- if anything had
+        // survived, this would open one and rewrite rules for a rename that
+        // never happened.
+        let next = OwedRuleTagRenames::take();
+        assert!(next.0.is_empty(), "a rename survived a batch that failed");
+        next.settle(true)
+            .expect("an empty batch settles without reaching the registry");
     }
 
     #[test]
@@ -3706,12 +9274,15 @@ mod tests {
         const SOURCE: &str = include_str!("lib.rs");
         for (command, sub, flags, ..) in COMMANDS {
             for flag in *flags {
-                // Watch owns additional list-valued filters while `--kind`
-                // remains scalar on notes, events and other operations.
-                if *command == "watch" && WATCH_REPEATABLE.contains(flag) {
-                    continue;
-                }
-                if *command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag) {
+                // A flag that is list-valued for SOME operation is outside
+                // this scan by construction: `--kind` repeats on watch and is
+                // scalar on notes and events, and `--choice` repeats on
+                // `attention raise` and is one answer on `attention resolve`.
+                // The scan reads the whole file at once, so it cannot tell
+                // which operation a `many()` call belongs to. `repeatable` is
+                // the authority for those, pinned per operation by the schema
+                // and parser cases.
+                if LIST_VALUED.iter().any(|entry| entry.flags.contains(flag)) {
                     continue;
                 }
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
@@ -3730,6 +9301,198 @@ mod tests {
                     .any(|(_, _, flags, ..)| flags.contains(&flag)),
                 "--{flag} is repeatable but no command accepts it"
             );
+        }
+        // And every per-operation list is claimed by an operation that
+        // actually declares the flag, so a renamed subcommand cannot leave a
+        // list-valued flag pointing at nothing.
+        for entry in &LIST_VALUED {
+            for flag in entry.flags {
+                assert!(
+                    COMMANDS.iter().any(|(command, sub, flags, ..)| {
+                        *command == entry.command
+                            && (entry.sub.is_none() || entry.sub == *sub)
+                            && flags.contains(flag)
+                    }),
+                    "--{flag} is list-valued for {} {:?} but no such operation accepts it",
+                    entry.command,
+                    entry.sub
+                );
+            }
+        }
+    }
+
+    /// The ADR-038 generated-schema contract: every `access` operation of
+    /// clause 12 is emitted by `schema --json` flag-for-flag and
+    /// kind-for-kind, with the exact `readOnly` split the ADR names and all
+    /// three board selectors refused. This is the contract an adapter reads;
+    /// nothing here restates a second description of the surface.
+    #[test]
+    fn access_schema_matches_the_clause_12_grammar() {
+        let schema = schema();
+        let operations = schema["operations"].as_array().unwrap();
+
+        // (subcommand, flags in grammar order, readOnly)
+        let expected: [(&str, &[&str], bool); 19] = [
+            (
+                "bootstrap",
+                &["username", "uid", "as", "reason", "confirm"],
+                false,
+            ),
+            (
+                "principal bind",
+                &["username", "uid", "replaces", "as", "reason"],
+                false,
+            ),
+            (
+                "principal prove-rebind",
+                &["principal", "username", "uid", "replaces", "as", "reason"],
+                false,
+            ),
+            (
+                "principal rebind",
+                &[
+                    "principal",
+                    "username",
+                    "uid",
+                    "replaces",
+                    "source-proof",
+                    "as",
+                    "reason",
+                ],
+                false,
+            ),
+            ("principal disable", &["principal", "as", "reason"], false),
+            ("principal show", &["principal"], true),
+            ("principal list", &["disabled"], true),
+            (
+                "grant",
+                &["principal", "capability", "scope", "as", "reason"],
+                false,
+            ),
+            (
+                "revoke",
+                &["principal", "capability", "scope", "as", "reason"],
+                false,
+            ),
+            (
+                "sso map-sso",
+                &[
+                    "provider",
+                    "subject",
+                    "subject-proof",
+                    "principal",
+                    "as",
+                    "reason",
+                ],
+                false,
+            ),
+            (
+                "sso unmap-sso",
+                &["provider", "subject", "as", "reason"],
+                false,
+            ),
+            ("explain", &["principal", "capability", "scope"], true),
+            (
+                "audit",
+                &[
+                    "principal",
+                    "actor-principal",
+                    "kind",
+                    "capability",
+                    "scope",
+                    "after-epoch",
+                    "limit",
+                ],
+                true,
+            ),
+            (
+                "breakglass principal-rebind",
+                &[
+                    "principal",
+                    "username",
+                    "uid",
+                    "replaces",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+            (
+                "breakglass map-sso",
+                &[
+                    "provider",
+                    "subject",
+                    "principal",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+            (
+                "breakglass registry-admin",
+                &["principal", "as", "reason", "confirm"],
+                false,
+            ),
+            ("enforcement show", &[], true),
+            (
+                "enforcement prepare",
+                &["expected-epoch", "as", "reason", "confirm"],
+                false,
+            ),
+            (
+                "enforcement activate",
+                &[
+                    "expected-epoch",
+                    "prepare-receipt",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+        ];
+
+        let access_ops = operations
+            .iter()
+            .filter(|op| op["command"] == "access")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            access_ops.len(),
+            expected.len(),
+            "the access surface gained or lost an operation"
+        );
+
+        for (sub, flags, read_only) in expected {
+            let name = format!("access {sub}");
+            let operation = access_ops
+                .iter()
+                .find(|op| op["name"] == name)
+                .unwrap_or_else(|| panic!("missing schema operation {name}"));
+            assert_eq!(operation["command"], "access", "{name}");
+            assert_eq!(operation["subcommand"], sub, "{name}");
+            assert_eq!(operation["longRunning"], false, "{name}");
+            assert_eq!(operation["readOnly"], read_only, "{name}");
+            assert_eq!(operation["createsBoard"], false, "{name}");
+            assert_eq!(
+                operation["ignoredSelectors"].as_array().unwrap(),
+                &[json!("db"), json!("project"), json!("workspace")],
+                "{name}"
+            );
+            let emitted = operation["flags"].as_array().unwrap();
+            assert_eq!(emitted.len(), flags.len(), "{name} flag count");
+            for (emitted, expected_flag) in emitted.iter().zip(flags) {
+                assert_eq!(emitted["name"], *expected_flag, "{name}");
+                let kind = if repeatable("access", Some(sub), expected_flag) {
+                    "list"
+                } else if BOOLEAN.contains(expected_flag) {
+                    "boolean"
+                } else {
+                    "value"
+                };
+                assert_eq!(emitted["kind"], kind, "{name} --{expected_flag}");
+            }
         }
     }
 
@@ -3806,7 +9569,7 @@ mod tests {
         ] {
             assert_eq!(parsed.many(flag).len(), expected, "--{flag} was not parsed");
             assert!(
-                REPEATABLE.contains(&flag) || WATCH_REPEATABLE.contains(&flag),
+                repeatable("watch", None, flag),
                 "--{flag} is not repeatable"
             );
         }
@@ -3828,30 +9591,70 @@ mod tests {
     fn repeating_a_single_valued_flag_is_refused() {
         assert!(
             args(&["--project", "alpha"])
-                .reject_repeated_for(None)
+                .reject_repeated_for(None, None)
                 .is_ok()
         );
-        assert!(args(&[]).reject_repeated_for(None).is_ok());
+        assert!(args(&[]).reject_repeated_for(None, None).is_ok());
         // A list-valued flag is exactly what repeating is for.
         assert!(
             args(&["--blocker", "a", "--blocker", "b"])
-                .reject_repeated_for(None)
+                .reject_repeated_for(None, None)
                 .is_ok()
         );
         let error = args(&["--project", "alpha", "--project", "beta"])
-            .reject_repeated_for(None)
+            .reject_repeated_for(None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("--project (alpha, beta)"), "{error}");
     }
 
+    /// `--choice` is a list of authored options on `attention raise` and
+    /// `attention update`, and exactly one answer on `attention resolve`.
+    /// Both live under the command `attention`, which is why the predicate
+    /// reads the subcommand.
+    #[test]
+    fn choice_is_repeatable_on_raise_and_update_and_single_on_resolve() {
+        let twice = args(&["--choice", "a=A|approve", "--choice", "b=B|reject"]);
+        for sub in ["raise", "update"] {
+            assert!(
+                twice
+                    .reject_repeated_for(Some("attention"), Some(sub))
+                    .is_ok(),
+                "--choice must repeat on attention {sub}"
+            );
+        }
+        let error = twice
+            .reject_repeated_for(Some("attention"), Some("resolve"))
+            .expect_err("a second --choice is two answers to one question")
+            .to_string();
+        assert!(
+            error.contains("--choice (a=A|approve, b=B|reject)"),
+            "{error}"
+        );
+        // And `--consequence` follows it.
+        assert!(
+            args(&["--consequence", "a=x", "--consequence", "b=y"])
+                .reject_repeated_for(Some("attention"), Some("raise"))
+                .is_ok()
+        );
+        assert!(
+            args(&["--consequence", "a=x", "--consequence", "b=y"])
+                .reject_repeated_for(Some("attention"), Some("resolve"))
+                .is_err()
+        );
+    }
+
     #[test]
     fn kind_is_repeatable_only_for_watch_and_subscription_add() {
         let repeated = args(&["--kind", "a", "--kind", "b"]);
-        assert!(repeated.reject_repeated_for(Some("watch")).is_ok());
-        assert!(repeated.reject_repeated_for(Some("subscription")).is_ok());
+        assert!(repeated.reject_repeated_for(Some("watch"), None).is_ok());
+        assert!(
+            repeated
+                .reject_repeated_for(Some("subscription"), Some("add"))
+                .is_ok()
+        );
         let error = repeated
-            .reject_repeated_for(Some("events"))
+            .reject_repeated_for(Some("events"), None)
             .expect_err("events --kind must remain scalar")
             .to_string();
         assert!(error.contains("--kind (a, b)"), "{error}");
@@ -3937,5 +9740,447 @@ mod tests {
         assert!(!SUBCOMMAND_GROUPS.contains(&"claim"));
         // Unlisted stems are not inferred.
         assert_eq!(canonical_sub("task", "li"), "li");
+    }
+
+    #[test]
+    fn every_group_shortform_is_derived_from_the_command_table() {
+        // The mechanical shortforms are derived from COMMANDS, not hand-listed:
+        // a group that declares the long subcommand must resolve the shortform,
+        // and one that does not must leave it alone. Walking every group in
+        // SUBCOMMAND_GROUPS here is what makes a group silently losing (or
+        // gaining) a shortform fail the gate — the defect that left
+        // `attention ls` unknown while the hand-written match listed nine of
+        // the ten shortform-bearing groups.
+        for group in SUBCOMMAND_GROUPS {
+            for (short, full) in MECHANICAL_SUBS {
+                if has_subcommand(group, full) {
+                    assert_eq!(
+                        canonical_sub(group, short),
+                        *full,
+                        "{group} declares `{full}` on the command surface but `{short}` does not resolve to it"
+                    );
+                } else {
+                    assert_eq!(
+                        canonical_sub(group, short),
+                        *short,
+                        "{group} does not declare `{full}` but `{short}` resolves to it"
+                    );
+                }
+            }
+            // `new` resolves to the group's creating verb, where it has one,
+            // and stays unknown where it does not.
+            match CREATING_VERBS.iter().find(|(name, _)| *name == group) {
+                Some((_, full)) => assert_eq!(
+                    canonical_sub(group, "new"),
+                    *full,
+                    "{group} declares `{full}` as its creating verb but `new` does not resolve to it"
+                ),
+                None => assert_eq!(
+                    canonical_sub(group, "new"),
+                    "new",
+                    "{group} has no creating verb but `new` resolves to a subcommand"
+                ),
+            }
+        }
+    }
+
+    fn task() -> crate::model::Task {
+        serde_json::from_value(json!({
+            "id": "t-1",
+            "type": "task",
+            "title": "Row",
+            "body": "long body",
+            "lane": "driver-2",
+            "driverOnly": false,
+            "status": "todo",
+            "priority": 3,
+            "createdAt": 1,
+            "updatedAt": 1,
+            "archived": false,
+            "metadata": {},
+            "tags": ["kanban"],
+            "allowedModels": ["Astra"],
+        }))
+        .unwrap()
+    }
+
+    /// A default `task list` row: no flag, and nobody holding it.
+    fn task_row() -> Value {
+        task_list_row(&task(), None, false, None).unwrap()
+    }
+
+    fn attention_row() -> Value {
+        serde_json::to_value(crate::model::Attention {
+            id: "a-1".into(),
+            task_id: Some("t-1".into()),
+            kind: "decision".into(),
+            body: "long body".into(),
+            question: Some("Assign a Claude seat to hax, or drop that receipt?".into()),
+            context: Some("A real turn answers HTTP 401 and nobody is waiting on it.".into()),
+            choices: crate::model::default_choice_pair(),
+            check: Some(crate::model::AttentionCheck {
+                question: "Where is the invariant enforced?".into(),
+                choices: vec![
+                    crate::model::AttentionCheckChoice {
+                        key: "store".into(),
+                        label: "The Store".into(),
+                    },
+                    crate::model::AttentionCheckChoice {
+                        key: "client".into(),
+                        label: "The client".into(),
+                    },
+                ],
+                answer: Some("store".into()),
+                explanation: Some("rust/store.rs enforces it.".into()),
+                about: "rust/store.rs".into(),
+                answered: None,
+                correct: None,
+                answered_at: None,
+            }),
+            raised_by: "worker@driver-2".into(),
+            lane: None,
+            return_trigger: None,
+            created_at: 1,
+            status: "open".into(),
+            priority: 0,
+            priority_level: Some("P0".into()),
+            resolved_at: None,
+            resolved_by: None,
+            resolution: None,
+            decision: None,
+            reopened_at: None,
+            reopened_by: None,
+            reopen_note: None,
+            archived: false,
+            tags: vec![],
+        })
+        .unwrap()
+    }
+
+    fn sprint_row() -> Value {
+        serde_json::to_value(crate::model::Sprint {
+            id: "sp-1".into(),
+            title: "Ship the decisions room".into(),
+            body: Some("Ship it.\n- criteria one".into()),
+            status: "current".into(),
+            target_version: "0.4.0".into(),
+            scheduled_start: 0,
+            scheduled_end: 1,
+            starts_at: 1,
+            ends_at: None,
+            closed_by_deployment: None,
+            created_at: 1,
+            updated_at: 1,
+            archived: false,
+        })
+        .unwrap()
+    }
+
+    fn keys(row: &Value) -> Vec<&str> {
+        row.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn the_field_lists_name_exactly_the_keys_a_row_carries() {
+        // `--fields` validates against these lists, not against the rows that
+        // came back, so the lists must be the rows: a key added to the row
+        // and not here would be refused as unknown, and a key removed from the
+        // row and not here would be accepted and silently absent.
+        let mut expected = TASK_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&task_row()), expected);
+        // Under both flags the row gains exactly the gated keys.
+        let claim = crate::model::ClaimSummary {
+            task_id: "t-1".into(),
+            agent_id: "driver-2".into(),
+            session_id: None,
+            claimed_at: 1,
+            heartbeat_at: 1,
+            expires_at: 2,
+            model: None,
+        };
+        let mut expected = TASK_FIELDS.to_vec();
+        expected.extend(TASK_GATED_FIELDS.iter().map(|(key, _)| *key));
+        expected.sort_unstable();
+        let full = task_list_row(&task(), Some(claim), true, Some((vec![], vec![]))).unwrap();
+        assert_eq!(keys(&full), expected);
+        assert_eq!(full["claimed"], true);
+        assert_eq!(full["claim"]["agentID"], "driver-2");
+        let mut expected = ATTENTION_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&attention_row()), expected);
+        let mut expected = SPRINT_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&sprint_row()), expected);
+    }
+
+    #[test]
+    fn fields_keeps_exactly_the_named_keys_and_nothing_else() {
+        let keep = projection(&args(&["--fields", "id,title, lane"]), &TASK_FIELDS, &[])
+            .unwrap()
+            .unwrap();
+        let mut rows = Value::Array(vec![task_row(), task_row()]);
+        project(&mut rows, &keep);
+        for row in rows.as_array().unwrap() {
+            assert_eq!(keys(row), ["id", "lane", "title"]);
+            assert_eq!(row["lane"], "driver-2");
+        }
+    }
+
+    #[test]
+    fn no_body_drops_only_the_body() {
+        let keep = projection(&args(&["--no-body"]), &ATTENTION_FIELDS, &[])
+            .unwrap()
+            .unwrap();
+        let mut rows = Value::Array(vec![attention_row()]);
+        project(&mut rows, &keep);
+        let mut expected = ATTENTION_FIELDS.to_vec();
+        expected.retain(|field| *field != "body");
+        expected.sort_unstable();
+        assert_eq!(keys(&rows[0]), expected);
+        assert_eq!(rows[0]["raisedBy"], "worker@driver-2");
+    }
+
+    #[test]
+    fn the_default_is_the_whole_row() {
+        assert!(projection(&args(&[]), &TASK_FIELDS, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_naming_the_keys_that_exist() {
+        let error = projection(&args(&["--fields", "id,bodyy"]), &ATTENTION_FIELDS, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bodyy"), "{error}");
+        for field in ATTENTION_FIELDS {
+            assert!(error.contains(field), "{error} does not name {field}");
+        }
+        // `claim` and `dependencies` exist only when their flag adds them. The
+        // refusal must not offer them otherwise, and must name the flag: a key
+        // list without `claim` reads as "there is no claim key" to the caller
+        // who is asking precisely who holds the task.
+        for (key, flag) in TASK_GATED_FIELDS {
+            let error = projection(&args(&["--fields", key]), &TASK_FIELDS, &TASK_GATED_FIELDS)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("the keys are"), "{error}");
+            assert!(error.contains(&format!("--{flag}")), "{error}");
+            let mut with_flag = TASK_FIELDS.to_vec();
+            with_flag.push(key);
+            assert_eq!(
+                projection(&args(&["--fields", key]), &with_flag, &TASK_GATED_FIELDS)
+                    .unwrap()
+                    .unwrap(),
+                [key]
+            );
+        }
+        // The wrong names for a holder are refused naming the keys that are.
+        for wrong in ["actor", "claim.actor", "holder"] {
+            let error = projection(
+                &args(&["--fields", wrong]),
+                &TASK_FIELDS,
+                &TASK_GATED_FIELDS,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(wrong), "{error}");
+            assert!(error.contains("claimed"), "{error}");
+        }
+        let error = projection(&args(&["--fields", "id,,title"]), &TASK_FIELDS, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty entry"), "{error}");
+    }
+
+    #[test]
+    fn fields_and_no_body_are_two_answers_to_one_question() {
+        let error = projection(&args(&["--fields", "id", "--no-body"]), &TASK_FIELDS, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pass one"), "{error}");
+    }
+
+    // -- managed-mode selector bypass gate (ADR-038 clause 9) -------------
+
+    /// A private canonical data root (`$XDG_DATA_HOME/kanban`) with a chosen
+    /// enforcement state, installed for the guard's lifetime and restored (and
+    /// deleted) on drop.
+    struct CanonicalRoot {
+        xdg: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        original: Option<std::ffi::OsString>,
+        /// An exported KANBAN_DATA_DIR contradicts a redirected canonical
+        /// root, AND is itself one of the five bypasses -- so an ambient one
+        /// (the gate runs `KANBAN_DATA_DIR=$(mktemp -d) cargo test`) would
+        /// mask whichever bypass a case means to observe. Cleared for the
+        /// guard's life, restored on drop.
+        original_data_dir: Option<std::ffi::OsString>,
+    }
+
+    impl CanonicalRoot {
+        fn managed() -> CanonicalRoot {
+            Self::with_state("managed")
+        }
+
+        /// A canonical data root with NO registry at all: the fresh-install
+        /// case, which must read as unmanaged (`direct`).
+        fn absent() -> CanonicalRoot {
+            let _guard = crate::dispatch::tests::env_guard();
+            let xdg = std::env::temp_dir().join(format!(
+                "kanban-routing-xdg-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&xdg).expect("create xdg dir");
+            let original = std::env::var_os("XDG_DATA_HOME");
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
+            CanonicalRoot {
+                xdg,
+                _guard,
+                original,
+                original_data_dir,
+            }
+        }
+
+        fn with_state(state: &str) -> CanonicalRoot {
+            let _guard = crate::dispatch::tests::env_guard();
+            let xdg = std::env::temp_dir().join(format!(
+                "kanban-routing-xdg-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let root = xdg.join("kanban");
+            fs::create_dir_all(&root).expect("create canonical root");
+            let registry = Registry::open_test_at(&root).expect("open canonical test registry");
+            registry
+                .connection
+                .execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])
+                .unwrap();
+            let original = std::env::var_os("XDG_DATA_HOME");
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
+            CanonicalRoot {
+                xdg,
+                _guard,
+                original,
+                original_data_dir,
+            }
+        }
+    }
+
+    impl Drop for CanonicalRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match &self.original_data_dir {
+                    Some(value) => std::env::set_var("KANBAN_DATA_DIR", value),
+                    None => std::env::remove_var("KANBAN_DATA_DIR"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.xdg);
+        }
+    }
+
+    /// An environment variable installed for the guard's lifetime, restored on
+    /// drop. Serialized by the [`CanonicalRoot`] env guard.
+    struct EnvVar {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> EnvVar {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvVar { key, original }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn managed_mode_refuses_each_selector_bypass_by_name() {
+        let _root = CanonicalRoot::managed();
+
+        // The three typed-flag bypasses, each refused by name.
+        for (flag, name) in [
+            (vec!["--db", "/tmp/x.db"], "--db"),
+            (vec!["--workspace", "/tmp/ws"], "--workspace"),
+            (vec!["--project", "alpha"], "--project"),
+        ] {
+            let error = refuse_managed_bypasses(&args(&flag))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "bypass {flag:?} refused as {error:?}");
+        }
+
+        // The root-path bypass: KANBAN_DATA_DIR.
+        {
+            let _dir = EnvVar::set("KANBAN_DATA_DIR", "/tmp/elsewhere");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_DATA_DIR"), "{error}");
+        }
+        // The environment selector: KANBAN_DB, then KANBAN_PROJECT.
+        {
+            let _db = EnvVar::set("KANBAN_DB", "/tmp/forged.db");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_DB"), "{error}");
+        }
+        {
+            let _proj = EnvVar::set("KANBAN_PROJECT", "alpha");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_PROJECT"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unmanaged_mode_keeps_every_selector_working() {
+        let _root = CanonicalRoot::with_state("direct");
+
+        // The same three typed flags are honoured, not refused.
+        for flag in [
+            vec!["--db", "/tmp/x.db"],
+            vec!["--workspace", "/tmp/ws"],
+            vec!["--project", "alpha"],
+        ] {
+            refuse_managed_bypasses(&args(&flag)).expect("a direct caller keeps its selectors");
+        }
+        // And the environment defaults keep working too.
+        let _dir = EnvVar::set("KANBAN_DATA_DIR", "/tmp/elsewhere");
+        let _db = EnvVar::set("KANBAN_DB", "/tmp/x.db");
+        let _proj = EnvVar::set("KANBAN_PROJECT", "alpha");
+        refuse_managed_bypasses(&args(&[])).expect("a direct caller keeps env defaults");
+    }
+
+    #[test]
+    fn an_absent_registry_reads_as_unmanaged_not_an_error() {
+        let _root = CanonicalRoot::absent();
+        // A fresh install has no canonical registry; that is `direct`, not a
+        // reason to refuse the selector and not an error to surface.
+        refuse_managed_bypasses(&args(&["--db", "/tmp/x.db"]))
+            .expect("no registry means no managed estate; --db is not refused");
     }
 }

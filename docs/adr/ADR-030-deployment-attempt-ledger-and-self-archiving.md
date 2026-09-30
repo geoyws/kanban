@@ -51,6 +51,20 @@ Compiled-process tests must prove the state machine, token enforcement, idempote
 
 Deployment of this feature is complete only after the exact pushed production commit is itself recorded, finished with a matching served commit, and visible in the live web projection.
 
+## Amendment 2026-09-30: which tier may run on which host
+
+`deploy start` refuses a tier-host pair the canonical table forbids: the MBP tiers `@_bdt` and
+`@_bd` belong on `geoywsMBP` (or `geoywsMBA`), and every other tier belongs on a Hetzner host.
+George's rule of 2026-09-28 adds one exception. The dev tiers `@_bdt` and `@_bd` may also run
+on `hax` for the Unum and geoyws estates, while IFCA products and GPU-bound projects keep them on
+the MBP. So an MBP-tier attempt on host `hax` is accepted when the board's estate is `unum` or
+`geoyws`, and refused by name for an IFCA board or a board no estate claims. The estate comes
+from the board's registered name through the compiled board-to-estate map, never from a
+`deploy start` field. Every other pairing, and every other refusal sentence, is unchanged.
+No schema moves, because the `tier` `CHECK` holds no host rule. The requirements are
+`docs/specs/deploy.md` DEPLOY-01..DEPLOY-08 (slice approved on attention `a-e7c70c63`),
+implemented by row `t-1220f80f`.
+
 ## References
 
 - [ADR-006: Rust runtime and compiled binary E2E](ADR-006-rust-runtime-and-compiled-binary-e2e.md)
@@ -60,3 +74,4 @@ Deployment of this feature is complete only after the exact pushed production co
 - [ADR-021: Settled history leaves operational indexes](ADR-021-settled-history-leaves-operational-indexes.md)
 - [ADR-029: Audit journals are hash-chained and externally anchored](ADR-029-audit-journals-are-hash-chained-and-externally-anchored.md)
 - Epic `e-a89b3db2`: Deployment tracking and current release matrix
+- [`docs/specs/deploy.md`](../specs/deploy.md): the DEPLOY slice this ADR's 2026-09-30 amendment names

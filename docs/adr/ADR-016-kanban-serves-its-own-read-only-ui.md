@@ -1,8 +1,10 @@
 # ADR-016: Kanban serves its own UI, read-only first, behind an edge it does not implement
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-053](ADR-053-the-web-view-is-retired.md) (epic `e-caeb1449`)
 **Date:** 2026-08-24
-**Amended:** 2026-08-26
+**Amended:** 2026-09-11 (decisions room: recent decisions, web undo, previews, markdown);
+2026-09-19 (ADR-048: the UI becomes a bundled SPA; §"Needs you is live" projection-swap wording
+and the inlined-asset arrangement superseded)
 **Deciders:** George
 
 ## Context
@@ -72,11 +74,12 @@ mutating call that happens to be a no-op on the day leaves the bytes identical
 and the capability in place — which was demonstrated, not assumed, by injecting
 a `sweep_expired_claims` call that the byte comparison passed straight over.
 
-So a second guard reads the module back and asserts it names none of `Store`'s
-twenty `&mut self` methods except `resolve_attention` and `move_task`, the two
-explicitly accepted browser capabilities. The compiled-binary E2E separately
-proves that cross-origin, malformed and duplicate submissions do not mutate a
-board.
+So a second guard reads the module back and checks all 23 of `Store`'s
+`&mut self` methods. It allowlists three method names — `resolve_attention`,
+`resolve_attention_from_trusted_edge`, and `move_task` — while the two shipped
+browser capabilities are trusted-edge attention resolution and draft opening.
+The compiled-binary E2E separately proves that cross-origin, malformed and
+duplicate submissions do not mutate a board.
 
 ### Write scope, decided 2026-08-24: two verbs, both approval-shaped
 
@@ -88,9 +91,18 @@ task, story, or non-draft epic. Everything else stays read-only. Full board
 control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 
-The actor for a UI write is `geo`. There is one person behind that password, so
-the attribution is honest. If this ever has a second user that stops being
-true, and it needs revisiting before then rather than after.
+The actor for a UI write is `geoyws` by default — `model::OPERATOR_ACTOR`,
+which is the single definition `serve` reads. It was written here as `geo`
+until 2026-09-06; the ledger's own resolve/reopen gate now accepts the literal
+`geoyws` and refuses the ambiguous `geo`, so an ADR still naming `geo` was
+documenting an actor its own board would reject. An opt-in `--actor-header NAME`
+path can replace that default when a trusted edge injects a validated header
+value; the edge must strip any client-supplied copy and set
+`X-Auth-Request-Email` from a successful `auth_request`. If the header name is
+invalid, missing, duplicated, empty, oversized, or malformed, the write fails
+closed. Same-origin still applies, and `--actor-header` may be enabled only
+while the server remains loopback-only. If this ever has a second user that
+stops being true, it needs revisiting before then rather than after.
 
 ### Needs you is live, but WebSockets are not a second ledger
 
@@ -102,14 +114,73 @@ lease token, or write capability.
 
 The server fingerprints the registered SQLite database, WAL and rollback
 journal file states. When one changes, the browser fetches and swaps in the
-canonical server-rendered projection. A draft reply blocks that swap so an
-agent update cannot erase text George is typing. This preserves one read path
-and makes the socket a notification channel rather than replicated state.
+canonical server-rendered projection. An answer in progress blocks that swap
+— words typed into a reply or a verdict picked for a free-text answer, both
+of which the re-rendered projection would come back empty — and the block is
+re-checked when the projection arrives, because an answer can be started
+while it is in flight. This preserves one read path and makes the socket a
+notification channel rather than replicated state.
+
+*Superseded 2026-09-19 by ADR-048 §1 and §5: the browser now fetches JSON from a thin projection over the same Store methods and re-renders it in the embedded SPA, rather than swapping in a server-rendered projection; the frame-content rule, the in-flight-answer hold and its releases below are kept.*
+
+Every hold is releasable, because one that is not is a frozen page: the card
+carries a `Clear verdict` control, shown exactly while a verdict is picked,
+and `Esc` inside the card does the same. HTML offers no other way to
+un-check a radio group. Typed words are never cleared for the operator —
+losing them is what the hold exists to prevent — so the release takes the
+verdict and the composer's own refusal and nothing else; what the board
+refused stays on the card until another attempt replaces it.
+
+Clicking an authored choice releases the picker too, before the body is
+built. An authored choice carries its own verdict and the route forwards no
+picker value onto it, so a verdict the operator happened to leave picked is
+not part of that decision — and a card that went on showing it would be
+claiming a verdict the ledger does not carry, which is exactly what the
+operator would check the card to find out.
+
+The two refusals a card can show are separate lines with separate voices,
+because they are separate claims. The composer's own is the card declining to
+post an answer it can see is half-written, and it speaks the page's language:
+pick a verdict, write your reply. What the route or the network said is
+quoted verbatim, flags and all, because the operator may have to act on the
+exact words. Neither can overwrite the other's line: one shared line meant a
+pre-flight refusal could take the board's sentence and the next keystroke
+could then clear it as the composer's own, leaving a card that looked
+unrefused with nothing recorded anywhere.
+
+The hold is page-wide and the release is per-card, and that asymmetry is real
+rather than an oversight: the swap replaces the whole `<main>`, so there is
+nothing narrower than the page to hold, while the only honest place for a
+`Clear verdict` button is beside the verdict it clears. A verdict picked on a
+card that is then scrolled out of view therefore holds the whole page's
+projection with its own release off screen. What is on screen in that state is
+the page-wide live line reading `update waiting`, for as long as the hold
+lasts; the way back is to reach that card and release it there.
+
+What no keystroke from outside the verdict picker can do is overwrite a
+verdict the operator picked. Inside it the browser's own keys still apply —
+the arrow keys move the verdict and `Space` picks one, which is how a radio
+group is operated — and `Esc` releases it, as above. The digits need a focused
+card to answer at all, and any field that takes text keeps them; on top of
+that they are inert on a card whose verdict picker has a checked radio — a
+property of the CARD rather than of whatever has focus inside it, because one
+`Tab` from the picker lands on the submit and a digit pressed there would
+otherwise reach the recommendation. `Enter` in the picker is aimed at that
+card's own submit for the same reason: the browser's implicit submission would
+pick the form's first submit button, which is that same recommendation. A
+typed reply alone does not disarm the digits, deliberately — a reply rides
+with whichever choice is clicked, which is what the field above it says it
+does — so `1` on a card with words typed, no verdict picked and the cursor
+outside the reply field records the recommendation and sends those words with
+it.
 
 Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
-authority to equal Host, resolve through `Store::resolve_attention`, and are
-attributed to `geo`. Empty, oversized, malformed, cross-origin, unknown-board
-and already-resolved submissions fail without a partial write.
+authority to equal Host and all browser attention resolution calls
+`Store::resolve_attention_from_trusted_edge`: default mode supplies
+`OPERATOR_ACTOR` (`geoyws`), while
+opt-in actor-header mode supplies the trusted edge value. The CLI uses
+`Store::resolve_attention`. Empty, oversized, malformed, cross-origin,
+unknown-board and already-resolved submissions fail without a partial write.
 
 ### No hot reload
 
@@ -142,6 +213,77 @@ can tell without knowing the names.
 This was a bare `!= "mcp"` inside the tool builder. It was correct while there
 was one such command and wrong the moment there were two, which is what a
 literal in place of a set always eventually is.
+
+## Amendment, 2026-09-11: the decisions room
+
+George commissioned this batch in one sitting, in his words: "when a decision
+has been made we need to put the item in a recent decisions tab or something
+so that the eye can easily engage the next item"; "hotkeys to make it easy to
+select and confirm and undo to bring back the last item that was decided on";
+"all reference links... must allow for mouseover to show what they are and
+also allow for nested mouseovers and if clicked should open a tab to that
+item"; "use formatting and markdown and etc to make it easier to read as well
+for all our texts"; and on the skin, that the phosphor-neon terminal look is
+not mandatory and the page may wear the OMP harness's palette instead.
+
+**The undo is a third write shape, on purpose.** `POST
+/attention/<board>/<id>/reopen` reopens exactly one decided item through the
+same audited `Store::reopen_attention` the CLI's `attention reopen` uses,
+gated exactly like the reply route: same-origin, the trusted-edge actor
+(default `geoyws`), the store's operator-or-resolver gate, and a fixed reopen
+note (`undone from the web view`) because an undo that demanded words would
+be a dialog wearing a button. It joins `move_task` and the subscription verbs
+in the module's write-guard allowlist. The reply route's refusals are
+inherited: cross-origin is a 403, an already-open row is a 409 carrying the
+store's own words, an unknown board a 404.
+
+**Recent decisions is a read view, `/decided`.** The newest resolved items
+across every board (each board scanned newest-first to a 200-row bound,
+merged, truncated to 20), each rendered with its question, its decision in
+the ledger's own words, its note, who decided and when, and one Undo. The
+keyboard rule is the same everywhere: `u` reopens the decided row under
+focus, and on Needs you it falls back to the newest receipt on the page —
+the one the last keypress just made. After an undo the projection refreshes
+and focus lands on the brought-back card, so `1`–`4` keep working.
+
+**Hover previews are a read route, `/preview/<kind>/<board>/<id>`.** The
+page script derives the URL by prefixing `/preview` to a reference anchor's
+own path, so task, board, deployment and attention references all preview
+without a second mapping. The fragment it returns is not a page: a whole
+document inside a document would bring a second socket and a second copy of
+the keyboard map into being behind the operator's back. Anchors are marked
+`data-ref` and open `target=_blank rel=noopener`; the fragments themselves
+render `data-ref` anchors (a task preview names its parent), which — with
+every listener delegated to the document — is what makes previews nest.
+
+**Markdown renders board texts, and raw HTML never survives it.** Bodies,
+notes, plan bodies and sitrep bodies go through `pulldown-cmark`
+(`default-features = false, features = ["html"]` — the crate's first entry in
+the dependency list since the server was chosen), with `Html`/`InlineHtml`
+events dropped and link destinations restricted to `http(s)`, `mailto` and
+same-page anchors. A soft break renders as a hard break: bodies were
+`pre-wrap` plain text before, and a receipt's SHA line or a `RESOLVE-WHEN`
+clause is line-shaped on purpose. Scalar interpolation still goes through
+`escape`; the parser is the one bounded place a body meets one.
+
+**The skin is the OMP harness's, not a terminal's.** The phosphor green, the
+CRT overlays and the webfont are gone; the palette follows the
+`dark-catppuccin-omp` theme installed in George's omp (crust `#11111b`,
+base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, green `#a6e3a1`, red
+`#f38ba8`, peach `#fab387`), the system sans stack reads the prose and mono
+is reserved for ids, keys and receipts. One register with the chat the
+decisions are made from, so the page and the harness do not read as two
+products.
+
+*Superseded 2026-09-19 by ADR-048 §7.2: the inlined-asset arrangement this clause realised — the `CSS` and `JS` constants in `rust/serve.rs` — becomes a build-time bundle embedded in the binary; the palette, the type register and ADR-046's design system are unchanged.*
+
+**Acceptance is compiled-process and real-Chrome, per this repo's rule.**
+`tests/e2e.rs` pins: the undo key round trip (receipt gone, card back with
+focus, row open, `decision` cleared, `attention_reopened` carrying the
+previous decision), `/decided` newest-first with an undo from the page, the
+reopen route's cross-origin/open-row/unknown-board refusals, hover previews
+opening and nesting with Escape closing them, and markdown rendering with raw
+HTML inert — plus the unit tests for the renderer itself.
 
 ## Consequences
 

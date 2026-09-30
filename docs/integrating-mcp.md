@@ -24,9 +24,18 @@ already reads.
 
 `KANBAN_PROJECT` is optional. Without it the server resolves a board the way any
 command does — from the working directory it was spawned in — and every tool
-still accepts `project`, `workspace` and `db` per call. Exactly one of those may
-be given at a time; two that disagree are refused rather than ranked
-([ADR-007](adr/ADR-007-global-project-addressing.md)).
+whose operation resolves a board accepts `project`, `workspace` and `db` per
+call. Exactly one of those may be given at a time; two that disagree are refused
+rather than ranked ([ADR-007](adr/ADR-007-global-project-addressing.md)).
+
+Tools whose operation surveys the registry instead — `doctor`, `dashboard`,
+`backup`, `restore`, `audit_verify`, `schema`, the `workspace_*` tools and the
+`rule_*` tools — do not offer those inputs at all, because the CLI refuses them
+there. `init` and `workspace_attach` offer `workspace` only, which names a tree
+rather than a board. The generated `inputSchema` is the authority: it is built
+from the same table the CLI refuses from, so a tool never advertises an argument
+the binary would reject. `kanban schema --json` publishes the same list per
+operation as `ignoredSelectors`.
 
 ## What the tools are
 

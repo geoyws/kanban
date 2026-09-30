@@ -1,5 +1,5 @@
 use crate::model::{
-    Attention, Checkpoint, ContextPacket, Handoff, RuleSummary, Sitrep, Task, TaskNote,
+    Attention, Checkpoint, ContextPacket, GateBlocker, Handoff, RuleSummary, Sitrep, Task, TaskNote,
 };
 use crate::store::Store;
 use anyhow::{Result, bail};
@@ -9,6 +9,47 @@ fn task_line(task: &Task) -> String {
         "- {} [{}] P{} {}",
         task.id, task.status, task.priority, task.title
     )
+}
+
+/// One unfinished prerequisite, and whose gate it is.
+///
+/// The owner is named because a leaf inherits the gates of every plan above
+/// it: told only that some other row is unfinished, a resuming agent reads
+/// its own dependencies, finds none, and concludes the tool is confused.
+///
+/// A title the caller may not read is `None` (`t-3548303e`), rendered as the
+/// em dash this product writes every absent value as. The gate itself — its
+/// id, its status and its owner — is on the line either way, because that is
+/// what the agent needs to understand why its claim is refused.
+fn gate_line(blocker: &GateBlocker) -> String {
+    format!(
+        "- {} [{}] {} (gate declared on {})",
+        blocker.prerequisite_id,
+        blocker.prerequisite_status,
+        blocker.prerequisite_title.as_deref().unwrap_or("—"),
+        blocker.source_task_id
+    )
+}
+
+/// The gate on one line, for the compact packet.
+///
+/// The compact path drops ancestry and dependencies, but not this: an agent
+/// resuming into work it cannot start needs to know that before it reads
+/// anything else, and the ids are short.
+fn render_gates_compact(blockers: &[GateBlocker]) -> String {
+    if blockers.is_empty() {
+        return "(none)".to_owned();
+    }
+    blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "{} [{}] via {}",
+                blocker.prerequisite_id, blocker.prerequisite_status, blocker.source_task_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_checkpoint(checkpoint: &Checkpoint) -> String {
@@ -230,7 +271,18 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
         format!("Priority: {}", task.priority),
         format!("Title: {}", task.title),
         format!("Body: {}", task.body.as_deref().unwrap_or("(none)")),
-        String::new(),
+        // The optional block owns both separators. Its empty form is exactly
+        // the one pre-sprint blank line between task and claim.
+        packet.sprint.as_ref().map_or_else(String::new, |sprint| {
+            format!(
+                "\n## Sprint\n{} \"{}\" v{} · {}\nGoal: {}\n",
+                sprint.sprint_id,
+                sprint.title,
+                sprint.target_version,
+                sprint.status,
+                sprint.goal.as_deref().unwrap_or("(unplanned)")
+            )
+        }),
         "## Claim".to_owned(),
         packet.claim.as_ref().map_or_else(
             || "unclaimed".to_owned(),
@@ -270,6 +322,18 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                 .collect::<Vec<_>>()
                 .join("\n")
         },
+        String::new(),
+        "## Blocking gates".to_owned(),
+        if packet.blocking_gates.is_empty() {
+            "(none)".to_owned()
+        } else {
+            packet
+                .blocking_gates
+                .iter()
+                .map(gate_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
     ]
     .join("\n");
     let newest_checkpoint = packet.checkpoints.last();
@@ -298,6 +362,17 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .claim
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
+            ),
+            format!(
+                "Sprint: {}",
+                packet
+                    .sprint
+                    .as_ref()
+                    .map_or("(none)", |sprint| { &sprint.sprint_id })
+            ),
+            format!(
+                "Blocking gates: {}",
+                render_gates_compact(&packet.blocking_gates)
             ),
             format!(
                 "Open attention: {}",
@@ -405,7 +480,7 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
 
 pub fn render_todo(store: &Store) -> Result<String> {
     let name = store.board_name()?.unwrap_or_else(|| "Kanban".to_owned());
-    let tasks = store.list_tasks(None, None, false)?;
+    let tasks = store.list_tasks(None, None, None, None, false)?;
     let active = tasks
         .iter()
         .filter(|task| task.status != "done" && task.status != "cancelled")
@@ -501,6 +576,7 @@ mod tests {
             archived_at: None,
             metadata: json!({}),
             tags: vec!["attention".to_owned()],
+            allowed_models: Vec::new(),
         }
     }
 
@@ -510,7 +586,13 @@ mod tests {
             task_id: Some("t-ctx".to_owned()),
             kind: kind.to_owned(),
             body: body.to_owned(),
+            question: None,
+            context: None,
+            choices: crate::model::default_choice_pair(),
+            check: None,
             raised_by: "codex@driver".to_owned(),
+            lane: None,
+            return_trigger: None,
             created_at: 3,
             status: "open".to_owned(),
             priority,
@@ -525,6 +607,7 @@ mod tests {
             resolved_at: None,
             resolved_by: None,
             resolution: None,
+            decision: None,
             reopened_at: None,
             reopened_by: None,
             reopen_note: None,
@@ -538,7 +621,9 @@ mod tests {
             task: sample_task(),
             ancestors: vec![],
             dependencies: vec![],
+            blocking_gates: vec![],
             claim: None,
+            orphaned_from: None,
             open_attention: vec![
                 sample_attention(
                     "a-1",
@@ -558,6 +643,7 @@ mod tests {
             handoffs: vec![],
             rules: vec![],
             sitreps: vec![],
+            sprint: None,
             generated_at: 4,
             truncated: false,
         }
@@ -567,6 +653,11 @@ mod tests {
     fn open_attention_is_rendered_in_full_and_compact_contexts() {
         let packet = sample_packet();
         let full = render_context(&packet, 5_000).unwrap();
+        assert!(
+            full.contains(&format!("Body: {}\n\n## Claim", "x".repeat(1_200))),
+            "sprintless spacing drifted: {full}"
+        );
+        assert!(!full.contains("## Sprint"), "{full}");
         assert!(full.contains("## Open attention"), "{full}");
         assert!(full.contains("2 open items"), "{full}");
         assert!(

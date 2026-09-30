@@ -1,0 +1,2476 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# Every executable the crate declares, in Cargo.toml order. This is the one
+# literal list in the release path: every other site that needs the set
+# (package contents, manifest and receipt name checks, the version probe, the
+# bin-link loops, and the embedded remote installer) derives it from here.
+BINARIES=(
+  kanban
+  kb
+  kanban-dispatcher
+  kanban-codex-queue-adapter
+  kanban-codex-app-server-adapter
+  kanban-claude-print-adapter
+  kanban-opencode-adapter
+  kanban-kimi-acp-adapter
+  kanban-cursor-worker-adapter
+  kanban-zcode-notify-adapter
+)
+MAX_RELEASES=10
+HOSTNAME_BIN="${HOSTNAME_BIN:-/bin/hostname}"
+BIN_DIR_DEFAULT="${BIN_DIR_DEFAULT:-${HOME:-/root}/.local/bin}"
+# The one platform a Kanban release IS (ADR-044 §1): every packaged binary is
+# this, whatever the machine that built it runs natively. A build is native
+# when the build machine already is it, and containerised when it is not. The
+# same platform is spelled twice more - in require_release_platform's refusal
+# sentence and in receipt_provenance_defs' artifactPlatform check, each with
+# its own remote twin - and all of them move together or not at all.
+RELEASE_ARTIFACT_PLATFORM="linux-x86_64"
+# Tried in this order when the operator names no runtime, first hit wins. Any
+# OCI runtime that accepts `run --rm --platform linux/amd64 <image> <command>`
+# qualifies; KANBAN_RELEASE_CONTAINER_RUNTIME replaces the search in full.
+RELEASE_CONTAINER_RUNTIMES=(docker podman nerdctl)
+# Measured by the capability gate, recorded by the package receipt. Nothing
+# else writes them, and no receipt field asserts one that was not measured.
+RELEASE_BUILD_PLATFORM=""
+RELEASE_BUILD_KIND=""
+RELEASE_BUILDER_IMAGE=""
+RELEASE_BUILD_RUNTIME=""
+TEMP_PATHS=()
+
+die() {
+  printf 'hig-release: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local status=$?
+  set +u
+  for path in "${TEMP_PATHS[@]}"; do
+    [[ -n "$path" && -e "$path" ]] || continue
+    rm -rf -- "$path"
+  done
+  exit "$status"
+}
+
+trap cleanup EXIT INT TERM HUP
+
+track_temp() {
+  TEMP_PATHS+=("$1")
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  hig-release.sh package hax [--output DIR] [--builder-image REF@sha256:HEX]
+  hig-release.sh install <hax|hig> --package DIR --install-root DIR [--hax-install-root DIR]
+  hig-release.sh rollback <hax|hig> --install-root DIR [--steps N]
+
+  install runs on hax for both targets: install_package refuses any other
+  host before dispatching, so a hig-shell 'install hig' dies with
+  'target hax requires host hax'. A hig install runs install_remote over
+  ssh from hax and copies the package itself (tar over the same ssh), so
+  no relay is needed and hig never needs to reach hax. It requires
+  --hax-install-root pointing at the hax install root that holds the
+  release's canonical activation receipt. Working invocation, from hax:
+    hig-release.sh install hig --package DIR \
+      --install-root /root/.local/share/kanban-releases \
+      --hax-install-root /root/.local/share/kanban-releases
+  --install-root is required and has no default. The live store on both
+  hosts is /root/.local/share/kanban-releases (George, a-e5391903): only
+  root reads it, so no ancestor needs other-traverse.
+EOF
+  exit 64
+}
+
+repo_root() {
+  git rev-parse --show-toplevel
+}
+
+host_short() {
+  "$HOSTNAME_BIN" -s 2>/dev/null || "$HOSTNAME_BIN"
+}
+
+require_host() {
+  local expected="$1"
+  local actual
+  actual="$(host_short)"
+  [[ "$actual" == "$expected" ]] || die "target $expected requires host $expected, but this shell is $actual"
+}
+
+sha256_of() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+# The release set as a JSON array, so the manifest and receipt name checks
+# compare against BINARIES rather than a second literal list that can drift.
+binaries_json() {
+  printf '%s\n' "${BINARIES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# Membership in the release set, derived from BINARIES so a name the package
+# does not ship can never be probed as though it belonged to the release.
+release_binary_known() {
+  local candidate="$1"
+  local binary
+  for binary in "${BINARIES[@]}"; do
+    [[ "$binary" != "$candidate" ]] || return 0
+  done
+  return 1
+}
+
+# Which branch of file_version answers a version probe on this host, so the
+# receipt can RECORD which one did rather than leave a reader to infer it.
+# One reading of HIG_RELEASE_TARGET_RUNNER, shared by the probe that follows
+# it and by the receipt's versionProbe field (ADR-044 §2), because two
+# readings are two facts and two facts can disagree.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+version_probe_kind() {
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    printf 'runner\n'
+  else
+    printf 'native\n'
+  fi
+}
+
+# Everything one release binary says when it is asked what it is, left in
+# FILE_PROBE_REPORT rather than printed.
+#
+# A global rather than stdout, for one reason that is not style: `die` inside
+# a command substitution exits only that substitution. Every caller runs
+# inside one already - `version="$(file_version "$binary")"` - so a probe
+# that printed its answer would put its own refusals one subshell deeper
+# than the caller, where a runner that cannot be executed, or that reports
+# nothing, would be swallowed and packaging would succeed with an empty
+# version. The refusal has to happen in the caller's subshell, so the value
+# comes back in a variable and nothing here is nested.
+#
+# HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
+# release platform: one executable program taking no arguments of its own,
+# invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
+# takes the same branch - means the host executes the release artifact
+# itself, which is the hax and hig case and the path production runs; the
+# container path sets it to the program that runs the artifact inside the
+# same pinned image the binaries were built in, because a host that is not
+# linux x86-64 cannot ask a release binary anything.
+#
+# What it can and cannot reach, stated as it is rather than as it should be:
+# it never carries a gate, because the platform header, the byte count and
+# every sha256 read the bytes on disk and never pass through it, and a
+# runner that fails or reports nothing is a refusal, so an empty version is
+# never recorded. But a runner that is set is TRUSTED: files[].version is
+# whatever it prints, a false runner yields a false version that
+# package_validate then re-validates against itself and accepts. What a
+# receipt can honestly say about that is WHICH BRANCH answered, so the
+# branch is chosen by version_probe_kind and the package receipt records
+# that same verdict in versionProbe.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+FILE_PROBE_REPORT=""
+file_probe() {
+  local binary="$1"
+  local name="${binary##*/}"
+  release_binary_known "$name" || die "unknown release binary $name"
+  # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
+  # dispatcher and every adapter answer the `--version` flag instead.
+  local probe="--version"
+  case "$name" in
+    kanban | kb)
+      probe="version"
+      ;;
+  esac
+  local reported
+  if [[ "$(version_probe_kind)" == runner ]]; then
+    [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
+      die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
+    reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: $HIG_RELEASE_TARGET_RUNNER could not report a version for it"
+  else
+    reported="$("$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: it could not report a version"
+  fi
+  [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
+  FILE_PROBE_REPORT="$reported"
+}
+
+# The version a binary reports: the FIRST line of its probe.
+#
+# The operator CLI answers on two lines since the operator UI became an
+# embedded bundle (ADR-048): the version, then `bundle <sha256>`. The version
+# is the first line for every binary in the set, and what comes after it is
+# additional provenance read by its own probe below - so files[].version
+# stays the one-line fact it has always been.
+file_version() {
+  file_probe "$1"
+  printf '%s\n' "${FILE_PROBE_REPORT%%$'\n'*}"
+}
+
+# The operator UI bundle a binary carries, or nothing.
+#
+# `kanban --version` prints `bundle <sha256>` as its second line, derived by
+# the build from the embedded bytes (SPA-03). Nothing - an adapter, or any
+# binary built before the bundle existed - is not a failure here: the field
+# is additive, and a receipt without it is a valid `formatVersion` 2 receipt
+# that simply proves one thing less. A malformed line IS a failure: a
+# fingerprint that is not 64 hex digits is not a fingerprint.
+file_bundle_sha256() {
+  local binary="$1"
+  file_probe "$binary"
+  local line="" candidate
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      "bundle "*)
+        line="${candidate#bundle }"
+        break
+        ;;
+    esac
+  done <<< "$FILE_PROBE_REPORT"
+  [[ -n "$line" ]] || return 0
+  [[ "$line" =~ ^[0-9a-f]{64}$ ]] ||
+    die "refusing $binary: it reported the bundle fingerprint $line, which is not 64 hex digits"
+  printf '%s\n' "$line"
+}
+
+ensure_regular_dir() {
+  local path="$1"
+  [[ -d "$path" ]] || die "directory does not exist: $path"
+  [[ ! -L "$path" ]] || die "path must not be a symlink: $path"
+}
+
+ensure_fresh_output() {
+  local path="$1"
+  [[ ! -e "$path" ]] || die "output already exists: $path"
+  local parent
+  parent="$(dirname "$path")"
+  [[ -d "$parent" ]] || die "output parent does not exist: $parent"
+  [[ ! -L "$parent" ]] || die "output parent must not be a symlink: $parent"
+}
+
+manifest_path() {
+  printf '%s/manifest.json' "$1"
+}
+
+receipt_path() {
+  printf '%s.receipt.json' "$1"
+}
+
+activation_sequence_path() {
+  printf '%s/releases/.activation-sequence' "$1"
+}
+
+exact_package_entries() {
+  printf '%s\n' manifest.json "${BINARIES[@]}" | sort
+}
+
+package_manifest_sha256() {
+  sha256_of "$(manifest_path "$1")"
+}
+
+package_targets_json() {
+  local target="$1"
+  case "$target" in
+    hax)
+      printf '["hax","hig"]'
+      ;;
+    hig)
+      die "package target must be hax"
+      ;;
+    *)
+      die "target must be hax or hig, got $target"
+      ;;
+  esac
+}
+
+# The release store's identity is derived, never carried: `releaseId` is
+# "$sourceCommit-$manifestSha256", and every activation field is written by the
+# installer when it activates. A package artifact that carries either is
+# refused here, before anything is written: otherwise the id a hand-edited
+# manifest or receipt names and the id it actually installs as disagree
+# silently, because the activation receipt is the package receipt plus the
+# installer's own fields and the installer's copy wins the merge.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+reject_carried_release_identity() {
+  local file="$1"
+  local expected_release_id="${2:-}"
+  jq -e --arg expected "$expected_release_id" '
+    (["activationSequence", "installedAt", "releaseDir", "currentLink", "binDir", "installerHost", "target"]
+      + (if $expected == "" then ["releaseId"] else [] end)) as $forbidden
+    | . as $doc
+    | (($forbidden | map(select(. as $key | $doc | has($key))) | length) == 0)
+      and (($doc | .releaseId // $expected) == $expected)
+  ' "$file" >/dev/null ||
+    die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
+# A Kanban release is linux x86-64, whatever the host that built it runs
+# natively: hax and hig both execute the packaged binaries, so a package
+# carrying a Mac's native build output is not a release at all. The witness is
+# the file's own ELF header, read as bytes here rather than asked of file(1),
+# which is not installed on every host this runs on, and never inferred from a
+# name, a mode bit or a build flag. Nothing is skipped for being awkward: a
+# symlink and anything that is not a regular file are refused before the file
+# is opened, and a file too short to carry a header is refused for that.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+require_release_platform() {
+  local file="$1"
+  local platform="a Kanban release targets linux x86-64 (ELF 64-bit, little-endian)"
+  # Refused before anything is opened, and refused rather than followed: a
+  # symlink is not the file it names, and a FIFO planted at a release binary's
+  # path would hold this read open forever instead of answering it.
+  [[ ! -L "$file" ]] ||
+    die "refusing $file: $platform, but this path is a symlink, not the release binary itself"
+  [[ -f "$file" ]] ||
+    die "refusing $file: $platform, but this path is not a regular file"
+  local -a header
+  local read_status=0
+  header=($(LC_ALL=C od -An -v -tu1 -N20 -- "$file" 2>/dev/null)) || read_status=$?
+  (( read_status == 0 && ${#header[@]} == 20 )) ||
+    die "refusing $file: $platform, but no executable header could be read from it: 20 bytes are needed and it produced ${#header[@]}"
+  local magic
+  magic="$(printf '%02x%02x%02x%02x' "${header[0]}" "${header[1]}" "${header[2]}" "${header[3]}")"
+  if [[ "$magic" == 7f454c46 ]]; then
+    # e_type as well as the machine: a relocatable object, a core dump and an
+    # ET_NONE file all carry an x86-64 ELF header and not one of them is a
+    # program a host can run. ET_EXEC and ET_DYN are what a release is - the
+    # linux release profile links PIE, which is ET_DYN.
+    local etype=$(( header[16] + header[17] * 256 ))
+    local machine=$(( header[18] + header[19] * 256 ))
+    local observed
+    observed="$(printf 'ELF class %s, data %s, type 0x%04x, machine 0x%04x' "${header[4]}" "${header[5]}" "$etype" "$machine")"
+    (( header[4] == 2 && header[5] == 1 && machine == 62 && (etype == 2 || etype == 3) )) ||
+      die "refusing $file: $platform, but this file is $observed"
+    return 0
+  fi
+  case "$magic" in
+    feedface | cefaedfe | feedfacf | cffaedfe)
+      die "refusing $file: $platform, but this file is Mach-O (magic 0x$magic)"
+      ;;
+    cafebabe | bebafeca)
+      die "refusing $file: $platform, but this file is a universal (fat) Mach-O (magic 0x$magic)"
+      ;;
+  esac
+  die "refusing $file: $platform, but this file is not an ELF image (magic 0x$magic)"
+}
+
+validate_release_files() {
+  local dir="$1"
+  local target="$2"
+  local manifest
+  manifest="$(manifest_path "$dir")"
+  [[ -f "$manifest" ]] || die "package has no manifest.json"
+  ensure_regular_dir "$dir"
+
+  local expected actual
+  expected="$(exact_package_entries)"
+  actual="$(find "$dir" -mindepth 1 -maxdepth 1 -print | sed 's|.*/||' | sort)"
+  [[ "$actual" == "$expected" ]] || {
+    printf 'hig-release: unexpected package contents in %s\n' "$dir" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+    exit 1
+  }
+
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
+    (.formatVersion == 1) and
+    (.targets | type == "array") and
+    (.targets | length == 2) and
+    (.targets | index("hax") != null) and
+    (.targets | index("hig") != null) and
+    (.targets | index($target) != null) and
+    (.sourceTreeClean == true) and
+    ((.sourceCommit | type) == "string") and
+    ((.sourceCommit | length) == 40) and
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
+  ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
+  reject_carried_release_identity "$manifest"
+
+  while IFS=$'\t' read -r name sha256 size version; do
+    local path="$dir/$name"
+    [[ -f "$path" ]] || die "package is missing binary $name"
+    [[ ! -L "$path" ]] || die "package binary must not be a symlink: $name"
+    require_release_platform "$path"
+    # The script's own verdict on whether this host could run it, so a mode
+    # bit is never left for the version probe - or whatever runs it - to
+    # discover.
+    [[ -x "$path" ]] || die "package binary $name is not executable"
+    [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || {
+      die "package binary $name has the wrong size"
+    }
+    [[ "$(sha256_of "$path")" == "$sha256" ]] || {
+      die "package binary $name hash mismatch"
+    }
+    [[ "$(file_version "$path")" == "$version" ]] || {
+      die "package binary $name version mismatch"
+    }
+  done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$manifest")
+
+  # The operator UI the executable carries, when the manifest names one.
+  # Additive: a manifest without the field is a manifest from before the UI
+  # was embedded and proves one thing less, which is a valid thing to be.
+  local declared_bundle
+  declared_bundle="$(jq -r '.bundleSha256 // empty' "$manifest")"
+  if [[ -n "$declared_bundle" ]]; then
+    [[ "$(file_bundle_sha256 "$dir/kanban")" == "$declared_bundle" ]] ||
+      die "kanban in $dir does not carry the bundle its manifest names ($declared_bundle)"
+  fi
+}
+
+validate_package() {
+  local package_dir="$1"
+  local target="$2"
+  validate_release_files "$package_dir" "$target"
+}
+
+# What a `formatVersion` 2 receipt must SAY ABOUT ITS OWN BUILD, as one jq
+# definition every receipt validator prepends to its own program (ADR-044
+# §2). One copy rather than three, because three copies of an invariant are
+# three chances to check a different thing on the local leg, the hig
+# activation check and the remote installer.
+#
+# `host` is shape-checked and never compared to a name: v1 asserted the
+# literal "hax" back, which authorized nothing and recorded nothing, and v2
+# admits any short hostname because the name is a record. What cannot be
+# faked is checked instead - `artifactPlatform` is the platform every
+# packaged file was verified to be, and the cross-field rules refuse the
+# receipts that could not have been produced: a native build that is not the
+# artifact's own platform, a native build naming an image, a containerised
+# build whose image is not digest-pinned, and a version probe claiming to
+# have run the artifact on a machine that cannot run it.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+receipt_provenance_defs() {
+  cat <<'JQ'
+def receipt_provenance_ok:
+  (.formatVersion == 2)
+  and ((.host | type) == "string") and (.host | test("^\\S+$"))
+  and ((.buildPlatform | type) == "string")
+  and (.buildPlatform | test("^[a-z0-9_]+-[a-z0-9_.]+$"))
+  and (.artifactPlatform == "linux-x86_64")
+  and ((.buildKind == "native") or (.buildKind == "container"))
+  and (has("builderImage"))
+  and (if .buildKind == "native"
+       then (.builderImage == null) and (.buildPlatform == .artifactPlatform)
+       else ((.builderImage | type) == "string")
+            and (.builderImage | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
+       end)
+  and ((.toolchain | type) == "object")
+  and ((.toolchain | keys) == ["cargo", "rustc"])
+  and ((.toolchain.rustc | type) == "string") and ((.toolchain.rustc | length) > 0)
+  and ((.toolchain.cargo | type) == "string") and ((.toolchain.cargo | length) > 0)
+  and ((.versionProbe == "native") or (.versionProbe == "runner"))
+  and (if .versionProbe == "native"
+       then .buildPlatform == .artifactPlatform
+       else true
+       end)
+  # Additive (ADR-048): a receipt that names the embedded operator UI bundle
+  # must name a fingerprint; a receipt from before the UI was embedded is
+  # still a valid formatVersion 2 receipt.
+  and (if has("bundleSha256")
+       then ((.bundleSha256 | type) == "string") and (.bundleSha256 | test("^[0-9a-f]{64}$"))
+       else true
+       end);
+JQ
+}
+
+validate_receipt() {
+  local receipt="$1"
+  local target="$2"
+  local package_dir="$3"
+  local manifest_sha
+  local manifest_commit
+  manifest_sha="$(package_manifest_sha256 "$package_dir")"
+  manifest_commit="$(jq -r '.sourceCommit' "$(manifest_path "$package_dir")")"
+  [[ -f "$receipt" ]] || die "package receipt is missing: $receipt"
+  ensure_regular_dir "$(dirname "$receipt")"
+  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
+    (.targets | type == "array") and
+    (.targets | length == 2) and
+    (.targets | index("hax") != null) and
+    (.targets | index("hig") != null) and
+    (.targets | index($target) != null) and
+    (.sourceTreeClean == true) and
+    ((.sourceCommit | type) == "string") and
+    ((.sourceCommit | length) == 40) and
+    (.manifestSha256 == $manifest_sha) and
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
+  ' "$receipt" >/dev/null || die "package receipt is incomplete or mismatched"
+  [[ "$(jq -r '.sourceCommit' "$receipt")" == "$manifest_commit" ]] || {
+    die "package receipt source commit mismatch"
+  }
+  # The receipt and the manifest name the same bundle, or neither names one:
+  # a receipt that proved a UI the package does not carry would be the exact
+  # false proof SPA-03 exists to stop.
+  local manifest_bundle receipt_bundle
+  manifest_bundle="$(jq -r '.bundleSha256 // empty' "$(manifest_path "$package_dir")")"
+  receipt_bundle="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ "$manifest_bundle" == "$receipt_bundle" ]] || {
+    die "package receipt names bundle ${receipt_bundle:-none} and its manifest names ${manifest_bundle:-none}"
+  }
+  reject_carried_release_identity "$receipt" "${manifest_commit}-${manifest_sha}"
+}
+
+next_activation_sequence() {
+  local install_root="$1"
+  local sequence_path
+  sequence_path="$(activation_sequence_path "$install_root")"
+  mkdir -p "$(dirname "$sequence_path")"
+  python3 - "$sequence_path" <<'PY'
+import fcntl
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "a+", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0)
+    current = handle.read().strip()
+    next_value = int(current) + 1 if current else 1
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{next_value}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    print(next_value)
+PY
+}
+
+validate_hax_activation_receipt() {
+  local hax_install_root="$1"
+  local target="$2"
+  local package_dir="$3"
+  local manifest
+  local manifest_sha
+  local manifest_commit
+  local release_id
+  local receipt
+  local release_dir
+  local current_path
+  manifest="$package_dir/manifest.json"
+  manifest_sha="$(sha256sum "$manifest" | awk '{print $1}')"
+  manifest_commit="$(jq -r '.sourceCommit' "$manifest")"
+  release_id="${manifest_commit}-${manifest_sha}"
+  receipt="$(release_receipt "$hax_install_root" "$release_id")"
+  release_dir="$(release_dir "$hax_install_root" "$release_id")"
+  current_path="$(current_link "$hax_install_root")"
+  ensure_regular_dir "$hax_install_root"
+  [[ -f "$receipt" ]] || die "hax activation receipt is missing: $receipt"
+  [[ ! -L "$receipt" ]] || die "hax activation receipt must not be a symlink: $receipt"
+  [[ -d "$release_dir" ]] || die "hax release directory is missing: $release_dir"
+  [[ ! -L "$release_dir" ]] || die "hax release directory must not be a symlink: $release_dir"
+  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --arg manifest_commit "$manifest_commit" --arg release_id "$release_id" --arg release_dir "$release_dir" --arg current_path "$current_path" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
+    # `target` and `installerHost` are facts about the machine that ACTIVATED
+    # this release, which is still hax, and are a different fact from `host`.
+    (.target == "hax") and
+    (.installerHost == "hax") and
+    (.targets | type == "array") and
+    (.targets | length == 2) and
+    (.targets | index("hax") != null) and
+    (.targets | index("hig") != null) and
+    (.targets | index($target) != null) and
+    (.sourceTreeClean == true) and
+    (.sourceCommit == $manifest_commit) and
+    (.manifestSha256 == $manifest_sha) and
+    (.releaseId == $release_id) and
+    (.releaseDir == $release_dir) and
+    (.currentLink == $current_path) and
+    ((.releaseDir | type) == "string") and
+    ((.currentLink | type) == "string") and
+    ((.binDir | type) == "string") and
+    ((.installedAt | type) == "number") and
+    ((.installedAt > 0) == true)
+  ' "$receipt" >/dev/null || die "hax activation receipt is incomplete or mismatched"
+  [[ "$(readlink "$current_path")" == "$release_dir" ]] || die "hax current pointer does not match the installed release"
+  [[ -f "$release_dir/manifest.json" ]] || die "hax release manifest is missing: $release_dir/manifest.json"
+  while IFS=$'\t' read -r name sha256 size version; do
+    local path="$release_dir/$name"
+    [[ -f "$path" ]] || die "hax release directory is missing binary $name"
+    require_release_platform "$path"
+    [[ -x "$path" ]] || die "hax release binary $name is not executable"
+    [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "hax release binary $name has the wrong size"
+    [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "hax release binary $name hash mismatch"
+    [[ "$(file_version "$path")" == "$version" ]] || die "hax release binary $name version mismatch"
+  done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$package_dir/manifest.json")
+}
+
+release_id_from_receipt() {
+  local receipt="$1"
+  jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt"
+}
+
+current_link() {
+  printf '%s/current' "$1"
+}
+
+release_dir() {
+  local root="$1"
+  local id="$2"
+  printf '%s/releases/%s' "$root" "$id"
+}
+
+release_receipt() {
+  local root="$1"
+  local id="$2"
+  printf '%s/releases/%s.receipt.json' "$root" "$id"
+}
+
+bin_link_path() {
+  printf '%s/%s' "$1" "$2"
+}
+
+# The five functions below are embedded verbatim in the remote install script
+# (see install_remote); hig_release_script_local_and_remote_install_guards_are_identical
+# in tests/e2e.rs fails when the two copies drift.
+physical_dir() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# A managed symlink is one this installer wrote: its target sits directly in
+# "$install_root/$expected_parent" (current -> releases/<id>, bin/<name> ->
+# current/<name>). Anything else belongs to the operator and is never replaced.
+managed_symlink() {
+  local link="$1"
+  local install_root="$2"
+  local expected_parent="$3"
+  [[ -L "$link" ]] || return 1
+  local target parent root_physical parent_physical
+  target="$(readlink "$link")"
+  [[ "$target" == /* ]] || target="$(dirname "$link")/$target"
+  parent="$(dirname "$target")"
+  [[ "${parent##*/}" == "$expected_parent" ]] || return 1
+  root_physical="$(physical_dir "$install_root")" || return 1
+  parent_physical="$(physical_dir "$(dirname "$parent")")" || return 1
+  [[ "$parent_physical" == "$root_physical" ]]
+}
+
+# `releases/<id>.receipt.json` is as much a managed destination as `current`
+# and the bin links: the installer writes it only when nothing is there, so a
+# receipt already at that path is adopted whole -- reported back as this
+# activation's receipt, and read by release_entries as the ordering key that
+# decides retention and rollback. A planted one therefore pins itself newest
+# and evicts a real release without ever having been installed. A receipt
+# this installer wrote names the release being installed in all three
+# identity fields and carries a sequence this install root actually issued,
+# so re-activating an installed release still passes; anything else is
+# refused before a byte is written.
+ensure_managed_activation_receipt() {
+  local receipt="$1"
+  local install_root="$2"
+  local release_id="$3"
+  [[ -e "$receipt" || -L "$receipt" ]] || return 0
+  [[ ! -L "$receipt" ]] ||
+    die "refusing to install: $receipt is a symlink, not an activation receipt this installer wrote; move it aside before installing"
+  [[ -f "$receipt" ]] ||
+    die "refusing to install: $receipt is not a regular file, so it is not an activation receipt this installer wrote; move it aside before installing"
+  jq -e 'type == "object"' "$receipt" >/dev/null 2>&1 ||
+    die "refusing to install: $receipt does not parse as a JSON object; move it aside before installing"
+  jq -e --arg release_id "$release_id" --arg source_commit "${release_id%%-*}" --arg manifest_sha "${release_id##*-}" '
+    (.releaseId == $release_id) and
+    (.sourceCommit == $source_commit) and
+    (.manifestSha256 == $manifest_sha)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt does not name the release being installed ($release_id); move it aside before installing"
+  local counter=0 sequence sequence_path
+  sequence="$(jq -c '.activationSequence' "$receipt")"
+  sequence_path="$install_root/releases/.activation-sequence"
+  if [[ -f "$sequence_path" && ! -L "$sequence_path" ]]; then
+    counter="$(tr -d '[:space:]' <"$sequence_path")"
+    [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+  fi
+  jq -e --argjson counter "$counter" '
+    ((.activationSequence | type) == "number") and
+    ((.activationSequence | floor) == .activationSequence) and
+    (.activationSequence >= 1) and
+    (.activationSequence <= $counter)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt carries activationSequence $sequence, which is not an integer this install root has issued (its counter stands at $counter); move it aside before installing"
+}
+
+# Refuses, before anything is written, every path an activation writes through
+# unless it has the shape this installer creates: releases/ and releases/<id>
+# real directories, current and bin/<name> absent or managed symlinks, the bin
+# dir a real directory. Called from a clean state so a refusal mutates nothing.
+ensure_safe_release_view() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local release_id="$3"
+  shift 3
+  local releases="$install_root/releases"
+  local current="$install_root/current"
+  local release_path="$releases/$release_id"
+  local release_meta="$releases/$release_id.receipt.json"
+  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
+  [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
+  if [[ -e "$releases" || -L "$releases" ]]; then
+    [[ ! -L "$releases" ]] || die "refusing to install through a symlink at $releases; remove it so releases/ is a real directory inside $install_root"
+    [[ -d "$releases" ]] || die "refusing to install: $releases is not a directory; move it aside so the installer can create releases/"
+  fi
+  if [[ -e "$release_path" || -L "$release_path" ]]; then
+    [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
+    [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
+  fi
+  ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
+  if [[ -e "$current" || -L "$current" ]]; then
+    managed_symlink "$current" "$install_root" releases ||
+      die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"
+  fi
+  if [[ -e "$bin_dir" || -L "$bin_dir" ]]; then
+    [[ ! -L "$bin_dir" ]] || die "bin dir must not be a symlink: $bin_dir; pass --bin-dir with the real directory"
+    [[ -d "$bin_dir" ]] || die "bin dir is not a directory: $bin_dir; pass --bin-dir with a directory"
+  fi
+  local binary link
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    if [[ -e "$link" || -L "$link" ]]; then
+      managed_symlink "$link" "$install_root" current ||
+        die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
+    fi
+  done
+}
+
+atomic_symlink() {
+  local target="$1"
+  local link_path="$2"
+  local link_parent
+  link_parent="$(dirname "$link_path")"
+  if [[ -e "$link_path" || -L "$link_path" ]] && [[ ! -L "$link_path" ]]; then
+    printf 'hig-release: refusing to replace %s: it is not a symlink; move it aside before installing\n' "$link_path" >&2
+    return 1
+  fi
+  if [[ -L "$link_parent" ]]; then
+    printf 'hig-release: refusing to write through a symlink at %s; replace it with a real directory\n' "$link_parent" >&2
+    return 1
+  fi
+  mkdir -p "$link_parent"
+  local staging
+  staging="$(mktemp -d "$link_parent/.${link_path##*/}.XXXXXX")"
+  ln -s "$target" "$staging/link"
+  python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$staging/link" "$link_path"
+  rmdir "$staging"
+}
+
+ensure_public_binary_links() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local current_path
+  current_path="$(current_link "$install_root")"
+  mkdir -p "$bin_dir"
+  for binary in "${BINARIES[@]}"; do
+    local link_path target
+    link_path="$(bin_link_path "$bin_dir" "$binary")"
+    target="$current_path/$binary"
+    if [[ ! -L "$link_path" || "$(readlink "$link_path")" != "$target" ]]; then
+      atomic_symlink "$target" "$link_path"
+    fi
+  done
+}
+
+rollback_activation_view() {
+  local status=$?
+  local install_root="$1"
+  local release_path="$2"
+  local release_meta="$3"
+  local previous_current="$4"
+  local current_switched="$5"
+  local release_created="$6"
+  local bin_dir="$7"
+
+  trap - ERR
+  set +e
+  (( status != 0 )) || status=1
+
+  local current_path
+  current_path="$(current_link "$install_root")"
+
+  if [[ "$current_switched" == 1 ]]; then
+    if [[ -n "$previous_current" ]]; then
+      atomic_symlink "$previous_current" "$current_path"
+    else
+      rm -f -- "$current_path"
+    fi
+  fi
+
+  if [[ -z "$previous_current" ]]; then
+    local binary
+    for binary in "${BINARIES[@]}"; do
+      rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
+    done
+  fi
+
+  # Restoring the links restores the PATHS. No service runs from a release
+  # since `kanban serve` was retired (ADR-053), so no process has to follow
+  # them back before the candidate's directory is removed.
+  # `current` may legitimately hold a relative target - ensure_safe_release_view
+  # accepts one, resolving it against the link's own directory - so the value
+  # is restored verbatim and normalised against the install root before it is
+  # handed to a proof that has to resolve it as a path.
+  local previous_release="$previous_current"
+  [[ -z "$previous_release" || "$previous_release" == /* ]] || previous_release="$install_root/$previous_release"
+  if [[ "$release_created" == 1 ]]; then
+    rm -rf -- "$release_path"
+    rm -f -- "$release_meta"
+  fi
+
+  exit "$status"
+}
+
+maybe_fail_after_current() {
+  if [[ "${HIG_RELEASE_FAIL_AFTER_CURRENT:-}" == "1" ]]; then
+    printf 'hig-release: injected failure after current activation\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+# The second half of the release proof, asked of the INSTALLED executable
+# (SPA-03, ADR-048). This proves WHICH OPERATOR UI that binary carries, by
+# running it and reading the `bundle <sha256>` line its version banner
+# prints. A receipt that names one bundle and an installed binary that
+# carries another is an activation nobody can describe, so it is refused
+# before the receipt - the commit - is written.
+#
+# Additive: a receipt with no `bundleSha256` - one built before the UI was
+# embedded - proves one thing less and installs exactly as it did before.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+prove_installed_bundle() {
+  local release_path="$1"
+  local receipt="$2"
+  local declared reported
+  declared="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ -n "$declared" ]] || return 0
+  reported="$(file_bundle_sha256 "$release_path/kanban")"
+  [[ -n "$reported" ]] ||
+    die "refusing this activation: the installed kanban reports no bundle, and its receipt names $declared"
+  [[ "$reported" == "$declared" ]] ||
+    die "refusing this activation: the installed kanban carries bundle $reported and its receipt names $declared"
+  printf 'hig-release: the installed kanban carries bundle %s\n' "$reported" >&2
+}
+
+release_entries() {
+  local root="$1"
+  local files=()
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find "$root/releases" -mindepth 1 -maxdepth 1 -type f -name '*.receipt.json' -print0 2>/dev/null)
+  if ((${#files[@]} == 0)); then
+    return 0
+  fi
+  jq -r '. as $meta | [($meta.activationSequence // 0), ($meta.installedAt // 0), $meta.releaseId] | @tsv' "${files[@]}" |
+    sort -t $'\t' -k1,1nr -k2,2nr |
+    awk -F '\t' '{print $3}'
+}
+
+prune_releases() {
+  local root="$1"
+  local keep="${2:-$MAX_RELEASES}"
+  local releases=()
+  while IFS= read -r release; do
+    [[ -n "$release" ]] || continue
+    releases+=("$release")
+  done < <(release_entries "$root")
+  if (( ${#releases[@]} <= keep )); then
+    return 0
+  fi
+  local index=0 failed=0
+  for release in "${releases[@]}"; do
+    (( index += 1 ))
+    if (( index > keep )); then
+      # Callers handle failure explicitly, disabling errexit in this function.
+      # Keep the receipt indexing any directory we could not remove, and do
+      # not let a later successful removal erase an earlier failure.
+      if rm -rf -- "$root/releases/$release"; then
+        rm -f -- "$root/releases/$release.receipt.json" || failed=1
+      else
+        failed=1
+      fi
+    fi
+  done
+  return "$failed"
+}
+
+validate_target() {
+  case "$1" in
+    hax|hig) ;;
+    *) die "target must be hax or hig, got $1" ;;
+  esac
+}
+
+manifest_path() {
+  printf '%s/manifest.json' "$1"
+}
+
+package_validate() {
+  local package_dir="$1"
+  local target="$2"
+  local manifest
+  manifest="$(manifest_path "$package_dir")"
+  [[ -f "$manifest" ]] || die "package has no manifest.json"
+
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
+    (.formatVersion == 1) and
+    (.targets | type == "array") and
+    (.targets | length == 2) and
+    (.targets | index("hax") != null) and
+    (.targets | index("hig") != null) and
+    (.targets | index($target) != null) and
+    (.sourceTreeClean == true) and
+    ((.sourceCommit | type) == "string") and
+    ((.sourceCommit | length) == 40) and
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
+  ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
+  reject_carried_release_identity "$manifest"
+
+  while IFS=$'\t' read -r name sha256 size version; do
+    local path="$package_dir/$name"
+    [[ -f "$path" ]] || die "package is missing binary $name"
+    require_release_platform "$path"
+    [[ -x "$path" ]] || die "package binary $name is not executable"
+    [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || {
+      die "package binary $name has the wrong size"
+    }
+    [[ "$(sha256_of "$path")" == "$sha256" ]] || {
+      die "package binary $name hash mismatch"
+    }
+    [[ "$(file_version "$path")" == "$version" ]] || {
+      die "package binary $name version mismatch"
+    }
+  done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$manifest")
+
+  # Same additive rule as validate_release_files: when the manifest names an
+  # embedded operator UI bundle, the packaged executable has to be carrying
+  # exactly that one.
+  local declared_bundle
+  declared_bundle="$(jq -r '.bundleSha256 // empty' "$manifest")"
+  if [[ -n "$declared_bundle" ]]; then
+    [[ "$(file_bundle_sha256 "$package_dir/kanban")" == "$declared_bundle" ]] ||
+      die "packaged kanban does not carry the bundle its manifest names ($declared_bundle)"
+  fi
+}
+
+write_manifest() {
+  local output="$1"
+  local target="$2"
+  local commit="$3"
+  local files="$4"
+  # The operator UI bundle the packaged `kanban` reports, or empty for a
+  # build that carries none. Additive: `formatVersion` stays 1 and a reader
+  # that does not know the field is unaffected (ADR-044 §2, ADR-048).
+  local bundle_sha="$5"
+  local targets
+  targets="$(package_targets_json "$target")"
+  jq -n -S \
+    --argjson targets "$targets" \
+    --arg source_commit "$commit" \
+    --arg bundle_sha "$bundle_sha" \
+    --argjson files "$files" \
+    '{
+      formatVersion: 1,
+      targets: $targets,
+      sourceCommit: $source_commit,
+      sourceTreeClean: true,
+      files: $files
+    }
+    + (if $bundle_sha == "" then {} else {bundleSha256: $bundle_sha} end)' > "$output/manifest.json"
+}
+
+# Runs one command with a deadline, stdout and stderr each to their own file,
+# and answers 124 when the deadline passed - the exit status `timeout(1)`
+# uses, which is not installed on every host this script runs on. What is
+# bounded is the program this shell launched: a container client killed here
+# leaves a `--rm` container to the runtime's own reaper, which is the right
+# trade for a probe that must not be able to hang a release.
+run_bounded() {
+  local seconds="$1"
+  local out="$2"
+  local err="$3"
+  shift 3
+  "$@" > "$out" 2> "$err" &
+  local pid=$!
+  local tenths=$(( seconds * 10 ))
+  while (( tenths > 0 )); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    (( tenths -= 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+  fi
+  local status=0
+  wait "$pid" || status=$?
+  return "$status"
+}
+
+# The ceiling on any single container call this script makes that is a probe
+# rather than a build: one `uname`, one `--version`, plus whatever pulling the
+# image costs the first time. An operator on a cold cache raises it; nobody
+# removes it, because every one of these calls sits before a release can be
+# refused for free.
+container_probe_seconds() {
+  local seconds="${KANBAN_RELEASE_CONTAINER_PROBE_SECONDS:-120}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] ||
+    die "KANBAN_RELEASE_CONTAINER_PROBE_SECONDS must be a whole number of seconds greater than zero, and it is $seconds"
+  printf '%s\n' "$seconds"
+}
+
+
+# The toolchain probe's own ceiling. It defaults to the container ceiling so
+# an operator's existing KANBAN_RELEASE_CONTAINER_PROBE_SECONDS keeps
+# governing everything, and exists as its own knob because the two probes
+# fail differently: the capability probe may legitimately wait out a cold
+# image pull, while the toolchain probe runs after the build on an image the
+# capability gate has already exercised. A test (or an operator) that wants a
+# wedged toolchain probe refused quickly no longer has to shrink the budget
+# the capability probe needs to succeed on a loaded machine.
+toolchain_probe_seconds() {
+  local seconds="${KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS:-$(container_probe_seconds)}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] ||
+    die "KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS must be a whole number of seconds greater than zero, and it is $seconds"
+  printf '%s\n' "$seconds"
+}
+# What THIS machine REPORTS it is, in the receipt's own vocabulary: `uname -s`
+# lowercased, a hyphen, `uname -m` verbatim - linux-x86_64, darwin-arm64. It
+# is a record and not an authorization: `uname` resolves through PATH like
+# every other program here, so a caller who redirects it gets a false
+# buildPlatform on a real receipt, exactly as a redirected HOSTNAME_BIN gets a
+# false `host`. What that buys is nothing, because the claim beside it -
+# artifactPlatform - is earned by require_release_platform reading the actual
+# bytes of every packaged file.
+build_platform() {
+  local kernel machine
+  kernel="$(uname -s | tr '[:upper:]' '[:lower:]')" || kernel=""
+  machine="$(uname -m)" || machine=""
+  [[ -n "$kernel" && -n "$machine" ]] ||
+    die "this machine did not report a platform: uname -s said ${kernel:-nothing} and uname -m said ${machine:-nothing}"
+  printf '%s-%s' "$kernel" "$machine"
+}
+
+# The first OCI runtime this machine offers, or nothing. The requirement is a
+# capability and not a brand - the runtime must accept `run --rm --platform
+# linux/amd64 <image> <command>` - so KANBAN_RELEASE_CONTAINER_RUNTIME naming
+# an executable replaces the search entirely, which is also how the tests
+# drive every container case without a daemon.
+container_runtime_path() {
+  local candidate
+  if [[ -n "${KANBAN_RELEASE_CONTAINER_RUNTIME:-}" ]]; then
+    command -v -- "$KANBAN_RELEASE_CONTAINER_RUNTIME" 2>/dev/null || return 1
+    return 0
+  fi
+  for candidate in "${RELEASE_CONTAINER_RUNTIMES[@]}"; do
+    command -v -- "$candidate" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# The gate that replaced `require_host hax` (ADR-044 §3). It asks what this
+# machine can PRODUCE rather than what it is called, and the difference is not
+# that one input is forgeable and the other is not - `uname`, `rustc` and
+# `cargo` all resolve through PATH, so a caller who redirects them can drive
+# this gate down the native branch and get `buildKind: native` on a machine
+# that is nothing of the sort. The difference is what happens next: whichever
+# branch is chosen, every binary that reaches the package is read byte by byte
+# by require_release_platform, so a redirected gate yields a false record of
+# HOW a release was built and can never yield a release that is not linux
+# x86-64.
+#
+# Native when this machine already is the release platform. Otherwise
+# containerised, and only when a runtime is found, the operator named a
+# digest-pinned image, and that image REALLY runs linux x86-64 - measured by
+# running `uname -m` inside it, never inferred from the runtime's name or
+# from the `--platform` flag it was asked for. Nothing is built or written
+# before this answers, and every refusal names this platform and exactly what
+# was missing.
+require_release_build_capability() {
+  local image="$1"
+  RELEASE_BUILD_PLATFORM="$(build_platform)"
+  if [[ "$RELEASE_BUILD_PLATFORM" == "$RELEASE_ARTIFACT_PLATFORM" ]]; then
+    RELEASE_BUILD_KIND="native"
+    RELEASE_BUILDER_IMAGE=""
+    RELEASE_BUILD_RUNTIME=""
+    return 0
+  fi
+  local refusal="cannot package a linux x86-64 release on $RELEASE_BUILD_PLATFORM"
+  local runtime=""
+  runtime="$(container_runtime_path)" || runtime=""
+  if [[ -z "$runtime" ]]; then
+    # Two different absences, said apart rather than papered over: an
+    # operator who named a runtime is not told the variable is unset.
+    [[ -z "${KANBAN_RELEASE_CONTAINER_RUNTIME:-}" ]] ||
+      die "$refusal: no container runtime found; KANBAN_RELEASE_CONTAINER_RUNTIME names $KANBAN_RELEASE_CONTAINER_RUNTIME, which is not an executable program, so there is no linux x86-64 build environment on this machine"
+    local names
+    names="$(printf '%s, ' "${RELEASE_CONTAINER_RUNTIMES[@]}")"
+    die "$refusal: no container runtime found; none of ${names%, } is on PATH and KANBAN_RELEASE_CONTAINER_RUNTIME is unset, so there is no linux x86-64 build environment on this machine"
+  fi
+  [[ -n "$image" ]] ||
+    die "$refusal: no builder image was named; pass --builder-image <ref>@sha256:<64 hex> or set KANBAN_RELEASE_BUILDER_IMAGE"
+  [[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
+    die "$refusal: builder image $image is not digest-pinned, and a tag can move, so its digest would not name the bytes that built this release"
+  # Bounded, because a wedged runtime would otherwise hang packaging with no
+  # deadline anywhere in this path, and the operator would see nothing at all.
+  # The build itself is deliberately NOT bounded - a release build takes as
+  # long as it takes - but this probe is one `uname` and a possible image
+  # pull, so KANBAN_RELEASE_CONTAINER_PROBE_SECONDS names the ceiling for a
+  # machine that still has to fetch the image.
+  local probe_seconds
+  probe_seconds="$(container_probe_seconds)"
+  local probe_out probe_err probe_status=0
+  probe_out="$(mktemp "${TMPDIR:-/tmp}/kanban-release-probe.XXXXXX")"
+  probe_err="$(mktemp "${TMPDIR:-/tmp}/kanban-release-probe-err.XXXXXX")"
+  track_temp "$probe_out"
+  track_temp "$probe_err"
+  run_bounded "$probe_seconds" "$probe_out" "$probe_err" \
+    "$runtime" run --rm --platform linux/amd64 "$image" uname -m || probe_status=$?
+  local reported
+  reported="$(tr -d '\r' < "$probe_out" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+  (( probe_status != 124 )) ||
+    die "$refusal: builder image $image did not answer uname -m through $runtime within ${probe_seconds}s, so nothing here shows it runs linux x86-64; raise KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine still has to pull it"
+  if (( probe_status != 0 )); then
+    # The runtime's own complaint, not a shrug: a daemon that is not running
+    # and an image that cannot be pulled are different problems and only it
+    # knows which one happened.
+    local complaint
+    complaint="$(tr -d '\r' < "$probe_err" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+    die "$refusal: $runtime could not run builder image $image: ${complaint:-it exited $probe_status without saying why}"
+  fi
+  [[ "$reported" == x86_64 ]] ||
+    die "$refusal: builder image $image does not run linux x86-64; uname -m inside it reported ${reported:-nothing}"
+  RELEASE_BUILD_KIND="container"
+  RELEASE_BUILDER_IMAGE="$image"
+  RELEASE_BUILD_RUNTIME="$runtime"
+}
+
+# The toolchain that COMPILED the binaries, asked in the environment that
+# compiled them: inside the pinned image on the container path, on this host
+# on the native one. One line, trailing whitespace stripped, exactly as
+# file_version treats a binary's own answer. A tool that cannot answer is a
+# refusal, because an unmeasured toolchain is not a toolchain field.
+#
+# Bounded on the container path for the same reason the capability probe is:
+# it is one `--version` call, and a runtime that has wedged must not be able
+# to stop a release with no deadline and no sentence. The build between them
+# stays unbounded on purpose - a release build takes as long as it takes.
+release_toolchain_version() {
+  local tool="$1"
+  local reported
+  if [[ "$RELEASE_BUILD_KIND" == container ]]; then
+    local seconds probe_out probe_err probe_status=0
+    seconds="$(toolchain_probe_seconds)"
+    probe_out="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain.XXXXXX")"
+    probe_err="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain-err.XXXXXX")"
+    track_temp "$probe_out"
+    track_temp "$probe_err"
+    run_bounded "$seconds" "$probe_out" "$probe_err" \
+      "$RELEASE_BUILD_RUNTIME" run --rm --platform linux/amd64 "$RELEASE_BUILDER_IMAGE" "$tool" --version ||
+      probe_status=$?
+    (( probe_status != 124 )) ||
+      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE did not answer $tool --version through $RELEASE_BUILD_RUNTIME within ${seconds}s; raise KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS if this machine needs longer"
+    if (( probe_status != 0 )); then
+      local complaint
+      complaint="$(tr -d '\r' < "$probe_err" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE could not report a $tool version: ${complaint:-it exited $probe_status without saying why}"
+    fi
+    reported="$(cat "$probe_out")"
+  else
+    reported="$("$tool" --version)" ||
+      die "refusing to record this release's toolchain: this host could not report a $tool version"
+  fi
+  reported="$(printf '%s' "$reported" | sed -n '1p' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+  [[ -n "$reported" ]] ||
+    die "refusing to record this release's toolchain: the $tool version probe reported nothing"
+  printf '%s\n' "$reported"
+}
+
+# `cargo build --release --locked --bins`, run against the worktree inside the
+# pinned image. The worktree is mounted READ-ONLY and CARGO_TARGET_DIR stays
+# outside it, because packaging refuses a run that changed the tree by so much
+# as an untracked file and a root-owned target/ written from inside a
+# container would be exactly that. Both paths keep their host names inside the
+# container so every path the build reports is the path this host holds.
+release_container_build() {
+  local root="$1"
+  local build_root="$2"
+  "$RELEASE_BUILD_RUNTIME" run --rm \
+    --platform linux/amd64 \
+    --volume "$root:$root:ro" \
+    --volume "$build_root:$build_root" \
+    --workdir "$root" \
+    --env "CARGO_TARGET_DIR=$build_root/target" \
+    "$RELEASE_BUILDER_IMAGE" \
+    cargo build --release --locked --bins
+}
+
+# How this host runs a target-platform binary when the build was
+# containerised: the same pinned image the binaries were built in, against the
+# package directory itself. One executable program taking the binary and its
+# probe, which is the HIG_RELEASE_TARGET_RUNNER contract, and it is only
+# installed when the operator named no runner of their own.
+release_container_target_runner() {
+  local package_dir="$1"
+  local runner_dir runner
+  runner_dir="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-runner.XXXXXX")"
+  track_temp "$runner_dir"
+  runner="$runner_dir/target-runner"
+  cat > "$runner" <<RUNNER
+#!/usr/bin/env bash
+set -Eeuo pipefail
+binary="\$1"
+shift
+exec "$RELEASE_BUILD_RUNTIME" run --rm \\
+  --platform linux/amd64 \\
+  --volume "$package_dir:$package_dir:ro" \\
+  --workdir "$package_dir" \\
+  "$RELEASE_BUILDER_IMAGE" \\
+  "\$binary" "\$@"
+RUNNER
+  chmod 0755 "$runner"
+  printf '%s\n' "$runner"
+}
+
+package_create() {
+  local target="$1"
+  [[ "$target" == hax ]] || die "package target must be hax"
+  shift
+  local output=""
+  # No default image, because a default would be an unpinned promise: the
+  # operator names the digest, on the flag or in the environment.
+  local builder_image="${KANBAN_RELEASE_BUILDER_IMAGE:-}"
+  while (($#)); do
+    case "$1" in
+      --output)
+        output="${2:?--output requires a directory}"
+        shift 2
+        ;;
+      --output=*)
+        output="${1#*=}"
+        shift
+        ;;
+      --builder-image)
+        builder_image="${2:?--builder-image requires an image reference}"
+        shift 2
+        ;;
+      --builder-image=*)
+        builder_image="${1#*=}"
+        shift
+        ;;
+      *)
+        die "unknown package flag $1"
+      ;;
+    esac
+  done
+
+  # Not "is this machine called hax" but "can this machine produce a linux
+  # x86-64 release, and how": the answer picks the build below and is what
+  # the receipt records.
+  require_release_build_capability "$builder_image"
+  # The name goes on the receipt, so it is measured here rather than at the
+  # jq that writes it: a HOSTNAME_BIN that reports nothing used to leave a
+  # bash error on stderr, an empty `host` on the receipt and exit 0, and the
+  # operator found out when the package reached hax. It authorizes nothing
+  # either way; it has to be a name.
+  local host
+  host="$(host_short 2>/dev/null)" || host=""
+  [[ -n "$host" && "$host" != *[[:space:]]* ]] ||
+    die "refusing to package: $HOSTNAME_BIN did not report a usable short hostname (it said ${host:-nothing}), and a release receipt records the machine that built it"
+  if [[ -z "$output" ]]; then
+    output="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-${target}.XXXXXX")"
+  else
+    ensure_fresh_output "$output"
+  fi
+
+  local root
+  root="$(repo_root)"
+  [[ -f "$root/skills/kb/SKILL.md" ]] ||
+    die "skills/kb is not initialized; run: git submodule update --init skills/kb"
+  local dirty_before
+  dirty_before="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+  [[ -z "$dirty_before" ]] || die "worktree must be clean before release packaging"
+
+  local build_root
+  build_root="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-build-${target}.XXXXXX")"
+  track_temp "$build_root"
+  if [[ "$RELEASE_BUILD_KIND" == container ]]; then
+    release_container_build "$root" "$build_root"
+  else
+    (
+      cd "$root"
+      CARGO_TARGET_DIR="$build_root/target" cargo build --release --locked --bins
+    )
+  fi
+  local rustc_version cargo_version
+  rustc_version="$(release_toolchain_version rustc)"
+  cargo_version="$(release_toolchain_version cargo)"
+  local commit
+  commit="$(git -C "$root" rev-parse HEAD)"
+  local files='[]'
+  mkdir -p "$output"
+  # A containerised build leaves this host unable to ask a release binary
+  # anything - it cannot execute one at all - so the probe goes back into the
+  # same pinned image. An operator who named their own runner keeps it: the
+  # receipt records which BRANCH answered either way, and never pretends the
+  # artifact answered for itself.
+  if [[ "$RELEASE_BUILD_KIND" == container && -z "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    local -x HIG_RELEASE_TARGET_RUNNER
+    HIG_RELEASE_TARGET_RUNNER="$(release_container_target_runner "$output")"
+  fi
+  for binary in "${BINARIES[@]}"; do
+    local source="$build_root/target/release/$binary"
+    [[ -x "$source" ]] || die "release build did not produce $binary"
+    # The gate on what a release IS, before a byte of it is copied, hashed or
+    # named in a manifest: the build produced whatever this host builds
+    # natively, and only a linux x86-64 executable may be packaged.
+    require_release_platform "$source"
+    install -m 0755 "$source" "$output/$binary"
+    local bytes sha256 version
+    bytes="$(wc -c <"$output/$binary" | tr -d '[:space:]')"
+    sha256="$(sha256_of "$output/$binary")"
+    version="$(file_version "$output/$binary")"
+    files="$(jq -n \
+      --argjson files "$files" \
+      --arg name "$binary" \
+      --arg sha256 "$sha256" \
+      --arg version "$version" \
+      --argjson bytes "$bytes" \
+      '$files + [{name:$name, sha256:$sha256, bytes:$bytes, version:$version}]')"
+  done
+
+  # The embedded operator UI, asked of the packaged executable itself
+  # (SPA-03). Empty for a build that carries none, which keeps a release of
+  # an older tree packageable by this script.
+  local bundle_sha
+  bundle_sha="$(file_bundle_sha256 "$output/kanban")"
+  write_manifest "$output" "$target" "$commit" "$files" "$bundle_sha"
+  local dirty_after
+  dirty_after="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+  [[ "$dirty_after" == "$dirty_before" ]] || die "release packaging changed the worktree"
+  package_validate "$output" "$target"
+  local manifest_sha receipt
+  manifest_sha="$(package_manifest_sha256 "$output")"
+  receipt="$(receipt_path "$output")"
+  # Provenance, every field of it measured before it is written: `host` is
+  # what this machine calls itself and authorizes nothing, `buildPlatform` is
+  # where it was built, `artifactPlatform` is what it IS - earned by
+  # require_release_platform on every build output above and by
+  # package_validate on every packaged copy just now, never copied from a
+  # flag - and `versionProbe` is the same branch of file_version that
+  # produced every files[].version.
+  jq -n -S \
+    --arg host "$host" \
+    --arg build_platform "$RELEASE_BUILD_PLATFORM" \
+    --arg artifact_platform "$RELEASE_ARTIFACT_PLATFORM" \
+    --arg build_kind "$RELEASE_BUILD_KIND" \
+    --arg builder_image "$RELEASE_BUILDER_IMAGE" \
+    --arg rustc_version "$rustc_version" \
+    --arg cargo_version "$cargo_version" \
+    --arg version_probe "$(version_probe_kind)" \
+    --arg manifest_sha "$manifest_sha" \
+    --arg source_commit "$commit" \
+    --argjson files "$files" \
+    --arg bundle_sha "$bundle_sha" \
+    --argjson targets "$(package_targets_json "$target")" \
+    '{
+      formatVersion: 2,
+      host: $host,
+      buildPlatform: $build_platform,
+      artifactPlatform: $artifact_platform,
+      buildKind: $build_kind,
+      builderImage: (if $builder_image == "" then null else $builder_image end),
+      toolchain: {rustc: $rustc_version, cargo: $cargo_version},
+      versionProbe: $version_probe,
+      targets: $targets,
+      manifestSha256: $manifest_sha,
+      sourceCommit: $source_commit,
+      sourceTreeClean: true,
+      files: $files
+    }
+    + (if $bundle_sha == "" then {} else {bundleSha256: $bundle_sha} end)' > "$receipt"
+  # Read back what was just written, through the same validator an install
+  # runs: a writer that cannot read its own receipt is how an empty `host`
+  # shipped in the first place, and this run is the last place that can be
+  # refused for free.
+  validate_receipt "$receipt" "$target" "$output"
+  jq -n -S \
+    --arg packageDir "$output" \
+    --arg manifest "$(manifest_path "$output")" \
+    --arg receipt "$receipt" \
+    --arg manifestSha256 "$manifest_sha" \
+    --arg bundleSha256 "$bundle_sha" \
+    --argjson targets "$(package_targets_json "$target")" \
+    '{packageDir:$packageDir, manifest:$manifest, receipt:$receipt, manifestSha256:$manifestSha256, targets:$targets}
+    + (if $bundleSha256 == "" then {} else {bundleSha256: $bundleSha256} end)'
+}
+
+install_release_tree() {
+  local target="$1"
+  local package_dir="$2"
+  local receipt="$3"
+  local install_root="$4"
+  local bin_dir="$5"
+
+  validate_package "$package_dir" "$target"
+  validate_receipt "$receipt" "$target" "$package_dir"
+
+  local release_id release_path release_meta staging receipt_json installed_at activation_sequence
+  local previous_current="" current_switched=0 release_created=0
+  release_id="$(release_id_from_receipt "$receipt")"
+  ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+  # What the installer creates it makes traversable (0755); it never changes
+  # the mode of a directory that already existed.
+  local had_root=0 had_releases=0
+  [[ -e "$install_root" ]] && had_root=1
+  [[ -e "$install_root/releases" ]] && had_releases=1
+  mkdir -p "$install_root/releases"
+  (( had_root == 1 )) || chmod 0755 "$install_root"
+  (( had_releases == 1 )) || chmod 0755 "$install_root/releases"
+
+  release_path="$(release_dir "$install_root" "$release_id")"
+  release_meta="$(release_receipt "$install_root" "$release_id")"
+  if [[ -L "$(current_link "$install_root")" ]]; then
+    previous_current="$(readlink "$(current_link "$install_root")")"
+  fi
+
+  if [[ ! -d "$release_path" ]]; then
+    staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
+    # mktemp makes 0700. Keep new release directories 0755 so a future
+    # service-traversed store needs no installer change (a-e5391903).
+    chmod 0755 "$staging"
+    track_temp "$staging"
+    for binary in "${BINARIES[@]}"; do
+      install -m 0755 "$package_dir/$binary" "$staging/$binary"
+    done
+    cp "$package_dir/manifest.json" "$staging/manifest.json"
+    validate_release_files "$staging" "$target"
+    mv "$staging" "$release_path"
+    release_created=1
+  else
+    validate_release_files "$release_path" "$target"
+  fi
+
+  trap 'rollback_activation_view "$install_root" "$release_path" "$release_meta" "$previous_current" "$current_switched" "$release_created" "$bin_dir"' ERR
+  ensure_public_binary_links "$install_root" "$bin_dir"
+
+  atomic_symlink "$release_path" "$(current_link "$install_root")"
+  current_switched=1
+  set +e
+  maybe_fail_after_current
+  local activation_status=$?
+  set -e
+  if (( activation_status != 0 )); then
+    if [[ -n "$previous_current" ]]; then
+      atomic_symlink "$previous_current" "$(current_link "$install_root")"
+    else
+      rm -f -- "$(current_link "$install_root")"
+    fi
+    if [[ "$release_created" == 1 ]]; then
+      rm -rf -- "$release_path"
+      rm -f -- "$release_meta"
+    fi
+    if [[ -z "$previous_current" ]]; then
+      local binary
+      for binary in "${BINARIES[@]}"; do
+        rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
+      done
+    fi
+    trap - ERR
+    return 1
+  fi
+
+    # Every check that can still refuse this activation runs BEFORE the receipt
+  # is written; the receipt is the commit.
+  validate_release_files "$release_path" "$target"
+  prove_installed_bundle "$release_path" "$receipt"
+
+  if [[ ! -f "$release_meta" ]]; then
+    receipt_json="$(jq -c '.' "$receipt")"
+    activation_sequence="$(next_activation_sequence "$install_root")"
+    installed_at="$(( $(date +%s) * 1000 ))"
+    jq -n -S \
+      --argjson receipt "$receipt_json" \
+      --argjson activation_sequence "$activation_sequence" \
+      --argjson installed_at "$installed_at" \
+      --arg target "$target" \
+      --arg release_id "$release_id" \
+      --arg release_dir "$release_path" \
+      --arg current_link "$(current_link "$install_root")" \
+      --arg bin_dir "$bin_dir" \
+      --arg installer "$(host_short)" \
+      '$receipt + {
+        activationSequence: $activation_sequence,
+        installedAt: $installed_at,
+        target: $target,
+        releaseId: $release_id,
+        releaseDir: $release_dir,
+        currentLink: $current_link,
+        binDir: $bin_dir,
+        installerHost: $installer
+      }' > "${release_meta}.tmp"
+    mv -f "${release_meta}.tmp" "$release_meta"
+  fi
+
+  # Committed: the release is installed and its receipt is on disk,
+  # so nothing after this line may roll it back. Retention still runs, and a
+  # retention failure is reported as what it is rather than becoming a reason
+  # to delete the installed release.
+  trap - ERR
+  local housekeeping=0
+  prune_releases "$install_root" "$MAX_RELEASES" || housekeeping=1
+
+  jq -n -S \
+    --arg installRoot "$install_root" \
+    --arg releaseDir "$release_path" \
+    --arg current "$(current_link "$install_root")" \
+    --arg receipt "$release_meta" \
+    --arg binDir "$bin_dir" \
+    --arg target "$target" \
+    '{installRoot:$installRoot, releaseDir:$releaseDir, current:$current, receipt:$receipt, binDir:$binDir, target:$target}'
+  if (( housekeeping )); then
+    printf 'hig-release: %s is installed and recorded; pruning older releases under %s failed and needs a look by hand - do NOT roll this activation back on account of it\n' "$release_path" "$install_root" >&2
+    return 1
+  fi
+}
+
+install_local() {
+  local target="$1"
+  shift
+  local package_dir=""
+  local install_root=""
+  local bin_dir="$BIN_DIR_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --package)
+        package_dir="${2:?--package requires a directory}"
+        shift 2
+        ;;
+      --package=*)
+        package_dir="${1#*=}"
+        shift
+        ;;
+      --install-root)
+        install_root="${2:?--install-root requires a directory}"
+        shift 2
+        ;;
+      --install-root=*)
+        install_root="${1#*=}"
+        shift
+        ;;
+      --bin-dir)
+        bin_dir="${2:?--bin-dir requires a directory}"
+        shift 2
+        ;;
+      --bin-dir=*)
+        bin_dir="${1#*=}"
+        shift
+        ;;
+      *)
+        die "unknown install flag $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$package_dir" ]] || die "--package is required"
+  [[ -n "$install_root" ]] || die "--install-root is required"
+  [[ -d "$package_dir" ]] || die "package directory does not exist: $package_dir"
+  local receipt
+  receipt="$(receipt_path "$package_dir")"
+  [[ -f "$receipt" ]] || die "package receipt is required: $receipt"
+  install_release_tree "$target" "$package_dir" "$receipt" "$install_root" "$bin_dir"
+}
+
+install_remote() {
+  local target="$1"
+  shift
+  local package_dir=""
+  local install_root=""
+  local bin_dir="$BIN_DIR_DEFAULT"
+  local hax_install_root=""
+  while (($#)); do
+    case "$1" in
+      --package)
+        package_dir="${2:?--package requires a directory}"
+        shift 2
+        ;;
+      --package=*)
+        package_dir="${1#*=}"
+        shift
+        ;;
+      --install-root)
+        install_root="${2:?--install-root requires a directory}"
+        shift 2
+        ;;
+      --install-root=*)
+        install_root="${1#*=}"
+        shift
+        ;;
+      --bin-dir)
+        bin_dir="${2:?--bin-dir requires a directory}"
+        shift 2
+        ;;
+      --bin-dir=*)
+        bin_dir="${1#*=}"
+        shift
+        ;;
+      --hax-install-root)
+        hax_install_root="${2:?--hax-install-root requires a directory}"
+        shift 2
+        ;;
+      --hax-install-root=*)
+        hax_install_root="${1#*=}"
+        shift
+        ;;
+      *)
+        die "unknown install flag $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$package_dir" ]] || die "--package is required"
+  [[ -n "$install_root" ]] || die "--install-root is required"
+  [[ -d "$package_dir" ]] || die "package directory does not exist: $package_dir"
+  local receipt
+  receipt="$(receipt_path "$package_dir")"
+  [[ -f "$receipt" ]] || die "package receipt is required: $receipt"
+  package_validate "$package_dir" "$target"
+  validate_receipt "$receipt" "$target" "$package_dir"
+  [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for hig installs"
+  [[ -d "$hax_install_root" ]] || die "hax install root does not exist: $hax_install_root"
+  validate_hax_activation_receipt "$hax_install_root" "$target" "$package_dir"
+  local release_id release_dir release_meta
+  release_id="$(release_id_from_receipt "$receipt")"
+  release_dir="$(release_dir "$install_root" "$release_id")"
+  release_meta="$(release_receipt "$install_root" "$release_id")"
+
+  local remote_stage
+  remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
+  tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
+  ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
+  local remote_status=0
+  # Keep the quoted heredoc outside command substitution for Bash 3.2.
+  if HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
+set -Eeuo pipefail
+
+stage_root="$1"
+package_dir="$2"
+receipt="$3"
+install_root="$4"
+target="$5"
+bin_dir="$6"
+keep="$7"
+shift 7
+# The release set arrives as the caller's BINARIES instead of a literal list
+# embedded here: a second copy of the set is exactly what drifted before, and
+# a remote installer that links fewer binaries than the package carries would
+# leave a validated release only partly reachable on the host.
+BINARIES=("$@")
+
+die() {
+  printf 'hig-release: %s\n' "$*" >&2
+  exit 1
+}
+
+(( ${#BINARIES[@]} > 0 )) || die "remote install received no release binary names"
+
+# Membership in the release set, derived from BINARIES so a name the package
+# does not ship can never be probed as though it belonged to the release.
+release_binary_known() {
+  local candidate="$1"
+  local binary
+  for binary in "${BINARIES[@]}"; do
+    [[ "$binary" != "$candidate" ]] || return 0
+  done
+  return 1
+}
+
+# Which branch of file_version answers a version probe on this host, so the
+# receipt can RECORD which one did rather than leave a reader to infer it.
+# One reading of HIG_RELEASE_TARGET_RUNNER, shared by the probe that follows
+# it and by the receipt's versionProbe field (ADR-044 §2), because two
+# readings are two facts and two facts can disagree.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+version_probe_kind() {
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    printf 'runner\n'
+  else
+    printf 'native\n'
+  fi
+}
+
+# Verbatim copy of the local probe; see the comment above the local
+# file_probe for why the answer comes back in a variable and what
+# HIG_RELEASE_TARGET_RUNNER can and cannot reach.
+FILE_PROBE_REPORT=""
+file_probe() {
+  local binary="$1"
+  local name="${binary##*/}"
+  release_binary_known "$name" || die "unknown release binary $name"
+  # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
+  # dispatcher and every adapter answer the `--version` flag instead.
+  local probe="--version"
+  case "$name" in
+    kanban | kb)
+      probe="version"
+      ;;
+  esac
+  local reported
+  if [[ "$(version_probe_kind)" == runner ]]; then
+    [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
+      die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
+    reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: $HIG_RELEASE_TARGET_RUNNER could not report a version for it"
+  else
+    reported="$("$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: it could not report a version"
+  fi
+  [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
+  FILE_PROBE_REPORT="$reported"
+}
+
+# The version a binary reports: the FIRST line of its probe. The operator CLI
+# answers on two lines since the operator UI became an embedded bundle.
+file_version() {
+  file_probe "$1"
+  printf '%s\n' "${FILE_PROBE_REPORT%%$'\n'*}"
+}
+
+# The operator UI bundle a binary carries, or nothing (SPA-03).
+file_bundle_sha256() {
+  local binary="$1"
+  file_probe "$binary"
+  local line="" candidate
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      "bundle "*)
+        line="${candidate#bundle }"
+        break
+        ;;
+    esac
+  done <<< "$FILE_PROBE_REPORT"
+  [[ -n "$line" ]] || return 0
+  [[ "$line" =~ ^[0-9a-f]{64}$ ]] ||
+    die "refusing $binary: it reported the bundle fingerprint $line, which is not 64 hex digits"
+  printf '%s\n' "$line"
+}
+
+# The second half of the release proof, asked of the INSTALLED executable
+# (SPA-03): `readlink /proc/<MainPID>/exe` says which binary is serving, and
+# this says which operator UI that binary carries. A receipt that names one
+# and an installed binary that carries another is an activation nobody can
+# describe, so it is refused before the receipt - the commit - is written.
+#
+# Additive: a receipt with no `bundleSha256` proves one thing less and
+# installs exactly as it did before.
+prove_installed_bundle() {
+  local release_path="$1"
+  local receipt="$2"
+  local declared reported
+  declared="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ -n "$declared" ]] || return 0
+  reported="$(file_bundle_sha256 "$release_path/kanban")"
+  [[ -n "$reported" ]] ||
+    die "refusing this activation: the installed kanban reports no bundle, and its receipt names $declared"
+  [[ "$reported" == "$declared" ]] ||
+    die "refusing this activation: the installed kanban carries bundle $reported and its receipt names $declared"
+  printf 'hig-release: the installed kanban carries bundle %s\n' "$reported" >&2
+}
+
+# The release set as a JSON array, so the receipt name check compares against
+# BINARIES rather than a second literal list that can drift.
+binaries_json() {
+  printf '%s\n' "${BINARIES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# Verbatim copy of the local guard; see the comment above the local
+# reject_carried_release_identity for why a carried identity is refused.
+reject_carried_release_identity() {
+  local file="$1"
+  local expected_release_id="${2:-}"
+  jq -e --arg expected "$expected_release_id" '
+    (["activationSequence", "installedAt", "releaseDir", "currentLink", "binDir", "installerHost", "target"]
+      + (if $expected == "" then ["releaseId"] else [] end)) as $forbidden
+    | . as $doc
+    | (($forbidden | map(select(. as $key | $doc | has($key))) | length) == 0)
+      and (($doc | .releaseId // $expected) == $expected)
+  ' "$file" >/dev/null ||
+    die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
+# What a `formatVersion` 2 receipt must SAY ABOUT ITS OWN BUILD, as one jq
+# definition every receipt validator prepends to its own program (ADR-044
+# §2). One copy rather than three, because three copies of an invariant are
+# three chances to check a different thing on the local leg, the hig
+# activation check and the remote installer.
+#
+# `host` is shape-checked and never compared to a name: v1 asserted the
+# literal "hax" back, which authorized nothing and recorded nothing, and v2
+# admits any short hostname because the name is a record. What cannot be
+# faked is checked instead - `artifactPlatform` is the platform every
+# packaged file was verified to be, and the cross-field rules refuse the
+# receipts that could not have been produced: a native build that is not the
+# artifact's own platform, a native build naming an image, a containerised
+# build whose image is not digest-pinned, and a version probe claiming to
+# have run the artifact on a machine that cannot run it.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+receipt_provenance_defs() {
+  cat <<'JQ'
+def receipt_provenance_ok:
+  (.formatVersion == 2)
+  and ((.host | type) == "string") and (.host | test("^\\S+$"))
+  and ((.buildPlatform | type) == "string")
+  and (.buildPlatform | test("^[a-z0-9_]+-[a-z0-9_.]+$"))
+  and (.artifactPlatform == "linux-x86_64")
+  and ((.buildKind == "native") or (.buildKind == "container"))
+  and (has("builderImage"))
+  and (if .buildKind == "native"
+       then (.builderImage == null) and (.buildPlatform == .artifactPlatform)
+       else ((.builderImage | type) == "string")
+            and (.builderImage | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
+       end)
+  and ((.toolchain | type) == "object")
+  and ((.toolchain | keys) == ["cargo", "rustc"])
+  and ((.toolchain.rustc | type) == "string") and ((.toolchain.rustc | length) > 0)
+  and ((.toolchain.cargo | type) == "string") and ((.toolchain.cargo | length) > 0)
+  and ((.versionProbe == "native") or (.versionProbe == "runner"))
+  and (if .versionProbe == "native"
+       then .buildPlatform == .artifactPlatform
+       else true
+       end)
+  # Additive (ADR-048): a receipt that names the embedded operator UI bundle
+  # must name a fingerprint; a receipt from before the UI was embedded is
+  # still a valid formatVersion 2 receipt.
+  and (if has("bundleSha256")
+       then ((.bundleSha256 | type) == "string") and (.bundleSha256 | test("^[0-9a-f]{64}$"))
+       else true
+       end);
+JQ
+}
+
+# Verbatim copy of the local guard; see the comment above the local
+# require_release_platform for why a release is refused unless it is the
+# platform hig actually executes.
+require_release_platform() {
+  local file="$1"
+  local platform="a Kanban release targets linux x86-64 (ELF 64-bit, little-endian)"
+  # Refused before anything is opened, and refused rather than followed: a
+  # symlink is not the file it names, and a FIFO planted at a release binary's
+  # path would hold this read open forever instead of answering it.
+  [[ ! -L "$file" ]] ||
+    die "refusing $file: $platform, but this path is a symlink, not the release binary itself"
+  [[ -f "$file" ]] ||
+    die "refusing $file: $platform, but this path is not a regular file"
+  local -a header
+  local read_status=0
+  header=($(LC_ALL=C od -An -v -tu1 -N20 -- "$file" 2>/dev/null)) || read_status=$?
+  (( read_status == 0 && ${#header[@]} == 20 )) ||
+    die "refusing $file: $platform, but no executable header could be read from it: 20 bytes are needed and it produced ${#header[@]}"
+  local magic
+  magic="$(printf '%02x%02x%02x%02x' "${header[0]}" "${header[1]}" "${header[2]}" "${header[3]}")"
+  if [[ "$magic" == 7f454c46 ]]; then
+    # e_type as well as the machine: a relocatable object, a core dump and an
+    # ET_NONE file all carry an x86-64 ELF header and not one of them is a
+    # program a host can run. ET_EXEC and ET_DYN are what a release is - the
+    # linux release profile links PIE, which is ET_DYN.
+    local etype=$(( header[16] + header[17] * 256 ))
+    local machine=$(( header[18] + header[19] * 256 ))
+    local observed
+    observed="$(printf 'ELF class %s, data %s, type 0x%04x, machine 0x%04x' "${header[4]}" "${header[5]}" "$etype" "$machine")"
+    (( header[4] == 2 && header[5] == 1 && machine == 62 && (etype == 2 || etype == 3) )) ||
+      die "refusing $file: $platform, but this file is $observed"
+    return 0
+  fi
+  case "$magic" in
+    feedface | cefaedfe | feedfacf | cffaedfe)
+      die "refusing $file: $platform, but this file is Mach-O (magic 0x$magic)"
+      ;;
+    cafebabe | bebafeca)
+      die "refusing $file: $platform, but this file is a universal (fat) Mach-O (magic 0x$magic)"
+      ;;
+  esac
+  die "refusing $file: $platform, but this file is not an ELF image (magic 0x$magic)"
+}
+
+cleanup_remote() {
+  rm -rf -- "$stage_root"
+}
+
+trap cleanup_remote EXIT
+
+# Verbatim copies of the local guard functions; see the comment above the
+# local physical_dir for the drift test that pins them.
+physical_dir() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# A managed symlink is one this installer wrote: its target sits directly in
+# "$install_root/$expected_parent" (current -> releases/<id>, bin/<name> ->
+# current/<name>). Anything else belongs to the operator and is never replaced.
+managed_symlink() {
+  local link="$1"
+  local install_root="$2"
+  local expected_parent="$3"
+  [[ -L "$link" ]] || return 1
+  local target parent root_physical parent_physical
+  target="$(readlink "$link")"
+  [[ "$target" == /* ]] || target="$(dirname "$link")/$target"
+  parent="$(dirname "$target")"
+  [[ "${parent##*/}" == "$expected_parent" ]] || return 1
+  root_physical="$(physical_dir "$install_root")" || return 1
+  parent_physical="$(physical_dir "$(dirname "$parent")")" || return 1
+  [[ "$parent_physical" == "$root_physical" ]]
+}
+
+# Verbatim copy of the local guard; see the comment above the local
+# ensure_managed_activation_receipt for why a receipt already at the release
+# receipt path is refused unless this installer could have written it.
+ensure_managed_activation_receipt() {
+  local receipt="$1"
+  local install_root="$2"
+  local release_id="$3"
+  [[ -e "$receipt" || -L "$receipt" ]] || return 0
+  [[ ! -L "$receipt" ]] ||
+    die "refusing to install: $receipt is a symlink, not an activation receipt this installer wrote; move it aside before installing"
+  [[ -f "$receipt" ]] ||
+    die "refusing to install: $receipt is not a regular file, so it is not an activation receipt this installer wrote; move it aside before installing"
+  jq -e 'type == "object"' "$receipt" >/dev/null 2>&1 ||
+    die "refusing to install: $receipt does not parse as a JSON object; move it aside before installing"
+  jq -e --arg release_id "$release_id" --arg source_commit "${release_id%%-*}" --arg manifest_sha "${release_id##*-}" '
+    (.releaseId == $release_id) and
+    (.sourceCommit == $source_commit) and
+    (.manifestSha256 == $manifest_sha)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt does not name the release being installed ($release_id); move it aside before installing"
+  local counter=0 sequence sequence_path
+  sequence="$(jq -c '.activationSequence' "$receipt")"
+  sequence_path="$install_root/releases/.activation-sequence"
+  if [[ -f "$sequence_path" && ! -L "$sequence_path" ]]; then
+    counter="$(tr -d '[:space:]' <"$sequence_path")"
+    [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+  fi
+  jq -e --argjson counter "$counter" '
+    ((.activationSequence | type) == "number") and
+    ((.activationSequence | floor) == .activationSequence) and
+    (.activationSequence >= 1) and
+    (.activationSequence <= $counter)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt carries activationSequence $sequence, which is not an integer this install root has issued (its counter stands at $counter); move it aside before installing"
+}
+
+# Refuses, before anything is written, every path an activation writes through
+# unless it has the shape this installer creates: releases/ and releases/<id>
+# real directories, current and bin/<name> absent or managed symlinks, the bin
+# dir a real directory. Called from a clean state so a refusal mutates nothing.
+ensure_safe_release_view() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local release_id="$3"
+  shift 3
+  local releases="$install_root/releases"
+  local current="$install_root/current"
+  local release_path="$releases/$release_id"
+  local release_meta="$releases/$release_id.receipt.json"
+  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
+  [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
+  if [[ -e "$releases" || -L "$releases" ]]; then
+    [[ ! -L "$releases" ]] || die "refusing to install through a symlink at $releases; remove it so releases/ is a real directory inside $install_root"
+    [[ -d "$releases" ]] || die "refusing to install: $releases is not a directory; move it aside so the installer can create releases/"
+  fi
+  if [[ -e "$release_path" || -L "$release_path" ]]; then
+    [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
+    [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
+  fi
+  ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
+  if [[ -e "$current" || -L "$current" ]]; then
+    managed_symlink "$current" "$install_root" releases ||
+      die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"
+  fi
+  if [[ -e "$bin_dir" || -L "$bin_dir" ]]; then
+    [[ ! -L "$bin_dir" ]] || die "bin dir must not be a symlink: $bin_dir; pass --bin-dir with the real directory"
+    [[ -d "$bin_dir" ]] || die "bin dir is not a directory: $bin_dir; pass --bin-dir with a directory"
+  fi
+  local binary link
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    if [[ -e "$link" || -L "$link" ]]; then
+      managed_symlink "$link" "$install_root" current ||
+        die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
+    fi
+  done
+}
+
+atomic_symlink() {
+  local target="$1"
+  local link_path="$2"
+  local link_parent
+  link_parent="$(dirname "$link_path")"
+  if [[ -e "$link_path" || -L "$link_path" ]] && [[ ! -L "$link_path" ]]; then
+    printf 'hig-release: refusing to replace %s: it is not a symlink; move it aside before installing\n' "$link_path" >&2
+    return 1
+  fi
+  if [[ -L "$link_parent" ]]; then
+    printf 'hig-release: refusing to write through a symlink at %s; replace it with a real directory\n' "$link_parent" >&2
+    return 1
+  fi
+  mkdir -p "$link_parent"
+  local staging
+  staging="$(mktemp -d "$link_parent/.${link_path##*/}.XXXXXX")"
+  ln -s "$target" "$staging/link"
+  python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$staging/link" "$link_path"
+  rmdir "$staging"
+}
+
+ensure_public_binary_links() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local current_path
+  current_path="$install_root/current"
+  mkdir -p "$bin_dir"
+  for binary in "${BINARIES[@]}"; do
+    local link_path target
+    link_path="$bin_dir/$binary"
+    target="$current_path/$binary"
+    if [[ ! -L "$link_path" || "$(readlink "$link_path")" != "$target" ]]; then
+      atomic_symlink "$target" "$link_path"
+    fi
+  done
+}
+
+rollback_activation_view() {
+  local status=$?
+  local install_root="$1"
+  local release_path="$2"
+  local release_meta="$3"
+  local previous_current="$4"
+  local current_switched="$5"
+  local release_created="$6"
+  local bin_dir="$7"
+
+  trap - ERR
+  set +e
+  (( status != 0 )) || status=1
+
+  local current_path="$install_root/current"
+  if [[ "$current_switched" == 1 ]]; then
+    if [[ -n "$previous_current" ]]; then
+      atomic_symlink "$previous_current" "$current_path"
+    else
+      rm -f -- "$current_path"
+    fi
+  fi
+  if [[ -z "$previous_current" ]]; then
+    local binary
+    for binary in "${BINARIES[@]}"; do
+      rm -f -- "$bin_dir/$binary"
+    done
+  fi
+
+  # Restoring the links restores the PATHS. No service runs from a release
+  # since `kanban serve` was retired (ADR-053), so no process has to follow
+  # them back before the candidate's directory is removed.
+  # `current` may legitimately hold a relative target - ensure_safe_release_view
+  # accepts one, resolving it against the link's own directory - so the value
+  # is restored verbatim and normalised against the install root before it is
+  # handed to a proof that has to resolve it as a path.
+  local previous_release="$previous_current"
+  [[ -z "$previous_release" || "$previous_release" == /* ]] || previous_release="$install_root/$previous_release"
+  if [[ "$release_created" == 1 ]]; then
+    rm -rf -- "$release_path"
+    rm -f -- "$release_meta"
+  fi
+
+  exit "$status"
+}
+
+maybe_fail_after_current() {
+  if [[ "${HIG_RELEASE_FAIL_AFTER_CURRENT:-}" == "1" ]]; then
+    printf 'hig-release: injected failure after current activation\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+next_activation_sequence() {
+  local install_root="$1"
+  local sequence_path
+  sequence_path="$install_root/releases/.activation-sequence"
+  mkdir -p "$(dirname "$sequence_path")"
+  python3 - "$sequence_path" <<'PY'
+import fcntl
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "a+", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0)
+    current = handle.read().strip()
+    next_value = int(current) + 1 if current else 1
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{next_value}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    print(next_value)
+PY
+}
+
+release_entries() {
+  local root="$1"
+  local files=()
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find "$root/releases" -mindepth 1 -maxdepth 1 -type f -name '*.receipt.json' -print0 2>/dev/null)
+  if ((${#files[@]} == 0)); then
+    return 0
+  fi
+  jq -r '. as $meta | [($meta.activationSequence // 0), ($meta.installedAt // 0), $meta.releaseId] | @tsv' "${files[@]}" |
+    sort -t $'\t' -k1,1nr -k2,2nr |
+    awk -F '\t' '{print $3}'
+}
+
+prune_releases() {
+  local root="$1"
+  local keep="${2:-$MAX_RELEASES}"
+  local releases=()
+  while IFS= read -r release; do
+    [[ -n "$release" ]] || continue
+    releases+=("$release")
+  done < <(release_entries "$root")
+  if (( ${#releases[@]} <= keep )); then
+    return 0
+  fi
+  local index=0 failed=0
+  for release in "${releases[@]}"; do
+    (( index += 1 ))
+    if (( index > keep )); then
+      # Callers handle failure explicitly, disabling errexit in this function.
+      # Keep the receipt indexing any directory we could not remove, and do
+      # not let a later successful removal erase an earlier failure.
+      if rm -rf -- "$root/releases/$release"; then
+        rm -f -- "$root/releases/$release.receipt.json" || failed=1
+      else
+        failed=1
+      fi
+    fi
+  done
+  return "$failed"
+}
+
+hostname_bin="${HOSTNAME_BIN:-/bin/hostname}"
+host="$("$hostname_bin" -s 2>/dev/null || "$hostname_bin")"
+[[ "$host" == "$target" ]] || die "remote host $target did not identify itself as $target"
+manifest="$package_dir/manifest.json"
+[[ -f "$manifest" ]] || die "remote package has no manifest.json"
+reject_carried_release_identity "$manifest"
+
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
+    (.targets | type == "array") and
+    (.targets | length == 2) and
+    (.targets | index("hax") != null) and
+    (.targets | index("hig") != null) and
+    (.targets | index($target) != null) and
+    (.sourceTreeClean == true) and
+  ((.sourceCommit | type) == "string") and
+  ((.sourceCommit | length) == 40) and
+  ((.manifestSha256 | type) == "string") and
+  ((.manifestSha256 | length) == 64) and
+  ((.files | length) == ($expected_files | length)) and
+  ([.files[].name] == $expected_files)
+' "$receipt" >/dev/null || die "remote package receipt is incomplete or mismatched"
+reject_carried_release_identity "$receipt" "$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
+
+while IFS=$'\t' read -r name sha256 size version; do
+  path="$package_dir/$name"
+  [[ -f "$path" ]] || die "remote package is missing binary $name"
+  require_release_platform "$path"
+  [[ -x "$path" ]] || die "remote binary $name is not executable"
+  [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "remote binary $name has the wrong size"
+  [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "remote binary $name hash mismatch"
+  [[ "$(file_version "$path")" == "$version" ]] || die "remote binary $name version mismatch"
+done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$receipt")
+
+release_id="$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
+ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+# What the installer creates it makes traversable (0755); it never changes
+# the mode of a directory that already existed.
+had_root=0; had_releases=0
+[[ -e "$install_root" ]] && had_root=1
+[[ -e "$install_root/releases" ]] && had_releases=1
+mkdir -p "$install_root/releases"
+(( had_root == 1 )) || chmod 0755 "$install_root"
+(( had_releases == 1 )) || chmod 0755 "$install_root/releases"
+release_path="$install_root/releases/$release_id"
+release_receipt="$install_root/releases/$release_id.receipt.json"
+previous_current=""
+current_switched=0
+release_created=0
+if [[ -L "$install_root/current" ]]; then
+  previous_current="$(readlink "$install_root/current")"
+fi
+if [[ ! -d "$release_path" ]]; then
+  staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
+  # mktemp makes 0700. Keep new release directories 0755 so a future
+  # service-traversed store needs no installer change (a-e5391903).
+  chmod 0755 "$staging"
+  for binary in "${BINARIES[@]}"; do
+    install -m 0755 "$package_dir/$binary" "$staging/$binary"
+  done
+  # The staged tree is what the publishing mv makes live, so it is measured
+  # before that mv rather than trusted because the package it was copied from
+  # was: the local leg validates its own staging directory the same way.
+  for binary in "${BINARIES[@]}"; do
+    require_release_platform "$staging/$binary"
+  done
+  cp "$package_dir/manifest.json" "$staging/manifest.json"
+  [[ "$(sha256sum "$staging/manifest.json" | awk '{print $1}')" == "$(jq -r '.manifestSha256' "$receipt")" ]] || {
+    die "remote manifest hash mismatch"
+  }
+  mv "$staging" "$release_path"
+  release_created=1
+fi
+
+trap 'rollback_activation_view "$install_root" "$release_path" "$release_receipt" "$previous_current" "$current_switched" "$release_created" "$bin_dir"' ERR
+
+ensure_public_binary_links "$install_root" "$bin_dir"
+atomic_symlink "$release_path" "$install_root/current"
+current_switched=1
+set +e
+maybe_fail_after_current
+activation_status=$?
+set -e
+if (( activation_status != 0 )); then
+  if [[ -n "$previous_current" ]]; then
+    atomic_symlink "$previous_current" "$install_root/current"
+  else
+    rm -f -- "$install_root/current"
+  fi
+  if [[ "$release_created" == 1 ]]; then
+    rm -rf -- "$release_path"
+    rm -f -- "$release_receipt"
+  fi
+  if [[ -z "$previous_current" ]]; then
+    for binary in "${BINARIES[@]}"; do
+      rm -f -- "$bin_dir/$binary"
+    done
+  fi
+  trap - ERR
+  exit 1
+fi
+
+prove_installed_bundle "$release_path" "$receipt"
+
+installed_at="$(( $(date +%s) * 1000 ))"
+if [[ ! -f "$release_receipt" ]]; then
+  activation_sequence="$(next_activation_sequence "$install_root")"
+  jq -n -S \
+    --argjson receipt "$(jq -c '.' "$receipt")" \
+    --argjson activation_sequence "$activation_sequence" \
+    --argjson installed_at "$installed_at" \
+    --arg target "$target" \
+    --arg release_id "$release_id" \
+    --arg release_dir "$release_path" \
+    --arg current_link "$install_root/current" \
+    --arg bin_dir "$bin_dir" \
+    --arg installer "$host" \
+    '$receipt + {
+      activationSequence: $activation_sequence,
+      installedAt: $installed_at,
+      target: $target,
+      releaseId: $release_id,
+      releaseDir: $release_dir,
+      currentLink: $current_link,
+      binDir: $bin_dir,
+      installerHost: $installer
+  }' > "$release_receipt"
+fi
+
+jq -e --arg target "$target" '
+  (.targets | type == "array") and
+  (.targets | length == 2) and
+  (.targets | index("hax") != null) and
+  (.targets | index("hig") != null) and
+  (.targets | index($target) != null)
+' "$release_receipt" >/dev/null || die "remote receipt target mismatch"
+# Committed: the release is installed and its receipt is on disk, so
+# nothing after this line may roll it back. Retention still runs, and a
+# retention failure is reported as what it is rather than becoming a reason to
+# delete the installed release.
+trap - ERR
+housekeeping=0
+prune_releases "$install_root" "$keep" || housekeeping=1
+if (( housekeeping )); then
+  printf 'hig-release: %s is installed and recorded; pruning older releases under %s failed and needs a look by hand - do NOT roll this activation back on account of it\n' "$release_path" "$install_root" >&2
+  exit 1
+fi
+REMOTE
+  then
+    remote_status=0
+  else
+    remote_status=$?
+  fi
+  jq -n -S \
+    --arg installRoot "$install_root" \
+    --arg releaseId "$release_id" \
+    --arg releaseDir "$release_dir" \
+    --arg current "$(current_link "$install_root")" \
+    --arg receipt "$release_meta" \
+    --arg packageDir "$package_dir" \
+    --arg target "$target" \
+    --arg binDir "$bin_dir" \
+    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir}'
+  return "$remote_status"
+}
+
+rollback_release() {
+  local target="$1"
+  shift
+  local install_root=""
+  local bin_dir="$BIN_DIR_DEFAULT"
+  local steps=1
+  while (($#)); do
+    case "$1" in
+      --install-root)
+        install_root="${2:?--install-root requires a directory}"
+        shift 2
+        ;;
+      --install-root=*)
+        install_root="${1#*=}"
+        shift
+        ;;
+      --bin-dir)
+        bin_dir="${2:?--bin-dir requires a directory}"
+        shift 2
+        ;;
+      --bin-dir=*)
+        bin_dir="${1#*=}"
+        shift
+        ;;
+      --steps)
+        steps="${2:?--steps requires a number}"
+        shift 2
+        ;;
+      --steps=*)
+        steps="${1#*=}"
+        shift
+        ;;
+      *)
+        die "unknown rollback flag $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$install_root" ]] || die "--install-root is required"
+  [[ -d "$install_root" ]] || die "install root does not exist: $install_root"
+  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
+  [[ "$steps" =~ ^[0-9]+$ ]] || die "--steps must be a non-negative integer"
+
+  releases=()
+  while IFS= read -r release; do
+    [[ -n "$release" ]] || continue
+    releases+=("$release")
+  done < <(release_entries "$install_root")
+  (( ${#releases[@]} > steps )) || die "no retained release available for rollback"
+  local release_id release_path release_receipt
+  local previous_current="" current_switched=0 release_created=0
+  release_id="${releases[$steps]}"
+  release_path="$(release_dir "$install_root" "$release_id")"
+  release_receipt="$(release_receipt "$install_root" "$release_id")"
+  if [[ -L "$(current_link "$install_root")" ]]; then
+    previous_current="$(readlink "$(current_link "$install_root")")"
+  fi
+  [[ -f "$release_receipt" ]] || die "release metadata missing for $release_id"
+  ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+  validate_release_files "$release_path" "$target"
+  trap 'rollback_activation_view "$install_root" "$release_path" "$release_receipt" "$previous_current" "$current_switched" "$release_created" "$bin_dir"' ERR
+  ensure_public_binary_links "$install_root" "$bin_dir"
+  atomic_symlink "$release_path" "$(current_link "$install_root")"
+  current_switched=1
+  set +e
+  maybe_fail_after_current
+  local activation_status=$?
+  set -e
+  if (( activation_status != 0 )); then
+    if [[ -n "$previous_current" ]]; then
+      atomic_symlink "$previous_current" "$(current_link "$install_root")"
+    else
+      rm -f -- "$(current_link "$install_root")"
+    fi
+    if [[ -z "$previous_current" ]]; then
+      local binary
+      for binary in "${BINARIES[@]}"; do
+        rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
+      done
+    fi
+    trap - ERR
+    return 1
+  fi
+
+
+  trap - ERR
+  local housekeeping=0
+  prune_releases "$install_root" "$MAX_RELEASES" || housekeeping=1
+  jq -n -S \
+    --arg installRoot "$install_root" \
+    --arg releaseId "$release_id" \
+    --arg releaseDir "$release_path" \
+    --arg current "$(current_link "$install_root")" \
+    --arg binDir "$bin_dir" \
+    --arg target "$target" \
+    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, binDir:$binDir, target:$target}'
+  if (( housekeeping )); then
+    printf 'hig-release: %s is rolled back to and recorded; pruning older releases under %s failed and needs a look by hand - do NOT undo this rollback on account of it\n' "$release_path" "$install_root" >&2
+    return 1
+  fi
+}
+
+install_package() {
+  local target="$1"
+  shift
+  require_host hax
+  case "$target" in
+    hax)
+      install_local "$target" "$@"
+      ;;
+    hig)
+      install_remote "$target" "$@"
+      ;;
+  esac
+}
+
+main() {
+  [[ $# -ge 1 ]] || usage
+  local command="$1"
+  shift
+  [[ $# -ge 1 ]] || usage
+  local target="$1"
+  shift
+  validate_target "$target"
+
+  case "$command" in
+    package)
+      package_create "$target" "$@"
+      ;;
+    install)
+      install_package "$target" "$@"
+      ;;
+    rollback)
+      rollback_release "$target" "$@"
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main "$@"

@@ -53,8 +53,7 @@ An update retains the current tags unless a targeting flag is supplied. Target
 changes preserve the previous tags in the registry audit trail.
 
 Claim, context and accepted-handoff injection filters global summaries using
-the addressed board name, then appends that board's project rules. The web view
-does the same and shows canonical board tags beside each applicable global rule.
+the addressed board name, then appends that board's project rules.
 The registry remains the only storage location; targeted rules are not copied
 into project databases.
 
@@ -62,8 +61,12 @@ into project databases.
 
 - One audited rule can cover one board, a named set, or all but named boards.
 - Agents spend tokens only on global constraints that apply to their board.
-- Renaming or deleting a registered board can leave a tag that no longer
-  matches; existing tags remain auditable, while new mutations validate names.
+- Historical note: this ADR originally allowed board rename or deletion to
+  leave unmatched selector tags. ADR-027 now supersedes that operational
+  consequence: workspace retirement refuses active `ONLY:<board>` and
+  `EXCEPT:<board>` blockers. Legacy or manually introduced stale active rows
+  remain inspectable and make `doctor` unhealthy until the operator updates or
+  retires them.
 - Direct unregistered `--db` boards inherit `ALL` rules and cannot match
   `ONLY:<name>` because they have no registered name.
 

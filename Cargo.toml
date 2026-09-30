@@ -29,6 +29,30 @@ path = "rust/bin/kanban-dispatcher.rs"
 name = "kanban-codex-queue-adapter"
 path = "rust/bin/kanban-codex-queue-adapter.rs"
 
+[[bin]]
+name = "kanban-codex-app-server-adapter"
+path = "rust/bin/kanban-codex-app-server-adapter.rs"
+
+[[bin]]
+name = "kanban-claude-print-adapter"
+path = "rust/bin/kanban-claude-print-adapter.rs"
+
+[[bin]]
+name = "kanban-opencode-adapter"
+path = "rust/bin/kanban-opencode-adapter.rs"
+
+[[bin]]
+name = "kanban-kimi-acp-adapter"
+path = "rust/bin/kanban-kimi-acp-adapter.rs"
+
+[[bin]]
+name = "kanban-cursor-worker-adapter"
+path = "rust/bin/kanban-cursor-worker-adapter.rs"
+
+[[bin]]
+name = "kanban-zcode-notify-adapter"
+path = "rust/bin/kanban-zcode-notify-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
@@ -36,13 +60,14 @@ libc = "0.2.189"
 rusqlite = { version = "0.37.0", features = ["backup", "bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha1 = "0.10.6"
 sha2 = "0.10.9"
-tiny_http = { version = "0.12.0", default-features = false }
 uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
-headless_chrome = "1"
+syn = { version = "2.0.119", features = ["full", "visit"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [profile.release]
 lto = "thin"

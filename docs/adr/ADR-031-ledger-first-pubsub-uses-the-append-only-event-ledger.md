@@ -47,7 +47,10 @@ The watch cursor is opaque. It binds the exact source, selector, predicate set,
 archive state, and last consumed ledger `seq` together. Consumers persist the
 cursor from every event or advancing-heartbeat envelope and resume from the
 next ledger row. Literal `0` is the only bootstrap cursor. Wall clock time,
-file mtime, WAL fingerprints, and payload hashes are not cursors.
+file mtime, WAL fingerprints, and payload hashes are not cursors. Visibility
+is evaluated at scan time: once a cursor has advanced past a row its scan
+denied, a later grant or retag does not replay that history — the consumer
+resumes from the next ledger row.
 
 Reusing a cursor against a different scope, selector, kind, archive state, or
 future sequence must fail closed rather than silently replaying the wrong
@@ -108,17 +111,27 @@ Semantics:
   synchronously with no intermediate queue, and then closes before the next
   poll. The runtime requires `--limit` to be at least `1` whenever `--follow`
   is set, so `--follow --limit 0` fails.
-- `--limit` bounds replay work and must be within `0..1000` in every mode;
+- `--limit` bounds replay work and must be within `0..1000000` in every mode;
   follow mode additionally rejects `0`. Sparse filtering happens before
   `--limit`, so the limit slices the filtered result set rather than the raw
-  rows.
+  rows. (Historical: this read `0..1000` until 2026-09-08, when t-5d38449a
+  retired `watch`'s private cap in favour of the one `LIMIT_CEILING` every
+  `--limit` surface shares. A batch is a SQL `LIMIT`, never a preallocated
+  buffer, so the higher bound costs nothing on a small board.)
 - `--db PATH` opens that exact database file rather than re-resolving a board.
 - `--json` is the machine contract. The stream stays NDJSON on stdout; errors
   and diagnostics belong on stderr.
 - Idle heartbeats do not advance the durable cursor. When predicates skip a
   committed tail with no matching event, an `advanced` heartbeat moves the
   opaque cursor to the last scanned row so follow mode does not rescan the same
-  unmatched rows forever.
+  unmatched rows forever. On a managed board, a one-shot run that scanned
+  but delivered nothing emits that heartbeat once and stops, so a polling
+  consumer re-running from the persisted cursor walks one more bounded page
+  per run; an empty run at the head stays silent, and off enforcement an
+  empty one-shot stays silent too — only a capped scan can hide a denied
+  stretch worth walking. Continuing the scan past the raw cap inside one run
+  is rejected: the cap bounds one scan's work, and any larger bound only
+  moves the stall further out.
 - Secrets are redacted recursively before payloads are emitted.
 
 Each delivery is an NDJSON envelope containing:
@@ -488,6 +501,57 @@ installed Codex support. It must use a separately owned idle test session in a
 disposable workspace, with no human driver session, no shared repository
 mutation, no terminal input modification, and no `send-keys`; it verifies the
 installed version, the exact ingress path, and one received queued message.
+
+The second experimental and opt-in bridge is consumer `codex.app-server`,
+action `start-readonly-turn`, and capability `start`, via
+`kanban-codex-app-server-adapter`. The host allow-list binding is installed,
+but this rollout enables no active declarative subscription. When the
+dispatcher invokes it, the adapter still accepts a structured `AdapterRequest`
+and returns `AdapterResponse`; that is the normal dispatcher path, not a
+general subscription bypass. The host pins the installed Codex CLI `0.150.1`,
+the canonical path, private
+`CODEX_HOME`, private empty cwd, the `ClientRequest` hash
+`efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, the
+combined v2 schema hash
+`8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`, and the
+protocol timeout. Each turn clears child env except `CODEX_HOME`, probes
+version/help, regenerates the schema with experimental API disabled in an
+identity-pinned 0700 temp dir, verifies both hashes, and cleans only that
+directory. The turn is read-only, approval never, stdio only, and any request,
+tool-ish item, policy/identity/status/schema/size drift, malformed output,
+stderr, timeout, wrong/extra/duplicate ack, or post-completion output fails
+closed. Success stdout is only `AdapterResponse` after one accepted
+`(subscriptionID,eventID)` completion. The acceptance matrix for this bridge
+is separate: focused unit protocol/runtime coverage, compiled-process
+adapter-contract coverage against a dependency-free fake Codex, and a distinct
+HAX live smoke against installed Codex/model. That third leg is now closed:
+the 2026-09-05 receipt in README records the host's own binding accepting one
+structured request against installed `codex-cli 0.150.1` with an
+`AdapterResponse`, no stderr, an unchanged private cwd, unchanged host tmux
+panes, and its schema temp dir removed. The bridge stays experimental and
+opt-in, and no active declarative subscription ships.
+In the summary-view final turn,
+only a completed `userMessage` may be omitted from `turn/completed.items`;
+`reasoning` and `agentMessage` items remain exact and fail closed.
+
+The third opt-in bridge is consumer `claude.print`, action
+`start-readonly-turn`, and capability `start`, via
+`kanban-claude-print-adapter`. The host allow-list binding is separate and no
+active declarative subscription ships. HAX pins stable Claude Code `2.1.236`,
+while the adapter keeps the required version configurable. It validates
+canonical executable, private `HOME`, private cwd, and every ancestor before
+each spawn; probes exact version and help markers; clears the child environment
+to exactly `HOME` and fixed `PATH=/usr/bin:/bin`; and starts a fresh safe-mode
+print worker rather than resuming a foreground session. The fixed child argv
+selects JSON output, empty tools, disallowed MCP, no persistence, and
+permission mode `dontAsk`; cwd is fixed and stdin is empty. Only bounded
+subscription/event IDs enter the exact acknowledgement prompt. The adapter
+accepts strict JSON object or array output only when the final result is the
+exact acknowledgement and there is no tool-use evidence, API/auth error,
+nonzero status, stderr, overflow, trailing JSON, or mismatch. Success stdout is
+only `AdapterResponse`. Its compiled-process adapter-contract test uses a
+dependency-free fake Claude and makes no installed-Claude claim; installed
+Claude requires a separately named live smoke.
 
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:

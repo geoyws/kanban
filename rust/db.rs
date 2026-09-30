@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde_json::json;
 use std::cell::Cell;
 use std::fs::{self, Permissions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown};
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -159,7 +161,7 @@ const BOARD_V5: &str = r#"
 CREATE TABLE attention (
  id TEXT PRIMARY KEY NOT NULL,
  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
- kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
  body TEXT NOT NULL,
  raised_by TEXT NOT NULL,
  created_at INTEGER NOT NULL,
@@ -423,9 +425,12 @@ CREATE INDEX idx_rules_active ON rules(created_at) WHERE archived=0;
 /// source metadata and optional semantic-vector bytes; the external-content
 /// virtual table owns only the lexical index. Source-table triggers rebuild the
 /// affected derived rows, and search-document triggers keep FTS5 in step. A
-/// source mutation deliberately clears its cached embedding: search computes a
-/// missing vector in memory, while the explicit rebuild operation persists the
-/// current model later without making an ordinary read write the board.
+/// trigger re-insert clears the cached embedding, so every Rust write path
+/// re-embeds the rows it touched in the same `Store` call (`search::embed_missing`);
+/// the explicit `search-rebuild` operation persists the whole corpus
+/// transactionally when a board predates the eager path or the model changed.
+/// `search` itself stays read-only and still recomputes a missing vector in
+/// memory, so an ordinary read never writes the board.
 const BOARD_V13: &str = r#"
 CREATE TABLE search_documents (
  seq INTEGER PRIMARY KEY,
@@ -742,7 +747,7 @@ ALTER TABLE attention RENAME TO attention_v16;
 CREATE TABLE attention (
  id TEXT PRIMARY KEY NOT NULL,
  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
- kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
  body TEXT NOT NULL,
  raised_by TEXT NOT NULL,
  created_at INTEGER NOT NULL,
@@ -1355,9 +1360,1290 @@ DROP INDEX IF EXISTS idx_events_created_seq;
 CREATE INDEX idx_events_created_seq ON events(created_at,seq);
 "#;
 
+/// Retiring a handoff makes its `status` `retired`, which widens the status
+/// CHECK — and SQLite cannot alter a CHECK in place, so the table is rebuilt.
+/// A rebuild is the easiest place in a schema to change something nobody asked
+/// to change, so the rebuilt table reproduces the original exactly apart from
+/// the widened CHECK and the three new columns. The copy names every column
+/// rather than `SELECT *`, so re-running this step against a table that already
+/// carries the new columns (a board whose `user_version` was lowered without
+/// reverting the schema) copies the original twenty-five and leaves the new
+/// three NULL instead of doubling them.
+///
+/// The search view `search_source_rows` reads `handoffs` by name, and the three
+/// `search_handoffs_*` triggers attach to it. `PRAGMA legacy_alter_table=ON`
+/// keeps the view's `FROM handoffs` reference from being rewritten to the old
+/// name during the rename, so after the new table takes the name the view is
+/// correct without being recreated; the three triggers follow their table
+/// through the rename, are dropped with it, and are recreated here.
+const BOARD_V24: &str = r#"
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE handoffs RENAME TO handoffs_old;
+CREATE TABLE handoffs (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ checkpoint_seq INTEGER REFERENCES checkpoints(seq) ON DELETE SET NULL,
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled','retired')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT,root_head TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ retired_at INTEGER,
+ retired_by TEXT,
+ retire_note TEXT
+) STRICT;
+INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority)
+ SELECT id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority FROM handoffs_old;
+DROP TABLE handoffs_old;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_handoffs_ai AFTER INSERT ON handoffs BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_au AFTER UPDATE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+END;
+"#;
+
+/// An attention item becomes a decision card: a question, the context needed
+/// to answer it, two to four authored choices, and the decision that settled
+/// it (ADR-042 §2).
+///
+/// The four columns land on the attention row, with the exact CHECKs ADR-042
+/// specifies: the length bounds and the shape of the two JSON documents,
+/// which a caller cannot corrupt past. The cross-field invariants (the
+/// question/context pairing, exactly-one-recommended, key uniqueness, the
+/// reserved `custom`, a consequence per choice) are deliberately NOT here:
+/// `CHECK constraint failed` names no fix, and ADR-008 requires a refusal
+/// that does, so those live in the store and only in the store.
+///
+/// **A rebuild rather than four `ALTER TABLE ADD COLUMN` statements**, which
+/// is the one place this differs from ADR-042 §2's stated mechanism. The
+/// ADR's reason for preferring `ADD COLUMN` was that the rebuild `BOARD_V17`
+/// had to do was forced by an unalterable CHECK and that added columns "need
+/// none of that". They need one thing: the ladder's LAST step must survive
+/// being re-run, because `compiled_binary_still_migrates_a_board_that_is_behind`
+/// lowers `user_version` by one WITHOUT reverting the schema, and
+/// `ADD COLUMN` answers a re-run with `duplicate column name`. `BOARD_V24`
+/// already carries that property and says so; this reproduces it the same
+/// way, by naming every copied column so a re-run against a table that
+/// already has the four copies the original fifteen and leaves the new four
+/// NULL rather than failing. Nothing else about the table changes: the
+/// rebuilt shape is `BOARD_V17`'s plus the four columns.
+///
+/// The three `search_attention_*` triggers follow their table and are
+/// recreated here, as `BOARD_V17` did. `search_source_rows` is dropped first
+/// and recreated last so that no statement is prepared against a view whose
+/// attention arm names a column that does not exist yet, and its new arm
+/// indexes the question, the context and the choices' labels and
+/// consequences. Existing `search_documents` rows keep the old text until
+/// their row is next written, which is why the release runs
+/// `kanban search-rebuild` per board.
+const BOARD_V25: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+DROP VIEW search_source_rows;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v24;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
+ body TEXT NOT NULL,
+ raised_by TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority
+FROM attention_v24;
+DROP TABLE attention_v24;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE VIEW search_source_rows AS
+SELECT
+ 'task' AS source_kind,
+ t.id AS source_id,
+ t.id AS task_id,
+ t.title AS title,
+ COALESCE(t.body,'') || char(10) || COALESCE(t.deliverable,'') || char(10) || t.metadata AS body,
+ t.status AS status,
+ t.lane AS lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=t.id AND archived=0 ORDER BY tag)), '') AS tags,
+ t.created_at AS created_at,
+ t.updated_at AS updated_at,
+ t.archived AS archived
+FROM tasks t
+UNION ALL
+SELECT
+ 'note', CAST(n.seq AS TEXT), n.task_id,
+ n.kind || ' note on ' || n.task_id,
+ n.author || char(10) || n.body,
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=n.task_id AND archived=0 ORDER BY tag)), ''),
+ n.created_at, n.created_at, n.archived
+FROM task_notes n JOIN tasks t ON t.id=n.task_id
+UNION ALL
+SELECT
+ 'checkpoint', CAST(c.seq AS TEXT), c.task_id,
+ 'checkpoint: ' || c.summary,
+ c.author || char(10) || c.summary || char(10) || c.intent || char(10) || c.next_action ||
+   char(10) || c.blockers || char(10) || c.validations || char(10) ||
+   COALESCE(c.repo_path,'') || char(10) || COALESCE(c.branch,''),
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=c.task_id AND archived=0 ORDER BY tag)), ''),
+ c.created_at, c.created_at, c.archived
+FROM checkpoints c JOIN tasks t ON t.id=c.task_id
+UNION ALL
+SELECT
+ 'handoff', h.id, h.task_id,
+ 'handoff: ' || h.summary,
+ h.from_agent || char(10) || COALESCE(h.to_agent,'') || char(10) || h.summary ||
+   char(10) || h.intent || char(10) || h.next_action || char(10) || h.blockers ||
+   char(10) || h.validations || char(10) || COALESCE(h.repo_path,'') ||
+   char(10) || COALESCE(h.branch,''),
+ h.status,
+ (SELECT lane FROM tasks WHERE id=h.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=h.task_id AND archived=0 ORDER BY tag)), ''),
+ h.created_at, COALESCE(h.accepted_at,h.created_at), h.archived
+FROM handoffs h
+UNION ALL
+SELECT
+ 'attention', a.id, a.task_id,
+ 'attention: ' || a.kind,
+ a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,'') ||
+   char(10) || COALESCE(a.question,'') || char(10) || COALESCE(a.context,'') ||
+   char(10) || COALESCE((SELECT group_concat(
+     json_extract(choice.value,'$.label') || char(10) ||
+     json_extract(choice.value,'$.consequence'), char(10))
+     FROM json_each(a.choices) choice), ''),
+ a.status,
+ (SELECT lane FROM tasks WHERE id=a.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=a.task_id AND archived=0 ORDER BY tag)), ''),
+ a.created_at, COALESCE(a.resolved_at,a.created_at), a.archived
+FROM attention a
+UNION ALL
+SELECT
+ 'sitrep', s.id, s.task_id,
+ 'sitrep: ' || s.lane,
+ s.author || char(10) || s.body || char(10) || COALESCE(s.worktree,'') ||
+   char(10) || COALESCE(s.branch,''),
+ NULL, s.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=s.task_id AND archived=0 ORDER BY tag)), ''),
+ s.created_at, s.created_at, s.archived
+FROM sitreps s
+UNION ALL
+SELECT
+ 'rule', r.id, NULL,
+ substr(r.body,1,instr(r.body || char(10),char(10))-1),
+ r.body,
+ CASE WHEN r.archived=0 THEN 'active' ELSE 'retired' END,
+ NULL, '', r.created_at, r.updated_at, r.archived
+FROM rules r
+UNION ALL
+SELECT
+ 'event', CAST(e.seq AS TEXT), e.task_id,
+ 'event: ' || e.kind,
+ COALESCE(e.actor,'') || char(10) || e.payload,
+ (SELECT status FROM tasks WHERE id=e.task_id),
+ (SELECT lane FROM tasks WHERE id=e.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=e.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, e.created_at, e.archived
+FROM events e
+WHERE e.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+);
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+"#;
+
+/// A deployment attempt names its identity mode, and an artifact-identity
+/// attempt states that its build commit is unknown (ADR-043 §2).
+///
+/// **A rebuild, because `commit_sha`'s CHECK has to be widened.** The column
+/// admits only 40 hexadecimal characters, so the literal `unknown` cannot be
+/// stored beside it, and a CHECK cannot be altered in place — the same reason
+/// `BOARD_V17` rebuilt `attention`. Storing forty zeroes or the deployer's
+/// own checkout instead would be the invented provenance this migration
+/// exists to make unnecessary.
+///
+/// `identity_mode` is reconstructed from `commit_sha` in the copy rather than
+/// read from the old table, which is what lets the ladder's last step survive
+/// being re-run: `compiled_binary_still_migrates_a_board_that_is_behind`
+/// lowers `user_version` WITHOUT reverting the schema, so the SELECT may only
+/// name columns the pre-rebuild table already had. A re-run therefore keeps
+/// every row and every mode, and loses only the two artifact documents, which
+/// are nullable — the same bounded degradation `BOARD_V24` and `BOARD_V25`
+/// accept and state.
+///
+/// **What stays in the schema is shape; what moves to the store is fit.** The
+/// mode/commit pairing, the digest shapes and "no served commit in artifact
+/// mode" are column CHECKs because they are true of one row read alone. The
+/// per-role expected-versus-observed match is not: it needs a refusal naming
+/// the role and both values (ADR-008), so it lives in `finish_deployment` and
+/// only there. A succeeded artifact attempt is held to phase, receipt and a
+/// recorded observation here, and to the match there.
+///
+/// `search_deployments_au` follows its table — a trigger is dropped with the
+/// table it watches — and is recreated here byte-for-byte from `BOARD_V20`,
+/// as `BOARD_V17` and `BOARD_V25` recreate `attention`'s. Without it an
+/// archived attempt's event documents stay in the hot search corpus, which
+/// `compiled_binary_tracks_verified_deployments_and_self_archives_only_non_current_history`
+/// measures. `search_deployment_event_rows` is a view over this table and is
+/// left alone: it is resolved when used, not when defined.
+const BOARD_V26: &str = r#"
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE deployments RENAME TO deployments_v25;
+CREATE TABLE deployments (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ repo TEXT NOT NULL,
+ identity_mode TEXT NOT NULL DEFAULT 'git' CHECK(identity_mode IN ('git','artifact')),
+ commit_sha TEXT NOT NULL CHECK(
+   (identity_mode='git' AND length(commit_sha)=40 AND commit_sha NOT GLOB '*[^0-9a-f]*')
+   OR
+   (identity_mode='artifact' AND commit_sha='unknown')
+ ),
+ deployer_checkout TEXT CHECK(deployer_checkout IS NULL OR (length(deployer_checkout)=40 AND deployer_checkout NOT GLOB '*[^0-9a-f]*')),
+ expected_artifacts TEXT CHECK(expected_artifacts IS NULL OR (json_valid(expected_artifacts)
+   AND json_type(expected_artifacts)='array' AND json_array_length(expected_artifacts)>=1)),
+ observed_artifacts TEXT CHECK(observed_artifacts IS NULL OR (json_valid(observed_artifacts)
+   AND json_type(observed_artifacts)='array' AND json_array_length(observed_artifacts)>=1)),
+ branch TEXT,
+ tier TEXT NOT NULL CHECK(tier IN ('@_bdt','@_bd','@_bst','@_bs','@_s','@_uat','@_p')),
+ environment TEXT NOT NULL,
+ host TEXT NOT NULL,
+ url TEXT NOT NULL,
+ mechanism TEXT,
+ operation_id TEXT UNIQUE,
+ retry_of TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+ status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','abandoned')),
+ phase TEXT CHECK(phase IS NULL OR phase IN ('build','publish','start','verification')),
+ actor TEXT NOT NULL,
+ lane TEXT,
+ capability_token TEXT NOT NULL UNIQUE,
+ receipt TEXT,
+ artifact_uri TEXT,
+ served_commit TEXT CHECK(served_commit IS NULL OR (length(served_commit)=40 AND served_commit NOT GLOB '*[^0-9a-f]*')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ completed_at INTEGER,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ archived_at INTEGER,
+ CHECK(identity_mode='git' OR served_commit IS NULL),
+ CHECK(
+   (status='started' AND completed_at IS NULL)
+   OR
+   (status<>'started' AND completed_at IS NOT NULL)
+ ),
+ CHECK(status<>'succeeded' OR (phase='verification' AND receipt IS NOT NULL AND length(trim(receipt))>0 AND (
+   (identity_mode='git' AND served_commit=commit_sha)
+   OR
+   (identity_mode='artifact' AND observed_artifacts IS NOT NULL)
+ )))
+) STRICT;
+INSERT INTO deployments(
+ id,task_id,repo,identity_mode,commit_sha,branch,tier,environment,host,url,mechanism,
+ operation_id,retry_of,status,phase,actor,lane,capability_token,receipt,artifact_uri,
+ served_commit,created_at,updated_at,completed_at,archived,archived_at
+)
+SELECT id,task_id,repo,
+ CASE WHEN commit_sha='unknown' THEN 'artifact' ELSE 'git' END,
+ commit_sha,branch,tier,environment,host,url,mechanism,
+ operation_id,retry_of,status,phase,actor,lane,capability_token,receipt,artifact_uri,
+ served_commit,created_at,updated_at,completed_at,archived,archived_at
+FROM deployments_v25;
+DROP TABLE deployments_v25;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_deployments_hot_target ON deployments(repo,tier,environment,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_status ON deployments(status,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_task ON deployments(task_id,created_at DESC) WHERE archived=0;
+CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
+ DELETE FROM search_documents
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID') IN (old.id,new.id)
+ );
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows
+ WHERE source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+"#;
+
+/// Sprints: a typed row that scopes claims and cannot close without a
+/// served version (ADR-045 §1).
+///
+/// Entirely additive — two tables, three deployment proof columns, one partial unique index,
+/// no ALTER on `tasks` — so a board that never opens a sprint behaves
+/// byte-identically, rollback is "abandon the sprint", not a migration back
+/// (ADR-045 §3). Each production migration runs exactly once. Planned dates
+/// are separate from actual lifecycle stamps.
+///
+/// `task_sprints` carries no CHECK beyond the FKs because the attachment
+/// rules are cross-row — an epic attaches its subtree; a descendant may sit
+/// in another sprint — and belong in the store where a refusal can name the
+/// fix (ADR-042 §2 precedent: half-enforced schema invariants read as though
+/// the schema were authoritative).
+const BOARD_V27: &str = r#"
+CREATE TABLE sprints (
+ id TEXT PRIMARY KEY NOT NULL,
+ title TEXT NOT NULL,
+ body TEXT,
+ status TEXT NOT NULL DEFAULT 'planned'
+  CHECK(status IN ('planned','current','closed','abandoned')),
+ target_version TEXT NOT NULL,
+ scheduled_start INTEGER NOT NULL,
+ scheduled_end INTEGER NOT NULL CHECK(scheduled_end >= scheduled_start),
+ starts_at INTEGER NOT NULL,
+ ends_at INTEGER,
+ closed_by_deployment TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))
+) STRICT;
+CREATE UNIQUE INDEX one_current_sprint ON sprints(status) WHERE status='current';
+CREATE TABLE task_sprints (
+ task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ sprint_id TEXT NOT NULL REFERENCES sprints(id),
+ attached_at INTEGER NOT NULL,
+ attached_by TEXT NOT NULL
+) STRICT;
+ALTER TABLE deployments ADD COLUMN sprint_id TEXT REFERENCES sprints(id);
+ALTER TABLE deployments ADD COLUMN target_version TEXT;
+ALTER TABLE deployments ADD COLUMN served_version TEXT;
+"#;
+
+/// Sprints are board-owned search sources, with the same indexed lifecycle as
+/// every other authoritative board row. SQLite cannot widen a CHECK in place,
+/// so the document table is rebuilt with all fifteen columns copied explicitly:
+/// row identities and any cached embeddings survive unchanged. The external-
+/// content FTS table is rebuilt from those preserved rows after its triggers and
+/// indexes are restored; existing sprints are then backfilled through the
+/// extended authoritative source view.
+const BOARD_V28: &str = r#"
+DROP TRIGGER search_documents_ai;
+DROP TRIGGER search_documents_ad;
+DROP TRIGGER search_documents_au;
+DROP TABLE search_fts;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE search_documents RENAME TO search_documents_v27;
+CREATE TABLE search_documents (
+ seq INTEGER PRIMARY KEY,
+ source_kind TEXT NOT NULL CHECK(source_kind IN ('task','note','checkpoint','handoff','attention','sitrep','rule','event','sprint')),
+ source_id TEXT NOT NULL,
+ task_id TEXT,
+ title TEXT NOT NULL,
+ body TEXT NOT NULL,
+ status TEXT,
+ lane TEXT,
+ tags TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ source_hash TEXT,
+ embedding_model TEXT,
+ embedding BLOB,
+ UNIQUE(source_kind,source_id)
+) STRICT;
+INSERT INTO search_documents(
+ seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+ archived,source_hash,embedding_model,embedding
+)
+SELECT
+ seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+ archived,source_hash,embedding_model,embedding
+FROM search_documents_v27;
+DROP TABLE search_documents_v27;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_search_documents_source ON search_documents(source_kind,source_id);
+CREATE INDEX idx_search_documents_task ON search_documents(task_id);
+CREATE INDEX idx_search_documents_active ON search_documents(updated_at DESC) WHERE archived=0;
+CREATE VIRTUAL TABLE search_fts USING fts5(
+ title,
+ body,
+ tags,
+ content='search_documents',
+ content_rowid='seq',
+ tokenize='porter unicode61 remove_diacritics 2',
+ prefix='2 3'
+);
+CREATE TRIGGER search_documents_ai AFTER INSERT ON search_documents BEGIN
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+CREATE TRIGGER search_documents_ad AFTER DELETE ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+END;
+CREATE TRIGGER search_documents_au AFTER UPDATE OF title,body,tags ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+DROP VIEW search_source_rows;
+CREATE VIEW search_source_rows AS
+SELECT
+ 'task' AS source_kind,
+ t.id AS source_id,
+ t.id AS task_id,
+ t.title AS title,
+ COALESCE(t.body,'') || char(10) || COALESCE(t.deliverable,'') || char(10) || t.metadata AS body,
+ t.status AS status,
+ t.lane AS lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=t.id AND archived=0 ORDER BY tag)), '') AS tags,
+ t.created_at AS created_at,
+ t.updated_at AS updated_at,
+ t.archived AS archived
+FROM tasks t
+UNION ALL
+SELECT
+ 'note', CAST(n.seq AS TEXT), n.task_id,
+ n.kind || ' note on ' || n.task_id,
+ n.author || char(10) || n.body,
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=n.task_id AND archived=0 ORDER BY tag)), ''),
+ n.created_at, n.created_at, n.archived
+FROM task_notes n JOIN tasks t ON t.id=n.task_id
+UNION ALL
+SELECT
+ 'checkpoint', CAST(c.seq AS TEXT), c.task_id,
+ 'checkpoint: ' || c.summary,
+ c.author || char(10) || c.summary || char(10) || c.intent || char(10) || c.next_action ||
+   char(10) || c.blockers || char(10) || c.validations || char(10) ||
+   COALESCE(c.repo_path,'') || char(10) || COALESCE(c.branch,''),
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=c.task_id AND archived=0 ORDER BY tag)), ''),
+ c.created_at, c.created_at, c.archived
+FROM checkpoints c JOIN tasks t ON t.id=c.task_id
+UNION ALL
+SELECT
+ 'handoff', h.id, h.task_id,
+ 'handoff: ' || h.summary,
+ h.from_agent || char(10) || COALESCE(h.to_agent,'') || char(10) || h.summary ||
+   char(10) || h.intent || char(10) || h.next_action || char(10) || h.blockers ||
+   char(10) || h.validations || char(10) || COALESCE(h.repo_path,'') ||
+   char(10) || COALESCE(h.branch,''),
+ h.status,
+ (SELECT lane FROM tasks WHERE id=h.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=h.task_id AND archived=0 ORDER BY tag)), ''),
+ h.created_at, COALESCE(h.accepted_at,h.created_at), h.archived
+FROM handoffs h
+UNION ALL
+SELECT
+ 'attention', a.id, a.task_id,
+ 'attention: ' || a.kind,
+ a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,'') ||
+   char(10) || COALESCE(a.question,'') || char(10) || COALESCE(a.context,'') ||
+   char(10) || COALESCE((SELECT group_concat(
+     json_extract(choice.value,'$.label') || char(10) ||
+     json_extract(choice.value,'$.consequence'), char(10))
+     FROM json_each(a.choices) choice), ''),
+ a.status,
+ (SELECT lane FROM tasks WHERE id=a.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=a.task_id AND archived=0 ORDER BY tag)), ''),
+ a.created_at, COALESCE(a.resolved_at,a.created_at), a.archived
+FROM attention a
+UNION ALL
+SELECT
+ 'sitrep', s.id, s.task_id,
+ 'sitrep: ' || s.lane,
+ s.author || char(10) || s.body || char(10) || COALESCE(s.worktree,'') ||
+   char(10) || COALESCE(s.branch,''),
+ NULL, s.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=s.task_id AND archived=0 ORDER BY tag)), ''),
+ s.created_at, s.created_at, s.archived
+FROM sitreps s
+UNION ALL
+SELECT
+ 'rule', r.id, NULL,
+ substr(r.body,1,instr(r.body || char(10),char(10))-1),
+ r.body,
+ CASE WHEN r.archived=0 THEN 'active' ELSE 'retired' END,
+ NULL, '', r.created_at, r.updated_at, r.archived
+FROM rules r
+UNION ALL
+SELECT
+ 'event', CAST(e.seq AS TEXT), e.task_id,
+ 'event: ' || e.kind,
+ COALESCE(e.actor,'') || char(10) || e.payload,
+ (SELECT status FROM tasks WHERE id=e.task_id),
+ (SELECT lane FROM tasks WHERE id=e.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=e.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, e.created_at, e.archived
+FROM events e
+WHERE e.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+)
+UNION ALL
+SELECT
+ 'sprint', sp.id, NULL,
+ sp.title,
+ COALESCE(sp.body,'') || char(10) || sp.target_version,
+ sp.status, NULL, '',
+ sp.created_at, sp.updated_at, sp.archived
+FROM sprints sp;
+
+CREATE TRIGGER search_sprints_ai AFTER INSERT ON sprints BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sprint' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sprints_au AFTER UPDATE ON sprints BEGIN
+ DELETE FROM search_documents WHERE source_kind='sprint' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sprint' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sprints_ad AFTER DELETE ON sprints BEGIN
+ DELETE FROM search_documents WHERE source_kind='sprint' AND source_id=old.id;
+END;
+INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+SELECT * FROM search_source_rows WHERE source_kind='sprint';
+INSERT INTO search_fts(search_fts) VALUES('rebuild');
+"#;
+
+/// Where a renamed tag records the spelling it arrived under.
+///
+/// Two nullable columns rather than a JSON `metadata` blob: the `tags` table
+/// has no metadata column at all, so the JSON route would have to add one
+/// column *and* teach every reader to parse it, where the provenance is two
+/// scalars every reader wants rendered. Two `ALTER TABLE ... ADD COLUMN`
+/// statements are also the smallest migration SQLite can run — no table
+/// rebuild, no trigger drop, no index churn — and `renamed_at` stays a
+/// first-class integer a query can order by.
+///
+/// Both are NULL for a tag still carrying the name it was registered under,
+/// which is what makes `renamedFrom` on a `tag list` row mean "this used to be
+/// called something else" rather than "this row predates the column".
+const BOARD_V29: &str = r#"
+ALTER TABLE tags ADD COLUMN renamed_from TEXT;
+ALTER TABLE tags ADD COLUMN renamed_at INTEGER;
+"#;
+
+/// Which models may claim a task, and which model a claim runs as.
+///
+/// A table rather than a JSON column on `tasks`: the allow-list is a set that
+/// is read back sorted, filtered on (`task list --allowed-model`) and joined
+/// per listing, and `task_tags` already establishes that shape for the one
+/// other set a task carries. `idx_task_models_model` is what makes the filter
+/// an index seek rather than a scan of every row's list.
+///
+/// `task_claims.model` is nullable and stays NULL for every claim taken before
+/// this migration and for every claim that declares no model: a claim without
+/// one is legal on an unrestricted task, so absent is a value here rather than
+/// a gap to backfill.
+///
+/// Re-run safe, for the reason `BOARD_V24` and `BOARD_V25` give: the ladder's
+/// LAST step must survive being run against a board whose `user_version` was
+/// lowered without its schema being reverted, and `ALTER TABLE ADD COLUMN`
+/// answers that with `duplicate column name`. So the table is `IF NOT EXISTS`
+/// and the column arrives by rebuild, naming every copied column, exactly as
+/// `BOARD_V24` does: a re-run against a `task_claims` that already carries
+/// `model` copies the original twelve and leaves the new one NULL instead of
+/// failing. No view or trigger reads `task_claims`, so the rebuild is the
+/// table and its one index and nothing else.
+const BOARD_V30: &str = r#"
+CREATE TABLE IF NOT EXISTS task_models (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ model TEXT NOT NULL,
+ PRIMARY KEY(task_id,model)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_task_models_model ON task_models(model);
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE task_claims RENAME TO task_claims_old;
+CREATE TABLE task_claims (
+ task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL,session_id TEXT,lease_token TEXT NOT NULL UNIQUE,
+ claimed_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
+ worktree TEXT,worktree_kind TEXT,branch TEXT,head_sha TEXT,root_head TEXT,
+ model TEXT
+) STRICT;
+INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head)
+ SELECT task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head FROM task_claims_old;
+DROP TABLE task_claims_old;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_task_claims_expiry ON task_claims(expires_at);
+"#;
+/// Native Active Comprehension Check definition (ACC-01..05). The last board
+/// migration uses the established table-rebuild pattern so a rewound
+/// user_version cannot collide with already-present columns. The migration
+/// runner skips this rebuild for a complete v31 shape, preserving check data.
+const BOARD_V31: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v30;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
+ body TEXT NOT NULL, raised_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),
+ check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'
+   AND json_array_length(check_choices) BETWEEN 2 AND 4)),
+ check_answer TEXT,
+ check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),
+ check_about TEXT,
+ CHECK(
+   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
+    AND check_explanation IS NULL AND check_about IS NULL)
+   OR
+   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL
+    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)
+ ),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision
+FROM attention_v30;
+DROP TABLE attention_v30;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+"#;
+
+/// The recorded check answer (ACC-07): three columns that are absent or
+/// complete together, and only ever on a row that carries a definition.
+/// v32 does not rebuild the table — plain ALTERs plus triggers carry the
+/// all-or-none law the v31 table CHECK cannot express after the fact.
+const BOARD_V32: &str = r#"
+ALTER TABLE attention ADD COLUMN check_answered TEXT;
+ALTER TABLE attention ADD COLUMN check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1));
+ALTER TABLE attention ADD COLUMN check_answered_at INTEGER;
+CREATE TRIGGER attention_check_result_insert_all_or_none AFTER INSERT ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+CREATE TRIGGER attention_check_result_update_all_or_none AFTER UPDATE OF check_question, check_choices, check_answer, check_explanation, check_about, check_answered, check_correct, check_answered_at ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+"#;
+
+/// The sixth attention kind (COMPLAINT-04): `complaint` joins the `attention`
+/// kind CHECK, and nothing else moves.
+///
+/// SQLite cannot alter a CHECK in place, so the table is rebuilt on the
+/// `BOARD_V31` precedent: drop the attached triggers, rename aside, recreate
+/// with the widened CHECK, copy every row back, drop the old table, and
+/// recreate the triggers and indexes. The recreated shape is the v31 table
+/// plus the three v32 result columns, in declared order, with every other
+/// constraint byte-identical.
+///
+/// The copy names every column rather than `SELECT *`, so re-running this
+/// step against a table that already carries the widened CHECK (a board
+/// whose `user_version` was lowered without reverting the schema) copies all
+/// twenty-seven columns verbatim instead of failing or doubling anything —
+/// the property `BOARD_V24`/`BOARD_V25` document. No backfill: existing rows
+/// keep their kinds, and no row becomes a complaint except by a fresh raise.
+///
+/// All five attention triggers are recreated here, not just the three
+/// `search_attention_*` ones `BOARD_V31` recreated: the two
+/// `attention_check_result_*` triggers `BOARD_V32` added attach to the same
+/// table, follow it through the rename, and are dropped with it.
+const BOARD_V33: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+DROP TRIGGER attention_check_result_insert_all_or_none;
+DROP TRIGGER attention_check_result_update_all_or_none;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v32;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
+ body TEXT NOT NULL, raised_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),
+ check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'
+   AND json_array_length(check_choices) BETWEEN 2 AND 4)),
+ check_answer TEXT,
+ check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),
+ check_about TEXT,
+ check_answered TEXT,
+ check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),
+ check_answered_at INTEGER,
+ CHECK(
+   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
+    AND check_explanation IS NULL AND check_about IS NULL)
+   OR
+   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL
+    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)
+ ),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at
+FROM attention_v32;
+DROP TABLE attention_v32;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+CREATE TRIGGER attention_check_result_insert_all_or_none AFTER INSERT ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+CREATE TRIGGER attention_check_result_update_all_or_none AFTER UPDATE OF check_question, check_choices, check_answer, check_explanation, check_about, check_answered, check_correct, check_answered_at ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+"#;
+/// The lane a card was raised in (SPA-62): one nullable `lane` on `attention`,
+/// forward-only, existing rows `NULL`.
+///
+/// A plain `ALTER TABLE` on the `BOARD_V32` precedent: no CHECK names the
+/// column and no trigger reads it, so there is nothing to rebuild. A row
+/// raised without `--lane` stores `NULL` exactly as every pre-v34 row does,
+/// and keeps reading through the raiser-suffix and task-lane routes.
+const BOARD_V34: &str = r#"
+ALTER TABLE attention ADD COLUMN lane TEXT;
+"#;
+
+/// What brings a snoozed card back (SPA-64): one nullable `return_trigger` on
+/// `attention`, forward-only, no backfill — existing rows `NULL`, because no
+/// row snoozed before this column existed.
+///
+/// A plain `ALTER TABLE` on the `BOARD_V34` precedent: no CHECK names the
+/// column and no trigger reads it. The grammar is the store's
+/// (`model::parse_return_trigger`), and the read-side firing test is the
+/// store's open-queue filter.
+const BOARD_V35: &str = r#"
+ALTER TABLE attention ADD COLUMN return_trigger TEXT;
+"#;
+
+/// Keep a removed task's link on its sitreps, handoffs, deployments and
+/// attention rows (ACC-14): `task_id` becomes plain `TEXT` with no foreign
+/// key, so removing the task leaves the id in place instead of nulling it.
+///
+/// Design (a) from the finding — keep the link — rather than (b) a second
+/// id-recording column, because every read path resolves an orphaned id
+/// through the `task_removed` tag union (`task_linked_row_visible`,
+/// `document_row_tags`, the deployment subject gates): with the id kept,
+/// those branches finally run for these four tables, exactly as they already
+/// do for `subscriptions.subject_task_id`, which carries no FK and is the
+/// precedent. `ON DELETE NO ACTION` was not an option — it would refuse the
+/// removal — and `SET NULL` is the leak: a nulled row reads as board scope.
+///
+/// Nothing relies on the dropped FK action. `remove_task` names blocking
+/// children itself (the `parent_id` FK stays), the row writers validate the
+/// task before linking, and `doctor` reports dangling task links on these
+/// four tables through the new `orphaned_task_links` check rather than
+/// `foreign_key_check`, which has one fewer FK to check. `NULL` once again
+/// means only what the writers put there: a session handoff, a lanewide
+/// sitrep, a taskless deployment, an untagged attention row — each board
+/// scope, as before.
+///
+/// SQLite cannot drop a FK in place, so each table is rebuilt on the
+/// `BOARD_V33` precedent: drop the attached triggers, rename aside, recreate
+/// byte-identical apart from the `task_id` column (the v35 `attention` shape
+/// keeps its `lane` and `return_trigger` columns), copy every row back naming
+/// every column, drop the old table, recreate indexes and triggers.
+/// `search_source_rows` and `search_deployment_event_rows` resolve by name
+/// and are left alone under `PRAGMA legacy_alter_table`, as is
+/// `attention_tags.attention_id`, which keeps pointing at the name `attention`
+/// takes back. Rows already nulled by an older removal recover their link
+/// from their creation event — each one records the row id against the task —
+/// but only when that event's task has a `task_removed` record and no live
+/// row, so session handoffs, lanewide sitreps and taskless deployments stay
+/// NULL.
+const BOARD_V36: &str = r#"
+DROP TRIGGER search_sitreps_ai;
+DROP TRIGGER search_sitreps_au;
+DROP TRIGGER search_sitreps_ad;
+DROP TRIGGER search_handoffs_ai;
+DROP TRIGGER search_handoffs_au;
+DROP TRIGGER search_handoffs_ad;
+DROP TRIGGER search_deployments_au;
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+DROP TRIGGER attention_check_result_insert_all_or_none;
+DROP TRIGGER attention_check_result_update_all_or_none;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE sitreps RENAME TO sitreps_v35;
+CREATE TABLE sitreps (
+ id TEXT PRIMARY KEY NOT NULL,
+ lane TEXT NOT NULL,
+ task_id TEXT,
+ author TEXT NOT NULL,
+ body TEXT NOT NULL,
+ worktree TEXT,
+ branch TEXT,
+ head_sha TEXT,
+ root_head TEXT,
+ dirty_summary TEXT,
+ archived INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO sitreps(
+ id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at
+)
+SELECT id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at
+FROM sitreps_v35;
+DROP TABLE sitreps_v35;
+ALTER TABLE handoffs RENAME TO handoffs_v35;
+CREATE TABLE handoffs (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ checkpoint_seq INTEGER REFERENCES checkpoints(seq) ON DELETE SET NULL,
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled','retired')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT,root_head TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ retired_at INTEGER,
+ retired_by TEXT,
+ retire_note TEXT
+) STRICT;
+INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority,retired_at,retired_by,retire_note)
+ SELECT id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority,retired_at,retired_by,retire_note FROM handoffs_v35;
+DROP TABLE handoffs_v35;
+ALTER TABLE deployments RENAME TO deployments_v35;
+CREATE TABLE deployments (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ repo TEXT NOT NULL,
+ identity_mode TEXT NOT NULL DEFAULT 'git' CHECK(identity_mode IN ('git','artifact')),
+ commit_sha TEXT NOT NULL CHECK(
+   (identity_mode='git' AND length(commit_sha)=40 AND commit_sha NOT GLOB '*[^0-9a-f]*')
+   OR
+   (identity_mode='artifact' AND commit_sha='unknown')
+ ),
+ deployer_checkout TEXT CHECK(deployer_checkout IS NULL OR (length(deployer_checkout)=40 AND deployer_checkout NOT GLOB '*[^0-9a-f]*')),
+ expected_artifacts TEXT CHECK(expected_artifacts IS NULL OR (json_valid(expected_artifacts)
+   AND json_type(expected_artifacts)='array' AND json_array_length(expected_artifacts)>=1)),
+ observed_artifacts TEXT CHECK(observed_artifacts IS NULL OR (json_valid(observed_artifacts)
+   AND json_type(observed_artifacts)='array' AND json_array_length(observed_artifacts)>=1)),
+ branch TEXT,
+ tier TEXT NOT NULL CHECK(tier IN ('@_bdt','@_bd','@_bst','@_bs','@_s','@_uat','@_p')),
+ environment TEXT NOT NULL,
+ host TEXT NOT NULL,
+ url TEXT NOT NULL,
+ mechanism TEXT,
+ operation_id TEXT UNIQUE,
+ retry_of TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+ status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','abandoned')),
+ phase TEXT CHECK(phase IS NULL OR phase IN ('build','publish','start','verification')),
+ actor TEXT NOT NULL,
+ lane TEXT,
+ capability_token TEXT NOT NULL UNIQUE,
+ receipt TEXT,
+ artifact_uri TEXT,
+ served_commit TEXT CHECK(served_commit IS NULL OR (length(served_commit)=40 AND served_commit NOT GLOB '*[^0-9a-f]*')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ completed_at INTEGER,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ archived_at INTEGER,
+ sprint_id TEXT REFERENCES sprints(id),
+ target_version TEXT,
+ served_version TEXT,
+ CHECK(identity_mode='git' OR served_commit IS NULL),
+ CHECK(
+   (status='started' AND completed_at IS NULL)
+   OR
+   (status<>'started' AND completed_at IS NOT NULL)
+ ),
+ CHECK(status<>'succeeded' OR (phase='verification' AND receipt IS NOT NULL AND length(trim(receipt))>0 AND (
+   (identity_mode='git' AND served_commit=commit_sha)
+   OR
+   (identity_mode='artifact' AND observed_artifacts IS NOT NULL)
+ )))
+) STRICT;
+INSERT INTO deployments(
+ id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,observed_artifacts,
+ branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,phase,actor,lane,
+ capability_token,receipt,artifact_uri,served_commit,created_at,updated_at,completed_at,
+ archived,archived_at,sprint_id,target_version,served_version
+)
+SELECT id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,observed_artifacts,
+ branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,phase,actor,lane,
+ capability_token,receipt,artifact_uri,served_commit,created_at,updated_at,completed_at,
+ archived,archived_at,sprint_id,target_version,served_version
+FROM deployments_v35;
+DROP TABLE deployments_v35;
+ALTER TABLE attention RENAME TO attention_v35;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk','complaint')),
+ body TEXT NOT NULL, raised_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),
+ check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'
+   AND json_array_length(check_choices) BETWEEN 2 AND 4)),
+ check_answer TEXT,
+ check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),
+ check_about TEXT,
+ check_answered TEXT,
+ check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),
+ check_answered_at INTEGER, lane TEXT, return_trigger TEXT,
+ CHECK(
+   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
+    AND check_explanation IS NULL AND check_about IS NULL)
+   OR
+   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL
+    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)
+ ),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at,lane,return_trigger
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision,
+ check_question,check_choices,check_answer,check_explanation,check_about,
+ check_answered,check_correct,check_answered_at,lane,return_trigger
+FROM attention_v35;
+DROP TABLE attention_v35;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_sitreps_lane_created ON sitreps(lane,created_at DESC) WHERE archived=0;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_target ON deployments(repo,tier,environment,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_status ON deployments(status,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_task ON deployments(task_id,created_at DESC) WHERE archived=0;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_sitreps_ai AFTER INSERT ON sitreps BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_au AFTER UPDATE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_ad AFTER DELETE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+END;
+CREATE TRIGGER search_handoffs_ai AFTER INSERT ON handoffs BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_au AFTER UPDATE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+END;
+CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
+ DELETE FROM search_documents
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID') IN (old.id,new.id)
+ );
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows
+ WHERE source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+CREATE TRIGGER attention_check_result_insert_all_or_none AFTER INSERT ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+CREATE TRIGGER attention_check_result_update_all_or_none AFTER UPDATE OF check_question, check_choices, check_answer, check_explanation, check_about, check_answered, check_correct, check_answered_at ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+UPDATE sitreps SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE handoffs SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE deployments SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE attention SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+"#;
+/// Done-gate verdicts (DG-11). One row per stored `pass` verdict, carrying the
+/// writer from `--as` at write time alongside reviewer, SHAs, verdict,
+/// evidence and the publication attestation (DG-13: who attested the SHAs are
+/// on origin, and when); rows are never updated and never deleted, and a
+/// newer verdict is a newer row. A new table, so the step is re-run safe by
+/// `IF NOT EXISTS`:
+/// a board rewound past its own v37 shape re-runs to the same table rather
+/// than failing. No backfill: pre-gate boards open as "no verdict" and the
+/// gate refuses until one is earned. The `done_gate` board flag needs no
+/// schema step: it is a `board_meta` key, absent (off) until set.
+const BOARD_V37: &str = r#"
+CREATE TABLE IF NOT EXISTS verdicts (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+ task_id TEXT NOT NULL,
+ writer TEXT NOT NULL,
+ reviewer TEXT NOT NULL,
+ shas TEXT NOT NULL CHECK(json_valid(shas)),
+ verdict TEXT NOT NULL,
+ evidence TEXT NOT NULL CHECK(json_valid(evidence)),
+ published_attested_by TEXT NOT NULL,
+ published_attested_at INTEGER NOT NULL,
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
- root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
+ root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
  created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
 ) STRICT;
 "#;
@@ -1528,8 +2814,136 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 23;
-pub const REGISTRY_SCHEMA_VERSION: usize = 11;
+const REGISTRY_V12: &str = r#"
+SELECT 1;
+"#;
+
+/// Board retirement keeps the identity row, while making the lifecycle and
+/// operator note explicit so retired authority can be restored or audited
+/// without inventing a new board.
+///
+/// This lands as v13 rather than replacing the empty v12 that shipped with the
+/// rule-transfer work. Reusing slot 12 would mean any registry that had already
+/// recorded 12 skips these columns forever, which fails open; an extra no-op
+/// step costs one migration and cannot.
+const REGISTRY_V13: &str = r#"
+ALTER TABLE workspace_alias_history ADD COLUMN archived_note TEXT;
+ALTER TABLE workspace_alias_history ADD COLUMN retirement_id TEXT;
+ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE boards ADD COLUMN archived_at INTEGER;
+ALTER TABLE boards ADD COLUMN archived_by TEXT;
+ALTER TABLE boards ADD COLUMN archived_note TEXT;
+ALTER TABLE boards ADD COLUMN retirement_id TEXT;
+"#;
+
+/// Linux principal, broker policy, and bootstrap state (ADR-038, ADR-033).
+///
+/// Entirely additive: three append-only policy journals plus their rebuildable
+/// projections. No existing registry table is altered, no board schema is
+/// touched, and every pre-existing registry and audit row is preserved. The
+/// journals join ADR-029's registry hash chain through
+/// `crate::audit::append_*`; their `payload` column holds the canonical JSON of
+/// the row and is what the chain digest covers, so truncation, reordering, or
+/// substitution in any of the three fails `audit verify`.
+const REGISTRY_V14: &str = r#"
+CREATE TABLE policy_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ event_id TEXT NOT NULL UNIQUE,
+ kind TEXT NOT NULL,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+CREATE INDEX idx_policy_events_kind ON policy_events(kind,seq);
+
+CREATE TABLE policy_epochs (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ epoch INTEGER NOT NULL UNIQUE,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+
+CREATE TABLE access_audit (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ event_id TEXT NOT NULL UNIQUE,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+CREATE INDEX idx_access_audit_event_id ON access_audit(event_id);
+
+CREATE TABLE principals (
+ id TEXT PRIMARY KEY NOT NULL,
+ username TEXT NOT NULL,
+ uid INTEGER NOT NULL,
+ enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+ bound_at_epoch INTEGER NOT NULL,
+ bound_by_event_id TEXT NOT NULL,
+ disabled_at_epoch INTEGER,
+ disabled_by_event_id TEXT,
+ successor_id TEXT,
+ predecessor_id TEXT,
+ replaces TEXT NOT NULL DEFAULT '[]'
+  CHECK(json_valid(replaces) AND json_type(replaces) = 'array')
+) STRICT;
+CREATE UNIQUE INDEX idx_principals_active_username ON principals(username) WHERE enabled=1;
+CREATE UNIQUE INDEX idx_principals_active_uid ON principals(uid) WHERE enabled=1;
+
+CREATE TABLE grants (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ capability TEXT NOT NULL CHECK(capability IN ('read','write','admin')),
+ scope TEXT NOT NULL
+  CHECK(json_valid(scope) AND json_type(scope) = 'array'),
+ state TEXT NOT NULL CHECK(state IN ('active','revoked','retired')),
+ origin TEXT NOT NULL CHECK(origin IN ('bootstrap','board_seed','grant','rebind_transfer','breakglass_registry_admin')),
+ granted_at_epoch INTEGER NOT NULL,
+ granted_by_principal_id TEXT,
+ granted_by_event_id TEXT NOT NULL,
+ retired_at_epoch INTEGER,
+ retired_by_event_id TEXT,
+ transferred_from_grant_id TEXT
+) STRICT;
+CREATE INDEX idx_grants_principal_state ON grants(principal_id,state);
+
+CREATE TABLE sso_mappings (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ provider TEXT NOT NULL,
+ subject TEXT NOT NULL,
+ mapped_at_epoch INTEGER NOT NULL,
+ mapped_by_event_id TEXT NOT NULL,
+ unmapped_at_epoch INTEGER,
+ unmapped_by_event_id TEXT
+) STRICT;
+CREATE UNIQUE INDEX idx_sso_active_pair ON sso_mappings(provider,subject)
+ WHERE unmapped_at_epoch IS NULL;
+CREATE INDEX idx_sso_principal ON sso_mappings(principal_id);
+
+CREATE TABLE enforcement_state (
+ id INTEGER PRIMARY KEY NOT NULL CHECK(id = 1),
+ state TEXT NOT NULL CHECK(state IN ('direct','prepared','managed'))
+) STRICT;
+INSERT INTO enforcement_state(id,state) VALUES(1,'direct');
+
+CREATE TABLE proofs (
+ proof_id TEXT PRIMARY KEY NOT NULL,
+ proof_hash TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('rebind','sso_subject')),
+ principal_id TEXT NOT NULL,
+ bound_epoch INTEGER NOT NULL,
+ bound_state_hash TEXT NOT NULL,
+ expires_at INTEGER NOT NULL,
+ created_at INTEGER NOT NULL
+) STRICT;
+"#;
+
+pub const BOARD_SCHEMA_VERSION: usize = 37;
+pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -1546,19 +2960,215 @@ pub fn create_private_dir_all(dir: &Path) -> Result<()> {
         create_private_dir_all(parent)?;
     }
     match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => Ok(()),
+        // A directory root creates inside a tree it does not own belongs to
+        // that tree's owner, not to root. See [`ownership_target`].
+        Ok(()) => mirror_directory_owner(dir),
         // A concurrent kanban process won the race; its mode is ours.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("create directory {}", dir.display())),
     }
 }
 
-/// Create `dir` if missing and assert mode 0700 on it. Only for the private
+/// Clear every permission bit on `path` outside `mode`, and never set one.
+///
+/// One-directional on purpose, and the direction is the whole point.
+///
+/// A board or data root reachable by group or other is the defect the rule
+/// was written for — a file created before the rule existed, or by another
+/// tool, or through a loose umask — and clearing those bits cannot hand
+/// anyone access they did not already have. So that half is asserted on
+/// every open, not only at creation.
+///
+/// A path the operator made MORE restrictive than `mode` is left exactly as
+/// it is. Asserting the mode unconditionally handed the missing bits back:
+/// `task add` against a board sealed at 0400 refused with `attempt to write
+/// a readonly database` and returned the file to 0600 on the way past, so
+/// the retry landed and the seal was a one-attempt delay rather than a seal.
+/// A seal the operator set has to survive a refused write, which is the only
+/// thing that makes it worth setting.
+///
+/// Only the nine permission bits are considered. The sticky bit restricts
+/// deletion rather than granting anything, and setuid/setgid are the
+/// operator's business on a path Kanban did not create, so they are carried
+/// across untouched — clearing them is the one loosening this could perform.
+fn tighten_to(path: &Path, mode: u32) -> Result<()> {
+    let current = fs::metadata(path)
+        .with_context(|| format!("read the mode of {}", path.display()))?
+        .permissions()
+        .mode();
+    let excess = current & 0o777 & !mode;
+    if excess == 0 {
+        return Ok(());
+    }
+    let tightened = current & 0o7777 & !excess;
+    fs::set_permissions(path, Permissions::from_mode(tightened))
+        .with_context(|| format!("tighten {} to mode {tightened:04o}", path.display()))
+}
+
+/// The uid and gid a file must end up with, or `None` to leave it alone.
+///
+/// Pure, because this is the entire rule and it has to be readable as one.
+///
+/// kb.geoy.ws answered 500 on every route on the morning of 2026-09-08 with
+/// one board file `root:root 0600`. The web service has run as the `kanban`
+/// user since the 2026-09-06 identity cutover; the CLI over ssh runs as root,
+/// so the board root created with `kb init` was born root-owned, and a later
+/// root read left root-owned `-wal`/`-shm` beside it. Boards are 0600 and
+/// `tighten_to` keeps them there on purpose, so the service could not open
+/// its own data and every route answered 500 until the files were chowned by
+/// hand.
+///
+/// So: when root writes into a directory that belongs to somebody else, the
+/// files it leaves belong to that somebody. Ownership of the bytes and ONLY
+/// that — the audit principal, the actor on every event, and every
+/// authorization decision stay exactly as they were, because who ran the
+/// command is a different question from who owns the file it touched.
+///
+/// `None` four ways, each for its own reason: a non-root process cannot
+/// chown and its own uid is the directory's business; a directory root owns
+/// has nothing to mirror; a file that already matches needs no syscall; and
+/// gid is included because `root:root` beside a `kanban:kanban` directory is
+/// wrong in both halves.
+fn ownership_target(
+    euid: u32,
+    dir_uid: u32,
+    dir_gid: u32,
+    file_uid: u32,
+    file_gid: u32,
+) -> Option<(u32, u32)> {
+    if euid != 0 || dir_uid == 0 || (file_uid == dir_uid && file_gid == dir_gid) {
+        return None;
+    }
+    Some((dir_uid, dir_gid))
+}
+
+/// What SQLite appends to a database's own name in WAL mode.
+const WAL_SIBLING_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
+
+/// `x.db` -> `x.db-wal`, `x.db-shm`.
+///
+/// Concatenation onto the whole file name, never `with_extension`, which
+/// would replace `.db` and name two files SQLite has never heard of.
+fn wal_siblings(path: &Path) -> [PathBuf; 2] {
+    WAL_SIBLING_SUFFIXES.map(|suffix| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    })
+}
+
+/// This process's euid and the owner of the directory `path` lives in, or
+/// `None` when the rule cannot apply at all.
+///
+/// The `geteuid` comes first so the entire non-root world — every ordinary
+/// run of this binary — pays one syscall and no `stat`.
+fn directory_owner(path: &Path) -> Result<Option<(u32, u32, u32)>> {
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = fs::metadata(parent)
+        .with_context(|| format!("read the owner of directory {}", parent.display()))?;
+    Ok(Some((euid, directory.uid(), directory.gid())))
+}
+
+/// Hand one path to the directory's owner, if [`ownership_target`] says so.
+///
+/// A path that is not there is not an error: `-wal` and `-shm` exist only
+/// while the database is open, and asking is how we find out. A `chown` that
+/// FAILS is an error and is reported as one — a root process that cannot
+/// chown has a real problem, and swallowing it is how a board goes back to
+/// being unopenable by the service that owns it.
+///
+/// `fs::metadata` rather than `symlink_metadata`, because `chown` follows
+/// symlinks: the two have to be asking about the same inode, and a dangling
+/// link reads as absent, which is the right answer for one.
+fn mirror_owner_onto(path: &Path, euid: u32, dir_uid: u32, dir_gid: u32) -> Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read the owner of {}", path.display()));
+        }
+    };
+    let Some((uid, gid)) = ownership_target(euid, dir_uid, dir_gid, metadata.uid(), metadata.gid())
+    else {
+        return Ok(());
+    };
+    chown(path, Some(uid), Some(gid)).with_context(|| {
+        format!(
+            "give {} to the owner of its directory, uid {uid} gid {gid}",
+            path.display()
+        )
+    })
+}
+
+/// Give `path` and any WAL sidecar beside it the owner of the directory they
+/// live in. See [`ownership_target`] for the rule and the outage behind it.
+///
+/// Called AFTER a database has been opened AND used, never only before.
+/// Measured on this crate's own `open`: `-wal` and `-shm` do not exist when
+/// the `journal_mode=WAL` pragma batch finishes, and both appear at the first
+/// statement that touches pages — the migration read, or a plain `SELECT` on
+/// a read-only connection. So the calls that cover the sidecars are the ones
+/// at the end of `open_board`, `open_registry`, each read-only open once its
+/// queries have run, and [`checkpoint`], which `Store::drop` and
+/// `Registry::drop` run on the way out of every command and which is what
+/// catches a sidecar a later write was the first to create. The call inside
+/// `open` itself covers the database file and nothing else.
+fn mirror_database_directory_owner(path: &Path) -> Result<()> {
+    let Some((euid, dir_uid, dir_gid)) = directory_owner(path)? else {
+        return Ok(());
+    };
+    mirror_owner_onto(path, euid, dir_uid, dir_gid)?;
+    for sibling in wal_siblings(path) {
+        mirror_owner_onto(&sibling, euid, dir_uid, dir_gid)?;
+    }
+    Ok(())
+}
+
+/// [`mirror_database_directory_owner`] for a connection whose path we do not
+/// otherwise hold. `None` for an in-memory or temporary database, which has
+/// no file.
+fn mirror_connection_directory_owner(connection: &Connection) -> Result<()> {
+    match connection.path() {
+        Some(path) if !path.is_empty() => mirror_database_directory_owner(Path::new(path)),
+        _ => Ok(()),
+    }
+}
+
+/// The rule for ONE path, with no sidecar sweep.
+///
+/// Two callers: a directory Kanban just created inside a tree it does not
+/// own, and the data root's `.lock` / `.init.lock`, which root creates the
+/// same way and which locks the service out exactly as a root-owned board
+/// does — measured as root on hax against the first cut of this fix, where
+/// the databases were mirrored, the lock file was not, and the `kanban` user
+/// met `open lock file <root>/.lock: Permission denied`.
+///
+/// Neither kind has WAL sidecars, and a file that merely happens to sit
+/// beside one under a matching name is not ours to re-own.
+pub(crate) fn mirror_directory_owner(path: &Path) -> Result<()> {
+    let Some((euid, dir_uid, dir_gid)) = directory_owner(path)? else {
+        return Ok(());
+    };
+    mirror_owner_onto(path, euid, dir_uid, dir_gid)
+}
+
+/// Create `dir` if missing and tighten it to mode 0700. Only for the private
 /// data root, which Kanban owns outright; never for an operator-supplied path.
+///
+/// Tighten-only through [`tighten_to`], because this is an open path and not
+/// a creation one: every writable registry open and every lock acquisition
+/// runs it, so an unconditional assert would re-permission a data root the
+/// operator narrowed on purpose.
 pub fn own_private_dir(dir: &Path) -> Result<()> {
     create_private_dir_all(dir)?;
-    fs::set_permissions(dir, Permissions::from_mode(0o700))
-        .with_context(|| format!("secure directory {}", dir.display()))
+    tighten_to(dir, 0o700).with_context(|| format!("secure directory {}", dir.display()))
 }
 
 /// Create `path` with mode 0600 before anything can open it.
@@ -1573,7 +3183,10 @@ fn create_private_file(path: &Path) -> Result<()> {
         .mode(0o600)
         .open(path)
     {
-        Ok(_) => Ok(()),
+        // Given away at BIRTH rather than at the end of `open`: an open that
+        // fails anywhere after this must not leave a root-owned board behind
+        // for the service that owns the directory to trip over.
+        Ok(_) => mirror_database_directory_owner(path),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
     }
@@ -1647,8 +3260,11 @@ fn open(path: &Path) -> Result<Connection> {
     create_private_file(path)?;
     let connection = Connection::open(path)
         .with_context(|| format!("open SQLite database {}", path.display()))?;
-    // Re-assert for databases created before this rule, or by another tool.
-    fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    // Tighten-only, and never on the way out of a refusal: a database left
+    // group- or world-reachable by an older Kanban or another tool is narrowed
+    // to 0600 here, and one the operator sealed tighter than 0600 stays sealed
+    // so the write below refuses again on the next attempt. See `tighten_to`.
+    tighten_to(path, 0o600)?;
     // synchronous=FULL, not NORMAL: a checkpoint that survives the agent but
     // not the host is not durable, and this ledger exists to be resumed from.
     // Write volume is a handful of rows per model turn, so the extra fsync is
@@ -1658,6 +3274,14 @@ fn open(path: &Path) -> Result<Connection> {
     )?;
     // Replaces `busy_timeout`, which installs SQLite's own unjittered handler.
     connection.busy_handler(Some(busy_backoff))?;
+    // The file itself, and any sidecar an earlier session left beside it.
+    // Measured: neither `-wal` nor `-shm` exists yet at this point — SQLite
+    // creates both on the first statement that reads or writes pages, which
+    // is after this whole pragma batch — so the calls at the end of
+    // `open_board`, `open_registry` and `checkpoint` are the ones that cover
+    // them, not this one. This one is here because an `open` that fails later
+    // must still not leave a root-owned database behind.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
 }
 
@@ -1678,7 +3302,82 @@ pub fn create_backup_target(path: &Path) -> Result<Connection> {
             }
             _ => anyhow::Error::new(error).context(format!("create {}", path.display())),
         })?;
-    Connection::open(path).with_context(|| format!("open backup target {}", path.display()))
+    let connection =
+        Connection::open(path).with_context(|| format!("open backup target {}", path.display()))?;
+    mirror_database_directory_owner(path)?;
+    Ok(connection)
+}
+
+fn board_v31_columns_exist(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare("SELECT name FROM pragma_table_info('attention')")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok([
+        "check_question",
+        "check_choices",
+        "check_answer",
+        "check_explanation",
+        "check_about",
+    ]
+    .iter()
+    .all(|wanted| columns.iter().any(|column| column == wanted)))
+}
+fn board_v31_shape_exists(connection: &Connection) -> Result<bool> {
+    if !board_v31_columns_exist(connection)? {
+        return Ok(false);
+    }
+    let sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok([
+        "length(check_question) BETWEEN 1 AND 160",
+        "json_array_length(check_choices) BETWEEN 2 AND 4",
+        "length(check_explanation) BETWEEN 1 AND 400",
+        "check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL",
+        "check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL",
+        "AND check_explanation IS NULL AND check_about IS NULL",
+        "AND check_explanation IS NOT NULL AND check_about IS NOT NULL",
+    ]
+    .iter()
+    .all(|constraint| sql.contains(constraint)))
+}
+
+fn board_v32_result_shape_exists(connection: &Connection) -> Result<bool> {
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('attention')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has = |name: &str| columns.iter().any(|column| column == name);
+    if !(has("check_answered") && has("check_correct") && has("check_answered_at")) {
+        return Ok(false);
+    }
+    let triggers: usize = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+         AND name IN ('attention_check_result_insert_all_or_none',\
+                      'attention_check_result_update_all_or_none')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(triggers == 2)
+}
+
+fn attention_has_column(connection: &Connection, name: &str) -> Result<bool> {
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('attention')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(columns.iter().any(|column| column == name))
+}
+
+fn board_v34_result_shape_exists(connection: &Connection) -> Result<bool> {
+    attention_has_column(connection, "lane")
+}
+
+fn board_v35_result_shape_exists(connection: &Connection) -> Result<bool> {
+    attention_has_column(connection, "return_trigger")
 }
 
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
@@ -1702,7 +3401,38 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
             transaction.commit()?;
             return Ok(());
         }
-        transaction.execute_batch(migrations[current])?;
+        // The rebuild guard belongs to the v31 step alone (index 30), never
+        // to "whatever migration is last": a later version must not inherit
+        // the rewind skip just by existing.
+        let board_v31_step = current + 1 == 31;
+        let v31_columns = board_v31_step && board_v31_columns_exist(&transaction)?;
+        let v31_rewind = v31_columns && board_v31_shape_exists(&transaction)?;
+        // The v32 ALTERs cannot re-run against columns that already stand,
+        // so a board rewound past its own physical v32 shape skips the step
+        // instead of failing on a duplicate column.
+        let board_v32_step = current + 1 == 32;
+        let v32_stands = board_v32_step && board_v32_result_shape_exists(&transaction)?;
+        // The v34 ALTER cannot re-run against a column that already stands,
+        // so a board rewound past its own physical v34 shape skips the step
+        // instead of failing on a duplicate column.
+        let board_v34_step = current + 1 == 34;
+        let v34_stands = board_v34_step && board_v34_result_shape_exists(&transaction)?;
+        // The v35 ALTER, for the same reason and by the same guard.
+        let board_v35_step = current + 1 == 35;
+        let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
+        if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
+            if v31_columns {
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
+                )?;
+            }
+            transaction.execute_batch(migrations[current])?;
+            if v31_columns {
+                transaction.execute_batch(
+                    "UPDATE attention SET\n                       check_question=(SELECT check_question FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_choices=(SELECT check_choices FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_answer=(SELECT check_answer FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_explanation=(SELECT check_explanation FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_about=(SELECT check_about FROM attention_v31_check_backup b WHERE b.id=attention.id)\n                     WHERE id IN (SELECT id FROM attention_v31_check_backup);\n                     DROP TABLE attention_v31_check_backup;",
+                )?;
+            }
+        }
         transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
         transaction.commit()?;
         current += 1;
@@ -1725,19 +3455,177 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     // that already satisfied its own constraints, `foreign_key_check` is what
     // `doctor` runs to prove it afterwards, and enforcement is restored before
     // the connection does any work.
+    let before: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     connection.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate(&mut connection, BOARD_MIGRATIONS);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
-    crate::audit::initialize_board_chain(&mut connection)?;
+    let after: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let chained = crate::audit::initialize_board_chain(&mut connection)?;
+    // A migration rebuilds search documents from their source rows, and
+    // initializing the audit chain updates every event row, which the
+    // search_events_au trigger answers by re-creating the event's document.
+    // Both leave vectors NULL, and neither goes through append_board_event,
+    // where an ordinary write embeds. Only an open that actually did one of
+    // them writes here, so a read-only open stays read-only.
+    if before != after || chained {
+        crate::search::embed_missing(&connection)?;
+    }
+    // The migrations and the chain read and wrote, so `-wal` and `-shm` exist
+    // now even though they did not when `open` returned. Every writable board
+    // open comes through here.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
+}
+
+/// Turn a private online-backup target into a normal current board without
+/// reopening its path. Adoption uses this so migration, validation, hashing,
+/// and publication all remain tied to the one destination inode it created.
+pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
+    connection.busy_handler(Some(busy_backoff))?;
+    // Turning the copied target into a WAL database creates its sidecars, and
+    // an adoption run by root into a directory it does not own must not leave
+    // them root's.
+    mirror_connection_directory_owner(connection)?;
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate(connection, BOARD_MIGRATIONS);
+    connection.pragma_update(None, "foreign_keys", true)?;
+    outcome?;
+    crate::audit::initialize_board_chain(connection)?;
+    // Adoption is always a write, and the copied board may predate the
+    // search schema entirely; embed whatever migration and chain-init left.
+    crate::search::embed_missing(connection)?;
+    Ok(())
 }
 
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
+    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
+    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37,
 ];
+
+/// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
+/// has, and that a board written by the retired TypeScript implementation has
+/// too. Distinctive together: another application's `tasks` table is not also
+/// carrying `parent_id`, `priority` and a `metadata` document.
+const BOARD_TASK_COLUMNS: [&str; 5] = ["id", "status", "priority", "parent_id", "metadata"];
+
+/// Whether this file carries a Kanban board's schema, without migrating it.
+///
+/// "Is this SQLite" cannot answer whether opening the file is safe, because
+/// `migrate` starts from the file's own `PRAGMA user_version` and runs the
+/// ladder into whatever it finds. A foreign database sits at version 0, so it
+/// gets all of it: an 8192-byte browser database measured 376832 bytes
+/// afterwards, its own table still there among 26 of ours.
+///
+/// Two signals, because either alone is wrong:
+///
+/// The column shape, not a set of table names. Requiring `board_meta`, `tasks`
+/// and `events` looked safer and was measured wrong — a v3 board written by the
+/// retired TypeScript implementation has only `tasks`, and
+/// `compiled_binary_imports_both_atmux_formats_backs_up_and_opens_v3_databases`
+/// exists because opening one has to keep working. Requiring only the *name*
+/// `tasks` would be far too loose in the other direction.
+///
+/// And `user_version` at 1 or more, which every board reaches on its first
+/// migration and which almost nothing else sets. No upper bound: a board from a
+/// newer schema must reach `migrate`, so that it can say "database version N is
+/// newer than supported" instead of being called a stranger.
+///
+/// This is a heuristic and worth naming as one. A database that has a `tasks`
+/// table with these five columns AND a nonzero `user_version` is treated as a
+/// board. Nothing cheaper distinguishes the two without opening the file the
+/// way the thing we are trying to prevent would.
+///
+/// The open is read-only, so the probe never writes to the file's own pages and
+/// cannot migrate it. It is not side-effect free, and the difference matters:
+/// opening a WAL database read-only can create and map its `-shm` sidecar. That
+/// is acceptable here because the caller has already matched the SQLite header,
+/// so this only ever runs against something that is a database — and a sidecar
+/// a root probe leaves behind is handed to the directory's owner before this
+/// returns, so the probe cannot be the thing that locks the service out.
+///
+/// # Errors
+///
+/// Every SQLite failure is returned rather than folded into `Other`. "Could not
+/// determine" and "is not a board" are different answers and only one of them is
+/// safe to act on: a `SQLITE_BUSY` reported as "not a board" is a false
+/// statement about healthy data, made to a caller that will act on it.
+/// A failed ownership mirror arrives the same way and for the same reason: it
+/// is not a statement about what the file holds either.
+pub fn probe_board_schema(path: &Path) -> Result<BoardSchema> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Every other board and registry open in this file installs this. Without
+    // it a probe is not merely slower under contention, it answers *wrongly*:
+    // `Store::drop` runs `PRAGMA wal_checkpoint(TRUNCATE)` on every command's
+    // exit, which takes exclusive WAL locks, so a concurrent read gets
+    // SQLITE_BUSY as a matter of routine rather than of bad luck.
+    connection.busy_handler(Some(busy_backoff))?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Both halves, not just the table count. `migrate` writes `BOARD_V1`'s
+    // tables and `user_version=1` in one IMMEDIATE transaction, so no committed
+    // board state has tables without a version, or a version without tables.
+    // Requiring both excludes a database that stamps `user_version` before
+    // writing its schema, at no cost to the case this is for.
+    let schema = if tables == 0 && version == 0 {
+        BoardSchema::Unwritten
+    } else if version < 1 {
+        BoardSchema::Other
+    } else {
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info('tasks')")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        if BOARD_TASK_COLUMNS
+            .iter()
+            .all(|wanted| columns.iter().any(|name| name == wanted))
+        {
+            BoardSchema::Board
+        } else {
+            BoardSchema::Other
+        }
+    };
+    // Last, and with the connection still open: the `-shm` those reads may
+    // have created exists now, and closing the database is what takes it away.
+    mirror_database_directory_owner(path)?;
+    Ok(schema)
+}
+
+/// What a readable SQLite file at a board path turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoardSchema {
+    /// Carries a board's schema, at any version from v1 onward.
+    Board,
+    /// A database with no tables and no schema version.
+    ///
+    /// Named for what it matches, not for what caused it. A board creation
+    /// passes through exactly this state — `open` creates the file and sets
+    /// `journal_mode=WAL` before the first migration commits — but so does any
+    /// database that has been created and not yet written to. And the state
+    /// cannot say *when*: under WAL a reader sees last-committed state, so a
+    /// creation running in another process right now is indistinguishable from
+    /// one that was interrupted an hour ago. Callers must not assert either.
+    ///
+    /// What it does support is proceeding: there are no tables to lose, and
+    /// `migrate` re-reads `user_version` inside its IMMEDIATE transaction, so
+    /// two processes finishing the same board serialize rather than collide.
+    Unwritten,
+    /// A database that belongs to something else.
+    Other,
+}
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
 ///
@@ -1755,6 +3643,10 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "query_only", true)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     let version = schema_version(&connection)?;
+    // Before the refusal below, not after `Ok`: the read above created the
+    // `-shm` if it was not there, and a refused inspection leaves the same
+    // root-owned sidecar an accepted one would.
+    mirror_database_directory_owner(path)?;
     if version != BOARD_MIGRATIONS.len() {
         bail!(
             "board schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
@@ -1764,12 +3656,326 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// The schema version stored in this file, read WITHOUT migrating it.
+///
+/// The probe is a READ and nothing else: `SQLITE_OPEN_READ_ONLY` plus
+/// `PRAGMA query_only`, exactly as [`open_board_readonly`] opens, and
+/// `PRAGMA user_version` is the whole question. It never creates the file,
+/// never runs a migration, and never re-permissions anything — a probe that
+/// wrote would defeat the decision it exists to inform.
+///
+/// `None` for a file that is not there, is not a database, or would not open.
+/// Each routes to the writable open, which is the one that creates, migrates,
+/// and produces the real error for anything else; a probe is not the place to
+/// invent a diagnosis.
+pub fn stored_schema_version(path: &Path) -> Option<usize> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // Without this a probe answers WRONGLY under contention rather than merely
+    // slowly: `Store::drop` checkpoints on every command's exit and takes
+    // exclusive WAL locks, so `SQLITE_BUSY` is routine.
+    connection.busy_handler(Some(busy_backoff)).ok()?;
+    connection.pragma_update(None, "query_only", true).ok()?;
+    let version = schema_version(&connection).ok()?;
+    // The probe's read created the `-shm` if it was not there. A chown that
+    // fails answers `None`, which is this function's documented "ask the
+    // writable open": that open mirrors ownership too, and reports the real
+    // error, rather than a probe inventing a diagnosis of its own.
+    mirror_database_directory_owner(path).ok()?;
+    Some(version)
+}
+
+/// Whether this registry file can be opened by [`open_registry_readonly`] as
+/// it stands. See [`stored_schema_version`].
+pub fn registry_schema_is_current(path: &Path) -> bool {
+    stored_schema_version(path) == Some(REGISTRY_MIGRATIONS.len())
+}
+
+/// Whether this file is there and refuses a write from this process.
+///
+/// The question a migration has to ask before it starts: mode bits, a
+/// read-only mount and a directory that will not open all answer here, and as
+/// root the mode bits correctly answer "writable" because they are.
+///
+/// A file that is NOT there answers `false`. Absence is not a refusal — the
+/// writable open creates a board there, which is how a `--db` path becomes one
+/// — and reporting it as unwritable would replace "does not exist" with a
+/// permissions story that is not true.
+pub fn refuses_writes(path: &Path) -> bool {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => false,
+        Err(error) => error.kind() != ErrorKind::NotFound,
+    }
+}
+
+/// A reader whose queries all run on one SQLite connection.
+///
+/// Snapshotting one connection while reading from another is the defect
+/// `read_snapshot` exists to prevent. Be precise about how much of that the
+/// compiler actually holds, because the rest is convention:
+///
+/// Enforced — the value `read_snapshot` hands the closure is, by construction,
+/// the same value it opened the transaction on. There is no second parameter
+/// that could disagree with the first.
+///
+/// Enforced — `snapshot_connection` returns a borrow tied to `&self`, so an
+/// impl cannot open a connection inside the method and return it; that does not
+/// borrow-check. The connection has to be one the value already holds.
+///
+/// NOT enforced — that the closure body reads through the value it was handed.
+/// `read_snapshot(&store, |_| other.events_since(..))` compiles, and so does a
+/// body that opens its own reader and queries that. Nothing there is inside the
+/// transaction, and nothing says so. The convention is to shadow the parameter
+/// (`|store| ..`) so the outer handle is out of scope for the body; that is a
+/// habit, not a guarantee, and a reviewer still has to read the body.
+///
+/// Forward hazard — the property holds because every impl is a single-connection
+/// type: `Store` and `Registry` each own exactly one `connection`. A type
+/// holding two would satisfy this trait while its other connection stayed
+/// outside every snapshot, silently. Nothing here prevents that.
+pub trait SnapshotSource {
+    fn snapshot_connection(&self) -> &Connection;
+}
+
+impl SnapshotSource for Connection {
+    fn snapshot_connection(&self) -> &Connection {
+        self
+    }
+}
+
+/// Run `read` inside one deferred read transaction on `source`.
+///
+/// In WAL a deferred transaction takes its snapshot at the first read and
+/// holds it until the transaction ends, so every query `read` issues on this
+/// source observes one database state. A reader that decides something from
+/// two queries needs exactly that: run them on two snapshots and a commit
+/// landing between them lets the second query see a row the first never had a
+/// chance to reject, with nothing in either result to say so. Watch polls
+/// depend on this — see `watch::poll_once`.
+///
+/// Nothing is committed. Readers open with `query_only`, so the transaction
+/// exists only to pin the snapshot and is rolled back on the way out — and on
+/// the error path too, since `Transaction` drops with `DropBehavior::Rollback`.
+pub fn read_snapshot<S: SnapshotSource, T>(
+    source: &S,
+    read: impl FnOnce(&S) -> Result<T>,
+) -> Result<T> {
+    let snapshot = begin_read_snapshot(source.snapshot_connection())?;
+    let value = read(source)?;
+    snapshot.finish()?;
+    Ok(value)
+}
+
+/// Begin the deferred read transaction [`read_snapshot`] runs inside, for a
+/// reader that has to do something between pinning the snapshot and reading
+/// from it — `Store::read_snapshot_as_caller` mints authority there. The
+/// snapshot is not taken until the first read on `connection`; dropping the
+/// transaction rolls it back.
+pub fn begin_read_snapshot(connection: &Connection) -> Result<Transaction<'_>> {
+    // Deferred is named, not inherited. `unchecked_transaction` reads the
+    // connection's mutable `transaction_behavior`, and BEGIN IMMEDIATE against
+    // a read-only `query_only` connection errors, which would propagate out of
+    // a poll and end the follow loop. The snapshot semantics are the whole
+    // correctness argument here, so the behavior is stated rather than assumed.
+    Ok(Transaction::new_unchecked(
+        connection,
+        TransactionBehavior::Deferred,
+    )?)
+}
+
+fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn sqlite_table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
+    let sql = match table {
+        "rules" => "SELECT name FROM pragma_table_info('rules')",
+        "rule_events" => "SELECT name FROM pragma_table_info('rule_events')",
+        "global_rules" => "SELECT name FROM pragma_table_info('global_rules')",
+        "global_rule_events" => "SELECT name FROM pragma_table_info('global_rule_events')",
+        other => bail!("unsupported table for column inspection: {other}"),
+    };
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .context("collect table columns")
+}
+
+fn ensure_registry_v12_rules(connection: &Connection) -> Result<()> {
+    let rules_exists = sqlite_table_exists(connection, "rules")?;
+    let global_rules_exists = sqlite_table_exists(connection, "global_rules")?;
+    let rule_events_exists = sqlite_table_exists(connection, "rule_events")?;
+    let global_rule_events_exists = sqlite_table_exists(connection, "global_rule_events")?;
+
+    if !rules_exists {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE rules (
+             id TEXT PRIMARY KEY NOT NULL,
+             body TEXT NOT NULL,
+             author TEXT NOT NULL,
+             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             tags TEXT NOT NULL DEFAULT '["ALL"]'
+              CHECK(json_valid(tags) AND json_type(tags) = 'array'),
+             source_board TEXT,
+             source_rule_id TEXT,
+             source_registry_uuid TEXT,
+             source_boards TEXT NOT NULL DEFAULT '[]'
+              CHECK(json_valid(source_boards) AND json_type(source_boards) = 'array'),
+             source_content_sha256 TEXT,
+             CHECK((source_board IS NULL) = (source_rule_id IS NULL)),
+             UNIQUE(source_board,source_rule_id)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_registry_rules_active ON rules(created_at,id) WHERE archived=0;
+            "#,
+        )?;
+        if global_rules_exists {
+            connection.execute_batch(
+                r#"
+                INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags)
+                SELECT id,body,author,archived,created_at,updated_at,
+                       (SELECT json_group_array(value)
+                          FROM (SELECT value,0 AS family,CAST(key AS INTEGER) AS position
+                                  FROM json_each(global_rules.board_tags)
+                                UNION ALL
+                                SELECT value,1 AS family,CAST(key AS INTEGER) AS position
+                                  FROM json_each(global_rules.task_tags)
+                                ORDER BY family,position))
+                  FROM global_rules;
+                "#,
+            )?;
+        }
+    } else {
+        let columns = sqlite_table_columns(connection, "rules")?;
+        for (column, ddl) in [
+            (
+                "source_registry_uuid",
+                "ALTER TABLE rules ADD COLUMN source_registry_uuid TEXT;",
+            ),
+            (
+                "source_boards",
+                r#"ALTER TABLE rules ADD COLUMN source_boards TEXT NOT NULL DEFAULT '[]'
+ CHECK(json_valid(source_boards) AND json_type(source_boards) = 'array');"#,
+            ),
+            (
+                "source_content_sha256",
+                "ALTER TABLE rules ADD COLUMN source_content_sha256 TEXT;",
+            ),
+        ] {
+            if !columns.iter().any(|name| name == column) {
+                connection.execute_batch(ddl)?;
+            }
+        }
+        connection.execute_batch(
+            r#"
+            UPDATE rules
+            SET source_boards = json_array(source_board)
+            WHERE source_board IS NOT NULL
+              AND (source_boards IS NULL OR source_boards = '[]');
+            "#,
+        )?;
+    }
+
+    if !rule_events_exists && global_rule_events_exists {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE rule_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+             created_at INTEGER NOT NULL,
+             prev_hash TEXT,
+             event_hash TEXT
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+            INSERT INTO rule_events(rule_id,kind,actor,payload,created_at)
+            SELECT rule_id,kind,actor,payload,created_at FROM global_rule_events ORDER BY seq;
+            "#,
+        )?;
+    }
+
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS rule_import_ledger (
+         source_registry_uuid TEXT NOT NULL,
+         source_rule_id TEXT NOT NULL,
+         source_content_sha256 TEXT NOT NULL,
+         destination_rule_id TEXT NOT NULL,
+         imported_at INTEGER NOT NULL,
+         imported_by TEXT NOT NULL,
+         PRIMARY KEY(source_registry_uuid,source_rule_id)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_rule_import_ledger_destination ON rule_import_ledger(destination_rule_id);
+        "#,
+    )?;
+
+    Ok(())
+}
+
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
+    {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_registry_v12_rules(&transaction)?;
+        transaction.commit()?;
+    }
     crate::audit::initialize_registry_chain(&mut connection)?;
     record_workspace_name_drift(&mut connection)?;
+    ensure_registry_uuid(&mut connection)?;
+    // As in `open_board`: the sidecars exist by now, and every writable
+    // registry open comes through here.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
+}
+
+fn ensure_registry_uuid(connection: &mut Connection) -> Result<()> {
+    let existing = connection
+        .query_row(
+            "SELECT value FROM registry_meta WHERE key='registry_uuid'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        uuid::Uuid::parse_str(value.trim())
+            .with_context(|| format!("invalid registry_uuid metadata: {value}"))?;
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = transaction
+        .query_row(
+            "SELECT value FROM registry_meta WHERE key='registry_uuid'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        uuid::Uuid::parse_str(value.trim())
+            .with_context(|| format!("invalid registry_uuid metadata: {value}"))?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO registry_meta(key,value) VALUES(?,?)",
+        params!["registry_uuid", uuid::Uuid::new_v4().to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn record_workspace_name_drift(connection: &mut Connection) -> Result<()> {
@@ -1837,6 +4043,9 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V9,
     REGISTRY_V10,
     REGISTRY_V11,
+    REGISTRY_V12,
+    REGISTRY_V13,
+    REGISTRY_V14,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -1848,6 +4057,8 @@ pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
     connection.busy_handler(Some(busy_backoff))?;
     connection.pragma_update(None, "query_only", true)?;
     let version = schema_version(&connection)?;
+    // Before the refusal, for the reason given in `open_board_readonly`.
+    mirror_database_directory_owner(path)?;
     if version != REGISTRY_MIGRATIONS.len() {
         bail!(
             "registry schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
@@ -1893,7 +4104,13 @@ pub fn foreign_key_violations(connection: &Connection) -> Result<Vec<String>> {
 
 pub fn checkpoint(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    Ok(())
+    // The last reachable moment for a sidecar this process created late.
+    // `Store::drop` and `Registry::drop` both come through here on the way out
+    // of every command, and the `-wal` a write created after `open` returned
+    // is still on disk at this point: closing the connection is what removes
+    // it, and only when no other process has the database open — which is
+    // exactly the case where a root-owned sidecar would otherwise survive.
+    mirror_connection_directory_owner(connection)
 }
 
 /// Integrity-check a database file without registering or migrating it.
@@ -1901,7 +4118,11 @@ pub fn checkpoint(connection: &Connection) -> Result<()> {
 pub fn verify(path: &Path) -> Result<Vec<String>> {
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open snapshot {}", path.display()))?;
-    integrity(&connection)
+    let report = integrity(&connection)?;
+    // While the connection is open, so an `-shm` this read created is still
+    // there to be handed over.
+    mirror_database_directory_owner(path)?;
+    Ok(report)
 }
 
 /// Put `source` in place of `destination`, atomically as far as readers are
@@ -1928,11 +4149,59 @@ pub fn replace_database(source: &Path, destination: &Path) -> Result<()> {
         sidecar.push(suffix);
         let _ = fs::remove_file(Path::new(&sidecar));
     }
+    // The staging copy was created by THIS process and renamed into place, so
+    // a restore run by root has just put a root-owned inode where the board
+    // was. The sidecars were removed above, so this is the main file only.
+    mirror_database_directory_owner(destination)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// A held read snapshot hides commits that land while it is open.
+    ///
+    /// This is the guarantee `read_snapshot` sells and that `watch` spends, so
+    /// it is measured against a real WAL board opened exactly the way readers
+    /// open one — `SQLITE_OPEN_READ_ONLY`, `query_only`, no shared cache —
+    /// rather than assumed from the SQLite documentation.
+    #[test]
+    fn a_read_snapshot_hides_commits_that_land_while_it_is_open() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-read-snapshot-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp snapshot dir");
+        let path = root.join("board.db");
+        let writer = open_board(&path).expect("open writable board");
+        crate::audit::append_board_event(&writer, None, "board_changed", "codex", "{}", 1)
+            .expect("append the seed event");
+        let reader = open_board_readonly(&path).expect("open read-only board");
+        let head = |connection: &Connection| -> i64 {
+            connection
+                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+                    row.get(0)
+                })
+                .expect("read ledger head")
+        };
+
+        read_snapshot(&reader, |reader| {
+            assert_eq!(head(reader), 1);
+            crate::audit::append_board_event(&writer, None, "board_changed", "codex", "{}", 2)
+                .expect("commit while the snapshot is held");
+            assert_eq!(
+                head(reader),
+                1,
+                "a held snapshot saw a commit that landed after it opened"
+            );
+            Ok(())
+        })
+        .expect("run the snapshot body");
+
+        assert_eq!(
+            head(&reader),
+            2,
+            "the snapshot outlived its read transaction"
+        );
+    }
+
     /// Every migration that exists is in the ladder that runs it.
     ///
     /// A migration can be written, reviewed and committed without ever being
@@ -1985,7 +4254,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "task_created",
-            "geo",
+            "geoyws",
             "{}",
             10,
         )
@@ -1995,7 +4264,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             anchor_payload,
             11,
         )
@@ -2005,7 +4274,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "checkpoint_added",
-            "geo",
+            "geoyws",
             matching_payload,
             12,
         )
@@ -2031,9 +4300,9 @@ mod tests {
                     Option::<String>::None,
                     "active",
                     20,
-                    "geo",
+                    "geoyws",
                     20,
-                    "geo",
+                    "geoyws",
                     Option::<i64>::None,
                     Option::<String>::None,
                 ],
@@ -2063,7 +4332,7 @@ mod tests {
             0
         );
 
-        let mut store = crate::store::Store { connection };
+        let mut store = crate::store::Store::from_connection(connection);
         assert_eq!(store.materialize_subscriptions().unwrap(), 1);
         assert_eq!(
             store
@@ -2141,7 +4410,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "task_created",
-            "geo",
+            "geoyws",
             "{}",
             10,
         )
@@ -2150,7 +4419,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             r#"{"subscriptionID":"sub-1"}"#,
             11,
         )
@@ -2159,7 +4428,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             r#"{"subscriptionID":"sub-old"}"#,
             12,
         )
@@ -2168,7 +4437,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "checkpoint_added",
-            "geo",
+            "geoyws",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"t-subject"},"relations":[],"priorStatus":"todo","currentStatus":"in_progress","tags":["pubsub"]}}"#,
             13,
         )
@@ -2194,9 +4463,9 @@ mod tests {
                     Option::<String>::None,
                     "active",
                     20,
-                    "geo",
+                    "geoyws",
                     20,
-                    "geo",
+                    "geoyws",
                     Option::<i64>::None,
                     Option::<String>::None,
                 ],
@@ -2316,7 +4585,7 @@ mod tests {
                         1,
                         Option::<String>::None,
                         "task_created",
-                        "geo",
+                        "geoyws",
                         "{}",
                         10,
                         0,
@@ -2333,7 +4602,7 @@ mod tests {
                             2,
                             Option::<String>::None,
                             "subscription_added",
-                            "geo",
+                            "geoyws",
                             first_payload,
                             11,
                             0,
@@ -2351,7 +4620,7 @@ mod tests {
                             3,
                             Option::<String>::None,
                             "subscription_added",
-                            "geo",
+                            "geoyws",
                             second_payload,
                             12,
                             0,
@@ -2382,9 +4651,9 @@ mod tests {
                         Option::<String>::None,
                         "active",
                         20,
-                        "geo",
+                        "geoyws",
                         20,
-                        "geo",
+                        "geoyws",
                         Option::<i64>::None,
                         Option::<String>::None,
                     ],
@@ -2408,7 +4677,7 @@ mod tests {
                 rusqlite::params![
                     "g-existing",
                     "Keep evidence exact.",
-                    "geo",
+                    "geoyws",
                     0,
                     10,
                     11,
@@ -2420,7 +4689,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-                rusqlite::params!["g-existing", "global_rule_added", "geo", "{}", 10],
+                rusqlite::params!["g-existing", "global_rule_added", "geoyws", "{}", 10],
             )
             .unwrap();
 
@@ -2448,14 +4717,703 @@ mod tests {
         );
     }
 
+    /// `REGISTRY_V14` is additive: it adds the policy journals and projections
+    /// without altering any existing registry table or any board schema, and
+    /// pre-existing registry rows survive the cutover untouched.
+    #[test]
+    fn registry_v14_adds_policy_tables_and_preserves_existing_registry_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..13]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 13);
+        // An old-shape board row and an old-shape rule event must survive.
+        connection
+            .execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at,archived) \
+                 VALUES('/root/boards/00000000-0000-0000-0000-000000000001.db','keep',10,11,0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) \
+                 VALUES('r-keep','rule_added','geoyws','{}',10)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 14);
+
+        let boards: i64 = connection
+            .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            boards, 1,
+            "board rows are preserved by the policy migration"
+        );
+        let events: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rule_events WHERE rule_id='r-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            events, 1,
+            "rule events are preserved by the policy migration"
+        );
+
+        // Every new table exists and the enforcement state starts direct.
+        for table in [
+            "policy_events",
+            "policy_epochs",
+            "access_audit",
+            "principals",
+            "grants",
+            "sso_mappings",
+            "enforcement_state",
+            "proofs",
+        ] {
+            assert!(
+                sqlite_table_exists(&connection, table).unwrap(),
+                "policy migration must create {table}"
+            );
+        }
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM enforcement_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "direct");
+    }
+
     use super::*;
+    #[test]
+    fn v31_shape_detection_requires_columns_and_constraints() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..30]).expect("migrate through v30");
+        assert!(!board_v31_shape_exists(&connection).expect("inspect v30"));
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v31");
+        assert!(board_v31_shape_exists(&connection).expect("inspect v31"));
+
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema=ON;\n                 UPDATE sqlite_master SET sql = replace(sql, 'length(check_question) BETWEEN 1 AND 160', '1') WHERE type='table' AND name='attention';\n                 PRAGMA writable_schema=OFF;",
+            )
+            .expect("remove a v31 constraint from the schema declaration");
+        assert!(!board_v31_shape_exists(&connection).expect("inspect unconstrained table"));
+    }
+    #[test]
+    fn v31_sqlite_refuses_both_partial_definition_directions() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v31");
+        connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let insert = |id: &str,
+                      question: Option<&str>,
+                      choices: Option<&str>,
+                      answer: Option<&str>,
+                      explanation: Option<&str>,
+                      about: Option<&str>| {
+            connection.execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,
+                   check_question,check_choices,check_answer,check_explanation,check_about
+                 ) VALUES(?1,'decision','body','raiser',1,'open',0,6,?2,?3,?4,?5,?6)",
+                params![id, question, choices, answer, explanation, about],
+            )
+        };
+        insert("a-none", None, None, None, None, None).unwrap();
+        insert(
+            "a-full",
+            Some("Where is it enforced?"),
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            Some("rust/store.rs"),
+        )
+        .unwrap();
+        let missing_question = insert(
+            "a-missing-question",
+            None,
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            Some("rust/store.rs"),
+        )
+        .unwrap_err();
+        assert!(
+            missing_question
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+        let missing_about = insert(
+            "a-missing-about",
+            Some("Where is it enforced?"),
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            missing_about
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+    }
+
+    #[test]
+    fn v32_result_columns_are_absent_complete_and_defined() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v32");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,
+                   check_question,check_choices,check_answer,check_explanation,check_about
+                 ) VALUES('a-full','decision','body','raiser',1,'open',0,6,
+                   'Where is it enforced?',
+                   '[{\"key\":\"a\",\"label\":\"A\"},{\"key\":\"b\",\"label\":\"B\"}]',
+                   'a','The Store enforces it.','rust/store.rs')",
+                [],
+            )
+            .expect("insert a defined row");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-none','decision','body','raiser',1,'open',0,6)",
+                [],
+            )
+            .expect("insert an undefined row");
+        let partial = connection
+            .execute(
+                "UPDATE attention SET check_answered='a' WHERE id='a-full'",
+                [],
+            )
+            .expect_err("a partial triple is corruption");
+        assert!(
+            partial
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{partial}"
+        );
+        let orphan = connection
+            .execute(
+                "UPDATE attention SET check_answered='a',check_correct=0,check_answered_at=1 \
+                 WHERE id='a-none'",
+                [],
+            )
+            .expect_err("a result without a definition is corruption");
+        assert!(
+            orphan
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{orphan}"
+        );
+        connection
+            .execute(
+                "UPDATE attention SET check_answered='a',check_correct=1,check_answered_at=1 \
+                 WHERE id='a-full'",
+                [],
+            )
+            .expect("a complete triple on a defined row stands");
+        let stored: (Option<String>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT check_answered,check_correct,check_answered_at FROM attention \
+                 WHERE id='a-full'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (Some("a".into()), Some(1), Some(1)));
+        // A later definition write cannot strand the standing result on an
+        // undefined row: the trigger's OF list covers the definition
+        // columns too.
+        let stranded = connection
+            .execute(
+                "UPDATE attention SET check_question=NULL,check_choices=NULL,check_answer=NULL,\
+                 check_explanation=NULL,check_about=NULL WHERE id='a-full'",
+                [],
+            )
+            .expect_err("clearing the definition under a result is corruption");
+        assert!(
+            stranded
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{stranded}"
+        );
+    }
+
+    #[test]
+    fn v34_lane_column_is_nullable_and_old_rows_keep_reading() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..33]).expect("migrate through v33");
+        assert_eq!(schema_version(&connection).unwrap(), 33);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6)",
+                [],
+            )
+            .expect("insert a pre-lane row");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        // The old row survived with no stored lane, so it keeps reading
+        // through the raiser-suffix and task-lane routes.
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-old'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lane, None);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,lane
+                 ) VALUES('a-new','decision','body','geoyws',2,'open',0,6,'driver-2')",
+                [],
+            )
+            .expect("insert a stored-lane row");
+        let matched: Vec<String> = connection
+            .prepare(
+                "SELECT id FROM attention WHERE lane=? \
+                 OR substr(raised_by, -length(?)) = ? \
+                 OR task_id IN (SELECT id FROM tasks WHERE lane=?)",
+            )
+            .unwrap()
+            .query_map(["driver-2", "@driver-2", "@driver-2", "driver-2"], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matched.contains(&"a-old".to_owned()), "{matched:?}");
+        assert!(matched.contains(&"a-new".to_owned()), "{matched:?}");
+    }
+
+    #[test]
+    fn v34_lane_column_rerun_after_a_rewind_skips_the_step() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..33]).expect("migrate through v33");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6)",
+                [],
+            )
+            .expect("insert a pre-lane row");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        // Rewinding one step re-runs V34 against a table that already has
+        // the column, so the shape guard must skip the ALTER instead of
+        // failing on a duplicate column name.
+        connection
+            .pragma_update(None, "user_version", 33)
+            .expect("rewind past v34");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v34 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-old'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lane, None);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,lane
+                 ) VALUES('a-new','decision','body','geoyws',2,'open',0,6,'driver-2')",
+                [],
+            )
+            .expect("insert a stored-lane row after the rerun");
+        let stored: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-new'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("driver-2"));
+    }
+
+    #[test]
+    fn v35_return_trigger_is_null_on_old_rows_and_a_rewound_rerun_skips_the_step() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..34]).expect("migrate through v34");
+        assert_eq!(schema_version(&connection).unwrap(), 34);
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,decision
+                 ) VALUES('a-old','decision','body','worker@driver-2',1,'open',0,6,NULL)",
+                [],
+            )
+            .expect("insert a pre-snooze row");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
+        assert_eq!(schema_version(&connection).unwrap(), 35);
+        assert_eq!(BOARD_SCHEMA_VERSION, 37);
+        let trigger = |connection: &Connection, id: &str| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT return_trigger FROM attention WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            trigger(&connection, "a-old"),
+            None,
+            "no backfill: a row older than v35 never snoozed"
+        );
+        // A rewound board re-runs V35 against a column that already stands;
+        // the shape guard must skip the ALTER, not fail on a duplicate.
+        connection
+            .execute(
+                "UPDATE attention SET return_trigger='date:2031-01-01' WHERE id='a-old'",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 34)
+            .expect("rewind past v35");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("rerun v35 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), 35);
+        assert_eq!(
+            trigger(&connection, "a-old").as_deref(),
+            Some("date:2031-01-01"),
+            "the rerun must keep what the column already holds"
+        );
+    }
+
+    #[test]
+    fn schema_36_keeps_task_links_without_foreign_keys() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,status,created_at,updated_at) \
+                 VALUES('t-keep','task','kept task','todo',1,1)",
+                [],
+            )
+            .expect("seed the linked task");
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-keep','driver-1','t-keep','seed','kept sitrep',2)",
+                [],
+            )
+            .expect("seed the linked sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-keep','t-keep','manual','pending','seed','kept summary','kept intent','kept next',3)",
+                [],
+            )
+            .expect("seed the linked handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,lane,return_trigger) \
+                 VALUES('a-keep','t-keep','decision','kept question','seed',4,'open','driver-1','date:2031-01-01')",
+                [],
+            )
+            .expect("seed the linked attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-keep','t-keep','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-keep',5,5)",
+                [],
+            )
+            .expect("seed the linked deployment");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v36");
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            BOARD_SCHEMA_VERSION,
+            "the ladder must end at the declared version"
+        );
+        // Every row and its link survive the rebuilds byte-for-byte,
+        // including the v34/v35 attention columns.
+        for (table, id, id_value) in [
+            ("sitreps", "id", "sr-keep"),
+            ("handoffs", "id", "h-keep"),
+            ("attention", "id", "a-keep"),
+            ("deployments", "id", "d-keep"),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE {id}='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the rebuilt link");
+            assert_eq!(
+                link.as_deref(),
+                Some("t-keep"),
+                "{table} lost its task link in the v36 rebuild"
+            );
+        }
+        let lane: Option<String> = connection
+            .query_row("SELECT lane FROM attention WHERE id='a-keep'", [], |row| {
+                row.get(0)
+            })
+            .expect("read the rebuilt lane");
+        assert_eq!(lane.as_deref(), Some("driver-1"));
+        let trigger: Option<String> = connection
+            .query_row(
+                "SELECT return_trigger FROM attention WHERE id='a-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the rebuilt return trigger");
+        assert_eq!(trigger.as_deref(), Some("date:2031-01-01"));
+        // No task_id foreign key stands on any of the four tables: the link
+        // is plain TEXT, so a removal keeps the id instead of nulling it.
+        for table in ["sitreps", "handoffs", "deployments", "attention"] {
+            let fks: Vec<String> = connection
+                .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                !fks.iter().any(|column| column == "task_id"),
+                "{table} still carries a task_id foreign key after v36"
+            );
+        }
+        // With enforcement on, removing the task keeps every link: the
+        // orphaned id is what the read paths gate on.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute("DELETE FROM tasks WHERE id='t-keep'", [])
+            .expect("remove the linked task");
+        for (table, id_value) in [
+            ("sitreps", "sr-keep"),
+            ("handoffs", "h-keep"),
+            ("attention", "a-keep"),
+            ("deployments", "d-keep"),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the orphaned link");
+            assert_eq!(
+                link.as_deref(),
+                Some("t-keep"),
+                "{table} nulled its task link on removal after v36"
+            );
+        }
+        // Re-running the ladder over the migrated shape is stable.
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("re-run the ladder");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn board_v37_adds_an_append_only_verdicts_table_and_a_rewound_rerun_keeps_rows() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..36]).expect("migrate through v36");
+        assert_eq!(schema_version(&connection).unwrap(), 36);
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v37");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        connection
+            .execute(
+                "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,\
+                 published_attested_by,published_attested_at,created_at) \
+                 VALUES('t-x','planner','lane-r','[\"abc\"]','pass','[\"a-1\"]','planner',1,1)",
+                [],
+            )
+            .expect("store a verdict row");
+        // A board rewound past its own v37 shape re-runs to the same table
+        // rather than failing, and keeps what the table already holds.
+        connection
+            .pragma_update(None, "user_version", 36)
+            .expect("rewind past v37");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v37 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        let stored: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM verdicts WHERE task_id='t-x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "the rerun must keep stored verdict rows");
+    }
+    #[test]
+    fn schema_36_backfills_pre_v36_nulled_links_from_creation_events() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,status,created_at,updated_at) \
+                 VALUES('t-old','task','removed task','todo',1,1)",
+                [],
+            )
+            .expect("seed the removed task");
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-old','driver-1','t-old','seed','old sitrep',2)",
+                [],
+            )
+            .expect("seed the linked sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-old','t-old','manual','pending','seed','old summary','old intent','old next',3)",
+                [],
+            )
+            .expect("seed the linked handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-old','t-old','decision','old question','seed',4,'open')",
+                [],
+            )
+            .expect("seed the linked attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-old','t-old','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-old',5,5)",
+                [],
+            )
+            .expect("seed the linked deployment");
+        // Genuinely taskless rows, which must stay NULL: a session handoff, a
+        // lanewide sitrep, a taskless deployment and an untagged attention row.
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-lane','driver-1',NULL,'seed','lanewide sitrep',6)",
+                [],
+            )
+            .expect("seed the lanewide sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-session',NULL,'manual','pending','seed','session summary','session intent','session next',7)",
+                [],
+            )
+            .expect("seed the session handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-free',NULL,'decision','untagged question','seed',8,'open')",
+                [],
+            )
+            .expect("seed the untagged attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-free',NULL,'kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-free',9,9)",
+                [],
+            )
+            .expect("seed the taskless deployment");
+        // The creation events the writers left behind, each naming its row id
+        // against the task — with taskless rows recording no task.
+        for (kind, task, payload) in [
+            ("sitrep_posted", Some("t-old"), r#"{"sitrepID":"sr-old"}"#),
+            ("handoff_created", Some("t-old"), r#"{"handoffID":"h-old"}"#),
+            (
+                "attention_raised",
+                Some("t-old"),
+                r#"{"attentionID":"a-old"}"#,
+            ),
+            (
+                "deployment_started",
+                Some("t-old"),
+                r#"{"deploymentID":"d-old"}"#,
+            ),
+            ("sitrep_posted", None, r#"{"sitrepID":"sr-lane"}"#),
+            ("handoff_created", None, r#"{"handoffID":"h-session"}"#),
+            ("attention_raised", None, r#"{"attentionID":"a-free"}"#),
+            ("deployment_started", None, r#"{"deploymentID":"d-free"}"#),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                    rusqlite::params![task, kind, "seed", payload, 10],
+                )
+                .expect("seed the creation event");
+        }
+        connection
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at) \
+                 VALUES('t-old','task_removed','seed','{}',11)",
+                [],
+            )
+            .expect("seed the removal record");
+        // The pre-V36 removal itself: the foreign key nulls every link.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute("DELETE FROM tasks WHERE id='t-old'", [])
+            .expect("remove the linked task");
+        for id_value in ["sr-old", "h-old", "a-old", "d-old"] {
+            let table = if id_value.starts_with("sr-") {
+                "sitreps"
+            } else if id_value.starts_with("h-") {
+                "handoffs"
+            } else if id_value.starts_with("a-") {
+                "attention"
+            } else {
+                "deployments"
+            };
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the nulled link");
+            assert_eq!(link, None, "{table} kept its link on a pre-v36 removal");
+        }
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v36");
+        // Exactly the rows whose creation event names the removed task recover
+        // their link; the genuinely taskless rows stay NULL.
+        for (table, id_value, expected) in [
+            ("sitreps", "sr-old", Some("t-old")),
+            ("handoffs", "h-old", Some("t-old")),
+            ("attention", "a-old", Some("t-old")),
+            ("deployments", "d-old", Some("t-old")),
+            ("sitreps", "sr-lane", None),
+            ("handoffs", "h-session", None),
+            ("attention", "a-free", None),
+            ("deployments", "d-free", None),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the migrated link");
+            assert_eq!(
+                link.as_deref(),
+                expected,
+                "{table} row {id_value} backfilled to the wrong link"
+            );
+        }
+    }
 
     fn index_sql(connection: &Connection, name: &str) -> String {
         connection
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
-                [name],
-                |row| row.get::<_, String>(0),
+                &format!("SELECT sql FROM sqlite_master WHERE type='index' AND name='{name}'"),
+                [],
+                |row| row.get(0),
             )
             .unwrap()
     }
@@ -2480,6 +5438,330 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    /// The probe retries a locked board on this crate's budget, not SQLite's.
+    ///
+    /// It was the one board access in this file installing no busy handler.
+    /// Measured, that does *not* mean it fails instantly: rusqlite installs a
+    /// five-second `busy_timeout` of its own, so routine contention was already
+    /// absorbed. What it meant was that the probe alone ran on SQLite's built-in
+    /// handler — a third of the budget every other board access gets, on the
+    /// fixed unjittered schedule `busy_backoff` exists to replace, exactly where
+    /// giving up produces a false statement rather than a slow answer.
+    ///
+    /// The lock is held for seven seconds: past rusqlite's five-second default,
+    /// well inside this crate's fifteen. Both margins are wide, and the holder
+    /// takes the lock deliberately rather than racing for it, so the test cannot
+    /// be flaky in the direction that matters. It costs seven seconds, which is
+    /// the price of measuring a timeout instead of asserting one.
+    #[test]
+    fn the_board_probe_retries_a_locked_board_on_this_crate_s_budget() {
+        let root = std::env::temp_dir().join(format!("kanban-probe-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+        let path = root.join("board.db");
+        drop(open_board(&path).expect("open writable board"));
+        assert_eq!(
+            probe_board_schema(&path).expect("probe an idle board"),
+            BoardSchema::Board,
+            "the board must be recognized when nothing is contending for it"
+        );
+
+        const HOLD: Duration = Duration::from_secs(7);
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder_started = std::sync::Arc::clone(&held);
+        let locked = path.clone();
+        let holder = std::thread::spawn(move || {
+            let connection = Connection::open(&locked).expect("open the lock holder");
+            connection
+                .execute_batch(
+                    "PRAGMA locking_mode=EXCLUSIVE; BEGIN IMMEDIATE; \
+                     CREATE TABLE probe_contention(x INTEGER);",
+                )
+                .expect("take an exclusive lock");
+            holder_started.wait();
+            std::thread::sleep(HOLD);
+            connection.execute_batch("ROLLBACK").expect("release");
+        });
+        held.wait();
+        let started = Instant::now();
+        let probed = probe_board_schema(&path);
+        let waited = started.elapsed();
+        holder.join().expect("lock holder finished");
+
+        match probed {
+            Ok(BoardSchema::Board) => {}
+            Ok(other) => panic!(
+                "a locked board was classified {other:?}: a false statement about healthy data, \
+                 and every caller acts on it"
+            ),
+            Err(error) => panic!(
+                "the probe gave up after {waited:?} on a lock held {HOLD:?}, inside a {}s budget: \
+                 {error}",
+                BUSY_BUDGET.as_secs()
+            ),
+        }
+        assert!(
+            waited >= HOLD,
+            "the probe answered in {waited:?} without waiting out a {HOLD:?} lock, so this \
+             measured nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A damaged board reads as unreadable, never as a stranger's database.
+    ///
+    /// This is the half that produced the lie. The probe returned `bool`, so
+    /// every SQLite failure — `SQLITE_BUSY`, `CORRUPT`, `NOTADB`, `IOERR` —
+    /// arrived at the caller as "this is not a Kanban board", which is a
+    /// statement about the file's contents that the probe never established.
+    /// "Could not determine" and "is not a board" are different answers and
+    /// only one of them is safe to act on.
+    #[test]
+    fn a_damaged_board_reads_as_unreadable_rather_than_as_a_stranger() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-probe-damaged-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+        let path = root.join("board.db");
+        // A valid SQLite header over a body that is not a database: past the
+        // caller's header check, and straight into a SQLite error.
+        let mut damaged = b"SQLite format 3\0".to_vec();
+        damaged.extend(std::iter::repeat_n(0xA5u8, 4096));
+        fs::write(&path, &damaged).expect("write the damaged file");
+
+        let error = probe_board_schema(&path)
+            .expect_err("a damaged database must not be answered with a verdict about its schema");
+        assert!(
+            !error.to_string().is_empty(),
+            "the reason has to survive, or the caller cannot say what went wrong"
+        );
+        assert_eq!(
+            fs::read(&path).expect("re-read the damaged file"),
+            damaged,
+            "probing a damaged file must not write to it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An interrupted creation is recoverable, not a permanent refusal.
+    ///
+    /// `open` creates the file and sets `journal_mode=WAL` before the first
+    /// migration commits. A Ctrl-C, a kill or ENOSPC in that window leaves a
+    /// header with no tables behind it — which the schema probe must call
+    /// `Unwritten`, not `Other`, or the retry of the very command that was
+    /// interrupted is refused forever.
+    #[test]
+    fn an_interrupted_creation_reads_as_unwritten_rather_than_a_stranger() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-probe-partial-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+
+        // Exactly what `open` leaves before the first migration commits.
+        let half = root.join("half.db");
+        let connection = Connection::open(&half).expect("create the partial file");
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("set WAL, as open does");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&half).expect("probe the partial file"),
+            BoardSchema::Unwritten
+        );
+
+        // Zero tables is not on its own enough. A database that stamps its
+        // schema version before creating anything is a stranger, and treating
+        // it as an unfinished board would migrate 26 kanban tables into it.
+        // `migrate` commits `BOARD_V1` and `user_version=1` together, so no
+        // board of ours can present this way.
+        let versioned = root.join("versioned-empty.db");
+        let connection = Connection::open(&versioned).expect("create a versioned empty database");
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA user_version=4;")
+            .expect("stamp a version with no tables");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&versioned).expect("probe the versioned empty database"),
+            BoardSchema::Other,
+            "a stranger that versions itself before writing its schema was taken for our own \
+             unfinished board"
+        );
+
+        // A database with tables that are not ours stays a stranger.
+        let stranger = root.join("stranger.db");
+        let connection = Connection::open(&stranger).expect("create a foreign database");
+        connection
+            .execute_batch("PRAGMA user_version=7; CREATE TABLE tasks(id INTEGER, name TEXT);")
+            .expect("write a foreign schema");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&stranger).expect("probe the foreign database"),
+            BoardSchema::Other,
+            "a tasks table alone must not be mistaken for a board"
+        );
+
+        // And finishing the interrupted one produces a board.
+        drop(open_board(&half).expect("finish the interrupted creation"));
+        assert_eq!(
+            probe_board_schema(&half).expect("probe the finished board"),
+            BoardSchema::Board
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The whole ownership rule, at the inputs that decide it.
+    ///
+    /// Unit-tested rather than measured end to end because the case that
+    /// matters cannot be produced by a test: a process cannot become root,
+    /// and a test running as root cannot conjure a directory owned by the
+    /// service user. So the decision is a pure function and this is where it
+    /// is proved; the compiled-process test proves the non-root half.
+    #[test]
+    fn ownership_target_mirrors_only_what_root_left_in_another_user_s_directory() {
+        const KANBAN: u32 = 998;
+        const KANBAN_GROUP: u32 = 997;
+
+        // A non-root process. It cannot chown, and what it owns is between it
+        // and the directory.
+        assert_eq!(
+            ownership_target(KANBAN, KANBAN, KANBAN_GROUP, KANBAN, KANBAN_GROUP),
+            None
+        );
+        assert_eq!(ownership_target(KANBAN, KANBAN, KANBAN_GROUP, 0, 0), None);
+
+        // Root in root's own tree. Root-owned files are the correct result.
+        assert_eq!(ownership_target(0, 0, 0, 0, 0), None);
+
+        // The outage: root created a file inside the service's data root.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, 0, 0),
+            Some((KANBAN, KANBAN_GROUP))
+        );
+
+        // Already the service's. No syscall to make.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, KANBAN, KANBAN_GROUP),
+            None
+        );
+
+        // Right uid, wrong group is still not what the directory says.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, KANBAN, 0),
+            Some((KANBAN, KANBAN_GROUP))
+        );
+    }
+
+    #[test]
+    fn wal_siblings_append_to_the_whole_database_name() {
+        assert_eq!(
+            wal_siblings(Path::new("/srv/kanban/boards/vidgen.db")),
+            [
+                PathBuf::from("/srv/kanban/boards/vidgen.db-wal"),
+                PathBuf::from("/srv/kanban/boards/vidgen.db-shm"),
+            ],
+            "a sidecar is the database's whole name plus a suffix; replacing \
+             the extension would name two files SQLite never opens"
+        );
+    }
+
+    /// The chown itself: the right file, the right ids, in the right order.
+    ///
+    /// Everything else here measures the DECISION, and a decision that is
+    /// correct in front of a `chown(path, gid, uid)` is worth nothing. The
+    /// root case cannot be produced by a test, but the syscall can: `euid` is
+    /// a parameter, and POSIX lets the owner of a file move it into any group
+    /// it belongs to, so aiming the mirror at a secondary group of this
+    /// process exercises the same call with the same arguments.
+    #[test]
+    fn mirroring_performs_the_chown_and_steps_over_a_sidecar_that_is_not_there() {
+        let root = std::env::temp_dir().join(format!("kanban-chown-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp chown dir");
+        let path = root.join("board.db");
+        fs::write(&path, b"not really a database").expect("create the file to hand over");
+        let before = fs::metadata(&path).expect("stat the file");
+
+        let mut groups = [0u32; 64];
+        let count = unsafe { libc::getgroups(64, groups.as_mut_ptr().cast::<libc::gid_t>()) };
+        let target = (0..count.max(0) as usize)
+            .map(|index| groups[index])
+            .find(|group| *group != before.gid());
+        let Some(target) = target else {
+            // One group, so there is no gid this process may move a file to
+            // and nothing here would be evidence either way.
+            eprintln!("skipped: this process belongs to no group other than its own");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        mirror_owner_onto(&path, 0, before.uid(), target).expect("hand the file to the group");
+        let after = fs::metadata(&path).expect("re-stat the file");
+        assert_eq!(
+            (after.uid(), after.gid()),
+            (before.uid(), target),
+            "the chown did not land, or landed with its arguments the wrong way round"
+        );
+        assert_eq!(
+            after.permissions().mode(),
+            before.permissions().mode(),
+            "the chown moved the mode bits"
+        );
+
+        // A `-wal` that is not there is the ordinary case, not a failure.
+        mirror_owner_onto(&root.join("absent.db-wal"), 0, before.uid(), target)
+            .expect("a sidecar that does not exist must not be an error");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A board and every sidecar beside it belong to their directory's owner
+    /// once `open` returns, and `open` did not have to touch anything to make
+    /// that true here.
+    ///
+    /// The invariant is stated as "matches the directory" rather than "is
+    /// uid N" so it is the same assertion whoever runs the suite: as an
+    /// ordinary user the temp directory and the board are both that user's,
+    /// and as root they are both root's. Either way a mirror that fired when
+    /// it should not have, or a chown that went to the wrong id, breaks it.
+    #[test]
+    fn an_open_leaves_the_board_and_its_sidecars_owned_by_their_directory() {
+        let root = std::env::temp_dir().join(format!("kanban-owner-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp ownership dir");
+        let path = root.join("board.db");
+        let directory = fs::metadata(&root).expect("stat the directory");
+
+        let connection = open_board(&path).expect("open a writable board");
+        crate::audit::append_board_event(&connection, None, "board_changed", "codex", "{}", 1)
+            .expect("write, so the -wal exists");
+        checkpoint(&connection).expect("checkpoint, which mirrors late sidecars");
+
+        let mut checked = 0;
+        for candidate in std::iter::once(path.clone()).chain(wal_siblings(&path)) {
+            let Ok(metadata) = fs::metadata(&candidate) else {
+                continue;
+            };
+            checked += 1;
+            assert_eq!(
+                (metadata.uid(), metadata.gid()),
+                (directory.uid(), directory.gid()),
+                "{} is not owned by the directory it lives in",
+                candidate.display()
+            );
+        }
+        assert!(
+            checked >= 1,
+            "nothing was checked, so this measured nothing"
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat the board")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "mirroring ownership changed the mode"
+        );
+
+        drop(connection);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2549,7 +5831,7 @@ mod tests {
 
         migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 23);
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
         assert_eq!(
             index_sql(&connection, "idx_tasks_priority_created_id"),
             "CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at,id)"
@@ -2568,5 +5850,389 @@ mod tests {
             "unexpected seq-only event index(es): {}",
             seq_only_secondary.join(", ")
         );
+    }
+
+    #[test]
+    fn board_schema_v24_adds_handoff_retire_columns_and_widens_the_status_check() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..23]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 23);
+        // A pending session handoff, written through the v23 shape.
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-v23','manual','pending','agent','summary','intent','next',1000)",
+                [],
+            )
+            .unwrap();
+        let handoff_triggers = |connection: &Connection| -> Vec<String> {
+            connection
+                .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'search_handoffs_%' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            handoff_triggers(&connection).len(),
+            3,
+            "the v23 board is missing the search_handoffs triggers"
+        );
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+
+        // The row survived the rebuild, byte for byte.
+        let (id, status): (String, String) = connection
+            .query_row(
+                "SELECT id,status FROM handoffs WHERE id='h-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "h-v23");
+        assert_eq!(status, "pending");
+
+        // The three retire columns exist and are null for the untouched row.
+        let mut statement = connection.prepare("PRAGMA table_info('handoffs')").unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for column in ["retired_at", "retired_by", "retire_note"] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "the rebuild lost the {column} column"
+            );
+        }
+        let (retired_at, retired_by, retire_note): (Option<i64>, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT retired_at,retired_by,retire_note FROM handoffs WHERE id='h-v23'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(retired_at, None);
+        assert_eq!(retired_by, None);
+        assert_eq!(retire_note, None);
+
+        // The status CHECK widened to admit `retired`, and the table now
+        // accepts the transition.
+        let ddl: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("'retired'"),
+            "the rebuilt handoffs status CHECK was not widened: {ddl}"
+        );
+        connection
+            .execute(
+                "UPDATE handoffs SET status='retired',retired_at=2000,retired_by='agent',retire_note='gone' WHERE id='h-v23'",
+                [],
+            )
+            .unwrap();
+
+        // The search view and handoff triggers survived the rebuild.
+        assert_eq!(
+            handoff_triggers(&connection).len(),
+            3,
+            "the rebuild dropped the search_handoffs triggers"
+        );
+        for index in [
+            "idx_handoffs_task_created",
+            "idx_handoffs_status_created",
+            "idx_handoffs_status_priority",
+        ] {
+            assert!(
+                index_names(&connection, "handoffs")
+                    .iter()
+                    .any(|name| name == index),
+                "the rebuild dropped {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_schema_v27_migrates_a_real_v26_board_and_preserves_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..26]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 26);
+        // A live v26 task, written through the pre-sprint shape.
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,body,status,priority,created_at,updated_at,completed_at,metadata) \
+                 VALUES('t-v26','task','survivor','body','todo',3,1,1,NULL,'{}')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+
+        // The row survived, byte for byte; the tasks table gained nothing.
+        let (title, body): (String, String) = connection
+            .query_row("SELECT title,body FROM tasks WHERE id='t-v26'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "survivor");
+        assert_eq!(body, "body");
+
+        // The partial unique index holds the one-current rule: a second
+        // current sprint is refused, a planned one coexists.
+        let insert = |status: &str| {
+            connection.execute(
+                "INSERT INTO sprints(id,title,status,target_version,scheduled_start,scheduled_end,starts_at,created_at,updated_at) VALUES(?,?,?,'0.1.0',0,1,1,1,1)",
+                params![format!("sp-{status}"), format!("{status} sprint"), status],
+            )
+        };
+        insert("planned").unwrap();
+        insert("current").unwrap();
+        assert!(
+            insert("current").is_err(),
+            "a second current sprint was admitted"
+        );
+        assert!(
+            index_names(&connection, "sprints")
+                .iter()
+                .any(|name| name == "one_current_sprint"),
+            "the v27 migration dropped the one-current index"
+        );
+        // Attachment is a junction row, and the FK refuses a sprint that
+        // does not exist; the PK refuses a second sprint for one task.
+        connection
+            .execute(
+                "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                 VALUES('t-v26','sp-current',1,'geoyws')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                     VALUES('t-v26','sp-planned',1,'geoyws')",
+                    [],
+                )
+                .is_err(),
+            "one task was attached to two sprints at once"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                     VALUES('t-v26','sp-nope',1,'geoyws')",
+                    [],
+                )
+                .is_err(),
+            "a task was attached to a sprint that does not exist"
+        );
+    }
+    #[test]
+    fn board_schema_v28_backfills_sprints_without_rekeying_or_erasing_cached_documents() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..27]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 27);
+        connection.execute(
+            "INSERT INTO tasks(id,type,title,body,status,priority,created_at,updated_at,metadata) \
+             VALUES('t-cache','task','preserved cache','other indexed kind','todo',3,10,11,'{}')",
+            [],
+        ).unwrap();
+        connection.execute(
+            "UPDATE search_documents SET source_hash='kept-hash',embedding_model='kept-model',embedding=x'01020304' \
+             WHERE source_kind='task' AND source_id='t-cache'",
+            [],
+        ).unwrap();
+        let old_seq: i64 = connection
+            .query_row(
+                "SELECT seq FROM search_documents WHERE source_kind='task' AND source_id='t-cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO sprints(id,title,body,status,target_version,scheduled_start,scheduled_end,starts_at,created_at,updated_at) \
+             VALUES('sp-1234abcd','Existing release','Backfill this release body','planned','7.8.9',0,100,1,20,21)",
+            [],
+        ).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM search_documents WHERE source_kind='sprint'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        let preserved: (i64, String, String, Vec<u8>) = connection
+            .query_row(
+                "SELECT seq,source_hash,embedding_model,embedding FROM search_documents \
+             WHERE source_kind='task' AND source_id='t-cache'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                old_seq,
+                "kept-hash".into(),
+                "kept-model".into(),
+                vec![1, 2, 3, 4]
+            )
+        );
+
+        let sprint: (
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT task_id,title,body,status,lane,tags,created_at,updated_at,archived \
+                 FROM search_documents WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            sprint,
+            (
+                None,
+                "Existing release".into(),
+                "Backfill this release body\n7.8.9".into(),
+                "planned".into(),
+                None,
+                String::new(),
+                20,
+                21,
+                0,
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH 'Existing release'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "INSERT INTO search_fts(search_fts) VALUES('integrity-check')",
+                [],
+            )
+            .unwrap();
+        for name in [
+            "idx_search_documents_source",
+            "idx_search_documents_task",
+            "idx_search_documents_active",
+        ] {
+            assert!(
+                index_names(&connection, "search_documents")
+                    .iter()
+                    .any(|actual| actual == name),
+                "missing {name}"
+            );
+        }
+
+        connection.execute(
+            "UPDATE sprints SET title='Fresh release',body='Fresh lifecycle body',status='current',updated_at=22 \
+             WHERE id='sp-1234abcd'",
+            [],
+        ).unwrap();
+        let fresh: (i64, String, String, String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT COUNT(*),title,body,status,embedding FROM search_documents \
+             WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fresh,
+            (
+                1,
+                "Fresh release".into(),
+                "Fresh lifecycle body\n7.8.9".into(),
+                "current".into(),
+                None
+            )
+        );
+        connection
+            .execute("DELETE FROM sprints WHERE id='sp-1234abcd'", [])
+            .unwrap();
+        assert_eq!(connection.query_row(
+            "SELECT COUNT(*) FROM search_documents WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
+    }
+
+    #[test]
+    fn v27_refuses_unexpected_objects_and_rolls_back_without_partial_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..26]).unwrap();
+        connection.execute_batch("CREATE TABLE task_sprints(id TEXT PRIMARY KEY); INSERT INTO tasks(id,type,title,status,priority,created_at,updated_at,metadata) VALUES('t-keep','task','keep','todo',3,1,1,'{}');").unwrap();
+        let error = migrate(&mut connection, BOARD_MIGRATIONS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task_sprints already exists"), "{error}");
+        assert_eq!(schema_version(&connection).unwrap(), 26);
+        assert_eq!(
+            connection
+                .query_row("SELECT title FROM tasks WHERE id='t-keep'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep"
+        );
+        assert!(
+            !sqlite_table_exists(&connection, "sprints").unwrap(),
+            "earlier V27 DDL was not rolled back"
+        );
+        assert!(
+            sqlite_table_exists(&connection, "task_sprints").unwrap(),
+            "the incompatible preexisting object was destroyed"
+        );
+        let sprint_column: i64 = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('deployments') WHERE name='sprint_id')", [], |row| row.get(0)).unwrap();
+        assert_eq!(sprint_column, 0);
     }
 }

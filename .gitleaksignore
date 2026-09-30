@@ -1,0 +1,4 @@
+# 2026-10-01 t-7778af27: one-off trunk merge scans the literal PEM header
+# in contains_pem_private_key_header. This Rust string is a detector marker,
+# not a private key or key body. Keep all other secret findings active.
+rust/store.rs:private-key:213

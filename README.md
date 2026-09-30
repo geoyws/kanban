@@ -75,11 +75,151 @@ kanban claim --candidates --project my-project --as atmux@_superbot \
 
 The result is priority ordered and contains task fields, including tags, lane,
 assignee and `driverOnly`, but never a lease token. It excludes containers,
-dependency-blocked work, work under draft plans, active leases, incompatible
-assignees and driver-only work unless `--caller-scope driver` is supplied.
-Inspection is read-only: it does not migrate or touch registry recency, expire
-leases, update task state, append events, or cache a result. A returned row is
-still only a candidate; take it with atomic `claim ID` or `claim --next`.
+work behind an unmet completion gate, work under draft plans, active leases,
+incompatible assignees, driver-only work unless `--caller-scope driver` is
+supplied, and model-restricted work unless `--model` names an allowed model.
+Inspection is read-only: it does not migrate or touch registry
+recency, expire leases, update task state, append events, or cache a result. A
+returned row is still only a candidate; take it with atomic `claim ID` or
+`claim --next`.
+
+To ask who holds a task, read the lease, not the assignee. Every `task list`
+row carries `claimed`, and `task list --with-claims` (or `task show`) adds
+`claim`, whose holder is `claim.agentID` alongside `expiresAt`; a free task has
+`claimed: false` and `claim: null`. There is no `claim.actor`, and `assignee`
+is a separate field recording intent, not possession: an assigned task can be
+free, and a held task can be assigned to someone else. `--fields actor` is
+refused naming the keys that exist, so the wrong question fails where it is
+typed rather than answering null.
+
+## Sprint release boundaries
+
+A sprint is a typed release boundary, not a task container or an estimate. Its
+scheduled millisecond dates are planning data; `sprint start`, `close`, and
+`abandon` record the actual lifecycle. Only one sprint can be current on a
+board. Planning requires a non-empty goal body and either explicit candidates,
+a parent epic, already attached scope, or an explicit `--empty-scope` decision.
+
+A minimal ledger lifecycle (with `TASK_ID`, `FULL_SHA`, and `OPERATION_ID` set
+for the board's own repository and staging tier) is:
+
+```bash
+printf '%s\n' 'Ship 1.4.0' 'Success: the served version is 1.4.0.' > /tmp/sprint-goal.txt
+kb sprint new "Release 1.4.0" --target-version 1.4.0 \
+  --start 1789344000000 --end 1789948800000 --as operator --json
+# Save the returned sprint id as SPRINT_ID.
+kb sprint plan "$SPRINT_ID" --body-file /tmp/sprint-goal.txt \
+  --candidate "$TASK_ID" --as operator --json
+kb sprint start "$SPRINT_ID" --as operator --json
+kb sprint list --status current --json
+kb sprint list --json
+kb sprint show "$SPRINT_ID" --json
+
+kb deploy start --repo example/service --commit "$FULL_SHA" \
+  --tier @_s --environment example-staging --host example-host \
+  --url https://staging.example.test --task "$TASK_ID" \
+  --operation-id "$OPERATION_ID" --sprint "$SPRINT_ID" --as operator --json
+# Save the returned deployment id. Keep its capability token private.
+# Independently deploy and inspect the endpoint, then record that observation:
+kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
+  --result succeeded --phase verification --served-commit "$FULL_SHA" \
+  --served-version 1.4.0 --receipt "observed served commit and version" \
+  --as operator --json
+kb sprint close "$SPRINT_ID" --deployment "$DEPLOYMENT_ID" --as operator --json
+```
+
+`deploy start` records an attempt; it neither deploys nor inspects an endpoint.
+With `--sprint`, it also copies the sprint target version into that attempt.
+After an independent observation of the exact served commit and version,
+`deploy finish --result succeeded --phase verification` records that evidence
+with the matching `--served-version`. `sprint close` then accepts only that
+same sprint's succeeded verification-phase attempt. A receipt alone is not
+version proof, and the deployment capability token must remain private.
+If work is unfinished, close also requires `--carry-to` and a non-empty
+`--carry-note`. Use `task add --sprint` or `task update --sprint` to attach work,
+`task update --clear-sprint` to detach it, and deliberate `claim --sprint` or
+`claim --any-sprint` overrides to cross the current boundary; those changes
+are audited. `dashboard` projects the current sprint for each board; `context`
+projects the task's own sprint only when that task is attached. The read-only
+web projections are `/sprints`, `/sprints/BOARD`, and `/sprint/BOARD/ID`.
+
+Sprint-scoped rules and first-class sprint search/citations are implemented. A
+sprint rule is encoded as `SPRINT:sp-ID` with exactly one `ONLY:BOARD`; optional
+repeatable `--tag` selectors intersect that scope. The sprint must exist on that
+board (closed history is valid). Add or replace the scope explicitly:
+
+```bash
+kb rule add "Ship only with served proof" --board BOARD --sprint sp-ID --as operator --json
+# Save the returned rule id as RULE_ID.
+kb rule update "$RULE_ID" --sprint sp-OTHER --as operator --json
+kb rule update "$RULE_ID" --clear-sprint --as operator --json
+kb search "release goal" --source sprint --json
+```
+
+`rule add` accepts `--as`, `--body`, `--body-file`, repeatable `--board`,
+repeatable `--except-board`, `--sprint`, and repeatable `--tag`; `rule update`
+also accepts `--clear-sprint` and `--clear-tags`. `--sprint` and
+`--clear-sprint` are mutually exclusive. Applicability reads the task's
+authoritative attached sprint for claim, handoff acceptance, and context;
+unattached work and work in another sprint do not receive the rule. Sprint
+rows have no tags and are board-only. Raw `rule list` (`--all`/`--full` only)
+and board-targeted search remain inventories and still list sprint-scoped
+rules; only board HTML without a task omits them, since it has no sprint to
+match. Sprint search indexes title, body, and target version, cites
+results as `kanban://BOARD/sprint/ID`, and is refreshed by lifecycle updates.
+There is no draft sprint status, estimation, automatic rollover, or automatic
+sprint archival.
+
+## Completion gates
+
+A dependency is a gate on doing the work, not only on being offered it. Declare
+one with the dependency flags that already exist — `task add --depends-on ID`,
+`task update --depends-on ID ...` (a repeatable set replacement) and
+`task update --clear-dependencies` — and a row inherits every prerequisite
+declared on itself **or on any ancestor**, the same way a draft ancestor holds
+back its whole tree (ADR-013). A prerequisite satisfies the gate at `done` and
+nowhere else: `cancelled` is a decision not to do the work, and an archived
+`done` row is still finished.
+
+While a prerequisite is unfinished, these refuse, naming the row, each
+unfinished prerequisite with its status, and the ancestor that declared it:
+`claim ID`, `claim --next`, `handoff accept`, `task add`/`task move` into
+`in_progress`, `review` or `done`, `story advance` past `ready`,
+`checkpoint --state continue|done`, and `heartbeat`. `--force` seizes a lease;
+it does not finish a prerequisite, so it is not a way through.
+
+What stays open is everything that records where the work stands rather than
+claiming it moved: `task move` to `draft`, `backlog`, `todo`, `blocked` or
+`cancelled`, `note`, `sitrep`, `attention`, `handoff create`,
+`checkpoint --state blocked` and `release`. A live lease is never revoked by a
+gate — a prerequisite introduced or reopened mid-lease stops the next renewal
+and leaves the holder the blocked checkpoint and the release. Nothing here
+auto-changes a status, claims work, marks an epic done, or reopens finished
+work.
+
+The blockers are data, not only a refusal. `task show`, `kanban context` and
+`task list --with-relations` carry `blockingGates`: an array of
+`{sourceTaskID, prerequisiteID, prerequisiteTitle, prerequisiteStatus}`,
+ordered nearest owner first then by prerequisite id, where `sourceTaskID` is the
+row that declared the edge — itself or an ancestor. `dependencies` is unchanged
+and still lists only what the row declared, so `--fields blockingGates` needs
+`--with-relations` exactly as `--fields dependencies` does. An empty array means
+no dependency gate; it is not a promise that the row is claimable, because
+draft ancestors, live leases, routing and authorization are separate rules.
+
+A dependency that no amount of work could satisfy is refused when it is
+declared, on the dependency change and on a parent change alike: an epic gated
+on a task inside its own subtree can never be unblocked, because the descendant
+inherits the epic's gate and would wait on itself. The existing self-dependency
+and dependency-cycle refusals are unchanged.
+
+```bash
+kb t up "$LEAF" --depends-on "$PREREQ" --as "$AGENT" --json
+kb t cat "$LEAF" --json | jq .blockingGates
+kb claim "$LEAF" --as "$AGENT"      # refused, naming PREREQ and its owner
+kb t mv "$PREREQ" done --as "$AGENT"
+kb claim "$LEAF" --as "$AGENT"      # granted
+```
 
 ## Roadmap todo lists
 
@@ -135,6 +275,12 @@ kanban handoff accept h-12345678 --as incoming-agent --json
 kanban context t-resume
 ```
 
+When `--to` names a driver lane, use its full typed actor, for example
+`--to @:team/project/driver-2`; new bare `driver` / `driver-N` targets are
+refused. A typed lane actor can still accept a pending legacy row addressed to
+the matching bare lane. The legacy row keeps its literal `toAgent`, while
+`acceptedBy` records the full actor. Other untyped identities are unchanged.
+
 ## Storage and privacy
 
 `kanban init` registers the current workspace in an operator-private registry:
@@ -163,23 +309,23 @@ Short, non-secret constraints live in one registry-owned rules document. Boards
 still own work; they are selectors on rules, never a second rule species:
 
 ```bash
-kb r new "Universal rule." --as geo                    # tags: ALL
-kb r new --body-file /tmp/non-secret-rule.md --as geo
+kb r new "Universal rule." --as geoyws                    # tags: ALL
+kb r new --body-file /tmp/non-secret-rule.md --as geoyws
 kb r ls                         # active table of contents, oldest first
 kb r cat r-12345678             # fetch one full body lazily
-kb r up r-12345678 --body "Production runtime is compiled Rust." --as geo
-kb rule retire r-12345678 --as geo
+kb r up r-12345678 --body "Production runtime is compiled Rust." --as geoyws
+kb rule retire r-12345678 --as geoyws
 kb r ls --all --full            # include retired rules and full bodies
 kb ev --rule r-12345678         # audited revision/retirement trail
 
 # Target one or more boards, or every board except named boards.
-kb r new "Kanban-only rule." --board kanban --as geo
-kb r new "Everywhere except project-a." --except-board project-a --as geo
+kb r new "Kanban-only rule." --board kanban --as geoyws
+kb r new "Everywhere except project-a." --except-board project-a --as geoyws
 
 # Intersect board selection with one or more subsystem tags.
-kb r new "Queuer-specific rule." --tag queuer --as geo
-kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix --as geo
-kb r up r-12345678 --clear-tags --as geo
+kb r new "Queuer-specific rule." --tag queuer --as geoyws
+kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix --as geoyws
+kb r up r-12345678 --clear-tags --as geoyws
 ```
 
 Examples below use bare tag names in storage and CLI. Prose may render them as
@@ -195,6 +341,16 @@ rules, and a stored claim does not pretend it re-read current rules.
 are `ALL, EXCEPT:<board>`. Operators use repeatable `--board` and
 `--except-board`, and the CLI validates exact registered board names. Lowercase
 `--tag` values are subsystem selectors registered on at least one active board.
+An active `ONLY:<board>` or `EXCEPT:<board>` reference is valid only while
+exactly one active board has that name. Rule add, active-rule update, and rule
+import recheck this invariant inside the write transaction. Workspace retirement
+refuses any active rule naming the board and lists the blocking rule IDs; update
+or retire those rules, then retry retirement. Retired rule bodies, tags, and
+events remain available through `rule list --all`, `rule show`, and rule events.
+`doctor --json` reports the complete check as
+`activeRuleSelectors: { healthy, errors }`; stale legacy or manually edited rows
+make top-level health false without blocking recovery reads, and `doctor --all`
+continues to inspect retired boards.
 Several subsystem tags are an OR set, intersected with the board selector.
 Task claim, context and task-handoff injection require a matching task tag;
 taskless session handoffs and web board projections omit subsystem-scoped rules.
@@ -208,49 +364,245 @@ put credentials or secret values in the plaintext board database. See
 [ADR-018](docs/adr/ADR-018-project-rules-frame-work-without-replacing-private-memory.md)
 and its superseding [ADR-027](docs/adr/ADR-027-rules-are-one-tag-scoped-kb-document.md).
 
+An attention item is a **decision card**: a question, the context needed to
+answer it, and two to four authored choices, each with the consequence of
+picking it and a machine-readable `outcome` of `approve`, `reject`, `defer` or
+`other`, exactly one marked as the recommendation. Every item also offers an
+implicit `custom` answer that needs its own `--outcome` and a note, so nothing
+closes an item without a verdict; a row that authored no choices is served as
+the `approve`/`reject` default pair with no recommendation, and the body stays
+what it always was — the long form
+([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)).
+A raiser may also attach one native Active Comprehension Check as five atomic
+inputs: `--check`, two to four repeatable `--check-choice KEY=LABEL` values,
+`--check-answer`, `--check-explain`, and `--check-about`. Check choices
+have no outcome or recommendation and cannot affect `decision.outcome`. Only
+the exact `raisedBy` actor may replace a check while the row is open;
+`geoyws` has no authoring exception. Before an answer is recorded, every later
+`attention list` and `attention show` read omits the answer and explanation,
+including the raiser's show; `--as` is self-declared, not authentication. Only
+the successful same-write raise receipt may echo the complete definition.
 Attention rows carry the same registered subsystem vocabulary as tasks:
 
 ```bash
-kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer
+kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer \
+  --question "The queuer is deployed but unproven - review it now, or ship and review after?" \
+  --context "The queuer has been live on staging since 2026-09-05 with no errors. One task waits on the review, and waiting costs a day of feedback." \
+  --choice "review-now=Review the deployed queuer today|approve" \
+  --consequence "review-now=You spend about twenty minutes reading it today and the waiting task unblocks this afternoon." \
+  --choice "ship-first=Ship it and review after the release|defer" \
+  --consequence "ship-first=The release goes out unreviewed and a task is filed to review it on 2026-09-12." \
+  --recommend review-now
+kb att raise "Choose after demonstrating the Store boundary." --as codex@driver \
+  --check "Where is the check definition validated?" \
+  --check-choice "store=The Store validates it" --check-choice "client=The client validates it" \
+  --check-answer store --check-explain "rust/store.rs validates it before writing." \
+  --check-about rust/store.rs
+kb att show a-12345678 --json
 kb att list --status open --tag queuer
 kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
-kb att resolve a-12345678 --as geo --note "Approved after review."
-kb att reopen a-12345678 --as geo --note "Resolved the wrong item."
+kb att update a-12345678 --clear-card --as codex@driver
+kb att resolve a-12345678 --as geoyws --choice review-now
+kb att resolve a-12345678 --as geoyws --choice review-now --check-answered store
+kb att check a-12345678 --as geoyws --key store
+kb att resolve a-12345678 --as geoyws --choice custom --outcome defer --note "After the aix pin lands."
 ```
 
-Several tags describe several touched subsystems. An agent may correct the body
-or tags only while the item remains open; the prior body and tags stay on the
-event trail, and the update does not settle the request. Resolving it freezes
-the row with the rest of the historical receipt. Unknown tags are refused
-rather than producing an empty-looking filter result.
+Several tags describe several touched subsystems. An agent may correct the body,
+tags or card only while the item remains open; the prior body, tags and card
+stay on the event trail, and the update does not settle the request. Resolving
+it freezes the row with the rest of the historical receipt. Unknown tags are
+refused rather than producing an empty-looking filter result. Every card refusal
+names its fix — an undeclared `--consequence` key, a duplicate key, a count
+outside two to four, no recommendation or two, a choice with no consequence,
+half a question/context pair, the reserved `custom` key, a `--recommend` with no
+choices, and each length bound — and refusals are store-level, so the CLI, the
+MCP tools and the web read the same wording.
 
-Resolution is deliberately asymmetric: `geo` may settle any item, while an
-agent may settle only an item whose `raisedBy` is that exact actor, and every
-resolution requires a non-empty note. If a resolution was mistaken, only
-`geo` or the recorded resolver may reopen it. Reopening returns the item to the
-open queue without clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds
-`reopenedAt`, `reopenedBy` and `reopenNote`, and the transition is audited.
+Resolution is deliberately asymmetric: the operator actor `geoyws` may settle
+any item, while an agent may settle only an item whose `raisedBy` is that exact
+actor, and every resolution requires a `--choice`. `geoyws` is the one
+operator spelling (`OPERATOR_ACTOR` in `rust/model.rs`); `geo` is not an alias
+and is refused like any other non-raiser. Rows resolved before 2026-09-05 carry
+`geo` in `resolvedBy` and `raisedBy` as the historical spelling; they are left
+as recorded. Settling writes a `decision` of
+`{choice, outcome, note, by, at}` on the row and into the `attention_resolved`
+event, and composes `resolution` itself as `Decision: <label>. <consequence>`
+plus a `Note: <note>` line when a note was given — one composer inside the
+write path, so no caller can produce a different trail. A `--choice` naming a
+key the row does not carry is refused by name, which is what makes a card a
+browser is still holding safe. Rows settled before 2026-09-08 keep their exact
+resolution bytes, including the `Comment: ` second line the web used to write.
+If a resolution was mistaken, only `geoyws` or the recorded resolver may reopen
+it. Reopening returns the item to the open queue without clearing `resolvedAt`,
+`resolvedBy` or `resolution`; it clears `decision` from the row and keeps it in
+the `attention_reopened` event, adds `reopenedAt`, `reopenedBy` and
+`reopenNote`, and the transition is audited.
+
+A row carrying a check may settle with or without its answer: `attention
+resolve` without `--check-answered` settles the row and leaves the check pending
+— still redacted, still answerable — while `--check-answered KEY` records the
+one answer as data — `check.answered`, `check.correct` and `check.answeredAt` —
+and appends the human echo `ACC: pass` or `ACC: miss on <key>` to the
+resolution. `attention check ID --as ACTOR --key KEY` records the one answer on
+its own, whether the row is open or resolved and without changing its status;
+only `geoyws` or the raiser may run it, and it prints the verdict, the correct
+key with its label and the explanation (`--json` returns the row). A key the
+check did not declare is refused before any write, a row with no check refuses
+the flag by name, and a second answer never replaces the first. After the
+answer is recorded, `attention show` reveals the answer and explanation; a
+reopen clears the recorded result with the decision, so the check answers again.
+On the web card, the check sits between the body and the decision it gates:
+the decision controls stay inert behind a disabled fieldset until
+`POST /attention/{project}/{id}/check` records the one answer, a miss shows
+the explanation above the unlocked choices, and neither the answer nor the
+explanation is in any pre-answer response byte.
+
+The card is also the only way to park work on him, so the writes that would
+strand it require one. A `checkpoint --state blocked` whose `--next-action` or
+`--blocker` names the operator — `geoyws`, or `George` — on a task with no open
+attention row is refused, and so is a `handoff create` whose `--blocker` names
+him; the refusal quotes the clause it matched and names the card to raise
+first. Only those fields are read, because they are what a record *assigns*: a
+summary that cites a past decision of his while the next action names a lane is
+an ordinary blocked checkpoint and is written, and so is a next action handing
+the step to a lane ADDRESS that carries his name, like
+`@:geoyws/kanban/driver` — a separator touching the match makes it a path
+rather than a person. Raise the card and the same
+write goes through unchanged. Reasoning:
+[ADR-050](docs/adr/ADR-050-parking-work-on-the-board-owner-requires-an-open-card.md).
 
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project
-tree. Board selection runs most explicit first ([ADR-007](docs/adr/ADR-007-global-project-addressing.md)):
+tree. Every flag you type is consulted before any environment default, and
+defaults are consulted before the working directory
+([ADR-007](docs/adr/ADR-007-global-project-addressing.md),
+[ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)):
 
-| Selector | Meaning |
-| --- | --- |
-| `--db PATH` / `KANBAN_DB` | a board file directly |
-| `--project NAME` / `KANBAN_PROJECT` | a registered project by name, from anywhere |
-| `--workspace PATH` | the project containing `PATH` |
-| _(none)_ | the project containing the working directory |
+| Order | Selector | Meaning |
+| --- | --- | --- |
+| 1 | `--db PATH` | a board file directly |
+| 2 | `--project NAME` | a registered project by name, from anywhere |
+| 3 | `--workspace PATH` | the project containing `PATH` |
+| 4 | `KANBAN_DB` | the default for `--db` |
+| 5 | `KANBAN_PROJECT` | the default for `--project` |
+| 6 | _(none)_ | the project containing the working directory |
+
+A flag beats an environment default, because a default is what applies when
+nothing was asked for — with `KANBAN_DB` exported, `task list --project alpha`
+reads alpha. Two flags are a different thing: `--project alpha --db /tmp/x.db`
+is refused rather than resolved, because the values disagree and nothing in the
+receipt would say which one was used.
+
+A selector applies only to a command that resolves one board. `doctor`,
+`dashboard`, `backup`, `restore`, `audit verify`, `schema`, `mcp` and
+the `workspace` and `rule` subcommands address the registry instead, so they
+refuse a selector by name rather than accepting and discarding it:
+`doctor --db PATH` used to answer `healthy: true` about every registered board,
+which is the wrong answer in the one shape an operator believes. `init` and
+`workspace attach` honour `--workspace`, which names a tree rather than a board,
+and refuse the other two. `events --registry` and `events --rule` read the
+registry trail and refuse all three, as `watch` already did.
+
+Refusing is also what keeps the data-root lock honest. The lock decides its
+scope from the board an invocation addresses, so while these commands accepted a
+`--db` they ignored, that flag's only effect was to *suppress* the lock:
+`KANBAN_DB=/tmp/elsewhere.db kanban restore --force` replaced the whole data
+root with no exclusive lock at all. A command that discards a selector now locks
+as though none were given.
 
 ```bash
 kanban task list --project my-project          # from any directory
 export KANBAN_PROJECT=my-project               # or once per shell or agent cage
 kanban task add "ships from anywhere"
+kanban task list --project other               # the flag still wins over the export
 kanban workspace list                          # registered names, including rootless boards
 ```
+
+A `--db` path that does not exist is created only by `task add`, and only when
+you name the path yourself: `KANBAN_DB` pointing at nothing is a misconfigured
+default, not a request to make a board, and every other command reports the
+missing file rather than answering `[]` from one it just made.
+
+A `--db` path that already holds a file is opened only if that file looks like
+a board: a `tasks` table carrying kanban's own columns, and a schema version
+that has been set. Opening a board migrates it, so this is what stops a mistyped
+path from being rewritten — an empty file, a text file, a directory, a FIFO and
+another application's SQLite database are all refused and left byte-for-byte as
+they were.
+
+Two limits worth stating rather than implying. It is a heuristic: a database
+that happens to have a kanban-shaped `tasks` table would still be treated as a
+board. And it only guards paths that already hold a file — typo `--db` onto a
+path that does not exist and `task add` will start a board there, because that
+is indistinguishable from asking for one.
+
+`kanban schema --json` publishes this: each operation carries `readOnly` (writes
+nothing anywhere), `createsBoard` (may bring a board file into existence) and
+`ignoredSelectors` (the board selectors it refuses). The first two are different
+questions — `todo` writes a file, so it is not read-only, and it still may not
+create a board — and adapters can rely on all three: the MCP tool builder reads
+`ignoredSelectors` so no tool offers an input the CLI would reject.
+
+`kanban mcp` lists one further tool that is not an operation: `batch`, which
+takes `{calls: [{name, arguments}]}` and answers up to 32 of them on one
+request, in order, as `{results: [{ok, result} | {ok, error}]}`. It exists
+because a remote agent loop pays a round trip per read — twelve reads, 2.45 s
+p50 from the MBP to the board home over SSH, measured 2026-09-07 with payload
+projection already in place — so the latency, not the payload, is the cost. It
+is a transport shortcut and can do nothing a separate call could not: every
+entry must name a tool whose operation is `readOnly`, the whole batch is
+validated before any of it runs, so a batch naming one write performs none of
+its reads, and each entry runs the same code path a standalone `tools/call`
+runs, so a batched result is byte-identical to the same call made alone. A
+failing entry travels as that entry's `error` beside the others' results rather
+than sinking the batch. `claim --candidates` is read-only in the CLI but shares
+a command row with the `claim` that writes a lease, so a batch refuses it and a
+caller issues that one read on its own.
+
+`kanban transact` is the writing half, and the thing it adds is not speed but
+failure: it takes the same items, `(--items JSON_ARRAY | --items-file PATH)`
+holding `[{"name": TOOL, "arguments": {…}}]`, runs up to 32 of them in order
+against one open board inside one `BEGIN IMMEDIATE`, and either all of them
+land or none of them do. It answers with one envelope — `{"ok", "batchId",
+"failedIndex", "rolledBack", "results": [{"index", "ok", "result"} |
+{"index", "ok": false, "error"} | {"index", "ok": false, "skipped": true}]}` —
+and exits non-zero whenever `ok` is `false`. Execution stops at the first
+failure, every item before it is rolled back, and every item after it is
+`skipped` rather than attempted, so `rolledBack: true` means the board is
+exactly where the batch found it. `rolledBack: false` on a failure means the
+opposite and only one thing: the list was refused before anything ran, because
+an item was malformed, named an operation a batch may not carry, named a second
+board, or carried a back-reference that could not resolve. Any argument value
+may be `{"$ref": {"item": N, "path": "/json/pointer"}}`, replaced by the value
+at that RFC 6901 pointer inside item `N`'s result, where `N` is strictly
+earlier — which is how the lease token a `claim` returns reaches the
+`checkpoint` three items later without the agent handling it. Each item is
+authorized exactly as if it had arrived alone, and each landed item's ledger
+event carries `batchId` and `batchIndex`, so the order is reconstructable from
+the ledger and a `batchId` there always means a batch that landed whole. Two
+things a rollback does not undo, stated because they are invisible otherwise.
+Opening the board retires expired claims and commits that sweep before any
+batch scope exists, so a `transact` that rolled back may still have retired
+somebody else's lapsed lease and appended those events — correct, because the
+sweep is not part of the caller's batch, but it means a rolled-back `transact`
+is not a no-op on the ledger in every possible sense. And there is no
+idempotency key in V1: **a replayed batch is not a no-op.** A replayed `claim`
+is refused, so a loop batch that starts with one fails at index 0 and lands
+nothing — good, but good by accident of `claim`'s own semantics. Two replayed
+`note` items are two notes. An agent that cannot tell whether a `transact` was
+received must read the board rather than retry blindly. `kanban mcp` offers it
+as the tool `transact`, taking `{"items": [{"name", "arguments"}]}` with
+`readOnlyHint: false` and the board selectors on the call rather than on any
+item: the server stages the list in a private temporary file it always removes,
+runs the binary **once** for the whole batch — a process per item would be a
+connection per item, and two connections cannot share a transaction — hands
+back the envelope exactly as the CLI printed it, and marks the tool result an
+error whenever `ok` is `false`; the read-only `batch` refuses `transact` as it
+refuses every other write.
 
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a
@@ -263,9 +615,12 @@ when needed:
 ```bash
 kanban init --name my-project --workspace /path/to/main-worktree
 kanban init --name scratchboard --rootless
+kanban workspace adopt --from-board /path/to/existing-board.db --name imported --workspace /path/to/adopted-root --as geoyws
 cd /path/to/another-worktree
 kanban workspace attach --to my-project
-kanban workspace detach --root /path/to/retired-worktree --as geo
+kanban workspace detach --root /path/to/retired-worktree --as geoyws
+kanban workspace retire NAME --as ACTOR --note TEXT
+kanban workspace unretire NAME --as ACTOR
 ```
 
 If a name is reused and one candidate is rootless, `workspace attach --to NAME`
@@ -273,6 +628,25 @@ chooses that unique rootless board. The registry refuses to create a second
 active board with the same name, and `workspace detach` refuses a last-root
 retirement only when it would create a second active board with that name, so
 the ambiguous state is blocked instead of becoming a dead end.
+
+`workspace adopt` is for a board file that already exists outside the registry
+and needs to become registry-owned storage. The source argument must identify
+the exact regular board file: a symlink `--from-board` path and `..` parent
+traversal are refused rather than silently changing source identity. Adoption
+opens the source and any WAL with no-follow handles, verifies their device and
+inode identities, and captures a stable WAL-aware snapshot without opening
+SQLite on or creating a sidecar beside the source. Source integrity,
+foreign-key integrity, audit, schema, and name preflight completes before the
+live registry path or lock can be created.
+
+Migration and final validation happen in a private staging directory. Kanban
+hashes the pinned final database handle and atomically publishes that same inode
+with a directory-relative rename into a freshly UUID-named file. Every
+registry path component is opened without following symlinks, and the pinned
+`boards/` identity is reverified before the registry transaction commits. The
+receipt and immutable `board_adopted` event therefore describe the exact bytes
+registered, not a later path reopen. Use `--rootless` when the adopted board
+should have no registered root; otherwise pass the exact root you want recorded.
 
 If a registered tree is later moved and a symlink left where it was, the root
 row is now only a hint. `doctor` reports that stale root and where it leads
@@ -295,6 +669,11 @@ mode `0600` before SQLite opens them, so they are never briefly world-readable.
 Directories Kanban creates are `0700` from creation. Kanban never re-permissions
 a directory it did not create, so pointing `--db` at a shared path leaves that
 path alone ([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
+When the CLI runs as root inside a data directory owned by somebody else — the
+shape on hax, where `kb` over ssh is root while the data directory is owned by the
+`kanban` user — every file it creates or opens there, the `-wal` and `-shm`
+beside a board included, is given that directory's owner, so a root command
+cannot leave the service unable to open its own data.
 Check and back up all registered boards with:
 
 ```bash
@@ -342,14 +721,15 @@ Ranking fuses exact identifiers and phrases, SQLite FTS5/BM25, and a small
 deterministic local semantic model (`kanban-semantic-lite-v1`). The local model
 keeps retrieval private and offline; it is a retrieval aid, not a general
 embedding model. Missing or stale vector cache entries are computed in memory,
-so `search` remains read-only. Only `search-rebuild` persists the cache and
-writes an audit event. `--limit` and `--max-chars` bound agent context, and
+so `search` remains read-only. Incremental writes re-embed the documents they
+touch in the same transaction, and `search-rebuild` refreshes the whole corpus
+and writes an audit event. `--limit` and `--max-chars` bound agent context, and
 `--source`, `--status`, `--tag`, `--lane`, `--after`, `--before`, and `--all`
-filter it. `doctor` reports source/document/FTS parity plus cache freshness.
+filter it. `doctor` reports source/document/FTS parity plus cache freshness and
+fails when any document lacks a current embedding.
 
 The same command description generates the MCP `search` and `search_rebuild`
-tools. The served UI exposes cross-board search at `/search`; both surfaces call
-the same Rust retrieval implementation as the CLI. See
+tools, which call the same Rust retrieval implementation as the CLI. See
 [ADR-023](docs/adr/ADR-023-sqlite-native-hybrid-rag-search.md) and the
 [evaluation contract](docs/testing/rag-search-evaluation.md).
 
@@ -366,6 +746,18 @@ whatever touched it next — `doctor` included, which then reported the result
 healthy. Commands that do work on one board now refuse and name the recovery;
 `doctor`, `dashboard` and `backup` report the gap and carry on, and `backup`
 lists what it could not include under `missingBoards`.
+
+A board that is there and will not open is reported apart from one that is
+gone, because the two call for opposite moves: you recover a missing board by
+restoring a snapshot over its path, and doing that to an unreadable one
+overwrites intact data. Boards are created `0600`, so one written by another
+user is unreadable and perfectly healthy at the same time. `doctor` and
+`dashboard` carry `boardState` — `readable`, `unreadable` or `missing` — with
+the reason the read failed beside it; `backup`, `audit verify`, `search
+--all-boards` and `search-rebuild --all-boards` carry an `unreadableBoards`
+list alongside `missingBoards`. `doctor` and `audit verify` count an unreadable
+board as unhealthy: nothing about it was checked, and a tool that could not
+open a file cannot certify it.
 
 Import an existing atmux board into the currently registered project without
 writing to the source database:
@@ -424,7 +816,9 @@ Posting archives everything past the newest ten in that lane. Archived sitreps
 are hidden from the default read and returned by `--all`; **nothing is deleted**
 — archiving bounds the view, not the table. Provenance (worktree, branch, HEAD,
 root HEAD, dirty count) is captured rather than requested, and `context` carries
-a task's sitreps so a resuming agent gets them without going looking.
+a task's sitreps so a resuming agent gets them without going looking. A
+checkpoint, handoff, or sitrep written from outside a checkout is refused rather
+than stored blank; `kb-board` supplies the checkout for you.
 
 A task's `status` is a workflow state and always a `--status` flag; a *sitrep*
 is prose about a lane and always the `sitrep` command. The old `status` command
@@ -456,13 +850,13 @@ search with `--all`.
 ## Deployment ledger
 
 ```bash
-kb deploy start --repo geoyws/kanban --commit "$FULL_SHA" \
-  --tier @_p --environment production --host hax --url https://kb.geoy.ws \
+kb deploy start --repo geoyws/acies --commit "$FULL_SHA" \
+  --tier @_p --environment production --host hax --url https://acies.geoy.ws \
   --task "$TASK_ID" --operation-id "$OPERATION_ID" --as codex@driver --json
 
 kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
   --result succeeded --phase verification --served-commit "$FULL_SHA" \
-  --receipt "live release endpoint and served bundle matched" --as codex@driver --json
+  --receipt "live release endpoint matched" --as codex@driver --json
 
 kb deploy current --json
 kb deploy list --status failed --json
@@ -472,8 +866,48 @@ kb deploy show "$DEPLOYMENT_ID" --json
 Success is deliberately strict: it requires a live verification receipt and a
 served commit exactly equal to the requested full 40-character commit. A retry
 is a new attempt linked with `--retry-of`; an idempotent caller supplies
-`--operation-id`. See ADR-030. The cross-board live matrix is at
-`https://kb.geoy.ws/deployments`.
+`--operation-id`. See ADR-030.
+
+### Recovering an artifact whose build commit is unknown
+
+Some releases are a retained image and nothing else: no build SHA anyone can
+trust, and inventing one is the failure the ledger exists to prevent. Such an
+attempt names its identity explicitly instead.
+
+```bash
+kb deploy start --repo geoyws/legacy-stack \
+  --artifact "api=docker-image-id:sha256:$API_IMAGE_ID" \
+  --artifact "web=oci-manifest-digest:sha256:$WEB_MANIFEST_DIGEST" \
+  --build-commit unknown --deployer-checkout "$FULL_SHA" \
+  --tier @_p --environment production --host hax --url https://legacy.geoy.ws \
+  --as codex@driver --json
+
+kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
+  --result succeeded --phase verification \
+  --observed "api=docker-image-id:sha256:$API_IMAGE_ID" \
+  --observed "web=oci-manifest-digest:sha256:$WEB_MANIFEST_DIGEST" \
+  --receipt "pulled both images on the tier and read their identities" \
+  --as codex@driver --json
+```
+
+One mode per attempt, named by the caller: `--commit` is refused in artifact
+mode and `--artifact` in Git mode. `--build-commit unknown` is required rather
+than defaulted, so the absence is stated; a full 40-character SHA there is
+refused and sends you to `--commit`. A `KIND` is `docker-image-id` (a Docker
+config/image ID) or `oci-manifest-digest` (a registry manifest digest), and the
+two are never compared to each other. A succeeded finish needs one `--observed`
+per expected role, exact per role and per kind; a missing role, an extra role, a
+kind mismatch or a value mismatch is refused naming the role and both values,
+and `--served-commit` is refused outright, so a digest-only success cannot be
+recorded as a verified Git commit.
+
+`--deployer-checkout` is the checkout the deployer ran from. It is stored in its
+own field and is never presented as the build commit. Every projection —
+`deploy show/list/current --json`, the MCP tools, `kanban schema` and the
+Deployments page — carries `identityMode`, `buildCommit` (`unknown` here),
+`buildCommitLabel`, `deployerCheckout` and `artifacts[{role, kind, expected,
+observed}]`, and renders `build commit unknown - recovered by artifact identity`
+in words rather than a blank where a SHA would be. See ADR-043.
 
 ## Off-site backup
 
@@ -501,52 +935,19 @@ The decryption key is the **only** copy — `keys/kanban-backup-age.key` in the
 git-crypt'd dotfiles, which is where it must live, because it has to survive the
 loss of the machine the backups are taken from.
 
-## The web view
+## Subscriptions and dispatcher delivery
 
-```bash
-kanban serve --port 14200      # loopback only; no --bind flag exists
-```
-
-Eight server-rendered views over every registered board: open attention items
-across all of them by priority then age, the dashboard projection, draft plans
-with the work each holds back, the verified deployment matrix and attempt
-detail, cross-board cited search, one board's rows, and one task in full.
-Priority badges use P0/P1/P2 everywhere a queued row appears.
-Every read goes through the same `Store` methods the CLI calls, so there is no
-second implementation to keep in step.
-
-The Plans page can open an existing draft epic as `geo`, moving it to `todo` and
-releasing its child work for claims. This is the only browser write besides an
-attention reply: it requires a same-origin POST and refuses any row that is not
-currently a draft epic.
-
-The **Needs you** page is the deliberately narrow exception to the read-only
-surface: reply inline to resolve an attention item as `geo`. Same-origin checks,
-strict bounded form decoding and the Store's duplicate-resolution refusal guard
-the write. Quick replies are available on a phone without removing free text.
-Every other route remains read-only, enforced by the source mutator allowlist
-and byte-for-byte process-boundary tests.
-
-`/live` is a WebSocket notification channel. It sends only revision notices and
-heartbeats; the browser fetches the canonical server-rendered page after a board
-changes. It never sends board content, cookies, credentials or lease tokens, and
-it defers a refresh while a reply is being typed. The compatibility socket
-stays on `/live`; the canonical long-running subscription is `kb watch`, which
-reads the append-only ledgers directly and leaves `kb events` as the newest-
-first snapshot view. `kb watch` uses the additive protocol-v1 envelope and the
-same fail-closed cursor rules described in ADR-031.
-
-Durable delivery intent is managed separately from the live process:
+Durable delivery intent is managed separately:
 
 ```bash
 kb subscription add --project NAME --id sub-codex-queue \
   --subject task:t-12345678 --kind checkpoint_added --tag orchestration \
   --consumer codex.queue --action enqueue-turn \
   --timeout-ms 30000 --max-retries 3 --rate-per-minute 60 \
-  --max-concurrency 1 --secret-ref codex_queue_token --as geo --json
+  --max-concurrency 1 --secret-ref codex_queue_token --as geoyws --json
 kb subscription list --project NAME --json
-kb subscription pause sub-codex-queue --project NAME --as geo --json
-kb subscription resume sub-codex-queue --project NAME --as geo --json
+kb subscription pause sub-codex-queue --project NAME --as geoyws --json
+kb subscription resume sub-codex-queue --project NAME --as geoyws --json
 ```
 
 Subscriptions are board-local declarative records. The selected board is the
@@ -573,6 +974,58 @@ ingress is `/root/.local/bin/codex queue --thread UUID_OR_EXACT_SESSION_NAME
 --message TEXT` when `codex-cli 0.150.1` is installed. This contract is not
 itself the live-smoke receipt; the separately named HAX live smoke receipt is
 the distinct runtime check for installed Codex support.
+
+The second experimental and opt-in bridge uses consumer `codex.app-server`,
+action `start-readonly-turn`, and capability `start`, implemented by
+`kanban-codex-app-server-adapter`. The host allow-list binding
+is installed, but this rollout enables no active declarative subscription.
+When the dispatcher invokes it, the adapter still accepts a structured
+`AdapterRequest` and returns `AdapterResponse`; that is the normal dispatcher
+path, not a general subscription bypass. Its operator synopsis, pins, and
+fail-closed rules live in `docs/PRD.md`; the architecture and acceptance
+matrix live in
+`docs/adr/ADR-031-ledger-first-pubsub-uses-the-append-only-event-ledger.md`.
+The host pins Codex CLI `0.150.1`, the `ClientRequest` hash
+`efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, and the
+combined v2 schema hash
+`8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`; each
+invocation clears child environment except `CODEX_HOME`, probes version/help,
+and emits only `AdapterResponse` on success.
+
+**HAX live smoke receipt, 2026-09-05.** Installed-Codex support is now
+established for this bridge, and separately from the compiled fake-Codex
+contract test. Against `@@hax`'s installed `codex-cli 0.150.1`, the host's own
+`dispatchers.json` binding was invoked with one structured `AdapterRequest`
+(subscription `smoke-t-560b778b`, a 64-hex event ID) and exited `0` in ~6s
+having written only an `AdapterResponse` to stdout and nothing to stderr. The
+turn mutated nothing: the private cwd
+`/root/.local/share/kanban/codex-app-server-cwd` was byte-for-byte the same
+directory listing before and after, the host's tmux panes and their foreground
+commands were unchanged, and the adapter's identity-pinned schema temp dir was
+removed — a `find /tmp -newermt '-3 minutes'` sweep for its own scratch
+returned nothing. A malformed request is still refused rather than coerced:
+a non-hex event ID exits `1` with `adapter delivery event ID must be
+lowercase 64-hex` and never reaches Codex. The interface stays **experimental
+and opt-in** after this receipt, and no active declarative subscription ships.
+
+The third opt-in bridge uses consumer `claude.print`, action
+`start-readonly-turn`, and capability `start`, implemented by
+`kanban-claude-print-adapter`. No active declarative subscription ships.
+Host-local configuration pins the canonical Claude executable, private
+`HOME`, private cwd, and required Claude Code version (the HAX stable version
+is `2.1.236`). Every invocation revalidates those identities and ancestor
+chains, probes the exact version and required help surface, clears the child
+environment to exactly `HOME` and `PATH=/usr/bin:/bin`, and starts a fresh
+`--safe-mode --print` worker with no tools, MCP, persistence, or permission
+prompts. It never resumes a foreground session. Only bounded subscription and
+event IDs enter the exact acknowledgement prompt. Success requires strict
+object-or-array JSON whose final result is that exact acknowledgement, with no
+tool evidence, API error, stderr, trailing JSON, overflow, or mismatch; adapter
+stdout is then only `AdapterResponse`. Compiled adapter-contract coverage uses
+a dependency-free fake Claude. Installed-Claude support requires a separately
+named live smoke and is not established by that compiled test.
+The installed-Claude live smoke is currently blocked by revoked OAuth attention
+`a-347ff24c`; the adapter does not work around authentication.
 
 The declaration-only phase historically stopped there. The shipped delivery
 worker is now a separate compiled process with one explicit board selector:
@@ -606,20 +1059,47 @@ is recovered after lease expiry. Delivery is therefore at-least-once, with
 immutable identity `(subscriptionID,eventID)` as the idempotency key rather
 than an exactly-once promise.
 
-Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
-The persisted target edge is nginx `auth_request` backed by the shared Google
-SSO at `https://kb.geoy.ws`; only `geoyws@gmail.com` is allowed, and the
-`.geoy.ws` session cookie is shared with Paste, Snip and Docs. The
-`kanban-serve.service` keeps the process up. There is deliberately no `--bind`
-flag — any value other than loopback publishes an unauthenticated surface.
-Reasoning: `docs/adr/ADR-016-*`.
-
 ## Short names
 
-The crate installs `kanban` and `kb` as two names for the same operator CLI,
-plus the separate `kanban-dispatcher` worker. `kb` is a real binary rather than
-a shell alias because agents invoke it from non-interactive cages that never
-source a shell profile.
+The crate installs ten executables, and the HIG release package ships all ten:
+`kanban` and `kb` are two names for the same operator CLI, alongside
+`kanban-dispatcher`, `kanban-codex-queue-adapter`,
+`kanban-codex-app-server-adapter`, `kanban-claude-print-adapter`,
+`kanban-opencode-adapter`, `kanban-kimi-acp-adapter`,
+`kanban-cursor-worker-adapter`, and `kanban-zcode-notify-adapter`. `kb` is a
+real binary rather than a shell alias because agents invoke it from
+non-interactive cages that never source a shell profile.
+
+Installing a release flips `current` and relinks all ten public binaries.
+Before it writes the release receipt, it checks every retained executable in
+the new `releases/<id>` (each one's version probe and platform), because the
+receipt is the commit: nothing after it rolls the install back. A check that
+fails restores the previous `current` and links and removes the candidate's
+directory; a first install with nothing to fall back to removes the links it
+made. No service is restarted, because the installer manages none: the web
+view and `kanban serve` were retired (ADR-053, epic `e-caeb1449`), and each
+`kb`/`kanban` invocation runs whatever binary the links point at when it
+starts.
+
+A receipt from before that retirement may name a `bundleSha256`, the
+fingerprint of the operator UI the binary then embedded (ADR-048). The
+installer still honours it: such a receipt installs only if the installed
+`kanban --version` prints the same `bundle <sha256>` line. A release built
+after the retirement carries no bundle and its receipt names none, so it
+proves one thing less and installs exactly as before.
+
+`hig-release.sh rollback` flips `current` and the links back to a retained
+release through the same checks.
+
+What none of this can undo is a schema migration. Rolling the CODE back does
+not roll a store back: a release that has already opened a board migrates it,
+and the older binary the recovery restores may then be unable to read it. In
+that case the recovery is simply unproved — the failure is reported next to
+the original one, the candidate release is kept on disk, and nothing is
+repointed at it automatically. No database is rolled back or restored by the
+release path, ever; a store that has moved forward is an operator decision
+with the backups (`kb backup`, `kb restore`), not something an installer may
+make on its own.
 
 Commands and subcommands have short forms:
 
@@ -656,6 +1136,13 @@ claim heartbeat when there is one and from `updated_at` otherwise, and
 `highestPriorityLevel`, and orders projects by that priority then the oldest
 row at the level. Projects with no queued work sink to the end.
 
+`kb dashboard` also carries `gatedTasks` per project: the unarchived,
+unfinished task rows waiting on a completion gate, whether declared on the row
+or inherited from a plan above it. It sits beside `taskCounts` rather than
+inside it, because `taskCounts` is the raw status tally and a gated `todo` row
+is still `todo` — subtracting or renaming it would leave the board's own
+arithmetic not adding up.
+
 ```bash
 kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]
 kb events --kind lease_seized
@@ -679,7 +1166,25 @@ kb audit verify --against <SNAPSHOT>/manifest.json --json
 `restore` verifies the manifested file set, byte digests and audit chains
 before it touches live state, refuses without `--force`, and writes a
 `pre-restore-<stamp>` rescue snapshot of
-what it replaced, including its own manifest. The receipt names the restored
+what it replaced, including its own manifest. It creates no rescue directory and
+touches no board file until it has classified every path it is about to write.
+What it overwrites is `<root>/boards/<file name>` for each board in the
+snapshot — decided by the snapshot and the filesystem, not by the registry, so
+a file the registry no longer lists is still rescued before being replaced.
+
+The test at each of those paths is whether the file can be *copied*, not
+whether it is a healthy board, because a rescue copy needs the bytes and
+nothing more. A board that opens is copied with SQLite's online backup, which
+is WAL-correct. Anything else readable — corrupt pages, a damaged header, a
+file that was never a board — is copied verbatim into `unparsed/` in the rescue
+snapshot and listed under `unparsedFiles` in its manifest and `rescuedUnparsed`
+in the receipt, so it is replaced but never silently. That matters because a
+corrupt board is the disaster `restore` exists for: refusing to run on one
+would block the only command that recovers it. `restore` refuses only when a
+file's bytes cannot be read at all, which is the one case where no copy is
+possible — and then the message says the data is very likely intact, because
+nothing opened the file to find otherwise. Fix the permissions and run it
+again, or move the file aside. The receipt names the restored
 and rescue journal heads, so a deliberate rollback remains visible. It also takes
 the data root exclusively and refuses outright while any other kanban process
 holds it — you do not have to remember to stop them. `--keep` prunes only the
@@ -736,6 +1241,28 @@ interpreted unambiguously is refused rather than guessed
   matters most, the marker used to be the first thing cut. `--max-chars` with
   `--json` is an error, because it bounds the rendered text and never bounded
   the packet.
+- **A capped listing refuses a default it would exceed.** `events` (50),
+  `sitrep list` (20), `search` (10), `attention list`, `deploy list`,
+  `handoff list` and `claim --candidates` (100), and `task show`'s notes (100),
+  checkpoints (20) and handoffs (100) each fetch one row past their default;
+  if it is there and no `--limit` was given, the listing exits non-zero and
+  names `--limit N` rather than handing back a page that reads as the whole.
+  `attention list --json` once returned exactly 100 rows that a session
+  report called "100 open attention" when there were 157. Exactly the default
+  with nothing past it is complete and answered as such — the extra row is
+  looked for, never inferred from the count — and an explicit `--limit` is
+  honoured as stated, with no marker in the payload
+  ([ADR-037](docs/adr/ADR-037-truncated-listings-refuse-a-default-limit-they-exceed.md)).
+- **`--limit` is bounded at 1000000, and that is a typo guard.** Every surface
+  that takes the flag — `events`, `search`, `watch`, `attention list`,
+  `sitrep list`, `deploy list`, `handoff list`, `claim --candidates`,
+  `task show` — refuses a value above the ceiling with one wording, and the
+  ceiling is past every board this tool holds, so it is effectively unbounded
+  for real use and catches a slipped keystroke rather than turning it into a
+  query. Defaults are unchanged. `events` alone names an explicit `--limit`
+  that cut, on stderr, in one line; stdout stays exactly the rows asked for and
+  the exit status stays zero, because a page of history that stops at the limit
+  reads as the whole history (ADR-037 addendum, 2026-09-08).
 - **A restore cannot race live work.** `restore` is the one operation that goes
   around SQLite, renaming whole database files into place. It now takes the
   data root exclusively and refuses while anything else holds it; board
@@ -743,6 +1270,15 @@ interpreted unambiguously is refused rather than guessed
   meets a restore in progress waits five seconds and then says so rather than
   reading a half-replaced root. A board named by path outside the data root
   (`--db /tmp/scratch.db`) is untouched by any of this.
+- **A `--json` refusal is JSON on stdout.** Every refusal exits non-zero and
+  names its fix on stderr; with `--json` the same message also reaches stdout
+  as `{"error": "…"}`, and nothing else does. `claim --candidates --json`
+  without `--as` used to leave stdout empty, so a consumer piping it into a
+  parser read a valid-looking empty candidate list while P0 rows sat in todo.
+  The one shape that differs is a command whose report *is* the answer:
+  `doctor` and `audit verify` print their JSON report and then exit non-zero
+  to say it was unhealthy, so no error object follows it and the report stays
+  parseable.
 
 Overrides are reviewable, because forcing one writes durable history:
 
@@ -779,11 +1315,31 @@ See the [product requirements](docs/PRD.md),
 ## Development
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+./scripts/release-gate.sh
 cargo build --release --locked
 ```
+
+`scripts/release-gate.sh` is the mechanical gate — one command, so the
+documented gate and the enforced gate cannot drift. It runs
+`cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked --lib` (including the two ignored fixed-descriptor
+remap tests, serially), the pinned `skills/kb` package's own wrapper tests,
+and then every integration target one at a time with `--test-threads=1`,
+ending with `e2e` — because `e2e` drives a real Chrome and must never run
+concurrently with another cargo command. `KANBAN_CHROME` passes through it
+to name that browser on a host whose system Chrome is broken. It goes green
+because the system became true, never because a measurement was loosened:
+too slow means faster or serialized, never sampled, which is why it carries
+no skip, sample or quick flag. Step order and reasons are written out in
+[`docs/testing/compiled-rust-e2e-matrix.md`](docs/testing/compiled-rust-e2e-matrix.md).
+
+A change to product behaviour has a
+precondition before it: `/quality spec` runs before implementation, and the
+specification, tests, code and trace row land in one change — see
+[`AGENTS.md`](AGENTS.md) §"Specification before implementation", the
+conventions in [`docs/specs/README.md`](docs/specs/README.md), and
+[ADR-047](docs/adr/ADR-047-kanban-adopts-specification-driven-development.md).
 
 `cargo test` runs unit tests for the pure logic (flag validation, the
 nearest-match hint, the alias tables, context trimming) alongside the E2E

@@ -1,9 +1,10 @@
-use crate::WATCH_BATCH_LIMIT;
+use crate::db::read_snapshot;
 use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
-use crate::registry::{Registry, data_root};
+use crate::registry::{BoardPathState, Registry, data_root, retired_board_message};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -16,14 +17,17 @@ const METADATA_LIMIT: usize = 16 * 1024;
 const REGISTRY_EVENT_KINDS: &[&str] = &[
     "rule_added",
     "rule_consolidated",
+    "rule_imported",
     "rule_retired",
     "rule_updated",
     "snapshot_restored",
     "workspace_alias_name_discarded",
     "workspace_attached",
     "workspace_detached",
+    "workspace_retired",
     "workspace_registered",
     "workspace_repointed",
+    "workspace_unretired",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +103,9 @@ enum Source {
         path: PathBuf,
         board_name: Option<String>,
     },
-    Registry,
+    Registry {
+        root: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -117,10 +123,16 @@ pub(crate) fn run(args: &super::Args) -> Result<()> {
 }
 
 fn resolve(args: &super::Args) -> Result<WatchSpec> {
-    resolve_with_source(args, super::direct_db(args))
+    resolve_with_source(args, super::direct_board(args))
 }
 
-fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result<WatchSpec> {
+/// `direct_board` carries whether the caller named the path or `KANBAN_DB` did,
+/// because the board guard says different things about the two and `watch`
+/// opens the file itself instead of going through `store_path_readonly`.
+fn resolve_with_source(
+    args: &super::Args,
+    direct_db: Option<(PathBuf, bool)>,
+) -> Result<WatchSpec> {
     let task = args.one("task").map(str::to_owned);
     let rule = args.one("rule").map(str::to_owned);
     let registry = args.has("registry");
@@ -135,10 +147,12 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
     let current_statuses = normalize_statuses(args.many("current-status"), "--current-status")?;
     let tags = normalized(args.many("tag"));
     let follow = args.has("follow");
+    // `Args::limit` holds this to LIMIT_CEILING like every other surface; a
+    // batch is a SQL `LIMIT`, not a preallocated buffer, so a caller who asks
+    // for a million gets whatever the board actually has. Zero under
+    // `--follow` is the one shape that is refused: a follow that fetches
+    // nothing per poll would sit there forever reporting nothing.
     let limit = args.limit(50)?;
-    if limit > WATCH_BATCH_LIMIT {
-        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
-    }
     if follow && limit == 0 {
         bail!("--follow requires --limit to be at least 1");
     }
@@ -161,8 +175,9 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
                 "--project, --workspace and --db address boards; registry watch uses the registry trail"
             );
         }
-        let registry_path = registry_source()?;
-        let registry_reader = Registry::open_readonly()?;
+        let registry_root = data_root()?;
+        let registry_path = registry_source(&registry_root)?;
+        let registry_reader = Registry::open_readonly_at(&registry_root)?;
         validate_kinds(&kinds, REGISTRY_EVENT_KINDS, |kind| {
             registry_reader.event_kind_exists(kind)
         })?;
@@ -188,7 +203,9 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
                 archived: false,
             },
         )?;
-        let source = Source::Registry;
+        let source = Source::Registry {
+            root: registry_root,
+        };
         ensure_cursor_within_head(&source, cursor)?;
         return Ok(WatchSpec {
             source,
@@ -211,7 +228,21 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
         });
     }
 
-    let (board_path, board_name) = if let Some(path) = direct_db {
+    let (board_path, board_name) = if let Some((path, explicit)) = direct_db {
+        // `Store::open_readonly` cannot create a file — it passes
+        // SQLITE_OPEN_READ_ONLY — so this branch was safe by accident, and said
+        // so with a raw `Error code 14`. The guard makes the safety deliberate
+        // and the diagnosis the same one every other board path gives.
+        super::require_board_file(&path, explicit, super::BoardCreation::Refused)?;
+        if path.exists()
+            && let Some(BoardPathState::Retired { name, note }) =
+                Registry::board_path_state_if_available(&path)?
+        {
+            bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            );
+        }
         (path, None)
     } else {
         let path = super::store_path_readonly(args)?;
@@ -220,7 +251,7 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
     };
     let board_source = canonical_source_path(&board_path)?;
     let archived = args.has("all");
-    let store = Store::open_readonly(&board_path)?;
+    let store = Store::open_readonly_as_caller(&board_path)?;
     if let Some(task_id) = task.as_deref()
         && !store.watch_subject_exists(task_id)?
     {
@@ -299,70 +330,393 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
     })
 }
 
+/// What one poll observed, taken from a single database snapshot.
+///
+/// `tail_seq` is the furthest sequence the poll may move the cursor to
+/// without delivering: every row up to it is a known non-match — either the
+/// filtered scan examined it in this snapshot and rejected it, or the
+/// filtered scan's SQL could never have materialised it (a kinds, task or
+/// archival mismatch) and the tail walk confirmed it. That is what makes it
+/// safe to move the cursor there: the rows being stepped over were ruled
+/// out, not rows that arrived after the scan had already run.
+struct Poll {
+    batch: Vec<Event>,
+    tail_seq: Option<i64>,
+}
+
+/// Read one poll's batch and advance from one board snapshot, under authority
+/// minted after that snapshot is pinned.
+///
+/// The board arm uses one bounded `Store::events_since_filtered_tail` scan and
+/// one bounded unfiltered walk in the same snapshot. A commit landing mid-poll
+/// is invisible to both reads and picked up by the next poll; no tail may skip
+/// an event that arrived after the filtered scan.
+///
+/// The initial open checks whole-board access before exposing SQLite bytes.
+/// `read_snapshot_as_caller` then pins the board snapshot and re-mints the
+/// caller's row authority before either scan. Otherwise a re-grant and event
+/// commit between the initial mint and the snapshot could be filtered under
+/// stale authority, while the tail advances past the event permanently.
+fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
+    match &spec.source {
+        Source::Board { path, .. } => {
+            let mut store = before_snapshot(Store::open_readonly_as_caller(path)?);
+            store.read_snapshot_as_caller(path, |store| poll_board_once(store, spec, cursor))
+        }
+        Source::Registry { root } => {
+            // No authority race here: registry rule events carry no per-row
+            // authority, so there is no mint for a snapshot to postdate.
+            let registry = Registry::open_readonly_at(root)?;
+            read_snapshot(&registry, |registry| {
+                let batch = registry.rule_events_since_filtered(
+                    spec.key.selector_value.as_deref(),
+                    &spec.key.kinds,
+                    cursor,
+                    spec.limit,
+                )?;
+                let tail_seq = if batch.is_empty() && spec.follow {
+                    registry
+                        .rule_events_since(
+                            spec.key.selector_value.as_deref(),
+                            None,
+                            between_scans(&registry.connection, cursor),
+                            spec.limit,
+                        )?
+                        .last()
+                        .map(|event| event.seq)
+                } else {
+                    None
+                };
+                Ok(Poll { batch, tail_seq })
+            })
+        }
+    }
+}
+
+/// One board poll's batch and advance from an already-open store.
+///
+/// Split from [`poll_once`] so tests can drive the managed-estate path:
+/// `poll_once` resolves its authority from the kernel and the canonical
+/// registry, which a unit test cannot mint, while this takes the store
+/// as-is — including one opened with an explicit managed context. The
+/// production path is unchanged: open, snapshot, delegate.
+fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll> {
+    // The filtered scan examines a bounded raw stretch and reports how far
+    // it got; the unfiltered walk then extends that frontier past rows the
+    // scan never materialised. Both reads sit in the caller's one snapshot,
+    // so a commit landing mid-poll is invisible to both and is picked up
+    // whole by the next poll. (The two reads used to run on two connections
+    // opened moments apart — two snapshots — and a matching event committing
+    // between them was invisible to the filtered scan and visible to the
+    // tail, which advanced the cursor past it: never delivered, never
+    // reported missing. The registry arm still has that two-scan shape and
+    // keeps its seam test; the board arm's filtered scan is capped but the
+    // window it shares with its walk is still exactly one snapshot.)
+    let tail = store.events_since_filtered_tail(
+        spec.key.selector_value.as_deref(),
+        &spec.key.kinds,
+        &spec.key.relations,
+        &spec.key.prior_statuses,
+        &spec.key.current_statuses,
+        &spec.key.tags,
+        cursor,
+        spec.limit,
+        spec.key.archived,
+    )?;
+    // The walk starts at the scan frontier, never back at the cursor: the
+    // scan already examined every row up to `scanned_through`, so starting
+    // lower re-covers them one `limit` at a time and drags a `--limit 1`
+    // follower to a crawl across a long denied stretch. From the frontier
+    // it steps only over rows the filtered scan never materialised: its SQL
+    // binds the kinds, task, archival and semantic predicates, so a row
+    // those reject is a known non-match without ever being read. The walk
+    // stops at the first row past the frontier that MIGHT still match —
+    // stepping over that one could skip a visible row the capped scan has
+    // not reached — so the cursor only ever covers ruled-out rows.
+    let mut advance = tail.scanned_through;
+    if tail.events.is_empty() {
+        for event in store.events_since(
+            None,
+            between_scans(&store.connection, tail.scanned_through),
+            spec.limit,
+            spec.key.archived,
+        )? {
+            if statically_rejected(&spec.key, &event) {
+                advance = event.seq;
+            } else {
+                break;
+            }
+        }
+    }
+    // The `follow` gate is gone only under managed enforcement: a one-shot
+    // poll behind a denied stretch longer than the raw cap would otherwise
+    // come back empty with no cursor, and a consumer re-running
+    // `kb watch --cursor C` would re-read the same denied rows forever. The
+    // stream emits this advance as one `advanced` heartbeat — the envelope
+    // ADR-031 already obliges consumers to persist — so each run walks one
+    // more bounded page. Only a managed scan caps its raw work per poll, so
+    // only there can an empty batch hide a denied stretch worth walking;
+    // anywhere else an empty one-shot stays silent, byte-identical to
+    // before. Still silent when nothing moved: an empty poll at the head
+    // carries no cursor either way.
+    let tail_seq =
+        if tail.events.is_empty() && advance != cursor && (spec.follow || store.is_enforcing()) {
+            Some(advance)
+        } else {
+            None
+        };
+    Ok(Poll {
+        batch: tail.events,
+        tail_seq,
+    })
+}
+
+/// Whether this row can never match the poll's static predicates.
+///
+/// Only the equality predicates the SQL binds verbatim — kinds, task and
+/// archival — are answered here, from the same key the SQL was built from,
+/// so the two cannot disagree. The semantic predicates (relations, statuses,
+/// tags) stay SQL-side: a row those alone would reject is NOT reported
+/// rejected here, and the advance walk stops instead. That is conservative —
+/// the cursor may wait one more poll for the filtered scan's own examined
+/// range to carry it past such a row — and conservatism there is correctness,
+/// because guessing a JSON predicate in Rust is how a visible row gets
+/// skipped.
+fn statically_rejected(key: &StreamKey, event: &Event) -> bool {
+    if !key.kinds.is_empty() && !key.kinds.iter().any(|kind| kind == &event.kind) {
+        return true;
+    }
+    if let Some(task) = key.selector_value.as_deref()
+        && event.task_id.as_deref() != Some(task)
+    {
+        return true;
+    }
+    if event.archived && !key.archived {
+        return true;
+    }
+    false
+}
+
+/// Runs after a poll's filtered scan and before its tail walk, inside the
+/// poll's snapshot. Empty in every build but the unit tests, which use it
+/// to commit an event into exactly the window a two-snapshot poll used to
+/// leak. The board arm hands it the scan frontier — the walk starts there,
+/// not at the cursor — while the registry arm hands it the cursor, so only
+/// the registry arm can shift what the walk then reads.
+///
+/// It returns the cursor the tail scan reads from, and is `#[must_use]`, so the
+/// tail scan consumes its result and the seam cannot drift after the tail scan
+/// without the build going red. A seam that silently slid out of the window
+/// would leave the race test asserting nothing while still passing.
+#[must_use]
+#[cfg(not(test))]
+fn between_scans(_connection: &Connection, cursor: i64) -> i64 {
+    cursor
+}
+/// Fires inside the poll's snapshot, between the two scans, and returns the
+/// cursor the tail walk then reads from.
+#[cfg(test)]
+type BetweenScansHook = Box<dyn FnMut(&Connection, i64) -> i64>;
+
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_SCANS: std::cell::RefCell<Option<BetweenScansHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[must_use]
+#[cfg(test)]
+fn between_scans(connection: &Connection, cursor: i64) -> i64 {
+    let hook = BETWEEN_SCANS.with(|slot| slot.borrow_mut().take());
+    match hook {
+        Some(mut hook) => {
+            let cursor = hook(connection, cursor);
+            BETWEEN_SCANS.with(|slot| *slot.borrow_mut() = Some(hook));
+            cursor
+        }
+        None => cursor,
+    }
+}
+
+/// Install (or clear) the hook a poll runs between its two scans.
+///
+/// The hook is handed the reader connection, so a test can measure what the
+/// poll's snapshot exposes while the window is open, and it returns the cursor
+/// the tail scan then reads from, so a test can prove the tail really does read
+/// through this point rather than around it.
+#[cfg(test)]
+fn set_between_scans(hook: Option<BetweenScansHook>) {
+    BETWEEN_SCANS.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Uninstalls the hook when it drops, including on the way out of a panic.
+///
+/// The hook lives in a thread-local, and the test harness reuses threads under
+/// `--test-threads=1`, so a panicking test that cleared the hook on its last
+/// line would leave it installed for whatever ran next.
+#[cfg(test)]
+struct BetweenScans;
+
+#[cfg(test)]
+impl Drop for BetweenScans {
+    fn drop(&mut self) {
+        set_between_scans(None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_between_scans(hook: BetweenScansHook) -> BetweenScans {
+    set_between_scans(Some(hook));
+    BetweenScans
+}
+
+/// Runs after a board poll's gate mint and open, before its snapshot is
+/// pinned. Empty in every build but the unit tests, which use it to re-grant
+/// authority and commit an event into exactly the window where a poll judging
+/// rows under its gate mint used to withhold them.
+///
+/// It takes and returns the store the snapshot then reads from, and is
+/// `#[must_use]`, so it can only sit between the open and the snapshot.
+#[must_use]
+#[cfg(not(test))]
+fn before_snapshot(store: Store) -> Store {
+    store
+}
+
+#[cfg(test)]
+type BeforeSnapshotHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SNAPSHOT: std::cell::RefCell<Option<BeforeSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[must_use]
+#[cfg(test)]
+fn before_snapshot(store: Store) -> Store {
+    let hook = BEFORE_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook();
+        BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+    store
+}
+
+/// Uninstalls the before-snapshot hook when it drops, panics included, for
+/// the same thread-reuse reason as [`BetweenScans`].
+#[cfg(test)]
+struct BeforeSnapshot;
+
+#[cfg(test)]
+impl Drop for BeforeSnapshot {
+    fn drop(&mut self) {
+        BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_before_snapshot(hook: BeforeSnapshotHook) -> BeforeSnapshot {
+    BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    BeforeSnapshot
+}
+/// Test-only seam inside Store's pinned snapshot, before the registry mint.
+/// The reader lets a test prove that a concurrent commit remains invisible.
+#[cfg(test)]
+type AfterSnapshotHook = Box<dyn FnMut(&Connection)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SNAPSHOT: std::cell::RefCell<Option<AfterSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn after_snapshot_before_mint(reader: &Connection) {
+    let hook = AFTER_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(reader);
+        AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
+
+#[cfg(test)]
+struct AfterSnapshot;
+
+#[cfg(test)]
+impl Drop for AfterSnapshot {
+    fn drop(&mut self) {
+        AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_after_snapshot(hook: AfterSnapshotHook) -> AfterSnapshot {
+    AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    AfterSnapshot
+}
+
 fn watch(spec: WatchSpec) -> Result<()> {
+    stream(&spec, &mut emit)
+}
+
+/// The follow loop, with its output behind a sink.
+///
+/// Split from `watch` so the cursor this loop publishes is measurable. The
+/// `advanced` heartbeat is the only place a cursor moves without an event being
+/// delivered, so if it encodes the wrong sequence a consumer either re-reads
+/// rows forever or steps over rows it never saw — and stdout is the only place
+/// that is visible. A sink that returns `Err` ends the stream, which is the
+/// same path a closed pipe already takes in production.
+fn stream(spec: &WatchSpec, sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>) -> Result<()> {
+    stream_with(spec, sink, &mut |spec, cursor| poll_once(spec, cursor))
+}
+
+/// The follow loop with its poll behind a seam.
+///
+/// Production passes [`poll_once`], which resolves its authority from the
+/// kernel and the canonical registry. Tests pass a closure over a store
+/// they opened themselves — the only way to drive the managed-estate path,
+/// where tag-denied rows exercise the scan floor and the one-shot
+/// heartbeat, through the real loop rather than a test-only copy of it.
+fn stream_with(
+    spec: &WatchSpec,
+    sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>,
+    poll: &mut dyn FnMut(&WatchSpec, i64) -> Result<Poll>,
+) -> Result<()> {
     let mut cursor = spec.cursor;
     let mut cursor_token = encode_cursor(&spec.key, cursor)?;
     loop {
-        let batch = match &spec.source {
-            Source::Board { path, .. } => {
-                let store = Store::open_readonly(path)?;
-                store.events_since_filtered(
-                    spec.key.selector_value.as_deref(),
-                    &spec.key.kinds,
-                    &spec.key.relations,
-                    &spec.key.prior_statuses,
-                    &spec.key.current_statuses,
-                    &spec.key.tags,
-                    cursor,
-                    spec.limit,
-                    spec.key.archived,
-                )?
-            }
-            Source::Registry => {
-                let registry = Registry::open_readonly()?;
-                registry.rule_events_since_filtered(
-                    spec.key.selector_value.as_deref(),
-                    &spec.key.kinds,
-                    cursor,
-                    spec.limit,
-                )?
-            }
-        };
-        if batch.is_empty() {
-            if !spec.follow {
-                return Ok(());
-            }
-            let tail = match &spec.source {
-                Source::Board { path, .. } => Store::open_readonly(path)?.events_since(
-                    spec.key.selector_value.as_deref(),
-                    None,
-                    cursor,
-                    spec.limit,
-                    spec.key.archived,
-                )?,
-                Source::Registry => Registry::open_readonly()?.rule_events_since(
-                    spec.key.selector_value.as_deref(),
-                    None,
-                    cursor,
-                    spec.limit,
-                )?,
-            };
-            if let Some(event) = tail.last()
-                && needs_advanced_heartbeat(Some(cursor), event.seq)
+        let poll = poll(spec, cursor)?;
+        if poll.batch.is_empty() {
+            if let Some(tail_seq) = poll.tail_seq
+                && needs_advanced_heartbeat(Some(cursor), tail_seq)
             {
-                cursor = event.seq;
+                cursor = tail_seq;
                 cursor_token = encode_cursor(&spec.key, cursor)?;
-                emit(&WatchEnvelope {
+                sink(&WatchEnvelope {
                     version: PROTOCOL_VERSION,
                     scope: scope_envelope(&spec.key, board_name(&spec.source)),
                     cursor: cursor_token.clone(),
                     kind: "heartbeat",
                     payload: json!({"state":"advanced"}),
                 })?;
+                // One shot behind a denied stretch reports its progress as
+                // this single heartbeat and stops; the caller re-runs from
+                // the persisted cursor to walk the next page.
+                if !spec.follow {
+                    return Ok(());
+                }
                 sleep(POLL_INTERVAL);
                 continue;
             }
-            emit(&WatchEnvelope {
+            if !spec.follow {
+                return Ok(());
+            }
+            sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
                 scope: scope_envelope(&spec.key, board_name(&spec.source)),
                 cursor: cursor_token.clone(),
@@ -372,10 +726,10 @@ fn watch(spec: WatchSpec) -> Result<()> {
             sleep(POLL_INTERVAL);
             continue;
         }
-        for event in batch {
+        for event in poll.batch {
             cursor = event.seq;
             cursor_token = encode_cursor(&spec.key, cursor)?;
-            emit(&WatchEnvelope {
+            sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
                 scope: scope_envelope(&spec.key, board_name(&spec.source)),
                 cursor: cursor_token.clone(),
@@ -396,7 +750,7 @@ fn needs_advanced_heartbeat(emitted_cursor: Option<i64>, scan_cursor: i64) -> bo
 fn board_name(source: &Source) -> Option<String> {
     match source {
         Source::Board { board_name, .. } => board_name.clone(),
-        Source::Registry => None,
+        Source::Registry { .. } => None,
     }
 }
 
@@ -422,7 +776,7 @@ fn event_payload(event: Event, source: &Source) -> Result<Value> {
         Source::Board { path, board_name } => {
             project_board_event(event, path, board_name.as_deref())
         }
-        Source::Registry => project_event(event, None),
+        Source::Registry { .. } => project_event(event, None),
     }
 }
 
@@ -755,7 +1109,7 @@ fn decode_cursor(raw: &str, expected: &StreamKey) -> Result<i64> {
 fn ensure_cursor_within_head(source: &Source, cursor: i64) -> Result<()> {
     let head = match source {
         Source::Board { path, .. } => board_head(path)?,
-        Source::Registry => registry_head()?,
+        Source::Registry { root } => registry_head(root)?,
     };
     if cursor > head {
         bail!("--cursor {cursor} is ahead of the current ledger head {head}");
@@ -763,8 +1117,14 @@ fn ensure_cursor_within_head(source: &Source, cursor: i64) -> Result<()> {
     Ok(())
 }
 
+/// The board's current ledger head, for the `--cursor` bound.
+///
+/// Board-scope read: the head is a sequence number, and telling an
+/// unauthorized caller how much traffic a board carries is still telling it
+/// something about a board it may not read.
 fn board_head(path: &Path) -> Result<i64> {
-    let store = Store::open_readonly(path)?;
+    let store = Store::open_readonly_as_caller(path)?;
+    store.require_board_read()?;
     Ok(store
         .connection
         .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
@@ -772,8 +1132,8 @@ fn board_head(path: &Path) -> Result<i64> {
         })?)
 }
 
-fn registry_head() -> Result<i64> {
-    let registry = Registry::open_readonly()?;
+fn registry_head(root: &Path) -> Result<i64> {
+    let registry = Registry::open_readonly_at(root)?;
     Ok(registry.connection.query_row(
         "SELECT COALESCE(MAX(seq),0) FROM rule_events",
         [],
@@ -789,17 +1149,20 @@ fn canonical_source_path(path: &Path) -> Result<String> {
         .into_owned())
 }
 
-fn registry_source() -> Result<String> {
-    canonical_source_path(&data_root()?.join("registry.db"))
+fn registry_source(root: &Path) -> Result<String> {
+    canonical_source_path(&root.join("registry.db"))
 }
 
 fn board_name_for_path(path: &Path) -> Result<Option<String>> {
-    let registry = Registry::open_readonly()?;
-    let source = canonical_source_path(path)?;
-    for project in registry.projects()? {
-        if canonical_source_path(Path::new(&project.board_path))? == source {
-            return Ok(Some(project.name));
+    match Registry::board_path_state_if_available(path)? {
+        Some(BoardPathState::Active(name)) => return Ok(Some(name)),
+        Some(BoardPathState::Retired { name, note }) => {
+            bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            )
         }
+        Some(BoardPathState::External) | None => {}
     }
     Ok(None)
 }
@@ -813,7 +1176,9 @@ fn emit(envelope: &WatchEnvelope) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn identity() -> StreamKey {
@@ -829,6 +1194,48 @@ mod tests {
             current_statuses: Vec::new(),
             tags: Vec::new(),
             archived: true,
+        }
+    }
+
+    fn ledger_head(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .expect("read board ledger head")
+    }
+
+    fn rule_ledger_head(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM rule_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read registry ledger head")
+    }
+
+    /// A board watch that follows, matching only `task_moved`.
+    fn follow_spec(path: &Path, cursor: i64) -> WatchSpec {
+        WatchSpec {
+            source: Source::Board {
+                path: path.to_path_buf(),
+                board_name: None,
+            },
+            key: StreamKey {
+                source_kind: "board".to_owned(),
+                source: canonical_source_path(path).expect("canonical source"),
+                selector_kind: "board".to_owned(),
+                selector_value: None,
+                kind: Some("task_moved".to_owned()),
+                kinds: vec!["task_moved".to_owned()],
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor,
+            limit: 32,
+            follow: true,
         }
     }
 
@@ -1014,7 +1421,7 @@ mod tests {
             Source::Board { path, board_name } => {
                 project_board_event(fixture, path, board_name.as_deref()).unwrap()
             }
-            Source::Registry => unreachable!(),
+            Source::Registry { .. } => unreachable!(),
         };
         assert_eq!(projected, direct);
         assert_eq!(projected["schemaVersion"], 1);
@@ -1044,7 +1451,9 @@ mod tests {
                 "token": "private",
                 "rule": "visible"
             })),
-            &Source::Registry,
+            &Source::Registry {
+                root: PathBuf::from("/tmp/kanban-watch-registry"),
+            },
         )
         .unwrap();
         assert_eq!(projected["board"], Value::Null);
@@ -1213,8 +1622,14 @@ mod tests {
         );
     }
 
+    // Direct `--db` resolution still opens the ambient registry read-only for
+    // the ADR-035 retired-board check, so every fixture below that reaches
+    // that check owns a private data root instead of inheriting the
+    // operator's registry.
     #[test]
     fn direct_db_watch_does_not_need_registry_name_lookup() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("direct-db");
         let path = root.join("board.db");
         let _store = Store::open(&path).expect("open test board");
@@ -1228,15 +1643,17 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let spec = resolve_with_source(&args, Some(path)).expect("resolve direct db");
+        let spec = resolve_with_source(&args, Some((path, true))).expect("resolve direct db");
         match spec.source {
             Source::Board { board_name, .. } => assert!(board_name.is_none()),
-            Source::Registry => panic!("expected board source"),
+            Source::Registry { .. } => panic!("expected board source"),
         }
     }
 
     #[test]
     fn direct_db_watch_rejects_unknown_subjects_and_relation_targets_but_accepts_history() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("direct-db-subject-relations");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1258,7 +1675,7 @@ mod tests {
             ];
             raw.extend(extra.iter().map(|value| (*value).to_owned()));
             let args = super::super::Args::parse(raw).expect("parse watch args");
-            resolve_with_source(&args, Some(path.clone()))
+            resolve_with_source(&args, Some((path.clone(), true)))
         };
 
         assert!(resolve(&["--task", "t-removed"]).is_ok());
@@ -1294,7 +1711,7 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let error = resolve_with_source(&args, Some(path))
+        let error = resolve_with_source(&args, Some((path, true)))
             .expect_err("zero limit with follow must fail")
             .to_string();
         assert!(error.contains("at least 1"), "{error}");
@@ -1302,6 +1719,8 @@ mod tests {
 
     #[test]
     fn future_cursor_is_rejected_before_the_watch_starts() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("future-cursor");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1340,12 +1759,974 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let error = resolve_with_source(&args, Some(path))
+        let error = resolve_with_source(&args, Some((path, true)))
             .expect_err("future cursor must be rejected")
             .to_string();
         assert!(
             error.contains("ahead of the current ledger head"),
             "{error}"
+        );
+    }
+
+    /// A poll must never step its cursor over an event its own filtered scan
+    /// could not have seen.
+    ///
+    /// The board is driven at exactly the interleaving that used to lose the
+    /// event: the filtered scan runs, a matching event commits, then the tail
+    /// scan runs. With the two scans on separate connections the tail saw the
+    /// new event, `watch` moved the cursor onto it, and the next poll started
+    /// after it — permanent, silent loss. With both scans inside one read
+    /// snapshot the commit is invisible to the poll that raced it and the next
+    /// poll delivers it.
+    #[test]
+    fn a_poll_never_advances_past_an_event_that_commits_between_its_two_scans() {
+        // Every board poll mints authority from the canonical root, which the
+        // managed-root test repoints; hold the env guard so it cannot land
+        // mid-poll.
+        let _env = crate::dispatch::tests::env_guard();
+        let root = temp_watch_dir("single-snapshot-poll");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            1,
+        )
+        .expect("append the seed event");
+
+        let spec = follow_spec(&path, 1);
+
+        let writer_path = path.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        // What the poll's own reader can see at the instant the window is open.
+        // Pinned at the pre-commit head, this proves the seam fires inside a
+        // live snapshot rather than before one was taken.
+        let observed = Rc::new(Cell::new(-1_i64));
+        let seen = Rc::clone(&observed);
+        let raced = {
+            let _seam = install_between_scans(Box::new(move |reader: &Connection, cursor: i64| {
+                if fired.replace(true) {
+                    return cursor;
+                }
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(
+                    &writer,
+                    Some("t-1"),
+                    "task_moved",
+                    "codex",
+                    "{}",
+                    2,
+                )
+                .expect("commit a matching event inside the poll window");
+                assert_eq!(
+                    ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                seen.set(ledger_head(reader));
+                cursor
+            }));
+            poll_once(&spec, 1).expect("poll across the commit window")
+        };
+
+        assert!(committed.get(), "the interposing commit never ran");
+        assert_eq!(
+            observed.get(),
+            1,
+            "the seam fired outside the poll's snapshot: the reader saw head {} while the \
+             committed head was 2, so this test is no longer measuring the race window",
+            observed.get()
+        );
+        assert!(
+            raced.batch.is_empty(),
+            "the snapshot predates the commit, so the filtered scan cannot hold it"
+        );
+        assert_eq!(
+            raced.tail_seq, None,
+            "the poll moved its cursor onto an event its filtered scan never saw; \
+             that event is dropped and no consumer is told"
+        );
+
+        let delivered = poll_once(&spec, 1).expect("poll after the commit window");
+        assert_eq!(
+            delivered
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the next poll must deliver the event the raced poll declined to skip"
+        );
+        assert_eq!(delivered.batch[0].kind, "task_moved");
+
+        // The tail still has to advance past rows the filters reject, or the
+        // cursor would freeze behind unrelated board traffic.
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            3,
+        )
+        .expect("append an unmatched event");
+        let advanced = poll_once(&spec, 2).expect("poll past an unmatched event");
+        assert!(advanced.batch.is_empty());
+        assert_eq!(
+            advanced.tail_seq,
+            Some(3),
+            "an event already committed before the poll must still move the cursor"
+        );
+    }
+
+    /// A private canonical data root (`$XDG_DATA_HOME/kanban`) whose registry
+    /// is `managed`, installed for the guard's life, the way `lib.rs`'s
+    /// selector-gate tests install theirs: `board_authz` reads the canonical
+    /// root and nothing else, so this is the only way to drive the real mint.
+    struct ManagedRoot {
+        xdg: PathBuf,
+        original_xdg: Option<std::ffi::OsString>,
+        original_data_dir: Option<std::ffi::OsString>,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ManagedRoot {
+        fn new(label: &str) -> ManagedRoot {
+            let _env = crate::dispatch::tests::env_guard();
+            let xdg = temp_watch_dir(label);
+            let root = xdg.join("kanban");
+            fs::create_dir_all(&root).expect("create canonical root");
+            let registry = Registry::open_test_at(&root).expect("open canonical test registry");
+            registry
+                .connection
+                .execute(
+                    "UPDATE enforcement_state SET state='managed' WHERE id=1",
+                    [],
+                )
+                .expect("enforce managed");
+            let original_xdg = std::env::var_os("XDG_DATA_HOME");
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            // SAFETY: serialized by the env guard held for this value's life.
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
+            ManagedRoot {
+                xdg,
+                original_xdg,
+                original_data_dir,
+                _env,
+            }
+        }
+
+        fn registry_path(&self) -> PathBuf {
+            self.xdg.join("kanban").join("registry.db")
+        }
+
+        /// Bind a principal for the identity this process's own mint resolves.
+        fn bind_self(&self, principal: &str) {
+            use crate::broker::PasswdDatabase as _;
+            let uid = unsafe { libc::geteuid() };
+            let username = crate::broker::SystemPasswd
+                .name_for_uid(uid)
+                .expect("read passwd")
+                .expect("this uid has a passwd entry");
+            Connection::open(self.registry_path())
+                .expect("open canonical registry")
+                .execute(
+                    "INSERT INTO principals(id,username,uid,enabled,bound_at_epoch,bound_by_event_id) \
+                     VALUES(?1,?2,?3,1,0,'pe-00000000')",
+                    rusqlite::params![principal, username, uid],
+                )
+                .expect("bind this process's principal");
+        }
+    }
+
+    impl Drop for ManagedRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_xdg {
+                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match &self.original_data_dir {
+                    Some(value) => std::env::set_var("KANBAN_DATA_DIR", value),
+                    None => std::env::remove_var("KANBAN_DATA_DIR"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.xdg);
+        }
+    }
+
+    /// Grant `principal` one active `(capability, atoms)` scope, committed.
+    fn grant(registry: &Path, id: &str, principal: &str, capability: &str, atoms: &[&str]) {
+        Connection::open(registry)
+            .expect("open canonical registry")
+            .execute(
+                "INSERT INTO grants(id,principal_id,capability,scope,state,origin,\
+                 granted_at_epoch,granted_by_event_id) \
+                 VALUES(?1,?2,?3,?4,'active','grant',0,'pe-00000000')",
+                rusqlite::params![
+                    id,
+                    principal,
+                    capability,
+                    serde_json::to_string(atoms).unwrap()
+                ],
+            )
+            .expect("grant scope");
+    }
+
+    /// A poll must judge its snapshot under authority read no earlier than
+    /// that snapshot.
+    ///
+    /// The board is driven at exactly the interleaving that used to lose the
+    /// event: the poll's open mints authority while the tag is revoked, then
+    /// the tag is re-granted and a matching tagged event commits, then the
+    /// snapshot is taken. Judged under the open's stale mint, the filtered
+    /// scan withheld the event and the tail stepped the cursor past it, so a
+    /// caller authorised when the event committed never received it.
+    #[test]
+    fn a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot() {
+        const TAGGED: &str = r#"{"_semanticV1":{"tags":["live"]}}"#;
+        let estate = ManagedRoot::new("authority-after-snapshot-xdg");
+        let root = temp_watch_dir("authority-after-snapshot");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(&store.connection, None, "task_moved", "codex", TAGGED, 1)
+            .expect("append a tagged seed event");
+        estate.bind_self("p-watcher");
+        let registry = estate.registry_path();
+        grant(
+            &registry,
+            "g-board-read",
+            "p-watcher",
+            "read",
+            &["board:board"],
+        );
+
+        let spec = follow_spec(&path, 0);
+
+        // Revoked: the tagged row is withheld and, deliberately, stepped over.
+        let revoked = poll_once(&spec, 0).expect("poll while the tag is revoked");
+        assert!(
+            revoked.batch.is_empty(),
+            "a caller without the tag was handed a tagged row"
+        );
+        assert_eq!(revoked.tail_seq, Some(1));
+
+        let writer_path = path.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        let raced = {
+            let _seam = install_before_snapshot(Box::new(move || {
+                if fired.replace(true) {
+                    return;
+                }
+                grant(
+                    &registry,
+                    "g-tag-read",
+                    "p-watcher",
+                    "read",
+                    &["board:board", "tag:live"],
+                );
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(&writer, None, "task_moved", "codex", TAGGED, 2)
+                    .expect("commit a tagged event after the re-grant");
+            }));
+            poll_once(&spec, 1).expect("poll across the re-grant window")
+        };
+
+        assert!(committed.get(), "the interposing re-grant never ran");
+        assert_eq!(
+            raced
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the poll judged an event committed after the re-grant under authority minted \
+             before it, so a caller authorised when the event committed never receives it"
+        );
+        assert_eq!(
+            raced.tail_seq, None,
+            "the poll moved its cursor past a row it should have delivered"
+        );
+    }
+
+    /// A revocation and commit after the snapshot pin must not be read by the
+    /// snapshot, and already-pinned rows must use the new revoked mint.
+    #[test]
+    fn a_poll_pins_its_snapshot_before_refreshing_authority() {
+        const TAGGED: &str = r#"{"_semanticV1":{"tags":["live"]}}"#;
+        let estate = ManagedRoot::new("pin-before-mint-xdg");
+        let root = temp_watch_dir("pin-before-mint");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(&store.connection, None, "task_moved", "codex", TAGGED, 1)
+            .expect("append tagged seed event");
+        estate.bind_self("p-watcher");
+        let registry = estate.registry_path();
+        grant(
+            &registry,
+            "g-board-read",
+            "p-watcher",
+            "read",
+            &["board:board"],
+        );
+        grant(
+            &registry,
+            "g-tag-read",
+            "p-watcher",
+            "read",
+            &["board:board", "tag:live"],
+        );
+        let spec = follow_spec(&path, 0);
+
+        let called = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&called);
+        let writer_path = path.clone();
+        let raced = {
+            let _seam = install_after_snapshot(Box::new(move |reader| {
+                fired.set(true);
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(&writer, None, "task_moved", "codex", TAGGED, 2)
+                    .expect("commit after the snapshot pin");
+                assert_eq!(
+                    ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                assert_eq!(
+                    ledger_head(reader),
+                    1,
+                    "the poll did not pin before the commit"
+                );
+                Connection::open(&registry)
+                    .expect("open canonical registry")
+                    .execute(
+                        "UPDATE grants SET state='revoked' WHERE id='g-tag-read'",
+                        [],
+                    )
+                    .expect("revoke tag before authority refresh");
+            }));
+            poll_once(&spec, 0).expect("poll across snapshot-to-mint window")
+        };
+        assert!(called.get(), "the snapshot-to-mint seam never ran");
+        assert!(
+            raced.batch.is_empty(),
+            "revoked rows escaped under the open-time grant"
+        );
+        assert_eq!(
+            raced.tail_seq,
+            Some(1),
+            "cursor moved beyond the pinned snapshot"
+        );
+
+        let next = poll_once(&spec, 1).expect("poll the next snapshot while revoked");
+        assert!(
+            next.batch.is_empty(),
+            "revoked row escaped in the next poll"
+        );
+        assert_eq!(
+            next.tail_seq,
+            Some(2),
+            "the next snapshot missed the new row"
+        );
+    }
+
+    #[test]
+    fn the_between_scans_hook_is_reusable_and_clears_and_passes_the_cursor_through() {
+        let root = temp_watch_dir("seam-reuse");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        let calls = Rc::new(RefCell::new(0_usize));
+        let counter = Rc::clone(&calls);
+        let _seam = install_between_scans(Box::new(move |_, cursor| {
+            *counter.borrow_mut() += 1;
+            cursor
+        }));
+        assert_eq!(between_scans(&store.connection, 41), 41);
+        assert_eq!(between_scans(&store.connection, 42), 42);
+        set_between_scans(None);
+        assert_eq!(between_scans(&store.connection, 43), 43);
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    /// Collect the envelopes a follow stream emits, stopping after `take`.
+    ///
+    /// The sink returning `Err` is how the loop ends here, which is the same
+    /// path a closed pipe takes in production (`reader_left` in `lib.rs`), so
+    /// this drives the real loop rather than a test-only variant of it.
+    fn collect_stream(spec: &WatchSpec, take: usize) -> Vec<WatchEnvelope> {
+        let mut captured: Vec<WatchEnvelope> = Vec::new();
+        let result = stream(spec, &mut |envelope| {
+            captured.push(envelope.clone());
+            if captured.len() >= take {
+                bail!("sink is done");
+            }
+            Ok(())
+        });
+        if captured.len() < take {
+            result.expect("stream ended before the sink had enough envelopes");
+        }
+        captured
+    }
+
+    fn envelope_state(envelope: &WatchEnvelope) -> String {
+        envelope
+            .payload
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The `advanced` heartbeat must publish the sequence the tail reached.
+    ///
+    /// This is the one place a cursor moves with no event delivered, so an
+    /// off-by-one here is invisible in the batch path and shows up only as a
+    /// consumer that re-reads the same rows forever. The two envelopes matter
+    /// jointly: the first pins the token the loop publishes, the second proves
+    /// the loop carried that cursor into the next iteration instead of
+    /// re-advancing over ground it had already covered.
+    #[test]
+    fn the_advanced_heartbeat_publishes_the_tail_sequence_and_the_loop_keeps_it() {
+        let _env = crate::dispatch::tests::env_guard();
+        let root = temp_watch_dir("advanced-heartbeat");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            1,
+        )
+        .expect("append an unmatched event");
+
+        let spec = follow_spec(&path, 0);
+        let envelopes = collect_stream(&spec, 2);
+
+        assert_eq!(envelopes[0].kind, "heartbeat");
+        assert_eq!(envelope_state(&envelopes[0]), "advanced");
+        assert_eq!(
+            decode_cursor(&envelopes[0].cursor, &spec.key).expect("decode advanced cursor"),
+            1,
+            "the advanced heartbeat published a cursor that is not the sequence the tail reached"
+        );
+
+        assert_eq!(envelopes[1].kind, "heartbeat");
+        assert_eq!(
+            envelope_state(&envelopes[1]),
+            "idle",
+            "the loop re-advanced over ground it had already covered, so a follower \
+             never makes progress"
+        );
+        assert_eq!(
+            decode_cursor(&envelopes[1].cursor, &spec.key).expect("decode idle cursor"),
+            1,
+            "the loop did not carry the advanced cursor into the next iteration"
+        );
+    }
+
+    /// Matched events are delivered with their own sequence, and a non-follow
+    /// watch terminates on its own.
+    #[test]
+    fn a_bounded_watch_delivers_matched_events_with_their_cursors_and_then_stops() {
+        let _env = crate::dispatch::tests::env_guard();
+        let root = temp_watch_dir("bounded-delivery");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for (seq, kind) in [(1, "board_changed"), (2, "task_moved"), (3, "task_moved")] {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                kind,
+                "codex",
+                "{}",
+                seq as i64,
+            )
+            .expect("append event");
+        }
+
+        let mut spec = follow_spec(&path, 0);
+        spec.follow = false;
+        let mut captured = Vec::new();
+        stream(&spec, &mut |envelope| {
+            captured.push(envelope.clone());
+            Ok(())
+        })
+        .expect("a bounded watch must terminate on its own");
+        assert_eq!(captured.len(), 2);
+        for (envelope, seq) in captured.iter().zip([2, 3]) {
+            assert_eq!(envelope.kind, "event");
+            assert_eq!(
+                decode_cursor(&envelope.cursor, &spec.key).expect("decode event cursor"),
+                seq
+            );
+        }
+
+        // An empty bounded watch returns without emitting anything at all.
+        let mut empty = follow_spec(&path, 3);
+        empty.follow = false;
+        let mut nothing = Vec::new();
+        stream(&empty, &mut |envelope| {
+            nothing.push(envelope.clone());
+            Ok(())
+        })
+        .expect("an empty bounded watch must terminate");
+        assert!(nothing.is_empty());
+    }
+
+    /// The tail scan must read its cursor through the seam.
+    ///
+    /// Without this, a seam that drifts to *after* the tail scan is invisible:
+    /// inside a held snapshot no data a hook can observe distinguishes "before
+    /// the tail scan" from "after" it — that indistinguishability is precisely
+    /// the property the fix establishes. So the seam is made load-bearing
+    /// instead. The hook shifts the cursor the tail reads from, and the tail's
+    /// answer has to move with it; if the tail already ran, it answers from the
+    /// unshifted cursor and this fails.
+    #[test]
+    fn the_tail_scan_reads_its_cursor_through_the_seam() {
+        let _env = crate::dispatch::tests::env_guard();
+        let root = temp_watch_dir("seam-placement");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for seq in 1..=3 {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                "board_changed",
+                "codex",
+                "{}",
+                seq,
+            )
+            .expect("append an unmatched event");
+        }
+
+        let mut spec = follow_spec(&path, 0);
+        spec.limit = 1;
+
+        // No hook: the tail steps to the first row after cursor 0.
+        assert_eq!(
+            poll_once(&spec, 0).expect("unshifted poll").tail_seq,
+            Some(1)
+        );
+
+        // Hook shifts the tail's cursor forward by one, so the tail must answer
+        // from sequence 2 instead. A seam sitting after the tail scan cannot
+        // move this number.
+        let shifted = {
+            let _seam = install_between_scans(Box::new(|_, cursor| cursor + 1));
+            poll_once(&spec, 0).expect("shifted poll")
+        };
+        assert_eq!(
+            shifted.tail_seq,
+            Some(2),
+            "the tail scan did not read its cursor through the seam, so the seam is no \
+             longer sitting between the two scans and every race test using it is vacuous"
+        );
+    }
+
+    /// Seed a board holding one visible event, six hundred tag-denied events,
+    /// and a closing visible event: more than two scan pages of denied rows,
+    /// so every tail here crosses a chunk boundary and the raw cap.
+    ///
+    /// Returns the board path, its board id, and the two visible sequences.
+    /// `poll_once` mints its authority from the kernel and cannot run under
+    /// this caller, so the tests open the managed store themselves and drive
+    /// [`poll_board_once`] (or [`stream_with`]) with it.
+    fn seed_denied_stretch_board(label: &str) -> (PathBuf, String, i64, i64) {
+        use uuid::Uuid;
+
+        let board = format!(
+            "dddddddd-0000-4000-8000-{:012x}",
+            Uuid::new_v4().as_u128() & 0xffffffffffff
+        );
+        let dir = std::env::temp_dir().join(format!("kanban-watch-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let (first_visible, last_visible);
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(crate::model::AddTask {
+                id: Some("t-visible".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: "visible row".to_owned(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: serde_json::json!({}),
+                actor: Some("seed".to_owned()),
+                allowed_models: Vec::new(),
+                tags: vec!["visible".to_owned()],
+            })
+            .expect("seed visible");
+            seed.add_task(crate::model::AddTask {
+                id: Some("t-secret".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: "secret row".to_owned(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: serde_json::json!({}),
+                actor: Some("seed".to_owned()),
+                allowed_models: Vec::new(),
+                tags: vec!["secret".to_owned()],
+            })
+            .expect("seed secret");
+            let mut clock = 100_i64;
+            let mut append = |task: &str| -> i64 {
+                clock += 1;
+                crate::audit::append_board_event(
+                    &seed.connection,
+                    Some(task),
+                    "task_updated",
+                    "seed",
+                    "{}",
+                    clock,
+                )
+                .expect("append event");
+                seed.connection
+                    .query_row("SELECT max(seq) FROM events", [], |row| row.get(0))
+                    .expect("head after append")
+            };
+            first_visible = append("t-visible");
+            for _ in 0..600 {
+                append("t-secret");
+            }
+            last_visible = append("t-visible");
+        }
+        (path, board, first_visible, last_visible)
+    }
+
+    /// Open a board for a caller holding board read and the `visible` tag but
+    /// not `secret`: the denied stretch is invisible, the bracketing events
+    /// are not.
+    fn open_visible_only(path: &Path, board: &str) -> Store {
+        use crate::authz::AuthzContext;
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        Store::open_with_authz(
+            path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority")
+    }
+
+    /// A board-wide spec over the denied stretch: no kinds, no tags, so every
+    /// row is a candidate and only the per-row tag filter denies.
+    fn stretch_spec(path: &Path, cursor: i64, limit: i64, follow: bool) -> WatchSpec {
+        WatchSpec {
+            source: Source::Board {
+                path: path.to_path_buf(),
+                board_name: None,
+            },
+            key: StreamKey {
+                source_kind: "board".to_owned(),
+                source: canonical_source_path(path).expect("canonical source"),
+                selector_kind: "board".to_owned(),
+                selector_value: None,
+                kind: None,
+                kinds: Vec::new(),
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor,
+            limit,
+            follow,
+        }
+    }
+
+    /// A `--limit 1` follower moves by the scan floor, not one row per poll.
+    ///
+    /// Six hundred denied rows sit ahead of the cursor with a visible row
+    /// past them. The old walk started at the cursor and stepped a single
+    /// row, so `tail_seq` came back one past the cursor while each poll
+    /// re-examined five hundred rows — the visible row arriving thousands of
+    /// polls late. Starting the walk at the scan frontier carries the whole
+    /// examined range forward instead.
+    #[test]
+    fn a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows() {
+        let (path, board, first_visible, _) = seed_denied_stretch_board("poll-floor");
+        let store = open_visible_only(&path, &board);
+        let spec = stretch_spec(&path, first_visible, 1, true);
+
+        let poll = poll_board_once(&store, &spec, first_visible).expect("poll over denied stretch");
+        assert!(
+            poll.batch.is_empty(),
+            "the capped scan delivered past its raw cap"
+        );
+        let tail_seq = poll
+            .tail_seq
+            .expect("the scan examined rows yet moved nowhere");
+        assert!(
+            tail_seq >= first_visible + 500,
+            "the poll advanced one row instead of the scan floor: tail_seq={tail_seq} from {first_visible}"
+        );
+    }
+
+    /// A one-shot watch behind a denied stretch longer than the raw cap hands
+    /// the consumer progress instead of silence.
+    ///
+    /// The first run delivers nothing but emits exactly one `advanced`
+    /// heartbeat carrying the scan frontier — the envelope ADR-031 already
+    /// obliges consumers to persist — and the second run from that cursor
+    /// delivers the visible row waiting past the stretch. On the old code
+    /// the first run emitted nothing at all, so a polling consumer re-ran
+    /// from the same cursor and re-read the same denied rows forever.
+    ///
+    /// A bare continue-scan in one-shot mode is the rejected alternative:
+    /// the raw cap exists to bound one scan's work, and any larger bound
+    /// only moves the stall further out. The heartbeat keeps every run
+    /// bounded while the persisted cursor walks the stretch a page per run.
+    #[test]
+    fn a_one_shot_watch_behind_denied_rows_reports_progress_not_silence() {
+        let (path, board, first_visible, last_visible) =
+            seed_denied_stretch_board("oneshot-heartbeat");
+        let store = open_visible_only(&path, &board);
+
+        let first = stretch_spec(&path, first_visible, 50, false);
+        let mut first_out = Vec::new();
+        stream_with(
+            &first,
+            &mut |envelope| {
+                first_out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("a one-shot watch must terminate on its own");
+        assert_eq!(
+            first_out.len(),
+            1,
+            "the stalled run emitted {} envelopes instead of one advancing heartbeat",
+            first_out.len()
+        );
+        assert_eq!(first_out[0].kind, "heartbeat");
+        assert_eq!(envelope_state(&first_out[0]), "advanced");
+        let advanced =
+            decode_cursor(&first_out[0].cursor, &first.key).expect("decode advanced cursor");
+        assert!(
+            advanced >= first_visible + 500,
+            "the heartbeat carried no progress: cursor={advanced} from {first_visible}"
+        );
+
+        let second = stretch_spec(&path, advanced, 50, false);
+        let mut second_out = Vec::new();
+        stream_with(
+            &second,
+            &mut |envelope| {
+                second_out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("the resumed one-shot watch must terminate on its own");
+        assert_eq!(
+            second_out.len(),
+            1,
+            "the resumed run did not deliver exactly the visible row past the stretch"
+        );
+        assert_eq!(second_out[0].kind, "event");
+        assert_eq!(
+            decode_cursor(&second_out[0].cursor, &second.key).expect("decode event cursor"),
+            last_visible,
+            "the resumed run did not deliver the visible row past the denied stretch"
+        );
+    }
+
+    /// Off enforcement an empty one-shot stays silent, byte-identical to
+    /// before the heartbeat fix.
+    ///
+    /// No raw cap applies outside enforcement, so an empty batch means no
+    /// row the filter could deliver — never a denied stretch hiding past
+    /// the cap. The static walk still steps over kinds-rejected rows, but a
+    /// one-shot poll must not publish that step: a filtered replay resumed
+    /// from its last cursor prints nothing when nothing new matches, and
+    /// the e2e removed-subjects replay pins exactly that silence.
+    #[test]
+    fn an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows() {
+        let root = temp_watch_dir("oneshot-silence");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for seq in 1..=3 {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                "board_changed",
+                "codex",
+                "{}",
+                seq,
+            )
+            .expect("append an unmatched event");
+        }
+
+        let mut spec = follow_spec(&path, 1);
+        spec.follow = false;
+        let poll = poll_board_once(&store, &spec, 1).expect("one-shot poll");
+        assert!(poll.batch.is_empty());
+        assert_eq!(
+            poll.tail_seq, None,
+            "an unenforced one-shot carried a cursor where no denied stretch can hide"
+        );
+
+        let mut out = Vec::new();
+        stream_with(
+            &spec,
+            &mut |envelope| {
+                out.push(envelope.clone());
+                Ok(())
+            },
+            &mut |spec, cursor| poll_board_once(&store, spec, cursor),
+        )
+        .expect("an empty one-shot watch must terminate");
+        assert!(
+            out.is_empty(),
+            "an unenforced one-shot printed {} envelope(s) where it used to print none",
+            out.len()
+        );
+    }
+
+    /// The registry arm loses events across a two-snapshot poll exactly as the
+    /// board arm did, so it gets the same proof rather than an argument that it
+    /// shares a helper.
+    #[test]
+    fn a_registry_poll_never_advances_past_a_rule_event_committed_between_its_scans() {
+        let root = temp_watch_dir("registry-single-snapshot");
+        let registry_db = root.join("registry.db");
+        let writer = crate::db::open_registry(&registry_db).expect("create the test registry");
+        crate::audit::append_registry_event(&writer, "rule-1", "rule_updated", "codex", "{}", 1)
+            .expect("append an unmatched rule event");
+
+        let spec = WatchSpec {
+            source: Source::Registry { root: root.clone() },
+            key: StreamKey {
+                source_kind: "registry".to_owned(),
+                source: registry_source(&root).expect("registry source"),
+                selector_kind: "registry".to_owned(),
+                selector_value: None,
+                kind: Some("rule_added".to_owned()),
+                kinds: vec!["rule_added".to_owned()],
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor: 1,
+            limit: 32,
+            follow: true,
+        };
+
+        let registry_path = registry_db.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        let observed = Rc::new(Cell::new(-1_i64));
+        let seen = Rc::clone(&observed);
+        let raced = {
+            let _seam = install_between_scans(Box::new(move |reader: &Connection, cursor: i64| {
+                if fired.replace(true) {
+                    return cursor;
+                }
+                let writer = crate::db::open_registry(&registry_path)
+                    .expect("open interposing registry writer");
+                crate::audit::append_registry_event(
+                    &writer,
+                    "rule-2",
+                    "rule_added",
+                    "codex",
+                    "{}",
+                    2,
+                )
+                .expect("commit a matching rule event inside the poll window");
+                assert_eq!(
+                    rule_ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                seen.set(rule_ledger_head(reader));
+                cursor
+            }));
+            poll_once(&spec, 1).expect("poll across the commit window")
+        };
+
+        assert!(committed.get(), "the interposing commit never ran");
+        assert_eq!(
+            observed.get(),
+            1,
+            "the seam fired outside the registry poll's snapshot, so this test is no \
+             longer measuring the race window"
+        );
+        assert!(raced.batch.is_empty());
+        assert_eq!(
+            raced.tail_seq, None,
+            "the registry poll moved its cursor onto a rule event its filtered scan \
+             never saw; that event is dropped and no consumer is told"
+        );
+
+        let delivered = poll_once(&spec, 1).expect("poll after the commit window");
+        assert_eq!(
+            delivered
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(delivered.batch[0].kind, "rule_added");
+
+        crate::audit::append_registry_event(&writer, "rule-3", "rule_updated", "codex", "{}", 3)
+            .expect("append another unmatched rule event");
+        let advanced = poll_once(&spec, 2).expect("poll past an unmatched rule event");
+        assert!(advanced.batch.is_empty());
+        assert_eq!(
+            advanced.tail_seq,
+            Some(3),
+            "a rule event committed before the poll must still move the cursor"
         );
     }
 }

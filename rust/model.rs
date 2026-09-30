@@ -1,5 +1,24 @@
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// The immutable per-board UUID ADR-032 mints as the board file's name, read
+/// back from a published board path: `<root>/boards/<uuid>.db` -> `<uuid>`.
+///
+/// This is the one place the path-to-identity mapping lives. Scope atoms key
+/// on this value, never on the board's display name, and the store's
+/// authorization context carries it so no surface re-parses a path. A path
+/// with no file stem (a scratch `--db` path, which only the direct estate
+/// opens) yields `None`, and callers fall back to the empty string — the
+/// value is never consulted because the guard no-ops outside
+/// [`crate::routing::Enforcement::Managed`].
+pub fn board_id_from_path(board_path: &str) -> Option<String> {
+    std::path::Path::new(board_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_owned)
+}
 
 /// Every status a task row may hold.
 ///
@@ -26,8 +45,34 @@ pub struct Tag {
     pub description: Option<String>,
     pub created_by: Option<String>,
     pub created_at: i64,
+    /// The spelling this tag was registered under, when it has been renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_at: Option<i64>,
     /// How many rows currently carry it, so a listing answers "is this used".
     pub uses: i64,
+}
+
+/// What one `tag rename` moved: the receipt, per table.
+///
+/// Counted rather than listed, because the answer a caller acts on is "did
+/// this reach everything" and a board with a thousand tagged rows would
+/// otherwise answer with a thousand ids.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagRename {
+    pub old: String,
+    pub new: String,
+    /// Live task rows retagged.
+    pub tasks: i64,
+    /// Archived task rows retagged — counted apart, because a rename that
+    /// skipped history would leave the old spelling readable and unfindable.
+    pub archived_tasks: i64,
+    pub attention: i64,
+    /// Registry rules rewritten. See [`crate::store::Store::rename_tag`] for
+    /// why this one is not inside the board's transaction.
+    pub rules: i64,
 }
 
 /// One operator rule in the registry-owned, tag-scoped document.
@@ -47,6 +92,12 @@ pub struct Rule {
     pub source_board: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_registry_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_boards: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_content_sha256: Option<String>,
 }
 
 pub const SUBSCRIPTION_STATUSES: [&str; 2] = ["active", "paused"];
@@ -58,6 +109,7 @@ pub const SUBSCRIPTION_PROTOCOL_VERSION: i64 = 1;
 /// can select a built-in kind before that kind has occurred on a new board.
 pub const BOARD_EVENT_KINDS: &[&str] = &[
     "archive_swept",
+    "attention_check_answered",
     "attention_raised",
     "attention_reopened",
     "attention_resolved",
@@ -70,6 +122,8 @@ pub const BOARD_EVENT_KINDS: &[&str] = &[
     "deployment_abandoned",
     "deployment_finished",
     "deployment_started",
+    "done_gate_override",
+    "done_gate_toggled",
     "epic_advanced",
     "handoff_accepted",
     "handoff_created",
@@ -214,6 +268,47 @@ pub struct RuleMigrationReport {
     pub source_rules_retired: usize,
 }
 
+/// One rule entry in a source-to-destination transfer bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferItem {
+    pub source_board: Option<String>,
+    pub source_registry_uuid: String,
+    pub source_rule_id: String,
+    pub source_boards: Vec<String>,
+    pub source_content_sha256: String,
+    pub body: String,
+    pub author: String,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub tags: Vec<String>,
+}
+
+/// A deterministic, auditable export bundle for allowlisted rule transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferBundle {
+    pub format_version: u32,
+    pub exported_by: String,
+    pub exported_at: i64,
+    pub source_registry_uuid: String,
+    pub source_registry_audit: crate::audit::AuditReport,
+    pub source_boards: Vec<String>,
+    pub rules: Vec<RuleTransferItem>,
+}
+
+/// Receipt for a registry-to-registry rule import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferReport {
+    pub imported_rules: usize,
+    pub already_imported_rules: usize,
+    pub destination_boards_verified: usize,
+    pub source_registry_uuid: String,
+    pub source_registry_audit_head: String,
+}
+
 /// A registered root that no longer names the directory it was registered for.
 ///
 /// Registration canonicalises, so a stored root is correct the moment it is
@@ -271,6 +366,30 @@ pub const NOTE_KINDS: [&str; 6] = [
 pub const HANDOFF_REASONS: [&str; 4] =
     ["token_pressure", "provider_limit", "session_end", "manual"];
 
+/// The states a checkpoint may record, and nothing else. `continue` keeps the
+/// lease and the row `in_progress`; `blocked` and `done` are terminal.
+pub const CHECKPOINT_STATES: [&str; 3] = ["continue", "blocked", "done"];
+
+/// The statuses a pending handoff may hold. `retired` is history — resolved,
+/// never deleted — so a retired handoff is closed rather than advanced.
+pub const HANDOFF_STATUSES: [&str; 4] = ["pending", "accepted", "cancelled", "retired"];
+
+/// The relation kinds a watch or subscription filter may select on. One
+/// vocabulary for both surfaces, so a filter cannot say a relation here that
+/// the other side refuses.
+pub const RELATION_KINDS: [&str; 3] = ["parent", "ancestor", "depends-on"];
+
+/// The story gate, in order. A story moves one step at a time along this list.
+pub const STORY_FLOW: [&str; 7] = [
+    "planning",
+    "ready",
+    "in-progress",
+    "testing",
+    "review",
+    "merging",
+    "done",
+];
+
 /// Operator-facing projection of the durable 0-9 queue key.
 pub fn priority_level(priority: i64) -> Option<&'static str> {
     match priority {
@@ -310,6 +429,32 @@ pub struct Task {
     /// Registered tags carried by this row, sorted. What the row is *about*,
     /// as opposed to `lane`, which is what kind of work it is.
     pub tags: Vec<String>,
+    /// The models allowed to claim this row, sorted. Empty is unrestricted,
+    /// which is what every row on a board that never used the feature reads
+    /// as; a non-empty list refuses every claim from outside it.
+    pub allowed_models: Vec<String>,
+}
+/// One incomplete prerequisite inherited by a task from itself or an ancestor.
+///
+/// This is a projection of task_dependencies, never stored separately. The
+/// source identity is retained because an inherited epic gate must tell a leaf
+/// which plan owns the edge rather than presenting the prerequisite as local.
+///
+/// The title is optional because a gate may name a row this caller may not
+/// read (`t-3548303e`). Under managed enforcement that title is `null` while
+/// the id and the status stay: the gate is why a claim is refused, so hiding
+/// the whole blocker would make a blocked row read as claimable, and the
+/// prose is the only part of it that is disclosure rather than function.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateBlocker {
+    #[serde(rename = "sourceTaskID")]
+    pub source_task_id: String,
+    #[serde(rename = "prerequisiteID")]
+    pub prerequisite_id: String,
+    #[serde(rename = "prerequisiteTitle")]
+    pub prerequisite_title: Option<String>,
+    #[serde(rename = "prerequisiteStatus")]
+    pub prerequisite_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +479,36 @@ pub struct Claim {
     pub head_sha: Option<String>,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
+    /// The model this claim declared it runs as, when it declared one. NULL
+    /// on every claim taken before `BOARD_V30` and on every claim that passed
+    /// no `--model`, which an unrestricted task still accepts.
+    pub model: Option<String>,
+}
+
+/// One stored review verdict (DG-02, DG-11): the planner-written foreign-actor
+/// `pass` a gated done-move must cite. Append-only: rows are never updated
+/// and never deleted, and a newer verdict is a newer row. The writer is the
+/// actor from `--as` at write time and is immutable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub writer: String,
+    pub reviewer: String,
+    /// Full 40-character commit SHAs the writer attested as published on
+    /// origin (DG-13). The ledger records the attestation; it does not check
+    /// origin itself.
+    pub shas: Vec<String>,
+    /// Always `pass`: a review that fails records nothing (DG-12).
+    pub verdict: String,
+    /// Attention decision IDs the reviewer checked (DG-04).
+    pub evidence: Vec<String>,
+    /// Who attested that every cited SHA is published on origin, and when
+    /// (DG-13): always the writer, at write time.
+    pub published_attested_by: String,
+    pub published_attested_at: i64,
+    pub created_at: i64,
 }
 
 /// A newly granted lease plus the active rules that frame its work.
@@ -347,6 +522,27 @@ pub struct ClaimReceipt {
     #[serde(flatten)]
     pub claim: Claim,
     pub rules: Vec<RuleSummary>,
+    /// Who last died holding this task, when, and how stale their last
+    /// checkpoint was — derived from the newest `claim_expired` event since
+    /// the task last entered `todo`. Absent when the task was never orphaned,
+    /// or when it was reclaimed and completed since, so a later holder is not
+    /// told a stale predecessor explains why the task sits in `todo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_from: Option<OrphanedFrom>,
+}
+
+/// The previous holder whose lease expired, surfaced to a successor so it can
+/// see who died, when, and how stale their last checkpoint is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanedFrom {
+    pub agent: String,
+    pub session_id: Option<String>,
+    pub expired_at: i64,
+    pub last_checkpoint_at: Option<i64>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +557,7 @@ pub struct ClaimSummary {
     pub claimed_at: i64,
     pub heartbeat_at: i64,
     pub expires_at: i64,
+    pub model: Option<String>,
 }
 
 impl From<&Claim> for ClaimSummary {
@@ -372,6 +569,7 @@ impl From<&Claim> for ClaimSummary {
             claimed_at: value.claimed_at,
             heartbeat_at: value.heartbeat_at,
             expires_at: value.expires_at,
+            model: value.model.clone(),
         }
     }
 }
@@ -444,6 +642,12 @@ pub struct Handoff {
     pub accepted_at: Option<i64>,
     pub accepted_by: Option<String>,
     pub accepted_session: Option<String>,
+    /// Set when a pending handoff was retired instead of accepted: a handoff
+    /// is history, resolved never deleted, so the row keeps who closed it and
+    /// why rather than vanishing.
+    pub retired_at: Option<i64>,
+    pub retired_by: Option<String>,
+    pub retire_note: Option<String>,
     pub archived: bool,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
@@ -488,12 +692,18 @@ pub struct StaleTask {
 pub struct WorkspaceRecord {
     pub root_path: String,
     pub name: String,
+    /// The immutable per-board UUID (ADR-032), derived from the board file's
+    /// stem. `workspace list --json` carries it as `boardID`.
+    #[serde(rename = "boardID")]
+    pub board_id: String,
     pub board_path: String,
     pub created_at: i64,
     pub last_used_at: i64,
     pub archived: bool,
     pub archived_at: Option<i64>,
     pub archived_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_note: Option<String>,
     pub rootless: bool,
 }
 
@@ -504,6 +714,28 @@ pub struct ProjectRecord {
     pub board_path: String,
     pub workspace_roots: Vec<String>,
     pub last_used_at: i64,
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_note: Option<String>,
+}
+
+/// Receipt for adopting an existing board file into the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAdoptReceipt {
+    #[serde(flatten)]
+    pub project: ProjectRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    pub source_board_path: String,
+    /// SHA-256 of the exact migrated snapshot inode published to the registry.
+    pub source_sha256: String,
+    /// Byte count of the exact migrated snapshot inode published to the registry.
+    pub source_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -512,7 +744,14 @@ pub struct ContextPacket {
     pub task: Task,
     pub ancestors: Vec<Task>,
     pub dependencies: Vec<Task>,
+    /// Incomplete direct prerequisites on this row and every ancestor.
+    pub blocking_gates: Vec<GateBlocker>,
     pub claim: Option<ClaimSummary>,
+    /// The previous holder whose lease expired, for a successor reading the
+    /// packet cold. See [`ClaimReceipt::orphaned_from`]; absent when nothing
+    /// is reportable so existing consumers see no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_from: Option<OrphanedFrom>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_attention: Vec<Attention>,
     pub notes: Vec<TaskNote>,
@@ -526,6 +765,12 @@ pub struct ContextPacket {
     /// only `sitrep list` could see would be an update the reader it was
     /// written for never gets.
     pub sitreps: Vec<Sitrep>,
+    /// The sprint this task is attached to, when it is inside one: the
+    /// version boundary the resuming agent is working toward (ADR-045 §5).
+    /// Absent when the task is unattached, so a board that never opened a
+    /// sprint reads exactly as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<ContextSprint>,
     pub generated_at: i64,
     pub truncated: bool,
 }
@@ -551,6 +796,55 @@ pub struct AddTask {
     pub actor: Option<String>,
     /// Registered tags to apply. Unregistered ones are refused.
     pub tags: Vec<String>,
+    /// The models allowed to claim the new row. Empty leaves it unrestricted.
+    pub allowed_models: Vec<String>,
+}
+
+/// The longest model name this board will store.
+const MODEL_NAME_MAX: usize = 64;
+
+/// A model name a task's allow-list or a claim will accept.
+///
+/// `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`, matched case-sensitively — the
+/// alphabet every harness already spells its models in (`claude-opus-4.1`,
+/// `openai/gpt-5`, `z.ai:glm-4.6`), and nothing else. Case is kept rather
+/// than folded because there is no master file to fold toward: the claimant's
+/// `--model` is free text on `checkpoint` and `handoff create` already, and
+/// an allow-list that quietly matched a different spelling would be a second
+/// vocabulary with no registry to arbitrate it.
+///
+/// The shape is checked at the door on BOTH sides. A typo in an allow-list
+/// then fails closed — nobody can claim the row — and the refusal prints the
+/// set, so the typo is visible rather than silent.
+pub fn validate_model_name(name: &str) -> Result<String> {
+    let usable = |name: &str| {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && name.len() <= MODEL_NAME_MAX
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+    };
+    if !usable(name) {
+        bail!(
+            "model name {name} is not a usable name: it must match \
+             ^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,63}}$"
+        );
+    }
+    Ok(name.to_owned())
+}
+
+/// Validate a whole allow-list, and return it sorted with duplicates dropped.
+///
+/// Sorted at the door rather than at every read: the list is a set, and the
+/// wire shape promises a sorted array, so the one place that can guarantee it
+/// is the one place that writes it.
+pub fn validate_model_names(names: &[String]) -> Result<Vec<String>> {
+    let mut canonical = names
+        .iter()
+        .map(|name| validate_model_name(name))
+        .collect::<Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone)]
@@ -573,12 +867,979 @@ pub struct CheckpointInput {
     pub root_head: Option<String>,
 }
 
+/// The planner-written `pass` verdict `task verdict add` stores (DG-12).
+#[derive(Debug, Clone)]
+pub struct VerdictInput {
+    pub task_id: String,
+    pub reviewer: String,
+    pub shas: Vec<String>,
+    pub evidence: Vec<String>,
+    pub writer: String,
+    /// `--attest-published`: the writer states every cited SHA is on origin.
+    pub attest_published: bool,
+}
+
+/// The receipt `task verdict gate` prints (DG-15).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoneGateState {
+    pub board: String,
+    pub done_gate: String,
+    pub old_value: String,
+    pub changed_by: String,
+}
+
+/// The one actor who may settle or reopen anyone's attention item and whom
+/// the browser acts as when no actor header is configured. Rows resolved
+/// before 2026-09-05 carry the historical spelling `geo`; that is a record,
+/// not an alias, and `geo` is refused like any other non-raiser today.
+pub const OPERATOR_ACTOR: &str = "geoyws";
+
 /// The kinds of thing that can need the operator, and nothing else.
 ///
 /// Deliberately no `info`: a note that does not need anyone is a note, and
 /// `task note` already holds those. Everything here is something only the
 /// operator can retire.
-pub const ATTENTION_KINDS: [&str; 5] = ["blocking", "decision", "approval", "review", "risk"];
+pub const ATTENTION_KINDS: [&str; 6] = [
+    "blocking",
+    "decision",
+    "approval",
+    "review",
+    "risk",
+    "complaint",
+];
+
+/// The statuses an attention row may hold. `resolved` is history — reopened
+/// rather than deleted — so a resolved row is closed until reopened.
+pub const ATTENTION_STATUSES: [&str; 2] = ["open", "resolved"];
+
+/// The machine-readable verdicts a choice can carry (ADR-042 §1).
+///
+/// Beside [`ATTENTION_KINDS`] and [`ATTENTION_STATUSES`] and for the same
+/// reason: a closed set the schema publishes rather than a convention. The
+/// label is what geoyws reads; this is what a lane branches on.
+pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"];
+
+/// The three forms a snoozing defer may name as the thing that brings the
+/// card back (SPA-64), quoted whole by every refusal of a malformed one.
+pub const RETURN_TRIGGER_FORMS: &str = "date:YYYY-MM-DD, task:<t-id> or event:<kind>";
+
+/// What brings a snoozed card back, parsed from `--return-trigger`.
+///
+/// Evaluated on read, never by sweep: `Date` fires at the start of that day
+/// in UTC, `Task` when that task is written after the deferral instant,
+/// `Event` when an event of that kind is recorded after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnTrigger<'a> {
+    Date(&'a str),
+    Task(&'a str),
+    Event(&'a str),
+}
+
+/// Parse one `--return-trigger` value, refusing anything that is not one of
+/// [`RETURN_TRIGGER_FORMS`] with a sentence naming all three.
+///
+/// Shape only: whether a named task or event kind exists on the board is the
+/// store's question, asked against the board the trigger will be read on.
+pub fn parse_return_trigger(value: &str) -> Result<ReturnTrigger<'_>> {
+    let refuse = || {
+        anyhow::anyhow!(
+            "--return-trigger {value:?} is not a return trigger; a trigger is one of {RETURN_TRIGGER_FORMS}"
+        )
+    };
+    let (form, argument) = value.split_once(':').ok_or_else(refuse)?;
+    let plain = |text: &str| {
+        !text.is_empty()
+            && !text
+                .chars()
+                .any(|character| character.is_whitespace() || character == ':')
+    };
+    match form {
+        "date" if calendar_date(argument) => Ok(ReturnTrigger::Date(argument)),
+        "task" if plain(argument) => Ok(ReturnTrigger::Task(argument)),
+        "event"
+            if plain(argument)
+                && argument
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            Ok(ReturnTrigger::Event(argument))
+        }
+        _ => Err(refuse()),
+    }
+}
+
+/// Whether `text` is a real `YYYY-MM-DD` calendar day: four-digit year, and
+/// a month and day that exist in it (so `2026-02-30` is refused rather than
+/// silently normalised to March by SQLite's date arithmetic).
+fn calendar_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let slice = &bytes[range];
+        slice
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(slice).ok()?.parse().ok())
+            .flatten()
+    };
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year >= 1 && (1..=days).contains(&day)
+}
+
+/// The statuses a sprint row may hold (ADR-045 §1).
+///
+/// A closed set beside [`ATTENTION_STATUSES`] for the same reason: the
+/// schema publishes the vocabulary instead of a convention growing one.
+/// `closed` and `abandoned` are history — reopened never, rewritten never —
+/// which is why the rewrite verbs refuse them by name.
+pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandoned"];
+
+/// Validate an explicit task-row identity against the board's own id shape
+/// for the kind being created.
+///
+/// The generator mints `{e|s|t}-<8 lowercase hex>` (`Store::add_task_in_sprint`),
+/// and the search index recognises exactly that generated shape
+/// (`canonical_generated_id_query` in `rust/search.rs`); the word suffixes
+/// already on boards (e.g. `e-q4`, documented in `skills/kb/SKILL.md:584`)
+/// widen it beyond generated hex: 1-62 lowercase letters, digits, dot,
+/// underscore, or hyphen, at most 64 characters total with the kind prefix.
+/// Everything else — whitespace, control characters, shell metacharacters
+/// (`bogus id!`, and `?`/`#`/`/` with them), uppercase, an empty suffix, and
+/// a prefix that does not match the kind — is refused with the expected
+/// shape, before the first write, so the CLI, `transact` batches and MCP
+/// share the one refusal. Opaque ids a legacy import can carry (e.g. the
+/// fixture `t-mobile/opaque?#`) keep reading back — reads never check the
+/// shape, and the atmux import writes by direct SQL and is not validated.
+pub fn task_id(value: &str, task_type: &str) -> Result<String> {
+    let prefix = match task_type {
+        "epic" => "e-",
+        "story" => "s-",
+        _ => "t-",
+    };
+    let suffix = value.strip_prefix(prefix).unwrap_or("");
+    if value.len() > 64
+        || suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "invalid {task_type} id {value:?}: expected {prefix}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)"
+        );
+    }
+    Ok(value.to_owned())
+}
+
+/// Validate the durable sprint identity shared by sprint rows and rule scopes.
+pub fn sprint_id(value: &str) -> Result<String> {
+    if value.len() > 64
+        || value
+            .strip_prefix("sp-")
+            .is_none_or(|suffix| suffix.is_empty())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "sprint id must start with sp-, include a suffix, be at most 64 ASCII characters, and contain only letters, digits, dot, underscore, or hyphen"
+        );
+    }
+    Ok(value.to_owned())
+}
+
+/// The reserved key of the free-text answer every item offers. Never stored
+/// in `choices`, and refused as an authored key (ADR-042 §4 refusal 9).
+pub const CUSTOM_CHOICE: &str = "custom";
+
+const QUESTION_MAX: usize = 160;
+const CONTEXT_MAX: usize = 800;
+const LABEL_MAX: usize = 60;
+const CONSEQUENCE_MAX: usize = 200;
+const KEY_MAX: usize = 32;
+const CHECK_EXPLANATION_MAX: usize = 400;
+const CHECK_ABOUT_RULE: &str = "`about` not matching one of the three subject shapes (a path containing `/` or a file extension; a sigil token `@@host`/`@_tier`; an UPPER_SNAKE flag or `--flag` name) is refused naming the three shapes.";
+const CHECK_DIAGNOSIS_RULE: &str = "The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back.";
+
+/// "approve, reject, defer, or other" — the four values, for a refusal that
+/// names them rather than leaving the caller to guess.
+fn outcome_list() -> String {
+    let (last, rest) = ATTENTION_OUTCOMES.split_last().expect("four outcomes");
+    format!("{}, or {last}", rest.join(", "))
+}
+
+/// One authored answer to an attention item's question.
+///
+/// `key` is what the CLI, the MCP tool, the form POST and the ledger all
+/// name, so it is a slug rather than prose; `label` is the button text and
+/// `consequence` is what happens if it is picked, including its cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionChoice {
+    pub key: String,
+    pub label: String,
+    pub consequence: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+/// One non-decisional answer offered by an active comprehension check.
+///
+/// It deliberately has neither an outcome nor a recommendation: answering a
+/// check cannot choose or influence the decision card's verdict (ACC-03).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionCheckChoice {
+    pub key: String,
+    pub label: String,
+}
+
+/// The native comprehension-check definition attached to an attention row.
+///
+/// `answer` and `explanation` are optional only at the read boundary, where a
+/// broad projection removes them. Every value accepted for persistence has
+/// both fields; [`AttentionCheck::validate_definition`] enforces that law.
+///
+/// `answered`, `correct` and `answered_at` are the one recorded answer
+/// (ACC-07/ACC-08): absent until someone answers, all-or-none thereafter,
+/// never written by a definition edit. Their presence is also the read
+/// boundary's switch — an answered check may reveal `answer` and
+/// `explanation`, an unanswered one never does (ACC-13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttentionCheck {
+    pub question: String,
+    pub choices: Vec<AttentionCheckChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    pub about: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correct: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<i64>,
+}
+
+impl AttentionCheck {
+    /// Whether the one answer this check accepts has been recorded.
+    pub fn is_answered(&self) -> bool {
+        self.answered.is_some()
+    }
+}
+
+/// Raw five-flag check input, kept unvalidated until the Store has applied
+/// row-level author authorization on update.
+#[derive(Debug, Clone, Default)]
+pub struct AttentionCheckInput {
+    pub question: Option<String>,
+    pub choices: Vec<String>,
+    pub answer: Option<String>,
+    pub explanation: Option<String>,
+    pub about: Option<String>,
+}
+
+impl AttentionCheckInput {
+    pub fn is_empty(&self) -> bool {
+        self.question.is_none()
+            && self.choices.is_empty()
+            && self.answer.is_none()
+            && self.explanation.is_none()
+            && self.about.is_none()
+    }
+
+    pub fn parse(&self) -> Result<Option<AttentionCheck>> {
+        AttentionCheck::parse(
+            self.question.as_deref(),
+            &self.choices,
+            self.answer.as_deref(),
+            self.explanation.as_deref(),
+            self.about.as_deref(),
+        )
+    }
+}
+impl AttentionCheck {
+    /// Parse the five CLI inputs as one all-or-none definition.
+    pub fn parse(
+        question: Option<&str>,
+        choices: &[String],
+        answer: Option<&str>,
+        explanation: Option<&str>,
+        about: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let present = [
+            question.is_some(),
+            !choices.is_empty(),
+            answer.is_some(),
+            explanation.is_some(),
+            about.is_some(),
+        ];
+        if present.iter().all(|value| !value) {
+            return Ok(None);
+        }
+        let names = [
+            "--check",
+            "--check-choice",
+            "--check-answer",
+            "--check-explain",
+            "--check-about",
+        ];
+        let missing = names
+            .iter()
+            .zip(present)
+            .filter_map(|(name, present)| (!present).then_some(*name))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "attention: a check is one complete block; missing {}",
+                missing.join(", ")
+            );
+        }
+        let mut parsed = Vec::with_capacity(choices.len());
+        for token in choices {
+            let Some((key, label)) = token.split_once('=') else {
+                bail!(
+                    "attention: --check-choice {token:?} must read KEY=LABEL, such as \
+                     --check-choice 'store=The Store validates it'"
+                );
+            };
+            parsed.push(AttentionCheckChoice {
+                key: key.trim().to_owned(),
+                label: label.trim().to_owned(),
+            });
+        }
+        let check = Self {
+            question: question.expect("presence checked").trim().to_owned(),
+            choices: parsed,
+            answer: Some(answer.expect("presence checked").trim().to_owned()),
+            explanation: Some(explanation.expect("presence checked").trim().to_owned()),
+            about: about.expect("presence checked").trim().to_owned(),
+            // A definition never carries a result; only answering writes one.
+            answered: None,
+            correct: None,
+            answered_at: None,
+        };
+        check.validate_definition()?;
+        Ok(Some(check))
+    }
+
+    /// Validate every persisted definition invariant in one Store-shared rule.
+    pub fn validate_definition(&self) -> Result<()> {
+        bounded(&self.question, "--check", QUESTION_MAX)?;
+        if !self.question.ends_with('?') {
+            bail!("attention: --check must end in '?'");
+        }
+        if !(2..=4).contains(&self.choices.len()) {
+            bail!(
+                "attention: --check-choice requires 2 to 4 choices; {} were given",
+                self.choices.len()
+            );
+        }
+        for (index, choice) in self.choices.iter().enumerate() {
+            valid_key(&choice.key)?;
+            bounded(
+                &choice.label,
+                &format!("--check-choice {} label", choice.key),
+                LABEL_MAX,
+            )?;
+            if choice.label.contains('|') {
+                bail!(
+                    "attention: --check-choice {} label contains '|'; check choices read KEY=LABEL",
+                    choice.key
+                );
+            }
+            if self.choices[..index]
+                .iter()
+                .any(|earlier| earlier.key == choice.key)
+            {
+                bail!(
+                    "attention: --check-choice key {} is given twice; keys must be unique",
+                    choice.key
+                );
+            }
+        }
+        let answer = self
+            .answer
+            .as_deref()
+            .filter(|answer| !answer.is_empty())
+            .context("attention: --check-answer is required")?;
+        if !self.choices.iter().any(|choice| choice.key == answer) {
+            bail!(
+                "attention: --check-answer {answer} names no --check-choice; declared keys are {}",
+                self.choices
+                    .iter()
+                    .map(|choice| choice.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let explanation = self
+            .explanation
+            .as_deref()
+            .context("attention: --check-explain is required")?;
+        bounded(explanation, "--check-explain", CHECK_EXPLANATION_MAX)?;
+        if !valid_check_about(&self.about) {
+            bail!(CHECK_ABOUT_RULE);
+        }
+        for text in std::iter::once(self.question.as_str())
+            .chain(self.choices.iter().map(|choice| choice.label.as_str()))
+            .chain(std::iter::once(explanation))
+        {
+            if let Some(token) = diagnosis_marker(text) {
+                bail!("offending token {token:?}. {CHECK_DIAGNOSIS_RULE}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The safe unanswered projection used by broad lists, MCP and web reads.
+    ///
+    /// It removes the result triple as well: `redacted` is the pre-answer
+    /// projection, and a check that has been answered is served whole by the
+    /// caller instead of passing through here (ACC-13).
+    pub fn redacted(&self) -> Self {
+        Self {
+            question: self.question.clone(),
+            choices: self.choices.clone(),
+            answer: None,
+            explanation: None,
+            about: self.about.clone(),
+            answered: None,
+            correct: None,
+            answered_at: None,
+        }
+    }
+}
+
+/// One `about` subject's resolved check results (ACC-18/ACC-19).
+///
+/// The group key is `about` alone: no raiser, actor, answer-key, explanation
+/// or choice-label column exists in either shape. `miss_rate` is the
+/// whole-percent integer `missed * 100 / answered`, truncated toward zero.
+/// Serialized `camelCase`, so the CLI `--json` shape carries `missRate`
+/// while the human table beside it heads the same column `miss-rate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckReportGroup {
+    pub about: String,
+    pub answered: i64,
+    pub correct: i64,
+    pub missed: i64,
+    pub miss_rate: i64,
+}
+
+fn valid_check_about(about: &str) -> bool {
+    let path = about.contains('/')
+        || about
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty());
+    let sigil = ["@@", "@_"].iter().any(|prefix| {
+        about.strip_prefix(prefix).is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    });
+    let upper_snake = !about.is_empty()
+        && about.bytes().any(|byte| byte.is_ascii_uppercase())
+        && about
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    let flag = about.strip_prefix("--").is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    });
+    path || sigil || upper_snake || flag
+}
+
+fn diagnosis_marker(text: &str) -> Option<&str> {
+    fn boundary(byte: Option<u8>) -> bool {
+        byte.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    }
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        for prefix in [b"sp-".as_slice(), b"a-", b"t-", b"s-", b"e-"] {
+            let end = index + prefix.len() + 8;
+            if end <= bytes.len()
+                && bytes[index..].starts_with(prefix)
+                && bytes[index + prefix.len()..end]
+                    .iter()
+                    .all(u8::is_ascii_hexdigit)
+                && boundary(index.checked_sub(1).map(|at| bytes[at]))
+                && boundary(bytes.get(end).copied())
+            {
+                return text.get(index..end);
+            }
+        }
+        let end = index + 10;
+        if end <= bytes.len()
+            && matches!(
+                &bytes[index..end],
+                [
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'-',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'-',
+                    b'0'..=b'9',
+                    b'0'..=b'9'
+                ]
+            )
+            && boundary(index.checked_sub(1).map(|at| bytes[at]))
+            && boundary(bytes.get(end).copied())
+        {
+            return text.get(index..end);
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    for phrase in ["today", "this row", "the sweep", "measured"] {
+        let mut start = 0;
+        while let Some(relative) = lower[start..].find(phrase) {
+            let index = start + relative;
+            let end = index + phrase.len();
+            if boundary(index.checked_sub(1).map(|at| bytes[at]))
+                && boundary(bytes.get(end).copied())
+            {
+                return text.get(index..end);
+            }
+            start = end;
+        }
+    }
+    None
+}
+
+/// What resolving recorded: the key that was picked, its verdict, any note,
+/// and who settled it when (ADR-042 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionDecision {
+    /// An authored key, or the literal [`CUSTOM_CHOICE`].
+    pub choice: String,
+    pub outcome: String,
+    pub note: Option<String>,
+    pub by: String,
+    pub at: i64,
+}
+
+/// The pair a row with no authored choices is served as (ADR-042 §2).
+///
+/// Nobody authored it, so nothing is recommended — the one place in the model
+/// where zero recommendations is legal. Labels are ASCII because they travel
+/// through argv, a form POST and a terminal.
+pub fn default_choice_pair() -> Vec<AttentionChoice> {
+    vec![
+        AttentionChoice {
+            key: "approve".to_owned(),
+            label: "Approve - proceed".to_owned(),
+            consequence: "The work the body describes goes ahead as written.".to_owned(),
+            outcome: "approve".to_owned(),
+            recommended: false,
+        },
+        AttentionChoice {
+            key: "reject".to_owned(),
+            label: "Reject - do not proceed".to_owned(),
+            consequence:
+                "The work the body describes does not happen; whoever raised it needs a new plan."
+                    .to_owned(),
+            outcome: "reject".to_owned(),
+            recommended: false,
+        },
+    ]
+}
+
+/// The authored card an `attention raise` or `attention update` carries: the
+/// question, the context needed to answer it, and two to four choices with
+/// exactly one recommendation.
+///
+/// Every ADR-042 §4 refusal that is about the card lives here and nowhere
+/// else, so the CLI, the MCP tool and the web edge share one wording. The
+/// schema cannot express these — a `CHECK constraint failed` names no fix
+/// (ADR-008) — so the columns bound lengths and this bounds the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionCard {
+    pub question: Option<String>,
+    pub context: Option<String>,
+    /// Empty when the raiser authored none; such a row reads as
+    /// [`default_choice_pair`].
+    pub choices: Vec<AttentionChoice>,
+}
+
+impl DecisionCard {
+    /// Whether this card asks for nothing to be written.
+    pub fn is_empty(&self) -> bool {
+        self.question.is_none() && self.context.is_none() && self.choices.is_empty()
+    }
+
+    /// Bind the CLI's tokens into a card, then validate it.
+    ///
+    /// `--choice KEY=LABEL|OUTCOME` splits on its FIRST `=` and its LAST `|`,
+    /// so a label may contain `=` and may not contain `|`.
+    /// `--consequence KEY=TEXT` is separate because a consequence is a
+    /// sentence that will contain `|`, `=`, commas and colons.
+    pub fn parse(
+        question: Option<&str>,
+        context: Option<&str>,
+        choices: &[String],
+        consequences: &[String],
+        recommend: Option<&str>,
+    ) -> Result<Self> {
+        let mut parsed: Vec<AttentionChoice> = Vec::with_capacity(choices.len());
+        for token in choices {
+            let Some((key, rest)) = token.split_once('=') else {
+                bail!(
+                    "attention: --choice {token:?} must read KEY=LABEL|OUTCOME, \
+                     such as --choice \"assign=Assign a Claude seat|approve\""
+                );
+            };
+            let Some((label, outcome)) = rest.rsplit_once('|') else {
+                bail!(
+                    "attention: --choice {token:?} names no outcome; it must read \
+                     KEY=LABEL|OUTCOME with the outcome one of {}",
+                    outcome_list()
+                );
+            };
+            parsed.push(AttentionChoice {
+                key: key.trim().to_owned(),
+                label: label.trim().to_owned(),
+                consequence: String::new(),
+                outcome: outcome.trim().to_owned(),
+                recommended: false,
+            });
+        }
+        // Before the consequences bind: a repeated key would take the first
+        // choice's consequence and leave the second without one, so the
+        // refusal would name a missing consequence rather than the duplicate
+        // that caused it.
+        unique_keys(&parsed)?;
+        let declared = |choices: &[AttentionChoice]| {
+            choices
+                .iter()
+                .map(|choice| choice.key.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for token in consequences {
+            let Some((key, text)) = token.split_once('=') else {
+                bail!(
+                    "attention: --consequence {token:?} must read KEY=TEXT, naming the \
+                     choice it belongs to"
+                );
+            };
+            let key = key.trim();
+            if !parsed.iter().any(|choice| choice.key == key) {
+                bail!(
+                    "attention: no choice named {key}; declared keys are {}",
+                    declared(&parsed)
+                );
+            }
+            let choice = parsed
+                .iter_mut()
+                .find(|choice| choice.key == key)
+                .expect("the key was just found");
+            if !choice.consequence.is_empty() {
+                bail!(
+                    "attention: choice {key} is given two --consequence values; \
+                     give one per choice"
+                );
+            }
+            choice.consequence = text.trim().to_owned();
+            if choice.consequence.is_empty() {
+                bail!(
+                    "attention: choice {key} has an empty --consequence; every choice must \
+                     say what happens if it is picked"
+                );
+            }
+        }
+        if let Some(key) = parsed
+            .iter()
+            .find(|choice| choice.consequence.is_empty())
+            .map(|choice| choice.key.clone())
+        {
+            bail!(
+                "attention: choice {key} has no --consequence; every choice must say what \
+                 happens if it is picked"
+            );
+        }
+        if let Some(key) = recommend {
+            let key = key.trim();
+            if parsed.is_empty() {
+                bail!("attention: --recommend needs choices; give --choice or drop it");
+            }
+            if !parsed.iter().any(|choice| choice.key == key) {
+                bail!(
+                    "attention: no choice named {key}; declared keys are {}",
+                    declared(&parsed)
+                );
+            }
+            for choice in parsed.iter_mut().filter(|choice| choice.key == key) {
+                choice.recommended = true;
+            }
+        }
+        let card = Self {
+            question: question.map(str::trim).map(str::to_owned),
+            context: context.map(str::trim).map(str::to_owned),
+            choices: parsed,
+        };
+        card.validate()?;
+        Ok(card)
+    }
+
+    /// Every cross-field and per-field invariant of a card, in one place.
+    pub fn validate(&self) -> Result<()> {
+        match (&self.question, &self.context) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => bail!("attention: --question and --context are one card; give both or neither"),
+        }
+        if let Some(question) = &self.question {
+            bounded(question, "--question", QUESTION_MAX)?;
+        }
+        if let Some(context) = &self.context {
+            bounded(context, "--context", CONTEXT_MAX)?;
+        }
+        if self.choices.is_empty() {
+            return Ok(());
+        }
+        if !(2..=4).contains(&self.choices.len()) {
+            bail!(
+                "attention: an item carries 2 to 4 choices; {} were given",
+                self.choices.len()
+            );
+        }
+        for choice in &self.choices {
+            valid_key(&choice.key)?;
+            if choice.key == CUSTOM_CHOICE {
+                bail!(
+                    "attention: {CUSTOM_CHOICE} is reserved for the free-text answer and \
+                     cannot be a choice key"
+                );
+            }
+            bounded(
+                &choice.label,
+                &format!("choice {} label", choice.key),
+                LABEL_MAX,
+            )?;
+            if choice.label.contains('|') {
+                bail!(
+                    "attention: choice {} label contains '|', which separates the label from \
+                     the outcome in --choice KEY=LABEL|OUTCOME; write the label without it",
+                    choice.key
+                );
+            }
+            bounded(
+                &choice.consequence,
+                &format!("choice {} consequence", choice.key),
+                CONSEQUENCE_MAX,
+            )?;
+            if !ATTENTION_OUTCOMES.contains(&choice.outcome.as_str()) {
+                bail!(
+                    "attention: choice {} has outcome {}; an outcome is one of {}",
+                    choice.key,
+                    choice.outcome,
+                    outcome_list()
+                );
+            }
+        }
+        unique_keys(&self.choices)?;
+        let recommended = self
+            .choices
+            .iter()
+            .filter(|choice| choice.recommended)
+            .count();
+        if recommended != 1 {
+            bail!("attention: exactly one choice is recommended; {recommended} were");
+        }
+        Ok(())
+    }
+
+    /// The `choices` column's value, or `NULL` when nothing was authored.
+    pub fn choices_json(&self) -> Option<String> {
+        if self.choices.is_empty() {
+            return None;
+        }
+        Some(serde_json::to_string(&self.choices).expect("choices serialize"))
+    }
+}
+
+/// Keys are unique within an item: the CLI, the form POST and the ledger all
+/// name a choice by its key, and two choices answering to one name make the
+/// decision ambiguous.
+fn unique_keys(choices: &[AttentionChoice]) -> Result<()> {
+    for (index, choice) in choices.iter().enumerate() {
+        if choices[..index]
+            .iter()
+            .any(|earlier| earlier.key == choice.key)
+        {
+            bail!(
+                "attention: choice key {} is given twice; keys must be unique within an item",
+                choice.key
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A field's length bound, named with what it got (ADR-042 §4 refusal 12).
+///
+/// Characters rather than bytes, because the columns' CHECKs use SQLite
+/// `length()`, which counts characters on TEXT.
+fn bounded(value: &str, field: &str, max: usize) -> Result<()> {
+    if value.is_empty() {
+        bail!("attention: {field} is empty; give it a value or drop it");
+    }
+    let length = value.chars().count();
+    if length > max {
+        bail!("attention: {field} is {length} characters; the bound is {max}");
+    }
+    Ok(())
+}
+
+/// `[a-z0-9][a-z0-9-]{0,31}`, checked without a regex dependency.
+fn valid_key(key: &str) -> Result<()> {
+    let shaped = key
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && key.len() <= KEY_MAX
+        && key
+            .chars()
+            .all(|letter| letter.is_ascii_lowercase() || letter.is_ascii_digit() || letter == '-');
+    if !shaped {
+        bail!(
+            "attention: choice key {key:?} is not a slug; a key matches \
+             [a-z0-9][a-z0-9-]{{0,31}} so it stays typeable in argv, a form POST and the ledger"
+        );
+    }
+    Ok(())
+}
+
+/// What a resolve names: an authored choice by key, or the reserved custom
+/// answer with its own outcome and a required note.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionAnswer<'a> {
+    pub choice: Option<&'a str>,
+    pub outcome: Option<&'a str>,
+    pub note: Option<&'a str>,
+}
+
+impl<'a> AttentionAnswer<'a> {
+    /// The custom answer, which every item offers and which always carries a
+    /// verdict and a note.
+    #[cfg(test)]
+    pub fn custom(outcome: &'a str, note: &'a str) -> Self {
+        Self {
+            choice: Some(CUSTOM_CHOICE),
+            outcome: Some(outcome),
+            note: Some(note),
+        }
+    }
+
+    /// The decision this answer records against a row's choices, and the
+    /// resolution text it composes.
+    ///
+    /// One composer inside the write path, so no caller can produce a
+    /// different trail and `resolution` is derived state rather than an
+    /// independent input (ADR-042 §3).
+    pub fn decide(
+        &self,
+        id: &str,
+        choices: &[AttentionChoice],
+        by: &str,
+        at: i64,
+    ) -> Result<(AttentionDecision, String)> {
+        let note = self
+            .note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_owned);
+        let Some(key) = self.choice.map(str::trim).filter(|key| !key.is_empty()) else {
+            bail!(
+                "attention resolve requires --choice KEY or \
+                 --choice {CUSTOM_CHOICE} --outcome X --note TEXT"
+            );
+        };
+        if key == CUSTOM_CHOICE {
+            let outcome = self
+                .outcome
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let (Some(outcome), Some(note)) = (outcome, note) else {
+                bail!(
+                    "attention: a custom answer needs --outcome ({}) and --note",
+                    ATTENTION_OUTCOMES.join(", ")
+                );
+            };
+            if !ATTENTION_OUTCOMES.contains(&outcome) {
+                bail!(
+                    "attention: --outcome {outcome} is not a verdict; an outcome is one of {}",
+                    outcome_list()
+                );
+            }
+            let resolution =
+                format!("Decision: Custom answer, recorded as {outcome}.\nNote: {note}");
+            return Ok((
+                AttentionDecision {
+                    choice: CUSTOM_CHOICE.to_owned(),
+                    outcome: outcome.to_owned(),
+                    note: Some(note),
+                    by: by.to_owned(),
+                    at,
+                },
+                resolution,
+            ));
+        }
+        if self.outcome.is_some_and(|value| !value.trim().is_empty()) {
+            bail!(
+                "attention: --outcome applies only to --choice {CUSTOM_CHOICE}; \
+                 an authored choice carries its own outcome"
+            );
+        }
+        let Some(choice) = choices.iter().find(|choice| choice.key == key) else {
+            bail!(
+                "attention {id} has no choice {key}; its choices are {}",
+                choices
+                    .iter()
+                    .map(|choice| choice.key.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        let mut resolution = format!("Decision: {}. {}", choice.label, choice.consequence);
+        if let Some(note) = &note {
+            resolution.push_str("\nNote: ");
+            resolution.push_str(note);
+        }
+        Ok((
+            AttentionDecision {
+                choice: choice.key.clone(),
+                outcome: choice.outcome.clone(),
+                note,
+                by: by.to_owned(),
+                at,
+            },
+            resolution,
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -588,7 +1849,27 @@ pub struct Attention {
     pub task_id: Option<String>,
     pub kind: String,
     pub body: String,
+    /// What geoyws is deciding, in his terms; `None` on a row with no
+    /// authored card, where the body serves as both question and context.
+    pub question: Option<String>,
+    pub context: Option<String>,
+    /// The answers on offer: what the raiser authored, or
+    /// [`default_choice_pair`] materialized on read for a row that authored
+    /// none. Never empty, and never carries the reserved `custom` key.
+    pub choices: Vec<AttentionChoice>,
+    /// Native reusable-system comprehension check. Absent on legacy/no-check
+    /// rows; broad projections remove its answer and explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<AttentionCheck>,
     pub raised_by: String,
+    /// The lane `--lane` named at raise (SPA-62), or `None` when the card
+    /// was raised without one — as every pre-v34 row was. A `None` row still
+    /// reads through the raiser-suffix and task-lane routes.
+    pub lane: Option<String>,
+    /// The `--return-trigger` a snoozing defer named (SPA-64), or `None` on
+    /// a row that never snoozed — as every pre-v35 row is. While it has not
+    /// fired, the open queue and every count it feeds read the row as absent.
+    pub return_trigger: Option<String>,
     pub created_at: i64,
     pub status: String,
     pub priority: i64,
@@ -596,6 +1877,9 @@ pub struct Attention {
     pub resolved_at: Option<i64>,
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
+    /// What settling it recorded, or `None` while it is open — a reopen
+    /// clears it from the row and keeps it in the ledger (ADR-042 §3).
+    pub decision: Option<AttentionDecision>,
     pub reopened_at: Option<i64>,
     pub reopened_by: Option<String>,
     pub reopen_note: Option<String>,
@@ -624,7 +1908,428 @@ pub struct ArchiveReport {
 pub const DEPLOYMENT_TIERS: [&str; 7] = ["@_bdt", "@_bd", "@_bst", "@_bs", "@_s", "@_uat", "@_p"];
 pub const DEPLOYMENT_STATUSES: [&str; 5] =
     ["started", "succeeded", "failed", "cancelled", "abandoned"];
+/// The results a finished deployment may record. `started` is the initial
+/// state and can never be a result, so this is [`DEPLOYMENT_STATUSES`] without
+/// its first entry.
+pub const DEPLOYMENT_RESULTS: [&str; 4] = ["succeeded", "failed", "cancelled", "abandoned"];
 pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verification"];
+
+/// The canonical seven-tier deployment table, quoted from the estate CLAUDE.md
+/// ("Deployment tiers" section): `@_bdt` and `@_bd` are MBP tiers, hosted on
+/// `geoywsMBP` (or the thin client `geoywsMBA`); `@_bst`, `@_bs`, `@_s`,
+/// `@_uat` and `@_p` are Hetzner tiers. Every other canonical tier is Hetzner
+/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table, apart from
+/// the one exception [`DEV_TIER_HAX_HOST`] names.
+pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
+
+/// The only hostnames that are MBP. Everything else is treated as a Hetzner
+/// host, which is the load-bearing half: an MBP tier stamped with a Hetzner
+/// host (`@_bdt` on `hig`, measured in the field) is refused, while a Hetzner
+/// tier on `geoywsMBP` is refused as the mirror image.
+pub const MBP_HOSTS: [&str; 2] = ["geoywsMBP", "geoywsMBA"];
+
+/// The one Hetzner host where the MBP tiers may also run, and only for boards
+/// in [`DEV_TIER_HAX_ESTATES`] (George, 2026-09-28: "`@_bdt` and `@_bd` run on
+/// `@@hax` for the Unum and geoyws estates"; docs/specs/deploy.md DEPLOY-05).
+/// Compared byte-exact: an alias or another spelling is not this host.
+pub const DEV_TIER_HAX_HOST: &str = "hax";
+
+/// The board estates whose MBP-tier attempts may record host
+/// [`DEV_TIER_HAX_HOST`]. IFCA boards and boards no estate claims keep the
+/// MBP hosts only (DEPLOY-06).
+pub const DEV_TIER_HAX_ESTATES: [&str; 2] = ["unum", "geoyws"];
+
+/// A full Git commit: 40 lowercase hexadecimal characters, and nothing
+/// shorter.
+///
+/// Lives here rather than in the store because it is a value rule the model
+/// enforces before a write is composed: [`DeployIdentity::parse`] uses it to
+/// tell a caller who knows the build commit from one who does not, and the
+/// store uses it for the served commit.
+pub(crate) fn full_commit(value: &str, label: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be a full 40-character hexadecimal commit");
+    }
+    Ok(value)
+}
+
+/// A `--version` value: `X.Y.Z` with an optional `-suffix` (ADR-045 §2).
+///
+/// The sprint's whole point is a version boundary, and a version nobody can
+/// match against a served artifact is decoration — so the shape is enforced
+/// here, once, for every surface that names one.
+pub fn target_version(value: &str) -> Result<String> {
+    let value = value.trim();
+    let (core, suffix) = match value.split_once('-') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (value, None),
+    };
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let core_valid = {
+        let mut parts = core.split('.');
+        (0..3).all(|_| numeric(parts.next().unwrap_or(""))) && parts.next().is_none()
+    };
+    let suffix_valid = suffix.is_none_or(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    });
+    if !core_valid || !suffix_valid {
+        bail!(
+            "version {value:?} must read X.Y.Z with an optional -suffix, such as 0.4.0 or \
+             0.4.0-rc.1 — the version is matched against a served artifact, so a shape nobody \
+             can match is decoration"
+        );
+    }
+    Ok(value.to_owned())
+}
+/// The canonical goal headline carried by context and dashboard projections.
+pub(crate) fn sprint_goal(body: Option<&str>) -> Option<&str> {
+    body?.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// The ordinary identity: a build commit, verified at finish against the
+/// commit the tier actually served. Every deploy that has Git provenance uses
+/// this and nothing about it changes.
+pub const IDENTITY_MODE_GIT: &str = "git";
+
+/// The recovery identity, for a retained artifact whose build provenance is
+/// genuinely lost: the attempt proves role-qualified artifact identities and
+/// states that the build commit is unknown, rather than borrowing a plausible
+/// SHA (ADR-043).
+///
+/// The mode is never parsed from a caller's argument — it is decided by which
+/// flags the caller passed ([`DeployIdentity::parse`]) — so these two are
+/// named constants rather than a validated closed set. The column's CHECK
+/// holds the same two values.
+pub const IDENTITY_MODE_ARTIFACT: &str = "artifact";
+
+/// A Docker config/image ID: the digest of an image's own config, computed
+/// locally by the engine that holds it.
+pub const ARTIFACT_KIND_IMAGE_ID: &str = "docker-image-id";
+
+/// An OCI registry manifest digest: the digest of the manifest a registry
+/// serves, which is not the image ID of the same image.
+pub const ARTIFACT_KIND_MANIFEST_DIGEST: &str = "oci-manifest-digest";
+
+/// The typed artifact-identity kinds.
+///
+/// Both are spelled `sha256:<64 hex>` and they are digests of different
+/// documents, so one is never evidence for the other. The kind therefore
+/// travels as part of the identity rather than as a comment beside it, and a
+/// finish that offers one where the other was expected is refused (ADR-043
+/// §3).
+pub const ARTIFACT_IDENTITY_KINDS: [&str; 2] =
+    [ARTIFACT_KIND_IMAGE_ID, ARTIFACT_KIND_MANIFEST_DIGEST];
+
+/// What `--build-commit` must say in artifact mode.
+///
+/// The literal, required rather than defaulted: a row whose build commit is
+/// unknown because the caller said so must not be reachable by a caller who
+/// simply omitted the flag.
+pub const UNKNOWN_BUILD_COMMIT: &str = "unknown";
+
+/// The words every surface prints where a build SHA would be, so that an
+/// unknown build commit never renders as a blank and never reads as verified.
+pub const UNKNOWN_BUILD_COMMIT_WORDS: &str =
+    "build commit unknown - recovered by artifact identity";
+
+const ROLE_MAX: usize = 32;
+const DIGEST_HEX: usize = 64;
+
+/// "docker-image-id (a Docker config or image ID) or oci-manifest-digest (a
+/// registry manifest digest)" — the two kinds, for a refusal that names them
+/// and says which is which.
+fn kind_list() -> String {
+    format!(
+        "{ARTIFACT_KIND_IMAGE_ID} (a Docker config or image ID) or \
+         {ARTIFACT_KIND_MANIFEST_DIGEST} (a registry manifest digest)"
+    )
+}
+
+/// `[a-z0-9][a-z0-9-]{0,31}`, the shape of a component role.
+///
+/// Same rule as an attention choice key and for the same reason: a role is
+/// named in argv, in JSON and in a refusal, so it stays typeable.
+fn valid_role(flag: &str, role: &str) -> Result<()> {
+    let shaped = role
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && role.len() <= ROLE_MAX
+        && role
+            .chars()
+            .all(|letter| letter.is_ascii_lowercase() || letter.is_ascii_digit() || letter == '-');
+    if !shaped {
+        bail!(
+            "deploy: {flag} role {role:?} is not a slug; a role names one component and \
+             matches [a-z0-9][a-z0-9-]{{0,{}}}, such as api or web",
+            ROLE_MAX - 1
+        );
+    }
+    Ok(())
+}
+
+/// One role-qualified artifact identity: which component, which typed kind,
+/// and the value.
+///
+/// This is what is stored, both as the attempt's expectation and as what its
+/// finish observed. The two are separate columns rather than one document a
+/// finish rewrites, so nothing a finish writes can edit what the start
+/// claimed (ADR-043 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactIdentity {
+    pub role: String,
+    pub kind: String,
+    pub value: String,
+}
+
+impl ArtifactIdentity {
+    /// Parse `ROLE=KIND:VALUE` tokens, named by the flag that carried them.
+    ///
+    /// Splits on the FIRST `=` and then the FIRST `:`: the value is itself
+    /// `sha256:<64 hex>` and owns every remaining colon. One identity per
+    /// role, because two identities for one component make "did it match"
+    /// unanswerable.
+    pub fn parse(tokens: &[String], flag: &str) -> Result<Vec<Self>> {
+        let mut parsed: Vec<Self> = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let Some((role, rest)) = token.split_once('=') else {
+                bail!(
+                    "deploy: {flag} {token:?} must read ROLE=KIND:VALUE, such as \
+                     {flag} \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<{DIGEST_HEX} hex>\""
+                );
+            };
+            let role = role.trim();
+            valid_role(flag, role)?;
+            let Some((kind, value)) = rest.split_once(':') else {
+                bail!(
+                    "deploy: {flag} role {role} names no typed value; it must read \
+                     ROLE=KIND:VALUE with KIND one of {}",
+                    kind_list()
+                );
+            };
+            let kind = kind.trim();
+            if !ARTIFACT_IDENTITY_KINDS.contains(&kind) {
+                bail!(
+                    "deploy: {flag} role {role} has kind {kind:?}; a kind is one of {}",
+                    kind_list()
+                );
+            }
+            let value = value.trim().to_ascii_lowercase();
+            let shaped = value.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == DIGEST_HEX && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !shaped {
+                bail!(
+                    "deploy: {flag} role {role} value {value:?} is not an identity; a {kind} is \
+                     sha256: followed by {DIGEST_HEX} hexadecimal characters"
+                );
+            }
+            if parsed.iter().any(|earlier| earlier.role == role) {
+                bail!("deploy: {flag} names role {role} twice; give one identity per role");
+            }
+            parsed.push(Self {
+                role: role.to_owned(),
+                kind: kind.to_owned(),
+                value,
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// `kind value`, for a refusal that names both halves of an identity.
+    fn named(&self) -> String {
+        format!("{} {}", self.kind, self.value)
+    }
+}
+
+/// One expected artifact identity and what the attempt's finish observed for
+/// it — the shape every surface renders (ADR-043 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactVerification {
+    pub role: String,
+    pub kind: String,
+    pub expected: String,
+    /// `None` until a terminal finish records what was measured.
+    pub observed: Option<String>,
+}
+
+/// Match what a finish observed against what the attempt expected, per role
+/// and per kind, and answer with the observations in the attempt's own
+/// expected order (ADR-043 §3).
+///
+/// Extra roles are refused before missing ones: a caller who misspelled a
+/// role produces both, and "this attempt does not expect ROLE, its roles are
+/// …" names the fix, while "ROLE was not observed" names the symptom.
+pub fn verify_artifacts(
+    id: &str,
+    expected: &[ArtifactIdentity],
+    observed: &[ArtifactIdentity],
+) -> Result<Vec<ArtifactIdentity>> {
+    let roles = expected
+        .iter()
+        .map(|artifact| artifact.role.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for offered in observed {
+        if !expected
+            .iter()
+            .any(|artifact| artifact.role == offered.role)
+        {
+            bail!(
+                "deployment {id} does not expect artifact role {}; its expected roles are {roles}",
+                offered.role
+            );
+        }
+    }
+    let mut verified = Vec::with_capacity(expected.len());
+    for artifact in expected {
+        let Some(offered) = observed
+            .iter()
+            .find(|offered| offered.role == artifact.role)
+        else {
+            bail!(
+                "deployment {id} expects artifact role {} ({}) and --observed named no \
+                 identity for it",
+                artifact.role,
+                artifact.named()
+            );
+        };
+        if offered.kind != artifact.kind {
+            bail!(
+                "deployment {id} artifact role {} expects {} but --observed offered {}; \
+                 a {ARTIFACT_KIND_IMAGE_ID} and an {ARTIFACT_KIND_MANIFEST_DIGEST} are \
+                 never compared to each other",
+                artifact.role,
+                artifact.named(),
+                offered.named()
+            );
+        }
+        if offered.value != artifact.value {
+            bail!(
+                "deployment {id} artifact role {} expects {} but --observed offered {}",
+                artifact.role,
+                artifact.named(),
+                offered.named()
+            );
+        }
+        verified.push(offered.clone());
+    }
+    Ok(verified)
+}
+
+/// The identity one attempt proves itself with: exactly one mode, named by
+/// the caller rather than inferred (ADR-043 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployIdentity {
+    /// `--commit FULL_SHA`: the ordinary verified-Git path, unchanged.
+    Git(String),
+    /// `--artifact ROLE=KIND:VALUE` with `--build-commit unknown`: at least
+    /// one typed identity, and the absence of a build commit stated out loud.
+    Artifact(Vec<ArtifactIdentity>),
+}
+
+impl DeployIdentity {
+    /// Resolve the flags a caller passed into exactly one mode.
+    ///
+    /// Every mode refusal lives here, so the CLI, the MCP tool and any later
+    /// surface share one wording, and none of them can compose a write the
+    /// others would have refused.
+    pub fn parse(
+        commit: Option<&str>,
+        build_commit: Option<&str>,
+        artifacts: &[String],
+    ) -> Result<Self> {
+        match (commit, artifacts.is_empty()) {
+            (Some(_), false) => bail!(
+                "deploy: --commit names a Git-mode attempt and --artifact names an \
+                 artifact-identity attempt; one mode per attempt, so pass one or the other"
+            ),
+            (Some(commit), true) => {
+                if let Some(stated) = build_commit {
+                    bail!(
+                        "deploy: --build-commit {stated:?} belongs to artifact mode; the Git \
+                         path names its commit with --commit FULL_SHA"
+                    );
+                }
+                Ok(Self::Git(full_commit(commit, "commit")?))
+            }
+            (None, false) => {
+                let Some(stated) = build_commit.map(str::trim) else {
+                    bail!(
+                        "deploy: artifact mode requires --build-commit {UNKNOWN_BUILD_COMMIT}, \
+                         so a missing build commit is stated rather than defaulted"
+                    );
+                };
+                if let Ok(commit) = full_commit(stated, "build commit") {
+                    bail!(
+                        "deploy: --build-commit {commit} is a full Git commit, so this build's \
+                         provenance is known; use the Git mode with --commit {commit} instead \
+                         of --artifact"
+                    );
+                }
+                if stated != UNKNOWN_BUILD_COMMIT {
+                    bail!(
+                        "deploy: --build-commit must be the literal {UNKNOWN_BUILD_COMMIT} in \
+                         artifact mode, got {stated:?}"
+                    );
+                }
+                Ok(Self::Artifact(ArtifactIdentity::parse(
+                    artifacts,
+                    "--artifact",
+                )?))
+            }
+            (None, true) => bail!(
+                "deploy start requires --commit FULL_SHA (the verified Git path) or \
+                 --artifact ROLE=KIND:VALUE with --build-commit {UNKNOWN_BUILD_COMMIT} \
+                 (the artifact-identity recovery path)"
+            ),
+        }
+    }
+
+    /// What the row records and every surface publishes.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Git(_) => IDENTITY_MODE_GIT,
+            Self::Artifact(_) => IDENTITY_MODE_ARTIFACT,
+        }
+    }
+
+    /// The build commit column's value: the 40-character commit in Git mode,
+    /// the literal `unknown` in artifact mode.
+    pub fn build_commit(&self) -> &str {
+        match self {
+            Self::Git(commit) => commit,
+            Self::Artifact(_) => UNKNOWN_BUILD_COMMIT,
+        }
+    }
+
+    /// The expected identities, empty in Git mode.
+    pub fn artifacts(&self) -> &[ArtifactIdentity] {
+        match self {
+            Self::Git(_) => &[],
+            Self::Artifact(artifacts) => artifacts,
+        }
+    }
+}
+
+/// What a surface prints for one attempt's build commit: the commit itself,
+/// or the words that say there is none.
+///
+/// Derived on read beside `priorityLevel` on a task, so the CLI, the MCP
+/// layer and the web page cannot each invent their own phrasing and none of
+/// them can leave the column blank.
+pub fn build_commit_label(identity_mode: &str, build_commit: &str) -> String {
+    if identity_mode == IDENTITY_MODE_ARTIFACT {
+        UNKNOWN_BUILD_COMMIT_WORDS.to_owned()
+    } else {
+        build_commit.to_owned()
+    }
+}
 
 /// One immutable deployment attempt. Terminal completion only fills the
 /// result columns; a retry is always a new row linked through `retry_of`.
@@ -635,7 +2340,18 @@ pub struct DeploymentAttempt {
     #[serde(rename = "taskID")]
     pub task_id: Option<String>,
     pub repo: String,
-    pub commit_sha: String,
+    /// `git` or `artifact`: which identity this attempt proves itself with.
+    pub identity_mode: String,
+    /// The build commit, or the literal [`UNKNOWN_BUILD_COMMIT`] in artifact
+    /// mode. Never a blank and never a borrowed SHA.
+    pub build_commit: String,
+    /// Derived on read, never stored: what a surface prints where a build SHA
+    /// would be. Beside a task's `priorityLevel`, and for the same reason —
+    /// one derivation every surface reads instead of its own.
+    pub build_commit_label: String,
+    /// The checkout the deployer ran from, when it stated one. Recorded
+    /// separately and never presented as the build commit.
+    pub deployer_checkout: Option<String>,
     pub branch: Option<String>,
     pub tier: String,
     pub environment: String,
@@ -651,6 +2367,15 @@ pub struct DeploymentAttempt {
     pub receipt: Option<String>,
     pub artifact_uri: Option<String>,
     pub served_commit: Option<String>,
+    #[serde(rename = "sprintID", skip_serializing_if = "Option::is_none")]
+    pub sprint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_version: Option<String>,
+    /// The expected identities and what the finish observed for each, in the
+    /// attempt's own expected order. Empty in Git mode.
+    pub artifacts: Vec<ArtifactVerification>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
@@ -671,7 +2396,9 @@ pub struct DeploymentStartReceipt {
 pub struct StartDeployment {
     pub task_id: Option<String>,
     pub repo: String,
-    pub commit_sha: String,
+    /// Exactly one identity mode, already resolved and validated.
+    pub identity: DeployIdentity,
+    pub deployer_checkout: Option<String>,
     pub branch: Option<String>,
     pub tier: String,
     pub environment: String,
@@ -682,6 +2409,8 @@ pub struct StartDeployment {
     pub retry_of: Option<String>,
     pub actor: String,
     pub lane: Option<String>,
+    /// Optional typed release boundary, resolved to its target version atomically at start.
+    pub sprint_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -693,7 +2422,90 @@ pub struct FinishDeployment {
     pub receipt: Option<String>,
     pub artifact_uri: Option<String>,
     pub served_commit: Option<String>,
+    /// What the finish measured, per role. Empty in Git mode, and one
+    /// identity per expected role for a succeeded artifact-mode attempt.
+    pub observed: Vec<ArtifactIdentity>,
+    /// The version actually observed as served. Required for successful, sprint-bound verification.
+    pub served_version: Option<String>,
     pub actor: String,
+}
+
+/// One sprint row: a typed boundary that scopes claims and cannot close
+/// without a served version (ADR-045 §1).
+///
+/// Not the tasks table, deliberately — a sprint is not work and must not be
+/// claimable, gated or handed off; typed rows get tables (the
+/// `attention`/`deployment`/`subscription` precedent) and `sp-` is a
+/// first-class id like `a-` and `d-`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sprint {
+    pub id: String,
+    pub title: String,
+    /// The goal and success criteria, authored by `sprint plan`.
+    pub body: Option<String>,
+    /// One of [`SPRINT_STATUSES`].
+    pub status: String,
+    /// The version this sprint ships; the close gate's deployment row is the
+    /// proof that version was served.
+    pub target_version: String,
+    /// Planned interval, independent of actual start/close stamps. Epoch milliseconds.
+    pub scheduled_start: i64,
+    pub scheduled_end: i64,
+    /// Stamped by `sprint start`. `0` until then — epoch zero is not a
+    /// moment anyone can have started at, so it can never read as a stamp.
+    pub starts_at: i64,
+    /// Stamped by `sprint close` and `sprint abandon`.
+    pub ends_at: Option<i64>,
+    /// The `d-` attempt that proved the version served, set by close.
+    pub closed_by_deployment: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived: bool,
+}
+
+/// The `sprint new` input. The row starts `planned`; `start` makes it the
+/// boundary, `close` ends it on proof, `abandon` ends it on a note.
+#[derive(Debug, Clone)]
+pub struct NewSprint {
+    pub id: Option<String>,
+    pub title: String,
+    pub body: Option<String>,
+    pub target_version: String,
+    pub scheduled_start: i64,
+    pub scheduled_end: i64,
+    pub actor: String,
+}
+
+/// What one task-sprint change did: the row it moved, its old boundary, and
+/// every row whose attachment changed — the same set the event payload
+/// names, so the CLI answer and the ledger cannot disagree (ADR-045 §2).
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSprintReceipt {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub old_sprint_id: Option<String>,
+    pub new_sprint_id: Option<String>,
+    /// Every row the change moved, parent-first: the named row plus each
+    /// subtree descendant that joined it.
+    pub moved: Vec<String>,
+}
+
+/// The sprint a context packet's task is attached to (ADR-045 §5): which
+/// release the resuming agent is working toward.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSprint {
+    #[serde(rename = "sprintID")]
+    pub sprint_id: String,
+    pub status: String,
+    pub target_version: String,
+    pub title: String,
+    /// The sprint body's first line — the goal as a headline, without the
+    /// whole success-criteria document.
+    pub goal: Option<String>,
 }
 
 /// One bounded retrieval request over Kanban's derived search corpus.
@@ -736,6 +2548,26 @@ pub struct SearchResult {
     pub citation: String,
 }
 
+/// A registered board a survey could not open, and the reason it could not.
+///
+/// Reported separately from the `missingBoards` list beside it because the two
+/// call for opposite responses. A missing board is recovered by restoring a
+/// snapshot over its path; doing that to an unreadable one overwrites intact
+/// data with older data. Boards are created `0600`, so one written by another
+/// user is unreadable and perfectly healthy at the same time, and a survey that
+/// prints `missing` at an operator has pointed them at the destructive move.
+///
+/// Carries the path as well as the name, because the fix is on the file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableBoard {
+    pub name: String,
+    pub board_path: String,
+    /// What stopped the read, verbatim — `Permission denied (os error 13)` and
+    /// a locked-database failure are different problems with different fixes.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchReceipt {
@@ -743,6 +2575,9 @@ pub struct SearchReceipt {
     pub embedding_model: String,
     pub boards: Vec<String>,
     pub missing_boards: Vec<String>,
+    /// Boards that exist and would not open. Never folded into
+    /// `missing_boards`: see [`UnreadableBoard`].
+    pub unreadable_boards: Vec<UnreadableBoard>,
     pub results: Vec<SearchResult>,
     pub result_chars: usize,
     pub truncated: bool,
@@ -769,6 +2604,9 @@ pub struct SearchIndexHealth {
     pub missing_embeddings: i64,
     pub stale_embeddings: i64,
     pub embedding_model: String,
+    /// Why `healthy` is false, each naming the measured gap and its fix
+    /// (`kb search-rebuild`). Empty when the index is healthy.
+    pub unhealthy_because: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -795,4 +2633,1494 @@ pub struct HandoffInput {
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
     pub root_head: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn board_id_from_path_reads_the_uuid_stem_and_ignores_extension() {
+        assert_eq!(
+            board_id_from_path("/root/boards/b1e2c2d9-b9e8-4c67-923d-153f7faed19a.db"),
+            Some("b1e2c2d9-b9e8-4c67-923d-153f7faed19a".to_owned())
+        );
+        // A path with no file component (the root, or the empty path) yields
+        // nothing, which the direct estate falls back to the empty string and
+        // never consults.
+        assert_eq!(board_id_from_path("/"), None);
+        assert_eq!(board_id_from_path(""), None);
+    }
+
+    /// The whole of `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`, boundary by
+    /// boundary: what a harness actually calls its models, and what the
+    /// refusal must catch before a typo reaches an allow-list nobody can
+    /// satisfy.
+    #[test]
+    fn a_model_name_has_one_shape() {
+        for good in [
+            "Astra",
+            "blender",
+            "claude-opus-4.1",
+            "openai/gpt-5",
+            "z.ai:glm-4.6",
+            "kimi_k2",
+            "4",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(validate_model_name(good).unwrap(), good, "{good} refused");
+        }
+        for bad in [
+            "",
+            "-leading",
+            ".leading",
+            "/leading",
+            "has space",
+            "has\ttab",
+            "bang!",
+            "emoji🙂",
+            &"a".repeat(65),
+        ] {
+            let error = validate_model_name(bad).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "model name {bad} is not a usable name: it must match \
+                     ^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,63}}$"
+                ),
+                "{bad} was accepted or refused with the wrong sentence"
+            );
+        }
+        // Case is kept, never folded: there is no master file to fold toward.
+        assert_eq!(validate_model_name("Astra").unwrap(), "Astra");
+        // A list is a sorted set, so the wire shape cannot depend on the
+        // order the flags arrived in.
+        assert_eq!(
+            validate_model_names(&[
+                "blender".to_owned(),
+                "Astra".to_owned(),
+                "blender".to_owned(),
+            ])
+            .unwrap(),
+            vec!["Astra".to_owned(), "blender".to_owned()]
+        );
+        assert!(validate_model_names(&["has space".to_owned()]).is_err());
+    }
+
+    /// The board's own id shape per kind: generated hex and legacy words —
+    /// refused with the expected shape otherwise. The process test proves the
+    /// CLI refusal end to end; this pins the boundaries it does not enumerate
+    /// (case, the rejected separators, the length bound, the empty suffix).
+    /// Opaque ids already on boards (`t-mobile/opaque?#`) are a read path,
+    /// not this check: they arrive through the import, which writes by direct
+    /// SQL, and reads never validate.
+    #[test]
+    fn a_task_id_has_one_shape_per_kind() {
+        for (kind, good) in [
+            ("task", "t-1234abcd"),
+            ("task", "t-ui-2"),
+            ("epic", "e-1234abcd"),
+            ("epic", "e-ui"),
+            ("epic", "e-q4"),
+            ("story", "s-1234abcd"),
+            ("story", "s-parent"),
+            ("task", &format!("t-{}", "a".repeat(62))),
+        ] {
+            assert_eq!(task_id(good, kind).unwrap(), good, "{kind} {good} refused");
+        }
+        for (kind, bad) in [
+            ("task", "bogus id!"),
+            ("task", "t-has space"),
+            ("task", "t-has\ttab"),
+            ("task", "t-line\nbreak"),
+            ("task", "t-bang!"),
+            ("task", "t-dollar$"),
+            ("task", "t-a/b"),
+            ("task", "t-a?b"),
+            ("task", "t-UPPER"),
+            ("task", "t-"),
+            ("task", "t"),
+            ("task", ""),
+            ("task", "e-1234abcd"),
+            ("task", "s-1234abcd"),
+            ("task", "sp-1234abcd"),
+            ("task", "b-1"),
+            ("task", "rm"),
+            ("epic", "t-1234abcd"),
+            ("story", "t-1234abcd"),
+            ("task", &format!("t-{}", "a".repeat(63))),
+        ] {
+            let error = task_id(bad, kind).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid {kind} id {bad:?}: expected {}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+                    match kind {
+                        "epic" => "e-",
+                        "story" => "s-",
+                        _ => "t-",
+                    }
+                ),
+                "{kind} {bad} was accepted or refused with the wrong sentence"
+            );
+        }
+    }
+
+    /// One well-formed pair of tokens, which every refusal case breaks in
+    /// exactly one way.
+    fn tokens() -> (Vec<String>, Vec<String>) {
+        (
+            vec![
+                "assign=Assign a Claude seat to hax and log in|approve".to_owned(),
+                "keep-parked=Keep it parked until a seat frees up|defer".to_owned(),
+            ],
+            vec![
+                "assign=You buy or free one seat and finish the login: ten minutes.".to_owned(),
+                "keep-parked=Nothing changes; a task is filed to re-raise it.".to_owned(),
+            ],
+        )
+    }
+
+    fn refusal(
+        question: Option<&str>,
+        context: Option<&str>,
+        choices: &[String],
+        consequences: &[String],
+        recommend: Option<&str>,
+    ) -> String {
+        DecisionCard::parse(question, context, choices, consequences, recommend)
+            .expect_err("the card must be refused")
+            .to_string()
+    }
+    fn check_choices() -> Vec<String> {
+        vec![
+            "store=The Store enforces the invariant".to_owned(),
+            "client=The client enforces the invariant".to_owned(),
+        ]
+    }
+
+    fn check_refusal(
+        question: Option<&str>,
+        choices: &[String],
+        answer: Option<&str>,
+        explanation: Option<&str>,
+        about: Option<&str>,
+    ) -> String {
+        AttentionCheck::parse(question, choices, answer, explanation, about)
+            .expect_err("the check must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn raw_check_input_reports_presence_without_validating_it() {
+        let empty = AttentionCheckInput::default();
+        assert!(empty.is_empty());
+        assert!(empty.parse().unwrap().is_none());
+        for input in [
+            AttentionCheckInput {
+                question: Some("partial".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                choices: vec!["a=A".into()],
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                answer: Some("a".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                explanation: Some("partial".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                about: Some("rust/store.rs".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!input.is_empty());
+            assert!(input.parse().is_err());
+        }
+    }
+    #[test]
+    fn a_complete_check_round_trips_and_every_partial_shape_names_its_missing_field() {
+        let choices = check_choices();
+        let check = AttentionCheck::parse(
+            Some("Where is this invariant enforced?"),
+            &choices,
+            Some("store"),
+            Some("The Store in rust/store.rs validates it before opening a write."),
+            Some("rust/store.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(check.choices[0].key, "store");
+        assert_eq!(check.answer.as_deref(), Some("store"));
+        assert_eq!(check.about, "rust/store.rs");
+        assert!(
+            AttentionCheck::parse(None, &[], None, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let cases = [
+            (
+                None,
+                choices.as_slice(),
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check",
+            ),
+            (
+                Some("Where is it enforced?"),
+                &[][..],
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check-choice",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                None,
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check-answer",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                Some("store"),
+                None,
+                Some("rust/store.rs"),
+                "--check-explain",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                None,
+                "--check-about",
+            ),
+        ];
+        for (question, choices, answer, explanation, about, missing) in cases {
+            let error = check_refusal(question, choices, answer, explanation, about);
+            assert!(error.contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn check_bounds_question_shape_and_answer_key_are_refused_by_field() {
+        let choices = check_choices();
+        let over_question = format!("{}?", "q".repeat(160));
+        let over_explanation = "x".repeat(401);
+        for (error, field) in [
+            (
+                check_refusal(
+                    Some(&over_question),
+                    &choices,
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced"),
+                    &choices,
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices[..1],
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check-choice",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices,
+                    Some("missing"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check-answer",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices,
+                    Some("store"),
+                    Some(&over_explanation),
+                    Some("rust/store.rs"),
+                ),
+                "--check-explain",
+            ),
+        ] {
+            assert!(error.contains(field), "{error}");
+        }
+        let five = (0..5)
+            .map(|n| format!("k{n}=Choice {n}"))
+            .collect::<Vec<_>>();
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &five,
+                Some("k0"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-choice")
+        );
+        let long_key = vec![format!("{}=Long key", "k".repeat(33)), "ok=Okay".into()];
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &long_key,
+                Some("ok"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("choice key")
+        );
+        let long_label = vec![format!("long={}", "l".repeat(61)), "ok=Okay".into()];
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &long_label,
+                Some("ok"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-choice long label")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store".into(), "client=Client".into()],
+                Some("client"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("must read KEY=LABEL")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store=Store|outcome".into(), "client=Client".into()],
+                Some("client"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("label contains '|'")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store=Store".into(), "store=Again".into()],
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("given twice")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &choices,
+                Some(""),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-answer")
+        );
+        AttentionCheck::parse(
+            Some("Where?"),
+            &choices,
+            Some("store"),
+            Some("The todayish component is stable."),
+            Some("rust/store.rs"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_about_accepts_only_the_three_approved_subject_shapes() {
+        let choices = check_choices();
+        for about in [
+            "rust/store.rs",
+            "store.rs",
+            "@@edge",
+            "@_uat",
+            "DEFAULT_TIER",
+            "--rootless",
+        ] {
+            AttentionCheck::parse(
+                Some("Where is it enforced?"),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some(about),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            check_refusal(
+                Some("Where is it enforced?"),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some("store module")
+            ),
+            "`about` not matching one of the three subject shapes (a path containing `/` or a file extension; a sigil token `@@host`/`@_tier`; an UPPER_SNAKE flag or `--flag` name) is refused naming the three shapes."
+        );
+    }
+
+    #[test]
+    fn diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule() {
+        let markers = [
+            "a-1234abcd",
+            "t-1234abcd",
+            "s-1234abcd",
+            "e-1234abcd",
+            "sp-1234abcd",
+            "2026-09-21",
+            "today",
+            "this row",
+            "the sweep",
+            "measured",
+        ];
+        for marker in markers {
+            for location in 0..3 {
+                let question = if location == 0 {
+                    format!("How does {marker} work?")
+                } else {
+                    "How does the Store work?".to_owned()
+                };
+                let choices = if location == 1 {
+                    vec![
+                        format!("store=Use {marker}"),
+                        "client=Use the client".to_owned(),
+                    ]
+                } else {
+                    check_choices()
+                };
+                let explanation = if location == 2 {
+                    format!("The Store observed {marker}.")
+                } else {
+                    "The Store component enforces it.".to_owned()
+                };
+                let error = check_refusal(
+                    Some(&question),
+                    &choices,
+                    Some("store"),
+                    Some(&explanation),
+                    Some("rust/store.rs"),
+                );
+                assert!(error.contains(marker), "{error}");
+                assert!(error.contains("The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back."), "{error}");
+            }
+        }
+    }
+    #[test]
+    fn diagnosis_markers_respect_case_and_word_boundaries() {
+        let choices = check_choices();
+        // The four phrases refuse case-insensitively in every text location;
+        // the row-ID scan also accepts uppercase hexadecimal digits.
+        for marker in [
+            "TODAY",
+            "Today",
+            "MEASURED",
+            "Measured",
+            "THIS ROW",
+            "The Sweep",
+            "t-1234ABcd",
+        ] {
+            for location in 0..3 {
+                let question = if location == 0 {
+                    format!("How does {marker} behave?")
+                } else {
+                    "How does the Store behave?".to_owned()
+                };
+                let choices = if location == 1 {
+                    vec![
+                        format!("store=Use {marker}"),
+                        "client=Use the client".to_owned(),
+                    ]
+                } else {
+                    choices.clone()
+                };
+                let explanation = if location == 2 {
+                    format!("The Store observed {marker}.")
+                } else {
+                    "The Store component enforces it.".to_owned()
+                };
+                let error = check_refusal(
+                    Some(&question),
+                    &choices,
+                    Some("store"),
+                    Some(&explanation),
+                    Some("rust/store.rs"),
+                );
+                assert!(error.contains(marker), "{error}");
+                assert!(error.contains("The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back."), "{error}");
+            }
+        }
+        // Word-bounded means bounded: near-misses teach instead of reciting.
+        for clean in [
+            "How does todayish versioning behave?",
+            "How does atoday behave?",
+            "How is measuredly scoped?",
+            "How does xa-1234abcd behave?",
+            "How does a-1234abc behave?",
+            "What shipped in 2026-09-211?",
+            "What shipped in 12026-09-21?",
+        ] {
+            AttentionCheck::parse(
+                Some(clean),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some("rust/store.rs"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn check_json_refuses_decisional_and_unknown_fields() {
+        let decisional = serde_json::from_str::<AttentionCheckChoice>(
+            r#"{"key":"store","label":"Store","outcome":"approve"}"#,
+        )
+        .unwrap_err();
+        assert!(decisional.to_string().contains("outcome"));
+        let recommended = serde_json::from_str::<AttentionCheckChoice>(
+            r#"{"key":"store","label":"Store","recommended":true}"#,
+        )
+        .unwrap_err();
+        assert!(recommended.to_string().contains("recommended"));
+        let definition = serde_json::from_str::<AttentionCheck>(
+            r#"{"question":"Where?","choices":[{"key":"a","label":"A"},{"key":"b","label":"B"}],"answer":"a","explanation":"Why.","about":"rust/store.rs","outcome":"approve"}"#,
+        )
+        .unwrap_err();
+        assert!(definition.to_string().contains("outcome"));
+    }
+
+    #[test]
+    fn a_well_formed_card_parses_into_its_choices_and_one_recommendation() {
+        let (choices, consequences) = tokens();
+        let card = DecisionCard::parse(
+            Some("  hax has no logged-in Claude account - assign a seat, or drop it?  "),
+            Some("  A real turn answers HTTP 401.  "),
+            &choices,
+            &consequences,
+            Some("assign"),
+        )
+        .expect("a well-formed card");
+        assert_eq!(
+            card.question.as_deref(),
+            Some("hax has no logged-in Claude account - assign a seat, or drop it?"),
+            "the question is stored trimmed"
+        );
+        assert_eq!(
+            card.context.as_deref(),
+            Some("A real turn answers HTTP 401.")
+        );
+        assert_eq!(card.choices.len(), 2);
+        assert_eq!(card.choices[0].key, "assign");
+        assert_eq!(
+            card.choices[0].label,
+            "Assign a Claude seat to hax and log in"
+        );
+        assert_eq!(card.choices[0].outcome, "approve");
+        assert!(card.choices[0].recommended, "--recommend marks its choice");
+        assert_eq!(card.choices[1].outcome, "defer");
+        assert!(!card.choices[1].recommended);
+        assert!(!card.is_empty());
+        // The column's value is the array, in declared order.
+        let stored: Vec<AttentionChoice> =
+            serde_json::from_str(&card.choices_json().expect("authored choices")).unwrap();
+        assert_eq!(stored, card.choices);
+    }
+
+    #[test]
+    fn an_empty_card_is_empty_and_stores_no_choices() {
+        let card = DecisionCard::parse(None, None, &[], &[], None).expect("nothing authored");
+        assert!(card.is_empty());
+        assert_eq!(card.choices_json(), None);
+    }
+
+    /// A label may contain `=` because the key splits on the FIRST one, and
+    /// the outcome splits on the LAST `|`.
+    #[test]
+    fn a_label_may_contain_an_equals_sign() {
+        let card = DecisionCard::parse(
+            None,
+            None,
+            &[
+                "pin=Set retries=3 and ship it|approve".to_owned(),
+                "hold=Hold the release|defer".to_owned(),
+            ],
+            &[
+                "pin=The queue retries three times and the release ships today.".to_owned(),
+                "hold=Nothing ships until 2026-09-15, when this is re-raised.".to_owned(),
+            ],
+            Some("pin"),
+        )
+        .expect("an `=` in a label is legal");
+        assert_eq!(card.choices[0].label, "Set retries=3 and ship it");
+    }
+
+    #[test]
+    fn a_consequence_naming_no_declared_choice_is_refused_with_the_declared_keys() {
+        let (choices, _) = tokens();
+        let error = refusal(
+            None,
+            None,
+            &choices,
+            &["typo=A consequence for a key nobody declared.".to_owned()],
+            None,
+        );
+        assert_eq!(
+            error,
+            "attention: no choice named typo; declared keys are assign, keep-parked"
+        );
+        // The same refusal covers --recommend, which names a key the same way.
+        let (_, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, Some("typo")),
+            "attention: no choice named typo; declared keys are assign, keep-parked"
+        );
+    }
+
+    #[test]
+    fn a_repeated_choice_key_is_refused_rather_than_the_last_one_winning() {
+        let error = refusal(
+            None,
+            None,
+            &[
+                "assign=Assign a seat|approve".to_owned(),
+                "assign=Assign two seats|approve".to_owned(),
+            ],
+            &[
+                "assign=One seat is bought and the login is finished today.".to_owned(),
+                "assign=Two seats are bought and both logins are finished.".to_owned(),
+            ],
+            Some("assign"),
+        );
+        assert_eq!(
+            error,
+            "attention: choice key assign is given twice; keys must be unique within an item"
+        );
+    }
+
+    #[test]
+    fn a_choice_count_outside_two_to_four_is_refused_with_the_count() {
+        let one = refusal(
+            None,
+            None,
+            &["assign=Assign a seat|approve".to_owned()],
+            &["assign=One seat is bought and the login is finished today.".to_owned()],
+            Some("assign"),
+        );
+        assert_eq!(
+            one,
+            "attention: an item carries 2 to 4 choices; 1 were given"
+        );
+        let mut choices = Vec::new();
+        let mut consequences = Vec::new();
+        for index in 0..5 {
+            choices.push(format!("k{index}=Take option {index}|other"));
+            consequences.push(format!(
+                "k{index}=Option {index} happens and costs nothing."
+            ));
+        }
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, Some("k0")),
+            "attention: an item carries 2 to 4 choices; 5 were given"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_recommendation_or_two_is_refused_with_the_count() {
+        let (choices, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, None),
+            "attention: exactly one choice is recommended; 0 were"
+        );
+        // Two is unreachable through a single-valued --recommend and is still
+        // the invariant, so the validator is asserted directly.
+        let mut card =
+            DecisionCard::parse(None, None, &choices, &consequences, Some("assign")).unwrap();
+        card.choices[1].recommended = true;
+        assert_eq!(
+            card.validate()
+                .expect_err("two recommendations")
+                .to_string(),
+            "attention: exactly one choice is recommended; 2 were"
+        );
+    }
+
+    #[test]
+    fn a_choice_with_no_consequence_is_refused_naming_the_choice() {
+        let (choices, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences[..1], Some("assign")),
+            "attention: choice keep-parked has no --consequence; every choice must say what \
+             happens if it is picked"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &["assign=   ".to_owned()],
+                Some("assign")
+            ),
+            "attention: choice assign has an empty --consequence; every choice must say what \
+             happens if it is picked"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &[consequences[0].clone(), consequences[0].clone()],
+                Some("assign")
+            ),
+            "attention: choice assign is given two --consequence values; give one per choice"
+        );
+    }
+
+    #[test]
+    fn a_question_without_a_context_is_refused_as_half_a_card() {
+        let paired = "attention: --question and --context are one card; give both or neither";
+        assert_eq!(
+            refusal(Some("Assign a seat?"), None, &[], &[], None),
+            paired
+        );
+        assert_eq!(
+            refusal(None, Some("A turn answers 401."), &[], &[], None),
+            paired
+        );
+    }
+
+    #[test]
+    fn the_reserved_custom_key_cannot_be_authored() {
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "custom=Write your own answer|other".to_owned(),
+                    "assign=Assign a seat|approve".to_owned(),
+                ],
+                &[
+                    "custom=Whatever you type is recorded as the verdict.".to_owned(),
+                    "assign=One seat is bought and the login is finished today.".to_owned(),
+                ],
+                Some("assign"),
+            ),
+            "attention: custom is reserved for the free-text answer and cannot be a choice key"
+        );
+    }
+
+    #[test]
+    fn recommend_without_choices_is_refused() {
+        assert_eq!(
+            refusal(None, None, &[], &[], Some("assign")),
+            "attention: --recommend needs choices; give --choice or drop it"
+        );
+    }
+
+    #[test]
+    fn every_bound_is_refused_naming_the_field_the_bound_and_what_it_got() {
+        let (choices, consequences) = tokens();
+        let long = "x".repeat(161);
+        assert_eq!(
+            refusal(Some(&long), Some("A turn answers 401."), &[], &[], None),
+            "attention: --question is 161 characters; the bound is 160"
+        );
+        let long_context = "y".repeat(801);
+        assert_eq!(
+            refusal(Some("Assign a seat?"), Some(&long_context), &[], &[], None),
+            "attention: --context is 801 characters; the bound is 800"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    format!("assign={}|approve", "L".repeat(61)),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign label is 61 characters; the bound is 60"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &[
+                    format!("assign={}", "C".repeat(201)),
+                    consequences[1].clone(),
+                ],
+                Some("assign"),
+            ),
+            "attention: choice assign consequence is 201 characters; the bound is 200"
+        );
+        // An empty question is refused as empty rather than as a length.
+        assert_eq!(
+            refusal(Some("   "), Some("A turn answers 401."), &[], &[], None),
+            "attention: --question is empty; give it a value or drop it"
+        );
+        // A label carrying `|` after the last-`|` split is refused by name.
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign=Assign a seat|and log in|approve".to_owned(),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign label contains '|', which separates the label from the \
+             outcome in --choice KEY=LABEL|OUTCOME; write the label without it"
+        );
+        // An empty label is empty, not zero-length-bounded.
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign= |approve".to_owned(),
+                    "keep=Keep it|defer".to_owned()
+                ],
+                &[
+                    consequences[0].clone(),
+                    "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+                ],
+                Some("assign"),
+            ),
+            "attention: choice assign label is empty; give it a value or drop it"
+        );
+    }
+
+    #[test]
+    fn a_malformed_choice_token_names_the_shape_it_must_take() {
+        assert_eq!(
+            refusal(None, None, &["assign".to_owned()], &[], None),
+            "attention: --choice \"assign\" must read KEY=LABEL|OUTCOME, such as \
+             --choice \"assign=Assign a Claude seat|approve\""
+        );
+        assert_eq!(
+            refusal(None, None, &["assign=Assign a seat".to_owned()], &[], None),
+            "attention: --choice \"assign=Assign a seat\" names no outcome; it must read \
+             KEY=LABEL|OUTCOME with the outcome one of approve, reject, defer, or other"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &["assign=Assign a seat|approve".to_owned()],
+                &["a consequence with no key".to_owned()],
+                None
+            ),
+            "attention: --consequence \"a consequence with no key\" must read KEY=TEXT, \
+             naming the choice it belongs to"
+        );
+    }
+
+    #[test]
+    fn an_outcome_outside_the_closed_set_is_refused_with_the_four_values() {
+        let (_, consequences) = tokens();
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign=Assign a seat|vibes".to_owned(),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign has outcome vibes; an outcome is one of approve, \
+             reject, defer, or other"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_slug_is_refused_with_the_pattern() {
+        let (_, consequences) = tokens();
+        let error = refusal(
+            None,
+            None,
+            &[
+                "Assign Seat=Assign a seat|approve".to_owned(),
+                "keep-parked=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                "Assign Seat=One seat is bought and the login is finished today.".to_owned(),
+                consequences[1].clone(),
+            ],
+            Some("Assign Seat"),
+        );
+        assert!(
+            error.starts_with("attention: choice key \"Assign Seat\" is not a slug;"),
+            "{error}"
+        );
+        assert!(error.contains("[a-z0-9][a-z0-9-]{0,31}"), "{error}");
+        // A 33-character key exceeds the bound the pattern names.
+        let long = "k".repeat(33);
+        let over = refusal(
+            None,
+            None,
+            &[
+                format!("{long}=Assign a seat|approve"),
+                "keep-parked=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                format!("{long}=One seat is bought and the login is finished today."),
+                consequences[1].clone(),
+            ],
+            Some(&long),
+        );
+        assert!(over.contains("is not a slug"), "{over}");
+        // A leading hyphen is refused; a digit start is not.
+        assert!(
+            refusal(
+                None,
+                None,
+                &[
+                    "-assign=Assign a seat|approve".to_owned(),
+                    "keep=Keep it parked|defer".to_owned(),
+                ],
+                &[
+                    "-assign=One seat is bought and the login is finished today.".to_owned(),
+                    "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+                ],
+                Some("-assign"),
+            )
+            .contains("is not a slug")
+        );
+        DecisionCard::parse(
+            None,
+            None,
+            &[
+                "2fa=Turn on two-factor|approve".to_owned(),
+                "keep=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                "2fa=Every login needs a second factor from today.".to_owned(),
+                "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+            ],
+            Some("2fa"),
+        )
+        .expect("a key may start with a digit");
+    }
+
+    #[test]
+    fn an_authored_choice_composes_its_label_and_consequence_and_carries_its_outcome() {
+        let (choices, consequences) = tokens();
+        let card =
+            DecisionCard::parse(None, None, &choices, &consequences, Some("assign")).unwrap();
+        let (decision, resolution) = AttentionAnswer {
+            choice: Some("keep-parked"),
+            ..Default::default()
+        }
+        .decide("a-1", &card.choices, "geoyws", 1788805112431)
+        .expect("an authored key resolves");
+        assert_eq!(decision.choice, "keep-parked");
+        assert_eq!(decision.outcome, "defer");
+        assert_eq!(decision.note, None);
+        assert_eq!(decision.by, "geoyws");
+        assert_eq!(decision.at, 1788805112431);
+        assert_eq!(
+            resolution,
+            "Decision: Keep it parked until a seat frees up. \
+             Nothing changes; a task is filed to re-raise it."
+        );
+        // A note is appended on its own line, and only when one was given.
+        let noted = AttentionAnswer {
+            choice: Some("assign"),
+            outcome: None,
+            note: Some("  after the pin lands  "),
+        }
+        .decide("a-1", &card.choices, "geoyws", 7)
+        .expect("a note is optional on an authored choice");
+        assert_eq!(noted.0.note.as_deref(), Some("after the pin lands"));
+        assert!(
+            noted.1.ends_with("\nNote: after the pin lands"),
+            "{}",
+            noted.1
+        );
+    }
+
+    #[test]
+    fn the_custom_answer_needs_an_outcome_and_a_note_and_records_both() {
+        let needs_both = "attention: a custom answer needs --outcome \
+                          (approve, reject, defer, other) and --note";
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("custom"),
+                outcome: Some("defer"),
+                note: None,
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a custom answer with no note")
+            .to_string(),
+            needs_both
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("custom"),
+                outcome: None,
+                note: Some("do it after the pin lands"),
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a custom answer with no outcome")
+            .to_string(),
+            needs_both
+        );
+        assert_eq!(
+            AttentionAnswer::custom("vibes", "do it")
+                .decide("a-1", &default_choice_pair(), "geoyws", 1)
+                .expect_err("an invented outcome")
+                .to_string(),
+            "attention: --outcome vibes is not a verdict; an outcome is one of approve, \
+             reject, defer, or other"
+        );
+        let (decision, resolution) = AttentionAnswer::custom("defer", "  after the pin lands  ")
+            .decide("a-1", &default_choice_pair(), "geoyws", 42)
+            .expect("a custom answer with both");
+        assert_eq!(decision.choice, "custom");
+        assert_eq!(decision.outcome, "defer");
+        assert_eq!(decision.note.as_deref(), Some("after the pin lands"));
+        assert_eq!(
+            resolution,
+            "Decision: Custom answer, recorded as defer.\nNote: after the pin lands"
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_choice_or_a_stale_one_or_a_stray_outcome_is_refused() {
+        assert_eq!(
+            AttentionAnswer::default()
+                .decide("a-1", &default_choice_pair(), "geoyws", 1)
+                .expect_err("no choice at all")
+                .to_string(),
+            "attention resolve requires --choice KEY or \
+             --choice custom --outcome X --note TEXT"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("   "),
+                ..Default::default()
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("an empty choice is no choice")
+            .to_string(),
+            "attention resolve requires --choice KEY or \
+             --choice custom --outcome X --note TEXT"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("keep-parked"),
+                ..Default::default()
+            }
+            .decide("a-347ff24c", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a key the row does not carry")
+            .to_string(),
+            "attention a-347ff24c has no choice keep-parked; its choices are approve, reject"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("approve"),
+                outcome: Some("reject"),
+                note: None,
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("an outcome on an authored choice")
+            .to_string(),
+            "attention: --outcome applies only to --choice custom; an authored choice \
+             carries its own outcome"
+        );
+    }
+
+    #[test]
+    fn the_default_pair_is_two_choices_with_no_recommendation() {
+        let pair = default_choice_pair();
+        assert_eq!(
+            pair.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+            ["approve", "reject"]
+        );
+        assert_eq!(pair.iter().filter(|c| c.recommended).count(), 0);
+        // ASCII only: these labels travel through argv, a form POST and a
+        // terminal.
+        for choice in &pair {
+            assert!(choice.label.is_ascii(), "{}", choice.label);
+            assert!(choice.consequence.is_ascii(), "{}", choice.consequence);
+        }
+        // Synthesized rather than chosen, so the one card the model refuses
+        // to author is the one it serves by default.
+        let synthesized = DecisionCard {
+            question: None,
+            context: None,
+            choices: pair,
+        };
+        assert_eq!(
+            synthesized
+                .validate()
+                .expect_err("nothing authored it, so nothing may be marked")
+                .to_string(),
+            "attention: exactly one choice is recommended; 0 were"
+        );
+    }
+
+    const API_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const WEB_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const OTHER_ID: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const FULL_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn expected_pair() -> Vec<ArtifactIdentity> {
+        ArtifactIdentity::parse(
+            &[
+                format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}"),
+                format!("web={ARTIFACT_KIND_MANIFEST_DIGEST}:{WEB_DIGEST}"),
+            ],
+            "--artifact",
+        )
+        .expect("two well-formed identities")
+    }
+
+    fn token_refusal(token: &str) -> String {
+        ArtifactIdentity::parse(&[token.to_owned()], "--artifact")
+            .expect_err("the token must be refused")
+            .to_string()
+    }
+
+    fn mode_refusal(
+        commit: Option<&str>,
+        build_commit: Option<&str>,
+        artifacts: &[String],
+    ) -> String {
+        DeployIdentity::parse(commit, build_commit, artifacts)
+            .expect_err("the identity must be refused")
+            .to_string()
+    }
+
+    fn verify_refusal(observed: &[ArtifactIdentity]) -> String {
+        verify_artifacts("d-1", &expected_pair(), observed)
+            .expect_err("the observation must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn an_artifact_token_parses_into_a_role_a_typed_kind_and_a_lowercased_digest() {
+        let parsed = ArtifactIdentity::parse(
+            &[format!(
+                "  api = {ARTIFACT_KIND_IMAGE_ID}:{}",
+                API_ID.to_uppercase()
+            )],
+            "--artifact",
+        )
+        .expect("a well-formed token");
+        assert_eq!(
+            parsed,
+            vec![ArtifactIdentity {
+                role: "api".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: API_ID.to_owned(),
+            }],
+            "the role and kind are trimmed and the digest is lowercased, so the same \
+             identity typed two ways compares equal"
+        );
+    }
+
+    #[test]
+    fn a_malformed_artifact_token_is_refused_naming_the_shape_the_role_or_the_kind() {
+        assert_eq!(
+            token_refusal("docker-image-id:sha256:x"),
+            format!(
+                "deploy: --artifact \"docker-image-id:sha256:x\" must read ROLE=KIND:VALUE, \
+                 such as --artifact \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<64 hex>\""
+            )
+        );
+        assert_eq!(
+            token_refusal(&format!("Api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")),
+            "deploy: --artifact role \"Api\" is not a slug; a role names one component and \
+             matches [a-z0-9][a-z0-9-]{0,31}, such as api or web"
+        );
+        assert_eq!(
+            token_refusal("api=docker-image-id"),
+            format!(
+                "deploy: --artifact role api names no typed value; it must read \
+                 ROLE=KIND:VALUE with KIND one of {}",
+                kind_list()
+            )
+        );
+        assert_eq!(
+            token_refusal(&format!("api=image-id:{API_ID}")),
+            format!(
+                "deploy: --artifact role api has kind \"image-id\"; a kind is one of {}",
+                kind_list()
+            )
+        );
+        // A short digest, a missing algorithm, and a Git commit offered as an
+        // image identity are all the same refusal, because all three are "not
+        // an identity of this kind".
+        for value in ["sha256:abcd", "1111111111111111", FULL_SHA] {
+            assert_eq!(
+                token_refusal(&format!("api={ARTIFACT_KIND_IMAGE_ID}:{value}")),
+                format!(
+                    "deploy: --artifact role api value {value:?} is not an identity; a \
+                     {ARTIFACT_KIND_IMAGE_ID} is sha256: followed by 64 hexadecimal characters"
+                )
+            );
+        }
+        assert_eq!(
+            ArtifactIdentity::parse(
+                &[
+                    format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}"),
+                    format!("api={ARTIFACT_KIND_IMAGE_ID}:{OTHER_ID}"),
+                ],
+                "--artifact",
+            )
+            .expect_err("one identity per role")
+            .to_string(),
+            "deploy: --artifact names role api twice; give one identity per role"
+        );
+        // The flag is named by the caller, so `finish`'s refusals read as
+        // `--observed` rather than as the flag `start` happens to use.
+        assert_eq!(
+            ArtifactIdentity::parse(&["api".to_owned()], "--observed")
+                .expect_err("the token must be refused")
+                .to_string(),
+            format!(
+                "deploy: --observed \"api\" must read ROLE=KIND:VALUE, such as \
+                 --observed \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<64 hex>\""
+            )
+        );
+    }
+
+    #[test]
+    fn each_identity_mode_refuses_the_other_mode_s_flags_and_names_the_one_to_use() {
+        let artifacts = vec![format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")];
+        assert_eq!(
+            mode_refusal(Some(FULL_SHA), None, &artifacts),
+            "deploy: --commit names a Git-mode attempt and --artifact names an \
+             artifact-identity attempt; one mode per attempt, so pass one or the other"
+        );
+        assert_eq!(
+            mode_refusal(Some(FULL_SHA), Some(UNKNOWN_BUILD_COMMIT), &[]),
+            "deploy: --build-commit \"unknown\" belongs to artifact mode; the Git path \
+             names its commit with --commit FULL_SHA"
+        );
+        assert_eq!(
+            mode_refusal(Some("aaaaaaa"), None, &[]),
+            "commit must be a full 40-character hexadecimal commit"
+        );
+        assert_eq!(
+            mode_refusal(None, None, &artifacts),
+            "deploy: artifact mode requires --build-commit unknown, so a missing build \
+             commit is stated rather than defaulted"
+        );
+        // The one that matters most: a caller who knows the build commit is
+        // sent to the Git path rather than allowed to record it as unknown.
+        assert_eq!(
+            mode_refusal(None, Some(&FULL_SHA.to_uppercase()), &artifacts),
+            format!(
+                "deploy: --build-commit {FULL_SHA} is a full Git commit, so this build's \
+                 provenance is known; use the Git mode with --commit {FULL_SHA} instead \
+                 of --artifact"
+            )
+        );
+        assert_eq!(
+            mode_refusal(None, Some("none"), &artifacts),
+            "deploy: --build-commit must be the literal unknown in artifact mode, got \"none\""
+        );
+        assert_eq!(
+            mode_refusal(None, None, &[]),
+            "deploy start requires --commit FULL_SHA (the verified Git path) or \
+             --artifact ROLE=KIND:VALUE with --build-commit unknown (the artifact-identity \
+             recovery path)"
+        );
+    }
+
+    #[test]
+    fn a_resolved_identity_carries_its_mode_its_build_commit_and_its_expectations() {
+        let git =
+            DeployIdentity::parse(Some(&FULL_SHA.to_uppercase()), None, &[]).expect("the Git path");
+        assert_eq!(git.mode(), IDENTITY_MODE_GIT);
+        assert_eq!(git.build_commit(), FULL_SHA);
+        assert!(git.artifacts().is_empty());
+        assert_eq!(build_commit_label(git.mode(), git.build_commit()), FULL_SHA);
+
+        let recovery = DeployIdentity::parse(
+            None,
+            Some(UNKNOWN_BUILD_COMMIT),
+            &[format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")],
+        )
+        .expect("the recovery path");
+        assert_eq!(recovery.mode(), IDENTITY_MODE_ARTIFACT);
+        assert_eq!(recovery.build_commit(), UNKNOWN_BUILD_COMMIT);
+        assert_eq!(recovery.artifacts().len(), 1);
+        // Where a SHA would be, a reader gets words rather than the bare
+        // literal or a blank.
+        assert_eq!(
+            build_commit_label(recovery.mode(), recovery.build_commit()),
+            "build commit unknown - recovered by artifact identity"
+        );
+    }
+
+    #[test]
+    fn an_observation_verifies_only_when_every_role_matches_by_kind_and_value() {
+        let expected = expected_pair();
+        let matched =
+            verify_artifacts("d-1", &expected, &expected).expect("the same identities verify");
+        assert_eq!(
+            matched, expected,
+            "the observations keep the expected order"
+        );
+        // Observed out of order still verifies: a role is matched by name,
+        // not by position, and the answer is in the attempt's own order.
+        let reversed = vec![expected[1].clone(), expected[0].clone()];
+        assert_eq!(
+            verify_artifacts("d-1", &expected, &reversed).expect("order is not identity"),
+            expected
+        );
+
+        let mut extra = expected.clone();
+        extra.push(ArtifactIdentity {
+            role: "worker".to_owned(),
+            kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+            value: OTHER_ID.to_owned(),
+        });
+        assert_eq!(
+            verify_refusal(&extra),
+            "deployment d-1 does not expect artifact role worker; its expected roles are api, web"
+        );
+        assert_eq!(
+            verify_refusal(&expected[..1]),
+            format!(
+                "deployment d-1 expects artifact role web ({ARTIFACT_KIND_MANIFEST_DIGEST} \
+                 {WEB_DIGEST}) and --observed named no identity for it"
+            )
+        );
+        // A config ID offered where a manifest digest was expected, with the
+        // value of the OTHER kind: refused on the kind, naming both.
+        let wrong_kind = vec![
+            expected[0].clone(),
+            ArtifactIdentity {
+                role: "web".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: OTHER_ID.to_owned(),
+            },
+        ];
+        assert_eq!(
+            verify_refusal(&wrong_kind),
+            format!(
+                "deployment d-1 artifact role web expects {ARTIFACT_KIND_MANIFEST_DIGEST} \
+                 {WEB_DIGEST} but --observed offered {ARTIFACT_KIND_IMAGE_ID} {OTHER_ID}; \
+                 a {ARTIFACT_KIND_IMAGE_ID} and an {ARTIFACT_KIND_MANIFEST_DIGEST} are \
+                 never compared to each other"
+            )
+        );
+        let wrong_value = vec![
+            ArtifactIdentity {
+                role: "api".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: OTHER_ID.to_owned(),
+            },
+            expected[1].clone(),
+        ];
+        assert_eq!(
+            verify_refusal(&wrong_value),
+            format!(
+                "deployment d-1 artifact role api expects {ARTIFACT_KIND_IMAGE_ID} {API_ID} \
+                 but --observed offered {ARTIFACT_KIND_IMAGE_ID} {OTHER_ID}"
+            )
+        );
+        // And nothing observed at all is the missing-role refusal for the
+        // first expected role, not a silent pass.
+        assert_eq!(
+            verify_refusal(&[]),
+            format!(
+                "deployment d-1 expects artifact role api ({ARTIFACT_KIND_IMAGE_ID} \
+                 {API_ID}) and --observed named no identity for it"
+            )
+        );
+    }
+
+    /// SPA-64: the three trigger forms parse, and every malformed value —
+    /// including a date the calendar does not have — is refused with a
+    /// sentence naming all three forms.
+    #[test]
+    fn a_return_trigger_is_one_of_three_forms_and_a_malformed_one_names_them() {
+        assert_eq!(
+            parse_return_trigger("date:2028-02-29").unwrap(),
+            ReturnTrigger::Date("2028-02-29"),
+            "2028 is a leap year"
+        );
+        assert_eq!(
+            parse_return_trigger("date:2000-02-29").unwrap(),
+            ReturnTrigger::Date("2000-02-29"),
+            "a year divisible by 400 is a leap year"
+        );
+        assert_eq!(
+            parse_return_trigger("task:t-1a2b3c4d").unwrap(),
+            ReturnTrigger::Task("t-1a2b3c4d")
+        );
+        assert_eq!(
+            parse_return_trigger("event:task_moved").unwrap(),
+            ReturnTrigger::Event("task_moved")
+        );
+        for malformed in [
+            "",
+            "2026-10-01",
+            "date:",
+            "date:2026-02-29",
+            "date:1900-02-29",
+            "date:2026-13-01",
+            "date:2026-04-31",
+            "date:2026-00-10",
+            "date:2026-1-01",
+            "date:26-10-01",
+            "date:2026-10-01T00:00",
+            "task:",
+            "task:t 1",
+            "event:",
+            "event:Task-Moved",
+            "week:2026-W40",
+            "Date:2026-10-01",
+        ] {
+            let refusal = format!(
+                "{:#}",
+                parse_return_trigger(malformed).expect_err(malformed)
+            );
+            assert!(
+                refusal.contains("date:YYYY-MM-DD, task:<t-id> or event:<kind>"),
+                "{malformed:?} must be refused naming the three forms: {refusal}"
+            );
+        }
+    }
 }

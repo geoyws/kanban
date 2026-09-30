@@ -1,6 +1,6 @@
 use crate::model::{TASK_STATUSES, TASK_TYPES};
 use crate::registry::now_ms;
-use crate::store::{Store, event, live_claims};
+use crate::store::{Store, event, live_claims, refuse_reused_task_id, whole_board_write_on};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -148,6 +148,7 @@ struct Input {
     completed_at: Option<i64>,
     metadata: Value,
     dependencies: Vec<String>,
+    allowed_models: Vec<String>,
     note: Option<String>,
 }
 
@@ -195,6 +196,22 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The model allow-list an imported row declares, sorted, under either
+/// spelling the rest of this file already accepts for a two-word key.
+///
+/// Absent means unrestricted, which is what every atmux export written before
+/// the feature says. Names are not validated here: the write below refuses a
+/// bad one by name, and refusing during parse would name no row.
+fn imported_allowed_models(row: &Map<String, Value>) -> Vec<String> {
+    let mut models = string_array(
+        row.get("allowedModels")
+            .or_else(|| row.get("allowed_models")),
+    );
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn status(value: Option<String>, workflow: bool) -> Result<String> {
@@ -258,6 +275,7 @@ fn epic(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Input
         completed_at: completed,
         metadata: json!({"importedFrom":source,"workflowStatus":workflow,"driverRef":row.get("driverRef").or_else(||row.get("driver_ref")).cloned().unwrap_or(Value::Null),"isReady":boolean(&row,"isReady")||boolean(&row,"is_ready"),"spawnedAt":row.get("spawnedAt").or_else(||row.get("spawned_at")).cloned().unwrap_or(Value::Null),"legacyStories":parse_json(row.get("stories"),json!([])),"atmuxExtra":parse_json(row.get("extra"),Value::Object(row.clone()))}),
         dependencies,
+        allowed_models: imported_allowed_models(&row),
         note: None,
     })
 }
@@ -294,6 +312,7 @@ fn story(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Inpu
         completed_at: completed,
         metadata: json!({"importedFrom":source,"workflowStatus":workflow,"acceptanceCriteria":row.get("acceptanceCriteria").or_else(||row.get("acceptance_criteria")).cloned().unwrap_or(Value::Null),"reviewSignoff":boolean(&row,"reviewSignoff")||boolean(&row,"review_signoff"),"mergeTaskID":row.get("mergeTaskId").or_else(||row.get("merge_task_id")).cloned().unwrap_or(Value::Null),"mergeMode":text(&row,"mergeMode").or_else(||text(&row,"merge_mode")).unwrap_or_else(||"feature-branch".into()),"advancedAt":advanced,"atmuxExtra":parse_json(row.get("extra"),Value::Object(row.clone()))}),
         dependencies: vec![],
+        allowed_models: imported_allowed_models(&row),
         note: None,
     })
 }
@@ -332,6 +351,7 @@ fn task(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Input
         completed_at: completed,
         metadata,
         dependencies,
+        allowed_models: imported_allowed_models(&row),
         note: text(&row, "note"),
     })
 }
@@ -372,6 +392,16 @@ fn normalize_and_insert(
     counts: ImportCounts,
     options: ImportOptions,
 ) -> Result<ImportReceipt> {
+    // Whole-board write before any work (ACC-14): an import rewrites arbitrary
+    // rows, deletes claims and dependencies on `--reconcile`, and seizes live
+    // leases with `--force`, so only a principal holding the whole board may
+    // run it. The gate sits ahead of the overlap listing, the dry-run receipt
+    // and the reuse refusal alike: each of those names existing ids, and none
+    // of them is reachable without this authority. Unmanaged boards stay
+    // unchanged — the gate is a no-op where nothing enforces. This early call
+    // is the fast refusal; the authorizing read repeats inside the IMMEDIATE
+    // transaction below, in the snapshot the overwrite sweeps.
+    store.require_whole_board_write()?;
     if actor.trim().is_empty() {
         bail!("actor is required");
     }
@@ -427,9 +457,17 @@ fn normalize_and_insert(
             }
         }
     }
+    // Cloned before the transaction opens: the write scope borrows the
+    // connection mutably, and the reuse refusal below needs the context.
+    let authz = store.authz().clone();
     let transaction = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Inside the mutation lock, before the first id-revealing read: the early
+    // gate above is a fast refusal, but the tag universe is read here, in the
+    // same snapshot the overwrite sweeps, so a concurrent retag cannot slip
+    // between the check and the write (ACC-14, like `archive_settled`).
+    whole_board_write_on(&authz, &transaction)?;
     let existing = {
         let mut statement = transaction.prepare("SELECT id FROM tasks")?;
         statement
@@ -494,10 +532,29 @@ fn normalize_and_insert(
     }
 
     for input in &inputs {
+        // A removed id is never reused, here no less than on `task add`: the
+        // surviving linked rows would re-parent under the imported row. Live
+        // ids keep their `--reconcile` upsert; only an id with no live row
+        // but a removal record or any event history is refused.
+        if !existing.contains(&input.id) {
+            refuse_reused_task_id(&transaction, &input.id, &authz)?;
+        }
         if !TASK_TYPES.contains(&input.task_type.as_str())
             || !TASK_STATUSES.contains(&input.status.as_str())
         {
             bail!("invalid imported task {}", input.id);
+        }
+        // The done gate covers every write that makes a task done (DG-17):
+        // a task-type row at `done` — inserted or flipped by the upsert below
+        // — is refused on a gated board with sentence 1 naming the row, and
+        // the bail rolls the whole import back so nothing is written. Import
+        // takes any `--as` actor, so it is not geoyws-only by design and fails
+        // closed here; stories and epics are DG-16 and take no verdict.
+        if input.task_type == "task"
+            && input.status == "done"
+            && crate::store::done_gate_on(&transaction)?
+        {
+            bail!("{}", crate::store::no_verdict_sentence(&input.id));
         }
         let completed = if input.status == "done" {
             input.completed_at.or(Some(input.updated_at))
@@ -537,6 +594,10 @@ fn normalize_and_insert(
                 params![input.id, dependency],
             )?;
         }
+        // Replaced wholesale, like the row itself: re-importing a source that
+        // dropped a model must not leave the board restricted to it. The
+        // helper validates every name before its first INSERT.
+        crate::store::set_allowed_models(&transaction, &input.id, &input.allowed_models)?;
     }
     crate::store::event_at(
         &transaction,
@@ -594,7 +655,12 @@ fn verify(
     source: String,
     counts: ImportCounts,
 ) -> Result<ParityReceipt> {
-    const FIELDS: [&str; 15] = [
+    // The same whole-board write gate as the import itself (ACC-14): the
+    // receipt names missing and differing ids and carries board field values,
+    // read across every tag the source happens to name, so a caller who may
+    // not run the import may not preview its answers either.
+    store.require_whole_board_write()?;
+    const FIELDS: [&str; 16] = [
         "type",
         "parentID",
         "title",
@@ -609,6 +675,7 @@ fn verify(
         "createdAt",
         "completedAt",
         "dependencies",
+        "allowedModels",
         "atmuxExtra",
     ];
     let mut missing = Vec::new();
@@ -664,6 +731,13 @@ fn verify(
             "completedAt",
             json!(input.completed_at),
             json!(board.completed_at),
+        );
+        // Both sides are sorted sets by construction, so this is an equality
+        // of lists and not an order comparison dressed up as one.
+        check(
+            "allowedModels",
+            json!(input.allowed_models),
+            json!(board.allowed_models),
         );
 
         // Dependencies the source declares but the board dropped. A dangling

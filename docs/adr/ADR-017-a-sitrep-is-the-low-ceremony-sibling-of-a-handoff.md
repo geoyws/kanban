@@ -92,8 +92,8 @@ posted when it was not.
 - **`context`** carries the sitreps mentioning a task, archived ones included: a
   resuming agent reads the packet and nothing else, so a sitrep only
   `sitrep list` could see is one its intended reader never gets.
-- **The web view** gains a **Lanes** page — the counterpart to Needs you. That
-  page is what waits on the operator; this is what the agents are doing.
+- **The web view** gained a **Lanes** page — the counterpart to Needs you (retired with the web view: [ADR-053](ADR-053-the-web-view-is-retired.md)). That
+  page was what waited on the operator; this is what the agents are doing.
 
 ## Consequences
 
@@ -107,8 +107,8 @@ returns the task to the queue in one transaction. What changes is that a handoff
 
 Nothing deletes a lane, either — which surfaced immediately, from probing this
 on the live board and leaving eleven throwaway rows in a `probe-lane` that
-cannot be removed. The Lanes page therefore orders lanes by most recent
-activity, so a lane whose driver is long gone sinks out of the way without
+cannot be removed. The retired Lanes page therefore ordered lanes by most recent
+activity, so a lane whose driver is long gone sank out of the way without
 anything destroying what it said. That is the same answer archiving gives
 within a lane, applied between them.
 
@@ -124,5 +124,5 @@ find out is to use it.
 
 - [ADR-004](ADR-004-token-pressure-handoffs-through-kanban.md) — the death-mid-task problem this widens the answer to
 - [ADR-012](ADR-012-session-handoffs-and-durable-attention.md) — lane-keyed session handoffs, and "resolved, never deleted"
-- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md) — the web view this adds a page to
+- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md) — the web view this added a page to (superseded by [ADR-053](ADR-053-the-web-view-is-retired.md))
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md) — why a laneless or bodyless update is refused rather than defaulted

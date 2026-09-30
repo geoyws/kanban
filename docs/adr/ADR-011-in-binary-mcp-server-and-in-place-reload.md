@@ -34,6 +34,17 @@ Each `tools/call` spawns the executable and lets the ordinary CLI parse,
 validate and answer it. The MCP layer builds an argument list and reads the
 result; it does not reach into the store.
 
+**Amended 2026-09-03 by
+[ADR-033](ADR-033-principals-are-frozen-username-plus-uid-and-minted-through-a-peer-credential-broker.md):**
+the client-facing transport remains stdio and this generated CLI hop remains a
+real process boundary. Under managed multi-user enforcement, however, neither
+the MCP process nor the spawned command opens registry, board, backup, or index
+files. The spawned command makes a separate short-lived Unix-domain-socket
+connection to the access broker. The broker derives that connection's peer UID
+with `SO_PEERCRED`, authorizes the operation, opens the stores, and executes it.
+Stdin, the MCP parent, JSON-RPC fields, tool arguments, `--as`, environment,
+and board selectors do not carry authority or bypass the broker.
+
 This costs a process spawn per call, a few milliseconds against operations that
 touch SQLite anyway, and buys the property that matters: there is no second code
 path. Validation cannot diverge because there is only one. The refusal an agent
@@ -76,10 +87,18 @@ noticed:
 
 Because the check runs before the server blocks on the next read, a replacement
 that appears while it is blocked is acted on at the end of the following turn —
-one request later. That lag is real and is not worth removing: tool calls spawn
-the binary from disk, so **operations are already running the new code from the
-first call after the update**. Only the protocol layer and the tool list wait
-for the swap, and neither changes in a typical update.
+one request later. That lag is real and is not worth removing. Tool calls spawn
+the command binary from disk, so the first call after an install runs the new
+**command-side** code. Under ADR-033 that is not an end-to-end freshness claim:
+the separately running broker still executes authorization and data access.
+Every command first negotiates the exact broker protocol version, generated
+command-schema hash, policy-schema version, supported board-schema range, and
+both binary identities. ADR-033 fixes the first broker protocol at integer `1`,
+requires exact protocol and command-schema equality, and requires overlapping
+schema support for the live registry and every target board. An incompatible
+or unavailable broker refuses before opening a board. A compatible but older
+broker is named as older in the result and audit receipt; it is never described
+as fresh merely because the command binary changed.
 
 The server does not require `initialize` before serving. Insisting on it would
 make a reload visible: the new image did not witness the handshake, and would
@@ -91,8 +110,24 @@ reject a client that is, correctly, not going to repeat it.
 newline-delimited JSON-RPC over stdio, which needs nothing beyond `serde_json`
 and the standard library, and the tool list is the ADR-010 manifest.
 
-An update is `install` over the binary, as it always was. Running servers pick it
-up without a client noticing, and a broken build is declined rather than adopted.
+ADR-033 adds a broker socket as an internal authorization hop, not as another
+MCP transport. The client still spawns `kanban mcp`, the MCP server still owns
+only the stdio protocol state, and each tool request's command process closes
+its broker connection before returning. The broker is a separately owned local
+service; it is not the long-lived socket server rejected below as an MCP
+transport. Broker protocol and schema negotiation occurs on every such
+connection, before an operation is accepted.
+
+An MCP/CLI update remains `install` over that binary. Running stdio servers pick
+up the MCP protocol layer and generated tool surface without a client
+reconnect, and a broken command build is declined rather than adopted. That
+install does not update the broker. Broker replacement is a separate managed
+service operation: preflight replay and compatibility, stop accepting, drain
+accepted requests, restart under the broker owner, negotiate the new identity,
+then resume clients. Failure stays fail-closed; it never makes command
+processes open managed stores directly. An unaccepted request may reconnect,
+but an accepted request is not replayed unless that operation carries its own
+idempotency key.
 
 The reload is Unix-specific: it rests on `execve` preserving descriptors and on
 a rename-over leaving the old inode intact. That is the platform this runs on.
@@ -157,3 +192,4 @@ waiting to be reported as success.
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) §6 — narrow operations, not arbitrary write SQL
 - [ADR-010](ADR-010-adapters-generated-from-the-command-surface.md) — the manifest the tool list is built from
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md) — the refusal rules the adapter inherits
+- [ADR-033](ADR-033-principals-are-frozen-username-plus-uid-and-minted-through-a-peer-credential-broker.md) — brokered principal and policy boundary without changing client-facing stdio

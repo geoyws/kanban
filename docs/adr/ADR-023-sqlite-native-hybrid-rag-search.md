@@ -82,14 +82,12 @@ the serialized context payload. The receipt reports returned results, used
 characters, searched and missing boards, model identity and truncation. Cache
 freshness is reported by `doctor`.
 
-### One command contract, three surfaces
+### One command contract, two surfaces
 
 - CLI: `kb search QUERY`, with source/status/tag/lane/time filters and explicit
   `--all-boards` cross-project scope.
 - MCP: generated from the same command table and marked read-only. The explicit
   rebuild operation is a separate write tool.
-- Web: one keyboard-friendly search form and a server-rendered results page.
-  The handler calls the same retrieval function and never receives a lease.
 
 `--all-boards` is explicit and cannot be combined with `--project`, `--workspace`
 or `--db`. It opens only present registered boards. Missing boards are named in
@@ -126,6 +124,26 @@ the receipt rather than silently omitted.
 - Backup/restore followed by `search-rebuild` produces the same source set and
   does not change authoritative ledger rows.
 
+## Amendment — 2026-09-05: incremental writes persist vectors, and doctor fails on gaps
+
+The original decision left a source mutation's vector to be recomputed in
+memory on the next read and treated `search-rebuild` as the only writer of the
+cache. Measured on the live boards, the incremental path accumulated most of the
+corpus as unembedded rows (px 71%, kanban 62% by 2026-09-05) while `doctor`
+still reported the index healthy.
+
+Two corrections:
+
+- Every Rust write path that a source trigger refreshes now re-embeds the rows
+  it touched in the same `Store` call (`search::embed_missing`), reusing the
+  rebuild path's per-document embed rather than duplicating the vector math.
+  The in-memory recompute on read remains as a fallback for boards written by
+  an older binary.
+- `doctor`'s `searchIndex.healthy` is false when any document lacks a current
+  embedding, not merely when source/document/FTS counts disagree. An
+  `unhealthyBecause` list names each gap and its fix (`kb search-rebuild`),
+  matching ADR-008's "name its own fix" rule.
+
 ## References
 
 - [SQLite FTS5](https://www.sqlite.org/fts5.html)
@@ -133,5 +151,5 @@ the receipt rather than silently omitted.
 - [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md)
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)
 - [ADR-010](ADR-010-adapters-generated-from-the-command-surface.md)
-- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md)
+- [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md) (the served results page — retired: [ADR-053](ADR-053-the-web-view-is-retired.md))
 - [ADR-021](ADR-021-settled-history-leaves-operational-indexes.md)
