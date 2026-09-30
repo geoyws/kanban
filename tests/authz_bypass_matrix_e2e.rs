@@ -1413,7 +1413,30 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-restore"));
+    let expected_event_hash: String = Connection::open(&estate.board_a)
+        .unwrap()
+        .query_row(
+            "SELECT event_hash FROM events WHERE kind='note_added' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before_delivery = stream.seen.len();
     stream.wait_for_event(APPEAR);
+    let delivered = stream.seen[before_delivery..]
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|envelope| envelope["type"] == "event")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "unexpected replay after re-grant: {delivered:?}"
+    );
+    assert_eq!(
+        delivered[0]["payload"]["eventID"], expected_event_hash,
+        "the restored stream delivered an old event instead of the new one"
+    );
 }
 
 /// ACC-14 (A11): a checked row stays non-enumerating to an unauthorized

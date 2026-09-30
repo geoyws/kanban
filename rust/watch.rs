@@ -344,26 +344,28 @@ struct Poll {
     tail_seq: Option<i64>,
 }
 
-/// Read one poll's batch and advance from one snapshot of one connection.
+/// Read one poll's batch and advance from one board snapshot, under authority
+/// minted after that snapshot is pinned.
 ///
-/// The board arm pairs one bounded [`Store::events_since_filtered_tail`]
-/// scan with one bounded unfiltered walk, and both reads sit in this one
-/// snapshot — so a commit landing mid-poll is invisible to both and is
-/// picked up whole by the next poll. (The two reads used to run on two
-/// connections opened moments apart — two snapshots — and a matching event
-/// committing between them was invisible to the filtered scan and visible
-/// to the tail, which advanced the cursor past it: never delivered, never
-/// reported missing. The registry arm below still has that two-snapshot
-/// history behind it and keeps its seam test; the board arm's pair shares
-/// one snapshot, and the walk stops at the first row the scan has not ruled
-/// out, so no interleaving left can step over a match.)
+/// The board arm uses one bounded `Store::events_since_filtered_tail` scan and
+/// one bounded unfiltered walk in the same snapshot. A commit landing mid-poll
+/// is invisible to both reads and picked up by the next poll; no tail may skip
+/// an event that arrived after the filtered scan.
+///
+/// The initial open checks whole-board access before exposing SQLite bytes.
+/// `read_snapshot_as_caller` then pins the board snapshot and re-mints the
+/// caller's row authority before either scan. Otherwise a re-grant and event
+/// commit between the initial mint and the snapshot could be filtered under
+/// stale authority, while the tail advances past the event permanently.
 fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
     match &spec.source {
         Source::Board { path, .. } => {
-            let store = Store::open_readonly_as_caller(path)?;
-            read_snapshot(&store, |store| poll_board_once(store, spec, cursor))
+            let mut store = before_snapshot(Store::open_readonly_as_caller(path)?);
+            store.read_snapshot_as_caller(path, |store| poll_board_once(store, spec, cursor))
         }
         Source::Registry { root } => {
+            // No authority race here: registry rule events carry no per-row
+            // authority, so there is no mint for a snapshot to postdate.
             let registry = Registry::open_readonly_at(root)?;
             read_snapshot(&registry, |registry| {
                 let batch = registry.rule_events_since_filtered(
@@ -567,6 +569,58 @@ impl Drop for BetweenScans {
 fn install_between_scans(hook: BetweenScansHook) -> BetweenScans {
     set_between_scans(Some(hook));
     BetweenScans
+}
+
+/// Runs after a board poll's gate mint and open, before its snapshot is
+/// pinned. Empty in every build but the unit tests, which use it to re-grant
+/// authority and commit an event into exactly the window where a poll judging
+/// rows under its gate mint used to withhold them.
+///
+/// It takes and returns the store the snapshot then reads from, and is
+/// `#[must_use]`, so it can only sit between the open and the snapshot.
+#[must_use]
+#[cfg(not(test))]
+fn before_snapshot(store: Store) -> Store {
+    store
+}
+
+#[cfg(test)]
+type BeforeSnapshotHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SNAPSHOT: std::cell::RefCell<Option<BeforeSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[must_use]
+#[cfg(test)]
+fn before_snapshot(store: Store) -> Store {
+    let hook = BEFORE_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook();
+        BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+    store
+}
+
+/// Uninstalls the before-snapshot hook when it drops, panics included, for
+/// the same thread-reuse reason as [`BetweenScans`].
+#[cfg(test)]
+struct BeforeSnapshot;
+
+#[cfg(test)]
+impl Drop for BeforeSnapshot {
+    fn drop(&mut self) {
+        BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_before_snapshot(hook: BeforeSnapshotHook) -> BeforeSnapshot {
+    BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    BeforeSnapshot
 }
 
 fn watch(spec: WatchSpec) -> Result<()> {
@@ -1690,6 +1744,10 @@ mod tests {
     /// poll delivers it.
     #[test]
     fn a_poll_never_advances_past_an_event_that_commits_between_its_two_scans() {
+        // Every board poll mints authority from the canonical root, which the
+        // managed-root test repoints; hold the env guard so it cannot land
+        // mid-poll.
+        let _env = crate::dispatch::tests::env_guard();
         let root = temp_watch_dir("single-snapshot-poll");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1789,6 +1847,180 @@ mod tests {
         );
     }
 
+    /// A private canonical data root (`$XDG_DATA_HOME/kanban`) whose registry
+    /// is `managed`, installed for the guard's life, the way `lib.rs`'s
+    /// selector-gate tests install theirs: `board_authz` reads the canonical
+    /// root and nothing else, so this is the only way to drive the real mint.
+    struct ManagedRoot {
+        xdg: PathBuf,
+        original_xdg: Option<std::ffi::OsString>,
+        original_data_dir: Option<std::ffi::OsString>,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ManagedRoot {
+        fn new(label: &str) -> ManagedRoot {
+            let _env = crate::dispatch::tests::env_guard();
+            let xdg = temp_watch_dir(label);
+            let root = xdg.join("kanban");
+            fs::create_dir_all(&root).expect("create canonical root");
+            let registry = Registry::open_test_at(&root).expect("open canonical test registry");
+            registry
+                .connection
+                .execute(
+                    "UPDATE enforcement_state SET state='managed' WHERE id=1",
+                    [],
+                )
+                .expect("enforce managed");
+            let original_xdg = std::env::var_os("XDG_DATA_HOME");
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            // SAFETY: serialized by the env guard held for this value's life.
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
+            ManagedRoot {
+                xdg,
+                original_xdg,
+                original_data_dir,
+                _env,
+            }
+        }
+
+        fn registry_path(&self) -> PathBuf {
+            self.xdg.join("kanban").join("registry.db")
+        }
+
+        /// Bind a principal for the identity this process's own mint resolves.
+        fn bind_self(&self, principal: &str) {
+            use crate::broker::PasswdDatabase as _;
+            let uid = unsafe { libc::geteuid() };
+            let username = crate::broker::SystemPasswd
+                .name_for_uid(uid)
+                .expect("read passwd")
+                .expect("this uid has a passwd entry");
+            Connection::open(self.registry_path())
+                .expect("open canonical registry")
+                .execute(
+                    "INSERT INTO principals(id,username,uid,enabled,bound_at_epoch,bound_by_event_id) \
+                     VALUES(?1,?2,?3,1,0,'pe-00000000')",
+                    rusqlite::params![principal, username, uid],
+                )
+                .expect("bind this process's principal");
+        }
+    }
+
+    impl Drop for ManagedRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_xdg {
+                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match &self.original_data_dir {
+                    Some(value) => std::env::set_var("KANBAN_DATA_DIR", value),
+                    None => std::env::remove_var("KANBAN_DATA_DIR"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.xdg);
+        }
+    }
+
+    /// Grant `principal` one active `(capability, atoms)` scope, committed.
+    fn grant(registry: &Path, id: &str, principal: &str, capability: &str, atoms: &[&str]) {
+        Connection::open(registry)
+            .expect("open canonical registry")
+            .execute(
+                "INSERT INTO grants(id,principal_id,capability,scope,state,origin,\
+                 granted_at_epoch,granted_by_event_id) \
+                 VALUES(?1,?2,?3,?4,'active','grant',0,'pe-00000000')",
+                rusqlite::params![
+                    id,
+                    principal,
+                    capability,
+                    serde_json::to_string(atoms).unwrap()
+                ],
+            )
+            .expect("grant scope");
+    }
+
+    /// A poll must judge its snapshot under authority read no earlier than
+    /// that snapshot.
+    ///
+    /// The board is driven at exactly the interleaving that used to lose the
+    /// event: the poll's open mints authority while the tag is revoked, then
+    /// the tag is re-granted and a matching tagged event commits, then the
+    /// snapshot is taken. Judged under the open's stale mint, the filtered
+    /// scan withheld the event and the tail stepped the cursor past it, so a
+    /// caller authorised when the event committed never received it.
+    #[test]
+    fn a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot() {
+        const TAGGED: &str = r#"{"_semanticV1":{"tags":["live"]}}"#;
+        let estate = ManagedRoot::new("authority-after-snapshot-xdg");
+        let root = temp_watch_dir("authority-after-snapshot");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(&store.connection, None, "task_moved", "codex", TAGGED, 1)
+            .expect("append a tagged seed event");
+        estate.bind_self("p-watcher");
+        let registry = estate.registry_path();
+        grant(
+            &registry,
+            "g-board-read",
+            "p-watcher",
+            "read",
+            &["board:board"],
+        );
+
+        let spec = follow_spec(&path, 0);
+
+        // Revoked: the tagged row is withheld and, deliberately, stepped over.
+        let revoked = poll_once(&spec, 0).expect("poll while the tag is revoked");
+        assert!(
+            revoked.batch.is_empty(),
+            "a caller without the tag was handed a tagged row"
+        );
+        assert_eq!(revoked.tail_seq, Some(1));
+
+        let writer_path = path.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        let raced = {
+            let _seam = install_before_snapshot(Box::new(move || {
+                if fired.replace(true) {
+                    return;
+                }
+                grant(
+                    &registry,
+                    "g-tag-read",
+                    "p-watcher",
+                    "read",
+                    &["board:board", "tag:live"],
+                );
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(&writer, None, "task_moved", "codex", TAGGED, 2)
+                    .expect("commit a tagged event after the re-grant");
+            }));
+            poll_once(&spec, 1).expect("poll across the re-grant window")
+        };
+
+        assert!(committed.get(), "the interposing re-grant never ran");
+        assert_eq!(
+            raced
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the poll judged an event committed after the re-grant under authority minted \
+             before it, so a caller authorised when the event committed never receives it"
+        );
+        assert_eq!(
+            raced.tail_seq, None,
+            "the poll moved its cursor past a row it should have delivered"
+        );
+    }
+
     #[test]
     fn the_between_scans_hook_is_reusable_and_clears_and_passes_the_cursor_through() {
         let root = temp_watch_dir("seam-reuse");
@@ -1846,6 +2078,7 @@ mod tests {
     /// re-advancing over ground it had already covered.
     #[test]
     fn the_advanced_heartbeat_publishes_the_tail_sequence_and_the_loop_keeps_it() {
+        let _env = crate::dispatch::tests::env_guard();
         let root = temp_watch_dir("advanced-heartbeat");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1888,6 +2121,7 @@ mod tests {
     /// watch terminates on its own.
     #[test]
     fn a_bounded_watch_delivers_matched_events_with_their_cursors_and_then_stops() {
+        let _env = crate::dispatch::tests::env_guard();
         let root = temp_watch_dir("bounded-delivery");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1943,6 +2177,7 @@ mod tests {
     /// unshifted cursor and this fails.
     #[test]
     fn the_tail_scan_reads_its_cursor_through_the_seam() {
+        let _env = crate::dispatch::tests::env_guard();
         let root = temp_watch_dir("seam-placement");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");

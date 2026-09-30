@@ -4610,6 +4610,39 @@ impl Store {
         Ok(Self { connection, authz })
     }
 
+    /// Run `read` inside one read snapshot of this board, under the caller's
+    /// authority as the registry states it AFTER that snapshot was pinned.
+    ///
+    /// A long-lived reader that minted its authority at open and only then
+    /// took its snapshot judges rows committed in between under authority
+    /// that predates them: a tag re-granted and a matching event committed in
+    /// that gap is withheld from a caller who was authorised when it
+    /// committed, and `watch`'s tail then steps its cursor past it for good.
+    /// Pinning first and minting second means every row the snapshot holds
+    /// committed before the authority was read. The mint is the same
+    /// [`crate::routing::board_authz`] an open takes, and a whole-board
+    /// denial refuses here exactly as [`Store::open_readonly_as_caller`]
+    /// would, before `read` sees a row.
+    pub(crate) fn read_snapshot_as_caller<T>(
+        &mut self,
+        path: &Path,
+        read: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        let snapshot = crate::db::begin_read_snapshot(&self.connection)?;
+        // A deferred transaction takes its snapshot at the first read, not at
+        // BEGIN, so the snapshot is pinned here, before the mint below.
+        self.connection
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let authz = crate::routing::board_authz(path)?;
+        authz.check_read(&[])?;
+        self.authz = authz;
+        let value = read(self)?;
+        snapshot.finish()?;
+        Ok(value)
+    }
+
     /// Open a board for a command that only READS it.
     ///
     /// Two branches, decided by the board's stored schema and nothing else:

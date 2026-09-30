@@ -127,7 +127,12 @@ named lanes. Values within the lane family are ORed; the family is ANDed with ev
 predicate family (--kind, --note-kind, --relation, --prior-status, --current-status, --tag).
 Matching is literal against the task row's lane; a lane that matches nothing yields an empty
 stream, not an error.`
-`Permissions: the caller's board/tag read scopes gate the stream — revoking authority stops a live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1301); watch itself grants nothing and writes nothing.`
+`Permissions: board/tag read scopes gate each poll. A revoked live stream
+withholds denied events without reconnecting; after a re-grant, a new event
+committed before the next board snapshot is delivered on that same stream,
+never skipped by a cursor advanced under older authority. Pin the board
+snapshot before re-minting row authority for its filtered scan and tail.
+Watch grants nothing and writes nothing.`
 `Failure behaviour: none beyond WATCH-04 on registry scope.`
 `Data rules: the predicate selects from stored rows; it writes nothing, archives nothing, and
 survives no restart beyond the persisted opaque cursor that carries it (WATCH-02).`
@@ -240,8 +245,12 @@ limit bounds the filtered result set, never the raw scan.`
 ## 4. Acceptance examples
 
 Concurrency needs no example: watch writes nothing, two streams share no mutable state, and
-one scope per stream (§2) keeps two consumers independent. Unauthorized access is read-authority gating rather
-than a write refusal: per-poll authority re-read stops a revoked live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1301).
+one scope per stream (§2) keeps two consumers independent. Unauthorized
+access is read-authority gating rather than a write refusal: per-poll
+authority re-read stops a revoked live stream without reconnecting and
+restores exact event delivery after re-grant
+(`revoking_authority_stops_a_live_watch_stream_without_a_reconnect`,
+`tests/authz_bypass_matrix_e2e.rs:1304`).
 
 ### A1 (WATCH-01, WATCH-02)
 
@@ -306,6 +315,16 @@ no lane in `--lane driver-2`,
 *then* the old cursor is accepted with the lane family empty-until-specified, delivery skips
 the fifty unmatched rows, and exactly one `advanced` heartbeat advances the opaque cursor to
 the scanned tail — the stream never re-loops those fifty rows.
+
+### A8 (WATCH-01 — existing per-poll authority, `t-2229d5c3`)
+
+*Given* a live tag-scoped stream whose grant is revoked and then restored,
+*when* a matching event commits after the re-grant but before the poll's board
+snapshot opens,
+*then* the same stream emits that exact event ID, not an older withheld event;
+the cursor never advances past it under authority minted before the snapshot.
+The deterministic in-process seam pins this ordering; the compiled-process
+stream test pins revocation, recovery and event identity at the user boundary.
 
 ## 5. Contracts and data
 
@@ -403,7 +422,7 @@ enumerated with `cargo test --locked --test e2e -- --list` and
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `WATCH-01` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: `--lane` does not exist at the baseline. |
+| `WATCH-01` | MUST | process | `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` | PARTIAL: existing live watch revocation/re-grant and exact restored event ID at the compiled-process boundary; deterministic in-process seam `watch::tests::a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot` pins mint-after-snapshot ordering. No e2e coverage for the new `--lane` predicate; owed by `t-fde5d91c`. |
 | `WATCH-02` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
 | `WATCH-03` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
 | `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
@@ -449,3 +468,10 @@ Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run)
   implementation gate GATE-ORD-READBACK per `a-97b3ab24` (choice `narrow`); no requirement
   depends on the retired web view. Status stamped `SPEC-READY`; no requirement ID changed
   meaning.
+- `2026-10-01` — bounded WATCH-01 permission delta for `t-2229d5c3`:
+  restore the already-specified live stream's re-grant behavior without
+  changing `watch` grammar or cursor format. A8 makes the mint-after-snapshot
+  ordering explicit; the existing compiled-process revocation test now pins
+  the exact restored event ID, and a deterministic unit seam pins the race.
+  The future `--lane` predicate still has no e2e coverage and remains owed
+  by `t-fde5d91c`; no requirement ID or implementation approval changed.

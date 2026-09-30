@@ -3763,16 +3763,27 @@ pub fn read_snapshot<S: SnapshotSource, T>(
     source: &S,
     read: impl FnOnce(&S) -> Result<T>,
 ) -> Result<T> {
+    let snapshot = begin_read_snapshot(source.snapshot_connection())?;
+    let value = read(source)?;
+    snapshot.finish()?;
+    Ok(value)
+}
+
+/// Begin the deferred read transaction [`read_snapshot`] runs inside, for a
+/// reader that has to do something between pinning the snapshot and reading
+/// from it — `Store::read_snapshot_as_caller` mints authority there. The
+/// snapshot is not taken until the first read on `connection`; dropping the
+/// transaction rolls it back.
+pub fn begin_read_snapshot(connection: &Connection) -> Result<Transaction<'_>> {
     // Deferred is named, not inherited. `unchecked_transaction` reads the
     // connection's mutable `transaction_behavior`, and BEGIN IMMEDIATE against
     // a read-only `query_only` connection errors, which would propagate out of
     // a poll and end the follow loop. The snapshot semantics are the whole
     // correctness argument here, so the behavior is stated rather than assumed.
-    let snapshot =
-        Transaction::new_unchecked(source.snapshot_connection(), TransactionBehavior::Deferred)?;
-    let value = read(source)?;
-    snapshot.finish()?;
-    Ok(value)
+    Ok(Transaction::new_unchecked(
+        connection,
+        TransactionBehavior::Deferred,
+    )?)
 }
 
 fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
