@@ -620,3 +620,30 @@ before the row landed.
 | `DG-16` | MUST | process | `done_gate_story_and_epic_project_done_without_verdict` | no e2e coverage; unit `done_gate_story_and_epic_moves_take_no_verdict` holds the story-projection refusal with no gate sentence and the direct epic move succeeding with no verdict |
 | `DG-17` | MUST | process | `a17_done_gate_checkpoint_done_is_gated`, `a17_done_gate_task_add_done_is_refused`, `a17_done_gate_import_done_is_refused` | no e2e coverage; each refuses with DG-08 sentence 1 on the gated board with nothing written and succeeds on the ungated twin |
 | `DG-18` | MUST | process | `a18_done_gate_verdict_list_hides_unreadable_evidence` | no e2e coverage; tag-scoped managed estate: the verdict row answers with writer, reviewer, SHAs and verdict intact while unreadable evidence ids are omitted, and granting the hidden tag brings the id back |
+## Requirements trace — `docs/specs/cross-board-gates.md` CROSS-01..CROSS-12
+
+One row per requirement. The docs-only specification became SPEC-READY on 2026-10-01
+after independent /quality spec review of revision 3B85, against published Kanban commit `b7867f6`. George approved this slice under
+`e-c0852fe7` in `a-2980be50`; its accepted parent is `e-df626704`.
+`process` means compiled Rust binaries across real process boundaries.
+Every `none` is truthful: **no e2e coverage** exists for CROSS.
+Acceptance examples A1–A5 in the specification define planned process evidence.
+Implementation must replace `none` with names enumerated via
+`cargo test --locked --test e2e -- --list` and run the Linux release gate.
+The parent epic’s historical web clause predates George’s accepted ADR-053,
+which deleted web routes; this slice builds no new web surface.
+
+| Requirement | Strength | Layer | Test name | Note |
+| --- | --- | --- | --- | --- |
+| `CROSS-01` | MUST | process | `none` | no e2e coverage; A2 malformed/mixed/local-ID cases |
+| `CROSS-02` | MUST | process | `none` | no e2e coverage; A2 pin/recreate/reopen cases |
+| `CROSS-03` | MUST | process | `none` | no e2e coverage; A1 done/reopen/archive cases |
+| `CROSS-04` | MUST | process | `none` | no e2e coverage; A1/A5 lifecycle cases |
+| `CROSS-05` | MUST | process | `none` | no e2e coverage; A3 denied/absent parity |
+| `CROSS-06` | MUST | process | `none` | no e2e coverage; A2/A3 no-partial-write cases |
+| `CROSS-07` | MUST | process | `none` | no e2e coverage; A4 reciprocal/ancestry cycles |
+| `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
+| `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
+| `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
+| `CROSS-11` | MUST | process | `none` | no e2e coverage; A2 older-board migration/open |
+| `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
