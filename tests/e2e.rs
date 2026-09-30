@@ -34268,15 +34268,11 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
 }
 
 /// A release directory is born from `mktemp -d`, which makes 0700, and `mv`
-/// carries that mode onto the release. That was invisible while root both
-/// installed the release and ran the service; since the hax identity cutover
-/// (2026-09-06) `kanban-serve` runs as the `kanban` user, and installing a
-/// 0700 release on 2026-09-07 09:27 CEST left systemd unable to reach the new
-/// binary at all: 203/EXEC, restart loop, loopback down for about three and a
-/// half minutes until the directory was chmod'ed by hand. The mode bits are
-/// exactly what the service identity sees, so they are what this asserts:
-/// this test cannot switch uid, but a directory missing its world execute bit
-/// is unreachable to every identity except its owner, whoever that is.
+/// carries that mode onto the release. Historically, while `kanban-serve` ran
+/// as the `kanban` user, a 0700 release caused 203/EXEC on 2026-09-07. Today
+/// only root reads the store (a-e5391903), but new release directories remain
+/// 0755 so a future service-traversed store needs no installer change. This
+/// test asserts the activated release's mode and its managed links.
 #[test]
 fn hig_release_script_installs_a_release_directory_another_identity_can_traverse() {
     let harness = ReleaseGuardHarness::new("hig-release-traversable");
