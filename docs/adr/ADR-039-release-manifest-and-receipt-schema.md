@@ -19,6 +19,11 @@ authorization-root code fix with Linux e2e comes before anything host-side,
 and production cutover is out of scope behind a separate George approval.
 See the addendum dated 2026-09-28 at the end of this document. The schema
 freeze is untouched.
+**Addendum 2026-10-01:** George's `a-e5391903` (choice `close`) keeps the
+store at `/root/.local/share/kanban-releases` on both hosts and moves no
+root, so the 2026-09-28 split is not carried out and the installer's
+pre-install other-traverse refusal is withdrawn. See the addendum dated
+2026-10-01 at the end of this document.
 
 ## Context
 
@@ -603,6 +608,24 @@ cutover. The split, in order:
    [ADR-034](ADR-034-hig-release-packages-and-board-rule-transfer.md)'s
    recorded invocation is unchanged.
 
+Addendum 2026-10-01 (owner verdict `a-e5391903` on `t-efb40c59`: choice
+`close`): the production cutover that item 3 deferred is closed without a
+move. A read-only measurement on 2026-09-30 found nothing outside root that
+reads the release store on either host. The store stays at
+`/root/.local/share/kanban-releases` on `hax` and `hig`; whether `/root` on
+`hax` goes to `0700` is infra `t-ad47ef63`. Consequence for the code that
+item 2 landed (`t-317647c9`, `916e3f9`): its install-time refusal of any root
+with an ancestor lacking other-traverse assumed a service identity would read
+the store. None does, and on 2026-10-01 the refusal stopped the approved
+`102799b` release on `hax` (`/root/.local` is `0750`; `/root` on `hig` is
+`0700`) before anything was written (deploy rows `d-2cd528cd` and
+`d-472513f9`, cancelled). The refusal is removed from both the local and the
+embedded remote installer (`t-49b72c73`). Directories the installer creates
+and every release directory stay `0755`, so a later move to a
+service-traversed root needs no installer change. `/var/lib/kanban` and
+`/var/lib/kanban-releases` are no longer declared canonical; they are one
+possible future layout behind a new approval.
+
 ## References
 
 - `scripts/hig-release.sh` — the whole release path; every citation above
@@ -615,4 +638,5 @@ cutover. The split, in order:
 - `tests/e2e.rs` — `hig_release_script_*`, including `hig_release_script_local_and_remote_install_guards_are_identical` and `hig_release_script_enumerates_exactly_the_executables_the_crate_declares`
 - `docs/testing/graphql-agent-loop-benchmark-2026-09-05.json:303` — the live store path in use
 - Kanban board: epic `e-c3c8a863`; task `t-66ca0c2d` (this ADR); decision `a-f0ced14b` (2026-09-06, the store paths stay)
+- Owner verdict `a-e5391903` (2026-09-30, choice `close`) on task `t-efb40c59` — the store stays under `/root/.local/share/kanban-releases`; the installer's other-traverse refusal is withdrawn (`t-49b72c73`)
 - Owner verdict `a-b68921fe` (2026-09-28, choice `split`, approve) on task `t-317647c9` — the replan this addendum records: canonical authz root `/var/lib/kanban` (`kanban:kanban`, `0700`) plus root-owned `/var/lib/kanban-releases`; authorization-root code fix with Linux e2e before anything host-side; production cutover out of scope behind a separate George approval

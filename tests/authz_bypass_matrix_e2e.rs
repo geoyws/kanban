@@ -46,6 +46,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The one refusal every denial in this file must be, byte for byte. A second
 /// wording anywhere would be an oracle.
+const SEED_HEAD: &str = "0000000000000000000000000000000000000000";
 const DENIED: &str = "denied or not found";
 
 /// How long a `watch --follow` assertion waits for a line that should arrive,
@@ -1291,12 +1292,14 @@ fn no_selector_reaches_a_board_the_caller_has_no_authority_over() {
 /// reconnect", which is not revocation.
 ///
 /// This starts a real `watch --follow` process, observes a tagged row's event
-/// arrive, retires the tag grant while the stream is still open, and then
-/// observes the next event on that same row NOT arrive. The process is
-/// asserted still running and still producing output, so what is measured is a
-/// live stream that stopped delivering — not a crashed one, and not a
-/// reconnect. Restoring the grant then makes the withheld row appear on the
-/// SAME stream, which is only possible if the authority is re-read per poll.
+/// arrive, retires the tag grant while the stream is still open — the next
+/// attach is refused outright, because a caller who cannot read the row
+/// cannot write to it either — then restores the grant just long enough to
+/// write one event, revokes again, and observes that event NOT arrive. The
+/// process is asserted still running and still producing output, so what is
+/// measured is a live stream that stopped delivering — not a crashed one, and
+/// not a reconnect. Restoring the grant then makes the withheld row appear on
+/// the SAME stream, which is only possible if the authority is re-read per poll.
 #[test]
 fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     let estate = ManagedEstate::new("revocation");
@@ -3028,5 +3031,3431 @@ fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
     assert_eq!(
         doctor["projects"][0]["orphanedTaskLinks"],
         serde_json::json!([])
+    );
+}
+
+/// George a-daa231b3: a child ID in a readable story's advance refusal is
+/// not secret, but the child row's content remains tag-gated. Exercise the
+/// compiled CLI across process boundaries with one visible and one hidden
+/// open child, then prove the refused advance left the story unchanged.
+#[test]
+fn story_advance_names_tag_denied_child_id_without_exposing_its_row() {
+    let estate = ManagedEstate::new("story-hidden-child-id");
+    let work = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret"] {
+        estate.ok_json(&work, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    estate.ok_json(
+        &work,
+        &[
+            "task",
+            "add",
+            "visible story",
+            "--id",
+            "s-visible",
+            "--type",
+            "story",
+            "--tag",
+            "geoyws/visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    for (id, title, tag) in [
+        ("t-visible-child", "visible child", "geoyws/visible"),
+        ("t-secret-child", "secret payload headline", "geoyws/secret"),
+    ] {
+        estate.ok_json(
+            &work,
+            &[
+                "task",
+                "add",
+                title,
+                "--id",
+                id,
+                "--parent",
+                "s-visible",
+                "--type",
+                "task",
+                "--lane",
+                "driver",
+                "--tag",
+                tag,
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+    }
+    // planning -> ready -> in-progress; the next step is gated by open children.
+    for _ in 0..2 {
+        estate.ok_json(
+            &work,
+            &["story", "advance", "s-visible", "--as", "seed", "--json"],
+        );
+    }
+    estate.bind_self(
+        "visible-reader",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+    assert_eq!(
+        estate.ok_json(&work, &["task", "show", "t-visible-child", "--json"])["id"],
+        "t-visible-child"
+    );
+    estate.denied(&work, &["task", "show", "t-secret-child", "--json"]);
+
+    let refused = estate.run(
+        &work,
+        &[
+            "story",
+            "advance",
+            "s-visible",
+            "--as",
+            "visible-reader",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "the open children were ignored");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("non-test-lane tasks still open:"),
+        "{message}"
+    );
+    assert!(message.contains("t-visible-child"), "{message}");
+    assert!(message.contains("t-secret-child"), "{message}");
+    assert!(!message.contains("secret payload headline"), "{message}");
+    assert!(!message.contains("geoyws/secret"), "{message}");
+    assert_eq!(
+        estate.ok_json(&work, &["task", "show", "s-visible", "--json"])["metadata"]["workflowStatus"],
+        "in-progress",
+        "the refused advance changed the story"
+    );
+}
+
+/// ACC-14, dependency replacement keeps the edges the caller cannot read — and
+/// the ones it can read but not write: the owner gates `t-visible` on
+/// `t-secret` (unreadable to the caller) and on `t-ops` (readable but
+/// read-only), and a managed caller holding board read and write (plus
+/// `visible` at both capabilities and `ops` read only) replaces the list with
+/// `t-other`. The write succeeds — refusing would confirm a hidden edge
+/// exists — but both kept edges survive: the caller's own listing still shows
+/// `t-ops` beside `t-other` while withholding `t-secret`, the gate still names
+/// both kept prerequisites, and the claim is still refused while either is
+/// open. Re-listing the read-only edge needs no new authority, clearing the
+/// list keeps both, and the owner can still drop any edge. Re-listing the
+/// hidden edge is refused byte-identically to naming an id that was never an
+/// edge — the re-list skip applies only to edges the caller can read — with
+/// nothing written either way.
+#[test]
+fn dependency_replacement_keeps_a_tag_denied_prerequisite() {
+    let estate = ManagedEstate::new("acc14-dep-replace");
+    let work_a = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret", "geoyws/ops"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, title, tag) in [
+        ("t-secret", "secret prerequisite", "geoyws/secret"),
+        ("t-ops", "ops prerequisite", "geoyws/ops"),
+        ("t-other", "other prerequisite", "geoyws/visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", tag, "--as", "seed", "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "visible row",
+            "--id",
+            "t-visible",
+            "--tag",
+            "geoyws/visible",
+            "--depends-on",
+            "t-secret",
+            "--depends-on",
+            "t-ops",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-visible-only",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+            tag_scope("read", &estate.id_a, "geoyws/ops"),
+        ],
+    );
+    estate.enforce("managed");
+    // The replacement succeeds: refusing would tell the caller an edge it
+    // cannot see exists. The receipt carries the row, never the edges, so it
+    // names no prerequisite either way.
+    let receipt = estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "p",
+        ],
+    );
+    assert!(
+        !receipt.contains("t-secret"),
+        "the update receipt revealed the hidden edge: {receipt}"
+    );
+    // The caller's own view still shows the edge it named beside the
+    // readable kept edge, and still withholds the hidden one.
+    let shown = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        shown["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-ops".to_owned(), "t-other".to_owned()],
+        "the listing lost the read-only edge or handed over the hidden one: {shown}"
+    );
+    // Both gates still hold: each id and status stays, the hidden title stays
+    // blanked while the readable one stays visible.
+    assert_eq!(
+        shown["blockingGates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| {
+                (
+                    gate["prerequisiteID"].as_str().unwrap().to_owned(),
+                    gate["prerequisiteStatus"].as_str().unwrap().to_owned(),
+                    gate["prerequisiteTitle"].clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "t-ops".to_owned(),
+                "todo".to_owned(),
+                serde_json::json!("ops prerequisite"),
+            ),
+            (
+                "t-other".to_owned(),
+                "todo".to_owned(),
+                serde_json::json!("other prerequisite"),
+            ),
+            ("t-secret".to_owned(), "todo".to_owned(), Value::Null),
+        ],
+        "the gates lost a kept edge: {shown}"
+    );
+    // Re-listing the hidden edge answers exactly like naming an id that was
+    // never an edge: the re-list skip applies only to edges the caller can
+    // read, so guessing the hidden prerequisite confirms nothing. Same exit
+    // code, byte-identical stderr carrying the generic denial, nothing
+    let hidden = estate.run(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-secret",
+            "--as",
+            "p",
+        ],
+    );
+    let unknown = estate.run(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-nonexistent",
+            "--as",
+            "p",
+        ],
+    );
+    assert!(
+        !hidden.status.success(),
+        "re-listing the hidden edge succeeded but must be refused"
+    );
+    assert_eq!(
+        hidden.status.code(),
+        unknown.status.code(),
+        "re-listing a hidden edge exits differently from naming an unknown id"
+    );
+    assert_eq!(
+        hidden.stderr, unknown.stderr,
+        "re-listing a hidden edge reads differently from naming an unknown id"
+    );
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr).contains(DENIED),
+        "the hidden-edge probe did not answer the non-enumerating denial: {}",
+        String::from_utf8_lossy(&hidden.stderr)
+    );
+    let reread = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        reread, shown,
+        "a refused edge probe wrote to the row: {reread}"
+    );
+    // Re-listing the read-only edge alongside the new one is accepted:
+    // a readable edge already on the row needs no new authority.
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-ops",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "p",
+        ],
+    );
+    // Clearing the list keeps both the hidden and the read-only edges: only
+    // the writable `t-other` edge is dropped.
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--clear-dependencies",
+            "--as",
+            "p",
+        ],
+    );
+    let cleared = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        cleared["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-ops".to_owned()],
+        "clearing dropped a kept edge or handed over the hidden one: {cleared}"
+    );
+    let mut gate_ids = cleared["blockingGates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gate| gate["prerequisiteID"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    gate_ids.sort();
+    assert_eq!(
+        gate_ids,
+        vec!["t-ops".to_owned(), "t-secret".to_owned()],
+        "clearing lost a kept gate: {cleared}"
+    );
+    // So the claim is still refused while a kept prerequisite is open — and
+    // the refusal still names the hidden edge.
+    let refused = estate.run(&work_a, &["claim", "t-visible", "--as", "p"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        !refused.status.success(),
+        "the kept gates let a claim through: {stderr}"
+    );
+    assert!(
+        stderr.contains("t-secret is todo"),
+        "the claim refusal no longer names the hidden edge: {stderr}"
+    );
+    // The owner sees every surviving edge, so the assertions above came from
+    // the tag scopes and not from missing rows — and the owner can still drop
+    // any edge, kept or not.
+    estate.grant("p-visible-only", &owner_of(&estate.id_a));
+    let owned = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    let mut owned_ids = owned["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    owned_ids.sort();
+    assert_eq!(
+        owned_ids,
+        vec!["t-ops".to_owned(), "t-secret".to_owned()],
+        "the owner lost an edge: {owned}"
+    );
+    estate.ok(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-visible",
+            "--depends-on",
+            "t-other",
+            "--as",
+            "owner",
+        ],
+    );
+    let dropped = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    assert_eq!(
+        dropped["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["t-other".to_owned()],
+        "the owner could not drop the kept edges: {dropped}"
+    );
+}
+
+/// ACC-14, task-attach writes: a managed caller holding board read and write
+/// (plus `visible` at both capabilities) but no `secret` scope must not
+/// attach rows to a `secret` task, and a denied task id must answer
+/// byte-identically to a never-created id on every such write — with nothing
+/// recorded.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Covers `note`, `attention raise --task`, `sitrep post
+/// --task`, `checkpoint`, `handoff create` with a task, `task add --parent` /
+/// `--depends-on`, `task update --parent` / `--depends-on`, `subscription
+/// add --subject` / `--relation`, and `deploy start --task`.
+#[test]
+fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
+    fn sitrep_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "sitrep",
+            "post",
+            "attach probe body",
+            "--as",
+            "probe",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    fn raise_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "attention",
+            "raise",
+            "attach probe body",
+            "--kind",
+            "decision",
+            "--as",
+            "probe",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    fn checkpoint_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "checkpoint",
+            task,
+            "--lease",
+            "lease-bogus",
+            "--as",
+            "probe",
+            "--summary",
+            "attach probe summary",
+            "--intent",
+            "attach probe intent",
+            "--next-action",
+            "attach probe next",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ]
+    }
+    fn handoff_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "handoff",
+            "create",
+            task,
+            "--lease",
+            "lease-bogus",
+            "--as",
+            "probe",
+            "--summary",
+            "attach probe summary",
+            "--intent",
+            "attach probe intent",
+            "--next-action",
+            "attach probe next",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ]
+    }
+    fn subscription_base<'a>() -> Vec<&'a str> {
+        vec![
+            "subscription",
+            "add",
+            "--consumer",
+            "probe-consumer",
+            "--action",
+            "probe-action",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "probe",
+        ]
+    }
+    fn subscription_on_subject(task: &str) -> Vec<&str> {
+        let mut args = subscription_base();
+        args.extend_from_slice(&["--subject", task, "--json"]);
+        args
+    }
+    fn subscription_on_relation(target: &str) -> Vec<&str> {
+        let mut args = subscription_base();
+        args.extend_from_slice(&["--relation", target, "--json"]);
+        args
+    }
+    fn deploy_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_uat",
+            "--environment",
+            "probe-env",
+            "--host",
+            "probe-host",
+            "--url",
+            "http://localhost:9999",
+            "--as",
+            "probe",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    let estate = ManagedEstate::new("acc14-task-attach");
+    let work_a = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    // Unmanaged first: where no guard can deny, an unknown id keeps its plain
+    // message on the paths that previously answered it.
+    for (args, what) in [
+        (note_on("t-never-created", "unmanaged probe"), "note add"),
+        (sitrep_on_task("t-never-created"), "sitrep post --task"),
+    ] {
+        let plain = estate.run(&work_a, &args);
+        assert!(!plain.status.success(), "{what} should fail unmanaged");
+        let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+        assert!(
+            plain_stderr.contains("task t-never-created not found"),
+            "{what} lost its plain unmanaged message: {plain_stderr}"
+        );
+        assert!(
+            !plain_stderr.contains(DENIED),
+            "{what} answers a denial where no guard can deny: {plain_stderr}"
+        );
+    }
+    for (id, title, tag) in [
+        ("s-attach-secret", "the attach secret task", "geoyws/secret"),
+        (
+            "s-attach-visible",
+            "the attach visible task",
+            "geoyws/visible",
+        ),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--type", "story", "--tag", tag, "--as", "seed",
+                "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the attach child",
+            "--id",
+            "t-attach-child",
+            "--parent",
+            "s-attach-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-attach",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+    // Each task-attach write: the denied id and the never-created id exit
+    // with the same code and byte-identical stderr — the generic denial —
+    // and the denied form must not succeed.
+    let assert_write_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_write_identical(
+        &note_on("s-attach-secret", "attach probe body"),
+        &note_on("t-never-created", "attach probe body"),
+        "note add",
+    );
+    assert_write_identical(
+        &raise_on_task("s-attach-secret"),
+        &raise_on_task("t-never-created"),
+        "attention raise --task",
+    );
+    assert_write_identical(
+        &sitrep_on_task("s-attach-secret"),
+        &sitrep_on_task("t-never-created"),
+        "sitrep post --task",
+    );
+    assert_write_identical(
+        &checkpoint_on_task("s-attach-secret"),
+        &checkpoint_on_task("t-never-created"),
+        "checkpoint",
+    );
+    assert_write_identical(
+        &handoff_on_task("s-attach-secret"),
+        &handoff_on_task("t-never-created"),
+        "handoff create --task",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "add",
+            "attach child probe",
+            "--id",
+            "t-attach-child-probe",
+            "--parent",
+            "s-attach-secret",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        &[
+            "task",
+            "add",
+            "attach child probe",
+            "--id",
+            "t-attach-child-probe",
+            "--parent",
+            "t-never-created",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        "task add --parent",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "add",
+            "attach dep probe",
+            "--id",
+            "t-attach-dep-probe",
+            "--depends-on",
+            "s-attach-secret",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        &[
+            "task",
+            "add",
+            "attach dep probe",
+            "--id",
+            "t-attach-dep-probe",
+            "--depends-on",
+            "t-never-created",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        "task add --depends-on",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--parent",
+            "s-attach-secret",
+            "--as",
+            "probe",
+        ],
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--parent",
+            "t-never-created",
+            "--as",
+            "probe",
+        ],
+        "task update --parent",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--depends-on",
+            "s-attach-secret",
+            "--as",
+            "probe",
+        ],
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--depends-on",
+            "t-never-created",
+            "--as",
+            "probe",
+        ],
+        "task update --depends-on",
+    );
+    assert_write_identical(
+        &subscription_on_subject("task:s-attach-secret"),
+        &subscription_on_subject("task:t-never-created"),
+        "subscription add --subject",
+    );
+    assert_write_identical(
+        &subscription_on_relation("depends-on:s-attach-secret"),
+        &subscription_on_relation("depends-on:t-never-created"),
+        "subscription add --relation",
+    );
+    assert_write_identical(
+        &deploy_on_task("s-attach-secret"),
+        &deploy_on_task("t-never-created"),
+        "deploy start --task",
+    );
+    // Nothing was written. As the board owner the same caller re-reads every
+    // row the refused writes could have touched: each task-scoped ledger
+    // holds only its birth event, the phantom children do not exist, and no
+    // subscription was created.
+    estate.grant("p-attach", &owner_of(&estate.id_a));
+    for task in ["s-attach-secret", "s-attach-visible", "t-attach-child"] {
+        let ledger = estate.ok(&work_a, &["events", "--task", task, "--all", "--json"]);
+        let events: Vec<Value> = serde_json::from_str(&ledger).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a refused attach wrote to {task}: {ledger}"
+        );
+        assert!(
+            ledger.contains("task_added"),
+            "{task} lost its birth event: {ledger}"
+        );
+        for marker in ["probe-host", "t-attach-child-probe", "t-attach-dep-probe"] {
+            assert!(
+                !ledger.contains(marker),
+                "a refused attach left {marker} on {task}: {ledger}"
+            );
+        }
+    }
+    for phantom in ["t-attach-child-probe", "t-attach-dep-probe"] {
+        let shown = estate.run(&work_a, &["task", "show", phantom]);
+        assert!(
+            !shown.status.success(),
+            "a refused relation add created {phantom}"
+        );
+    }
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        subscriptions.as_array().unwrap().is_empty(),
+        "a refused subscription was created: {subscriptions}"
+    );
+    // The control path works: as the owner the same caller attaches a note
+    // to the secret task, so the denials above came from the tag and not a
+    // broken write path.
+    estate.ok(&work_a, &note_on("s-attach-secret", "control note"));
+}
+
+/// Paged listings are bound by readable rows, not raw rows (ACC-14).
+///
+/// Under enforcement the SQL `LIMIT` used to run before the tag filter, so a
+/// page came back short when denied rows fell in range — and the callers'
+/// `+1` truncation probes with it: `events --task t-visible --limit 1`
+/// answered `[]` when the newest events concerned a denied attention row,
+/// and `deploy list --limit 1` came back empty while readable attempts
+/// waited behind a denied one. A managed reader holding board read but no
+/// `secret` tag now gets a full page of visible rows with a true probe,
+/// while the owner still sees every row.
+#[test]
+fn managed_pages_fill_past_denied_rows_with_a_true_truncation_probe() {
+    let estate = ManagedEstate::new("page-fill");
+    let work_a = estate.work_a.clone();
+
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/visible", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "visible row",
+            "--id",
+            "t-visible",
+            "--tag",
+            "geoyws/visible",
+            "--as",
+            "seed",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "secret row",
+            "--id",
+            "t-secret",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+        ],
+    );
+
+    // Fifty-five visible events about the readable task, beneath the denied
+    // rows the CLI writes below.
+    // Inserted directly: the filter reads live task tags, so plain
+    // task-scoped rows with no frozen snapshot are visible to anyone who can
+    // read the task, exactly like the CLI-written ones below them. The
+    // placeholder hashes keep the audit head initialized for the CLI writes
+    // that follow; chain verification is not what this test measures (the
+    // direct-estate `UPDATE events` precedent in `tests/e2e.rs` mutates rows
+    // the same way).
+    let board = Connection::open(&estate.board_a).unwrap();
+    for index in 0..55 {
+        board
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES('t-visible','task_updated','seed','{}',?1,0,'0000000000000000000000000000000000000000000000000000000000000000',?2)",
+                rusqlite::params![
+                    2_000_000_i64 + index,
+                    format!("{:064x}", 1_000_000 + index),
+                ],
+            )
+            .unwrap();
+    }
+    let newest_visible: i64 = board
+        .query_row("SELECT max(seq) FROM events", [], |row| row.get(0))
+        .unwrap();
+    for index in 0..101 {
+        board
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+                 host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+                 VALUES(?1,'t-visible','kanban','git',\
+                 '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+                 'geoywsMBP','http://localhost:9999','started','seed',?2,?3,?3,NULL)",
+                rusqlite::params![
+                    format!("d-s{index:03}"),
+                    format!("token-s{index:03}"),
+                    3_000_000_i64 + index,
+                ],
+            )
+            .unwrap();
+    }
+    for index in 0..31 {
+        board
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+                 host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+                 VALUES(?1,'t-visible','kanban','git',\
+                 '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+                 'geoywsMBP','http://localhost:9999','failed','seed',?2,?3,?3,?3)",
+                rusqlite::params![
+                    format!("d-f{index:02}"),
+                    format!("token-f{index:02}"),
+                    4_000_000_i64 + index,
+                ],
+            )
+            .unwrap();
+    }
+    // The denied failure is newer than every visible one, so it sits in
+    // range of the failures page.
+    board
+        .execute(
+            "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,tier,environment,\
+             host,url,status,actor,capability_token,created_at,updated_at,completed_at) \
+             VALUES('d-fsec','t-secret','kanban','git',\
+             '0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing',\
+             'geoywsMBP','http://localhost:9999','failed','seed','token-fsec',4_000_031,4_000_031,\
+             4_000_031)",
+            [],
+        )
+        .unwrap();
+    // Three hundred denied events about the `secret` task, newer than every
+    // visible one: plain task-scoped rows carry their task's live tags, so a
+    // caller without `secret` sees none of them. Together with the two
+    // denied attention envelopes raised below, the visible history sits more
+    // than one 256-row scan chunk down — every page that fills past them
+    // crosses a chunk boundary.
+    for index in 0..300 {
+        board
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES('t-secret','task_updated','seed','{}',?1,0,'0000000000000000000000000000000000000000000000000000000000000000',?2)",
+                rusqlite::params![
+                    2_100_000_i64 + index,
+                    format!("{:064x}", 2_000_000 + index),
+                ],
+            )
+            .unwrap();
+    }
+    drop(board);
+
+    // Two newest events, both denied: a `secret` attention row raised on the
+    // readable task, then settled. Each envelope unions the row's live tags,
+    // so a caller without `secret` sees neither — but the task-scoped read
+    // must still answer the visible history beneath them.
+    let secret_attention = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "the secret question",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--task",
+            "t-visible",
+            "--tag",
+            "geoyws/secret",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &secret_attention,
+            "--as",
+            "seed",
+            "--choice",
+            "approve",
+        ],
+    );
+    // The denied start is newer than every visible one, so it sits in range
+    // of the starts page.
+    let denied_start = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            "t-secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The owner's view, taken while enforcement is still direct: the newest
+    // rows are the denied ones, on every listing.
+    let owner_task_page = estate.ok(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        owner_task_page.contains(&secret_attention),
+        "the owner lost the newest task event before enforcement: {owner_task_page}"
+    );
+    let owner_starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        owner_starts.contains(&denied_start),
+        "the owner lost the newest start before enforcement: {owner_starts}"
+    );
+    let owner_failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        owner_failures.contains("d-fsec"),
+        "the owner lost the newest failure before enforcement: {owner_failures}"
+    );
+
+    estate.bind_self(
+        "p-page",
+        &[
+            board_scope("read", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+
+    // The CLI pages: full, visible, and honest about the remainder. Before
+    // the fix each of these came back short — the task page empty — because
+    // the SQL bound ran ahead of the tag test.
+    let task_page = estate.run(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        task_page.status.success(),
+        "task page failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&task_page.stdout),
+        String::from_utf8_lossy(&task_page.stderr)
+    );
+    let task_stdout = String::from_utf8_lossy(&task_page.stdout).into_owned();
+    let task_rows: Vec<Value> = serde_json::from_str(&task_stdout).unwrap();
+    assert_eq!(
+        task_rows.len(),
+        1,
+        "the task page came back short behind denied rows: {task_stdout}"
+    );
+    assert_eq!(
+        task_rows[0]["seq"].as_i64().unwrap(),
+        newest_visible,
+        "the task page skipped the newest visible event: {task_stdout}"
+    );
+    assert!(
+        !task_stdout.contains(&secret_attention) && !task_stdout.contains("secret"),
+        "the task page carried the hidden row: {task_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&task_page.stderr).contains("showing 1 of more than 1"),
+        "the task page hid its truncation: {task_stdout}"
+    );
+    let board_page = estate.run(&work_a, &["events", "--limit", "1", "--all", "--json"]);
+    assert!(board_page.status.success());
+    let board_stdout = String::from_utf8_lossy(&board_page.stdout).into_owned();
+    let board_rows: Vec<Value> = serde_json::from_str(&board_stdout).unwrap();
+    assert_eq!(
+        board_rows.len(),
+        1,
+        "the board page came back short behind denied rows: {board_stdout}"
+    );
+    assert_eq!(
+        board_rows[0]["seq"].as_i64().unwrap(),
+        newest_visible,
+        "the board page skipped the newest visible event: {board_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&board_page.stderr).contains("showing 1 of more than 1"),
+        "the board page hid its truncation: {board_stdout}"
+    );
+    // A wider board page across the same stretch: five visible rows, no
+    // duplicates across the chunk boundary, still newest-first from the
+    // newest visible event, and an honest truncation flag. Three hundred
+    // denied rows sit ahead of it, so filling this page crosses two chunk
+    // boundaries.
+    let wide_page = estate.run(&work_a, &["events", "--limit", "5", "--all", "--json"]);
+    assert!(wide_page.status.success());
+    let wide_stdout = String::from_utf8_lossy(&wide_page.stdout).into_owned();
+    let wide_rows: Vec<Value> = serde_json::from_str(&wide_stdout).unwrap();
+    let wide_seqs: Vec<i64> = wide_rows
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        wide_seqs,
+        vec![
+            newest_visible,
+            newest_visible - 1,
+            newest_visible - 2,
+            newest_visible - 3,
+            newest_visible - 4,
+        ],
+        "the wide board page duplicated or skipped visible rows across chunks: {wide_stdout}"
+    );
+    assert!(
+        !wide_stdout.contains(&secret_attention) && !wide_stdout.contains("secret"),
+        "the wide board page carried the hidden row: {wide_stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&wide_page.stderr).contains("showing 5 of more than 5"),
+        "the wide board page hid its truncation: {wide_stdout}"
+    );
+    let starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    let starts_rows: Vec<Value> = serde_json::from_str(&starts).unwrap();
+    assert_eq!(
+        starts_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["d-s100"],
+        "the starts page came back short behind a denied attempt: {starts}"
+    );
+    let failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    let failures_rows: Vec<Value> = serde_json::from_str(&failures).unwrap();
+    assert_eq!(
+        failures_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["d-f30"],
+        "the failures page came back short behind a denied attempt: {failures}"
+    );
+
+    // Granting `secret` makes exactly the withheld rows appear, which is
+    // what proves the tag was the reason — and the owner's newest-first
+    // order is unchanged.
+    estate.enforce("direct");
+    estate.grant(
+        "p-page",
+        &[
+            tag_scope("read", &estate.id_a, "geoyws/secret"),
+            tag_scope("write", &estate.id_a, "geoyws/secret"),
+        ],
+    );
+    estate.enforce("managed");
+    let granted_task_page = estate.ok(
+        &work_a,
+        &["events", "--task", "t-visible", "--limit", "1", "--json"],
+    );
+    assert!(
+        granted_task_page.contains(&secret_attention),
+        "granting the tag did not restore the newest task event: {granted_task_page}"
+    );
+    let granted_starts = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "started", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        granted_starts.contains(&denied_start),
+        "granting the tag did not restore the newest start: {granted_starts}"
+    );
+    let granted_failures = estate.ok(
+        &work_a,
+        &[
+            "deploy", "list", "--status", "failed", "--limit", "1", "--all", "--json",
+        ],
+    );
+    assert!(
+        granted_failures.contains("d-fsec"),
+        "granting the tag did not restore the newest failure: {granted_failures}"
+    );
+}
+
+/// ACC-14 on every CLI by-id surface: a tag-denied id and a never-created id
+/// answer byte-identically on `attention show`, `attention resolve`,
+/// `attention reopen`, `attention check` and `task show`.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The caller holds board read AND write plus `tag:visible` at both
+/// capabilities on Alpha — write as well, so every denial below is the ROW's
+/// and not the guard's blanket refusal of a principal who can write nothing.
+///
+/// The fixture raises one `secret` decision row (open, no check), one
+/// `secret` checked row with a known key, one `visible` checked row (the
+/// control that proves a past-guard refusal still names its reason), and one
+/// `secret` task. The unknown ids `att-never-raised` and `t-never-created`
+/// were never raised or added. Refusals past the guard — no check, already
+/// answered, undeclared key, not the raiser — keep the store's own sentence,
+/// and the unmanaged estate keeps its plain `not found` message.
+#[test]
+fn denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface() {
+    let estate = ManagedEstate::new("acc14-by-id-oracle");
+    let work_a = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    // Unmanaged first: where no guard can deny, an unknown id keeps its plain
+    // message. This fix must not change that UX.
+    let plain = estate.run(&work_a, &["attention", "show", "att-never-raised"]);
+    assert!(
+        !plain.status.success(),
+        "an unknown show should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("attention att-never-raised not found"),
+        "unmanaged show lost its plain message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "unmanaged show answers a denial where no guard can deny: {plain_stderr}"
+    );
+    let secret_task = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle secret task",
+            "--id",
+            "t-oracle-secret",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "the oracle secret body",
+            "--kind",
+            "decision",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let raise_checked = |body: &str, tag: &str, key_a: &str, key_b: &str| -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--kind",
+                "decision",
+                "--tag",
+                tag,
+                "--check",
+                "Oracle check question quorum?",
+                "--check-choice",
+                &format!("{key_a}=First label"),
+                "--check-choice",
+                &format!("{key_b}=Second label"),
+                "--check-answer",
+                key_a,
+                "--check-explain",
+                "Oracle check explanation quorum",
+                "--check-about",
+                "rust/store.rs",
+                "--as",
+                "seed",
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let checked = raise_checked(
+        "the oracle secret check body",
+        "geoyws/secret",
+        "okey-alpha",
+        "okey-beta",
+    );
+    let visible = raise_checked(
+        "the oracle visible check body",
+        "geoyws/visible",
+        "vkey-alpha",
+        "vkey-beta",
+    );
+    estate.bind_self(
+        "p-oracle",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. Each CLI by-id surface: the denied id and the never-created id exit
+    //    with the same code and byte-identical stderr — the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["attention", "show", &secret],
+        &["attention", "show", "att-never-raised"],
+        "attention show",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "resolve",
+            &secret,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        &[
+            "attention",
+            "resolve",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        "attention resolve",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "reopen",
+            &secret,
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        &[
+            "attention",
+            "reopen",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        "attention reopen",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "check",
+            &checked,
+            "--as",
+            "seed",
+            "--key",
+            "okey-alpha",
+        ],
+        &[
+            "attention",
+            "check",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--key",
+            "okey-alpha",
+        ],
+        "attention check",
+    );
+    assert_cli_identical(
+        &["task", "show", &secret_task],
+        &["task", "show", "t-never-created"],
+        "task show",
+    );
+    // 2. A refusal past the guard keeps the store's own sentence: an
+    //    undeclared key on the VISIBLE row is refused by name, not as denied.
+    let named = estate.run(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &visible,
+            "--as",
+            "seed",
+            "--key",
+            "no-such-key",
+        ],
+    );
+    assert!(!named.status.success(), "an undeclared key should fail");
+    let named_stderr = String::from_utf8_lossy(&named.stderr).into_owned();
+    assert!(
+        named_stderr.contains("names no --check-choice"),
+        "the past-guard refusal lost its sentence: {named_stderr}"
+    );
+    assert!(
+        !named_stderr.contains(DENIED),
+        "the past-guard refusal collapsed into the generic denial: {named_stderr}"
+    );
+    // 3. The control path works: the visible row's correct key records, so
+    //    the denials above came from the guard and not a broken route.
+    let recorded = estate.run(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &visible,
+            "--as",
+            "seed",
+            "--key",
+            "vkey-alpha",
+        ],
+    );
+    assert!(
+        recorded.status.success(),
+        "the control check answer should record: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+}
+
+/// ACC-14 over the CLI, every task route that names a row: a tag-denied task
+/// id and a never-created one answer with identical stderr and exit code on
+/// `task move`, `task update`, `task remove`, `claim`, `events --task` and
+/// `deploy show`, and a task-filtered listing (`attention list --task`)
+/// succeeds for both alike — the unknown filter proceeds exactly as the
+/// denied one does. `notes` and `checkpoints` have no standalone CLI read —
+/// every command reaches them only past `require_task`, which already denies
+/// both alike — so they are pinned at store level instead
+/// (`managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`).
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate, running as the same identity the grants were bound for.
+/// The caller holds board read AND write on Alpha and no tag scope at all,
+/// so every denial below is the ROW's and not the guard's blanket refusal of
+/// a principal who can write nothing. The fixture holds one `secret` task
+/// (with a deployment started against it before enforcement, so the attempt
+/// is a projection of a denied subject) and one untagged control task. The
+/// unknown ids `t-never-created` and `dep-never-started` were never added or
+/// started. Outside enforcement an unknown task keeps its plain `not found`
+/// message.
+#[test]
+fn denied_and_unknown_task_ids_answer_identically_on_task_routes() {
+    let estate = ManagedEstate::new("acc14-task-routes");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    let visible = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle visible task",
+            "--id",
+            "t-oracle-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle secret task",
+            "--id",
+            "t-oracle-secret",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attempt = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            &secret,
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Unmanaged first: where no guard can deny, an unknown task keeps its
+    // plain message. This fix must not change that UX.
+    let plain = estate.run(
+        &work_a,
+        &["task", "move", "t-never-created", "todo", "--as", "seed"],
+    );
+    assert!(
+        !plain.status.success(),
+        "an unknown move should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("task t-never-created not found"),
+        "unmanaged move lost its plain message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "unmanaged move answers a denial where no guard can deny: {plain_stderr}"
+    );
+    estate.bind_self(
+        "p-oracle-tasks",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. Every task mutation and named task read: the denied id and the
+    //    never-created id fail with the same code and byte-identical stderr —
+    //    the existing non-enumerating denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["task", "move", &secret, "todo", "--as", "seed"],
+        &["task", "move", "t-never-created", "todo", "--as", "seed"],
+        "task move",
+    );
+    assert_cli_identical(
+        &[
+            "task",
+            "update",
+            &secret,
+            "--title",
+            "oracle rename",
+            "--as",
+            "seed",
+        ],
+        &[
+            "task",
+            "update",
+            "t-never-created",
+            "--title",
+            "oracle rename",
+            "--as",
+            "seed",
+        ],
+        "task update",
+    );
+    assert_cli_identical(
+        &["task", "remove", &secret, "--as", "seed"],
+        &["task", "remove", "t-never-created", "--as", "seed"],
+        "task remove",
+    );
+    assert_cli_identical(
+        &["claim", &secret, "--as", "seed"],
+        &["claim", "t-never-created", "--as", "seed"],
+        "claim",
+    );
+    assert_cli_identical(
+        &["events", "--task", &secret],
+        &["events", "--task", "t-never-created"],
+        "events --task",
+    );
+    assert_cli_identical(
+        &["deploy", "show", &attempt],
+        &["deploy", "show", "dep-never-started"],
+        "deploy show",
+    );
+    // 2. A task-filtered listing succeeds for both alike: the unknown filter
+    //    proceeds exactly as the denied one does, tag-filtered per row.
+    for task in [secret.as_str(), "t-never-created"] {
+        let listed = estate.run(&work_a, &["attention", "list", "--task", task, "--json"]);
+        assert!(
+            listed.status.success(),
+            "attention list --task {} should succeed: {}",
+            task,
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        assert!(
+            listed.stderr.is_empty(),
+            "attention list --task {} wrote to stderr: {}",
+            task,
+            String::from_utf8_lossy(&listed.stderr)
+        );
+    }
+    // 3. The control paths work: the visible task's history reads and its
+    //    filtered listing answers, so the denials above came from the guard
+    //    and not a broken route.
+    let history = estate.ok(&work_a, &["events", "--task", &visible]);
+    assert!(
+        history.contains(&visible),
+        "the control task's history lost its rows: {history}"
+    );
+    let control = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--task", &visible, "--json"],
+    );
+    assert_eq!(
+        control.as_array().unwrap().len(),
+        0,
+        "the control listing should be empty, not failed: {control}"
+    );
+    // 4. Nothing was removed: with enforcement lifted the refused remove's
+    //    target still shows, so the denials above recorded nothing.
+    estate.enforce("direct");
+    let survived = estate.ok_json(&work_a, &["task", "show", &secret, "--json"]);
+    assert_eq!(
+        survived["id"].as_str(),
+        Some(secret.as_str()),
+        "a refused remove moved a row: {survived}"
+    );
+}
+
+/// ACC-14, task-linked rows: a sitrep, a handoff, an untagged attention row or
+/// a subscription naming a `secret` task is visible only to a caller who can
+/// read that task — on every listing and on `handoff retire` — while a denied task id and a never-created id answer
+/// byte-identically everywhere.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The owner seeds rows on a `secret` task and on a visible
+/// task; principal P holds board read and write but no `secret` scope, so the
+/// visible rows are the positive control: P sees those, never the secret
+/// ones, and the owner still sees all of them.
+#[test]
+fn task_linked_rows_withhold_a_tag_denied_task_on_every_listing() {
+    let estate = ManagedEstate::new("acc14-task-linked-rows");
+    let work_a = estate.work_a.clone();
+    let repo = work_a.to_string_lossy().into_owned();
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the linked secret task",
+            "--id",
+            "t-linked-secret",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // The control task carries no tag, so principal P — board read and write,
+    // no `secret` scope — reads it and its rows: P's listings are non-empty
+    // by construction, and an answer that hid everything could not pass.
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the linked visible task",
+            "--id",
+            "t-linked-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // The owner seeds one row of each kind on each task, all carrying a
+    // marker no other row carries, so "no trace" is a string search.
+    for task in ["t-linked-secret", "t-linked-visible"] {
+        let marker = task.strip_prefix("t-linked-").unwrap().to_owned();
+        let sitrep_args = vec![
+            "sitrep".to_owned(),
+            "post".to_owned(),
+            format!("linked {marker} sitrep body"),
+            "--as".to_owned(),
+            "seed".to_owned(),
+            "--lane".to_owned(),
+            "driver-1".to_owned(),
+            "--repo".to_owned(),
+            repo.clone(),
+            "--branch".to_owned(),
+            "main".to_owned(),
+            "--head".to_owned(),
+            SEED_HEAD.to_owned(),
+            "--dirty".to_owned(),
+            "clean".to_owned(),
+            "--task".to_owned(),
+            task.to_owned(),
+            "--json".to_owned(),
+        ];
+        let sitrep_refs: Vec<&str> = sitrep_args.iter().map(String::as_str).collect();
+        estate.ok_json(&work_a, &sitrep_refs);
+        let token =
+            estate.ok_json(&work_a, &["claim", task, "--as", "seed", "--json"])["leaseToken"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        estate.ok_json(
+            &work_a,
+            &[
+                "handoff",
+                "create",
+                task,
+                "--lease",
+                &token,
+                "--as",
+                "seed",
+                "--summary",
+                &format!("linked {marker} handoff summary"),
+                "--intent",
+                &format!("linked {marker} handoff intent"),
+                "--next-action",
+                &format!("linked {marker} handoff next"),
+                "--repo",
+                &repo,
+                "--branch",
+                "main",
+                "--head",
+                SEED_HEAD,
+                "--dirty",
+                "clean",
+                "--json",
+            ],
+        );
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                &format!("linked {marker} attention question"),
+                "--kind",
+                "decision",
+                "--as",
+                "seed",
+                "--task",
+                task,
+                "--json",
+            ],
+        );
+        estate.ok_json(
+            &work_a,
+            &[
+                "subscription",
+                "add",
+                "--consumer",
+                &format!("linked-{marker}-consumer"),
+                "--action",
+                "linked-action",
+                "--timeout-ms",
+                "100",
+                "--max-retries",
+                "1",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "seed",
+                "--subject",
+                &format!("task:{task}"),
+                "--json",
+            ],
+        );
+    }
+    let secret_handoff = estate
+        .ok_json(
+            &work_a,
+            &["handoff", "list", "--task", "t-linked-secret", "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "pending")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seeded_subs = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    let sub_id = |consumer: &str| {
+        seeded_subs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["consumerID"] == consumer)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let secret_sub = sub_id("linked-secret-consumer");
+    let visible_sub = sub_id("linked-visible-consumer");
+    assert_ne!(secret_sub, visible_sub, "the two seeds collided on one row");
+    estate.bind_self(
+        "p-linked-rows",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The `--task` listings succeed for both ids alike and hand over
+    //    nothing: the denied filter withholds exactly what the unknown filter
+    //    cannot match.
+    for (base, what) in [
+        (&["sitrep", "list", "--task"][..], "sitrep list --task"),
+        (&["handoff", "list", "--task"][..], "handoff list --task"),
+        (
+            &["attention", "list", "--task"][..],
+            "attention list --task",
+        ),
+    ] {
+        let mut denied_args = base.to_vec();
+        denied_args.extend_from_slice(&["t-linked-secret", "--json"]);
+        let mut unknown_args = base.to_vec();
+        unknown_args.extend_from_slice(&["t-never-created", "--json"]);
+        let denied = estate.run(&work_a, &denied_args);
+        let unknown = estate.run(&work_a, &unknown_args);
+        assert!(
+            denied.status.success(),
+            "{what} with a denied id should succeed: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        assert!(
+            unknown.status.success(),
+            "{what} with an unknown id should succeed: {}",
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        assert_eq!(
+            denied.stdout, unknown.stdout,
+            "{what} output differs between a denied id and an unknown id"
+        );
+        assert!(
+            denied.stderr.is_empty() && unknown.stderr.is_empty(),
+            "{what} wrote to stderr: {} / {}",
+            String::from_utf8_lossy(&denied.stderr),
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        let rows: Value = serde_json::from_slice(&denied.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            0,
+            "{what} with the denied id handed over a row the caller may not read: {rows}"
+        );
+    }
+    // 2. The unfiltered listings carry the visible rows and no trace of the
+    //    secret ones — neither their markers nor their task id.
+    for (args, visible_marker, what) in [
+        (
+            &["sitrep", "list", "--json"][..],
+            "linked visible sitrep body",
+            "sitrep list",
+        ),
+        (
+            &["handoff", "list", "--json"][..],
+            "linked visible handoff summary",
+            "handoff list",
+        ),
+        (
+            &["attention", "list", "--json"][..],
+            "linked visible attention question",
+            "attention list",
+        ),
+        (
+            &["subscription", "list", "--all", "--json"][..],
+            "linked-visible-consumer",
+            "subscription list",
+        ),
+    ] {
+        let listed = estate.run(&work_a, args);
+        assert!(
+            listed.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+        assert!(
+            body.contains(visible_marker),
+            "{what} withheld the visible row, so an empty answer proves nothing: {body}"
+        );
+        assert!(
+            !body.contains("t-linked-secret"),
+            "{what} served a row on the denied task: {body}"
+        );
+    }
+    let unfiltered = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        !unfiltered.contains("linked secret"),
+        "subscription list served the secret subject: {unfiltered}"
+    );
+    // 3. `handoff retire` answers the denied handoff exactly like an unknown
+    //    one — the same exit code and byte-identical stderr — and records
+    //    nothing.
+    let denied_retire = estate.run(
+        &work_a,
+        &[
+            "handoff",
+            "retire",
+            &secret_handoff,
+            "--as",
+            "seed",
+            "--note",
+            "linked probe",
+        ],
+    );
+    let unknown_retire = estate.run(
+        &work_a,
+        &[
+            "handoff",
+            "retire",
+            "h-never-created",
+            "--as",
+            "seed",
+            "--note",
+            "linked probe",
+        ],
+    );
+    assert!(
+        !denied_retire.status.success(),
+        "retiring a handoff on the denied task succeeded but must be refused"
+    );
+    assert_eq!(
+        denied_retire.status.code(),
+        unknown_retire.status.code(),
+        "handoff retire exit codes differ between a denied handoff and an unknown one"
+    );
+    assert_eq!(
+        denied_retire.stderr, unknown_retire.stderr,
+        "handoff retire stderr differs between a denied handoff and an unknown one"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_retire.stderr).contains(DENIED),
+        "handoff retire did not answer the non-enumerating denial: {}",
+        String::from_utf8_lossy(&denied_retire.stderr)
+    );
+    // 4. The by-id surfaces on a linked row answer the denied id exactly like
+    //    a never-created one — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and record nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &["subscription", "show", &secret_sub, "--json"],
+        &["subscription", "show", "sub-never-created", "--json"],
+        "subscription show",
+    );
+    assert_by_id_identical(
+        &["subscription", "pause", &secret_sub, "--as", "seed"],
+        &["subscription", "pause", "sub-never-created", "--as", "seed"],
+        "subscription pause",
+    );
+    assert_by_id_identical(
+        &["subscription", "resume", &secret_sub, "--as", "seed"],
+        &[
+            "subscription",
+            "resume",
+            "sub-never-created",
+            "--as",
+            "seed",
+        ],
+        "subscription resume",
+    );
+    assert_by_id_identical(
+        &["handoff", "accept", &secret_handoff, "--as", "seed"],
+        &["handoff", "accept", "h-never-created", "--as", "seed"],
+        "handoff accept",
+    );
+    // The visible subscription stays readable and pausable, so the refusals
+    // above came from the task gate and not a broken route.
+    let visible_shown = estate.ok_json(&work_a, &["subscription", "show", &visible_sub, "--json"]);
+    assert_eq!(
+        visible_shown["consumerID"].as_str(),
+        Some("linked-visible-consumer"),
+        "the visible subscription lost its row: {visible_shown}"
+    );
+    // 5. The owner still sees every row, so the denials above came from the
+    //    guard and not from missing rows — and the refused writes recorded
+    //    nothing.
+    estate.enforce("direct");
+    for (args, secret_marker, what) in [
+        (
+            &["sitrep", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret sitrep body",
+            "sitrep list --task",
+        ),
+        (
+            &["handoff", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret handoff summary",
+            "handoff list --task",
+        ),
+        (
+            &["attention", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret attention question",
+            "attention list --task",
+        ),
+    ] {
+        let owned = estate.ok(&work_a, args);
+        assert!(
+            owned.contains(secret_marker),
+            "the owner lost {what} on the secret task: {owned}"
+        );
+    }
+    let owned_subs = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        owned_subs.contains("t-linked-secret"),
+        "the owner lost the secret subscription: {owned_subs}"
+    );
+    let handoffs = estate.ok_json(
+        &work_a,
+        &["handoff", "list", "--task", "t-linked-secret", "--json"],
+    );
+    assert!(
+        handoffs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == secret_handoff && row["status"] == "pending"),
+        "the refused retire moved a row: {handoffs}"
+    );
+    let secret_shown = estate.ok_json(&work_a, &["subscription", "show", &secret_sub, "--json"]);
+    assert_eq!(
+        secret_shown["status"].as_str(),
+        Some("active"),
+        "a refused pause or resume moved the secret subscription: {secret_shown}"
+    );
+}
+
+/// ACC-14 residual oracles: heartbeat and release, sprint plan candidates and
+/// parent epics, deploy finish/abandon/retry-of, and removed-task watch and
+/// subscription subjects.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Principal P holds board write only. A `secret` story is
+/// leased to the seed holder, a `secret` epic stands by, two deployments prove
+/// the secret story, and a second `secret` story is removed. P addresses each
+/// denied id beside a never-created id: the same exit code and byte-identical
+/// stderr carrying the existing non-enumerating denial, with nothing written.
+/// The removed-then-denied id answers identically on `watch --task` and
+/// `subscription add --subject`. Unmanaged boards keep their plain messages,
+/// and the holder's own heartbeat, release, watch, subscription, sprint plan
+/// and deploy finish/abandon still work.
+#[test]
+fn residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement() {
+    fn subscription_on_subject(task: &str) -> Vec<&str> {
+        vec![
+            "subscription",
+            "add",
+            "--consumer",
+            "residual-consumer",
+            "--action",
+            "residual-action",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "probe",
+            "--subject",
+            task,
+            "--json",
+        ]
+    }
+    fn deploy_start_commit() -> &'static str {
+        "0123456789abcdef0123456789abcdef01234567"
+    }
+    let estate = ManagedEstate::new("acc14-residual-oracle");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual visible task",
+            "--id",
+            "s-resid-visible",
+            "--type",
+            "story",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual secret task",
+            "--id",
+            "t-resid-secret",
+            "--type",
+            "task",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual secret epic",
+            "--id",
+            "e-resid-secret",
+            "--type",
+            "epic",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual removed task",
+            "--id",
+            "s-resid-gone",
+            "--type",
+            "story",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "sprint",
+            "new",
+            "Residual sprint",
+            "--id",
+            "sp-resid",
+            "--target-version",
+            "9.9.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let lease = estate.ok_json(
+        &work_a,
+        &["claim", "t-resid-secret", "--as", "seed", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut deployments = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let started = estate.ok_json(
+            &work_a,
+            &[
+                "deploy",
+                "start",
+                "--repo",
+                "kanban",
+                "--commit",
+                deploy_start_commit(),
+                "--tier",
+                "@_bdt",
+                "--environment",
+                "branch-dev-testing",
+                "--host",
+                "geoywsMBP",
+                "--url",
+                "http://localhost:9999",
+                "--task",
+                "t-resid-secret",
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+        deployments.push(started["id"].as_str().unwrap().to_owned());
+        tokens.push(started["capabilityToken"].as_str().unwrap().to_owned());
+    }
+    estate.ok(&work_a, &["task", "remove", "s-resid-gone", "--as", "seed"]);
+    for (args, plain, what) in [
+        (
+            vec!["heartbeat", "t-never-created", "--lease", "lease-bogus"],
+            "has no active lease",
+            "heartbeat",
+        ),
+        (
+            vec!["release", "t-never-created", "--lease", "lease-bogus"],
+            "has no active lease",
+            "release",
+        ),
+        (
+            vec![
+                "sprint",
+                "plan",
+                "sp-resid",
+                "--body",
+                "residual probe",
+                "--candidate",
+                "t-never-created",
+                "--as",
+                "seed",
+            ],
+            "task t-never-created not found",
+            "sprint plan --candidate",
+        ),
+        (
+            vec![
+                "sprint",
+                "plan",
+                "sp-resid",
+                "--body",
+                "residual probe",
+                "--parent-epic",
+                "t-never-created",
+                "--as",
+                "seed",
+            ],
+            "task t-never-created not found",
+            "sprint plan --parent-epic",
+        ),
+        (
+            vec![
+                "deploy",
+                "finish",
+                "d-never-started",
+                "--token",
+                "token-bogus",
+                "--result",
+                "failed",
+                "--phase",
+                "build",
+                "--receipt",
+                "residual probe",
+                "--as",
+                "seed",
+            ],
+            "deployment d-never-started not found",
+            "deploy finish",
+        ),
+        (
+            vec![
+                "deploy",
+                "abandon",
+                "d-never-started",
+                "--as",
+                "seed",
+                "--note",
+                "residual probe",
+                "--token",
+                "token-bogus",
+            ],
+            "deployment d-never-started not found",
+            "deploy abandon",
+        ),
+        (
+            vec![
+                "deploy",
+                "start",
+                "--repo",
+                "kanban",
+                "--commit",
+                deploy_start_commit(),
+                "--tier",
+                "@_bdt",
+                "--environment",
+                "branch-dev-testing",
+                "--host",
+                "geoywsMBP",
+                "--url",
+                "http://localhost:9999",
+                "--retry-of",
+                "d-never-started",
+                "--as",
+                "seed",
+                "--json",
+            ],
+            "deployment d-never-started not found",
+            "deploy start --retry-of",
+        ),
+        (
+            vec!["watch", "--task", "t-never-created", "--json"],
+            "not present in this board or its event history",
+            "watch --task",
+        ),
+    ] {
+        let output = estate.run(&work_a, &args);
+        assert!(!output.status.success(), "{what} should fail unmanaged");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains(plain),
+            "{what} lost its plain unmanaged message: {stderr}"
+        );
+        assert!(
+            !stderr.contains(DENIED),
+            "{what} answers a denial where no guard can deny: {stderr}"
+        );
+    }
+    let plain_subscription = estate.run(&work_a, &subscription_on_subject("task:t-never-created"));
+    assert!(
+        !plain_subscription.status.success(),
+        "subscription add should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain_subscription.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("not found in current or historical board state"),
+        "subscription add lost its plain unmanaged message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "subscription add answers a denial where no guard can deny: {plain_stderr}"
+    );
+    estate.bind_self("p-residual", &[board_scope("write", &estate.id_a)]);
+    estate.enforce("managed");
+    // Each denied id answers exactly like the never-created one: the same
+    // exit code, byte-identical stderr, and the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert!(
+            !unknown.status.success(),
+            "{what} with an unknown id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["heartbeat", "t-resid-secret", "--lease", "lease-bogus"],
+        &["heartbeat", "t-never-created", "--lease", "lease-bogus"],
+        "heartbeat",
+    );
+    assert_cli_identical(
+        &["release", "t-resid-secret", "--lease", "lease-bogus"],
+        &["release", "t-never-created", "--lease", "lease-bogus"],
+        "release",
+    );
+    assert_cli_identical(
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--candidate",
+            "t-resid-secret",
+            "--as",
+            "seed",
+        ],
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--candidate",
+            "t-never-created",
+            "--as",
+            "seed",
+        ],
+        "sprint plan --candidate",
+    );
+    assert_cli_identical(
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--parent-epic",
+            "e-resid-secret",
+            "--as",
+            "seed",
+        ],
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--parent-epic",
+            "t-never-created",
+            "--as",
+            "seed",
+        ],
+        "sprint plan --parent-epic",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "finish",
+            &deployments[0],
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual probe",
+            "--as",
+            "seed",
+        ],
+        &[
+            "deploy",
+            "finish",
+            "d-never-started",
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual probe",
+            "--as",
+            "seed",
+        ],
+        "deploy finish",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "abandon",
+            &deployments[0],
+            "--as",
+            "seed",
+            "--note",
+            "residual probe",
+            "--token",
+            "token-bogus",
+        ],
+        &[
+            "deploy",
+            "abandon",
+            "d-never-started",
+            "--as",
+            "seed",
+            "--note",
+            "residual probe",
+            "--token",
+            "token-bogus",
+        ],
+        "deploy abandon",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            deploy_start_commit(),
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--retry-of",
+            &deployments[0],
+            "--as",
+            "seed",
+            "--json",
+        ],
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            deploy_start_commit(),
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--retry-of",
+            "d-never-started",
+            "--as",
+            "seed",
+            "--json",
+        ],
+        "deploy start --retry-of",
+    );
+    assert_cli_identical(
+        &["watch", "--task", "s-resid-gone", "--json"],
+        &["watch", "--task", "t-never-created", "--json"],
+        "watch --task on a removed task",
+    );
+    assert_cli_identical(
+        &subscription_on_subject("task:s-resid-gone"),
+        &subscription_on_subject("task:t-never-created"),
+        "subscription add --subject on a removed task",
+    );
+    // Nothing was written. As the board owner the same caller re-reads every
+    // row the refused commands could have touched.
+    estate.grant("p-residual", &owner_of(&estate.id_a));
+    let shown = estate.ok_json(&work_a, &["task", "show", "t-resid-secret", "--json"]);
+    assert_eq!(
+        shown["claim"]["agentID"].as_str(),
+        Some("seed"),
+        "a refused heartbeat or release moved the lease: {shown}"
+    );
+    let ledger = estate.ok(
+        &work_a,
+        &["events", "--task", "t-resid-secret", "--all", "--json"],
+    );
+    for marker in [
+        "task_sprint_changed",
+        "claim_released",
+        "deployment_finished",
+        "deployment_abandoned",
+    ] {
+        assert!(
+            !ledger.contains(marker),
+            "a refused command wrote {marker}: {ledger}"
+        );
+    }
+    assert!(
+        ledger.contains("task_added"),
+        "the secret task lost its birth event: {ledger}"
+    );
+    let listed = estate.ok_json(&work_a, &["deploy", "list", "--json"]);
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        2,
+        "a refused retry started a deployment: {listed}"
+    );
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        subscriptions.as_array().unwrap().is_empty(),
+        "a refused subscription was created: {subscriptions}"
+    );
+    let gone = estate.run(&work_a, &["task", "show", "s-resid-gone", "--json"]);
+    assert!(
+        !gone.status.success(),
+        "a refused command restored the removed task"
+    );
+    // The control paths work: the holder's own heartbeat and release still
+    // move the lease, the owner still watches the removed task's history,
+    // subscribes to it, plans the sprint and finishes the deployments — so
+    // the denials above came from the tag and not a broken path.
+    estate.ok(
+        &work_a,
+        &["heartbeat", "t-resid-secret", "--lease", &lease, "--json"],
+    );
+    estate.ok(&work_a, &["release", "t-resid-secret", "--lease", &lease]);
+    let released = estate.ok_json(&work_a, &["task", "show", "t-resid-secret", "--json"]);
+    assert!(
+        released["claim"].is_null(),
+        "the holder's release kept the lease: {released}"
+    );
+    assert_eq!(
+        released["status"].as_str(),
+        Some("todo"),
+        "the holder's release kept the status: {released}"
+    );
+    estate.ok(&work_a, &["watch", "--task", "s-resid-gone", "--json"]);
+    estate.ok_json(&work_a, &subscription_on_subject("task:s-resid-gone"));
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert_eq!(
+        subscriptions.as_array().unwrap().len(),
+        1,
+        "the owner's subscription to the removed task was not created: {subscriptions}"
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual control",
+            "--candidate",
+            "s-resid-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "finish",
+            &deployments[0],
+            "--token",
+            &tokens[0],
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual control",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "abandon",
+            &deployments[1],
+            "--as",
+            "seed",
+            "--note",
+            "residual control",
+            "--token",
+            &tokens[1],
+            "--json",
+        ],
+    );
+}
+
+/// ACC-14, attention by-id reads through the linked task: a managed caller
+/// holding board read and write but no `secret` scope must answer an untagged
+/// attention row raised on a `secret` task exactly like a never-created id on
+/// `attention show`, `resolve`, `reopen` and `check` — the same exit code and byte-identical stderr carrying the existing
+/// non-enumerating denial, with nothing recorded — while the owner still runs
+/// every one of those operations.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Sibling of
+/// `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`, which pins
+/// the listings; this one pins the by-id paths that used to check only the
+/// row's own tags.
+#[test]
+fn attention_by_id_withholds_rows_on_a_tag_denied_task() {
+    let estate = ManagedEstate::new("acc14-attention-byid-task");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    for (id, title) in [
+        ("t-byid-secret", "the by-id secret task"),
+        ("t-byid-visible", "the by-id visible task"),
+    ] {
+        let mut args = vec!["task", "add", title, "--id", id, "--as", "seed"];
+        if id == "t-byid-secret" {
+            args.extend_from_slice(&["--tag", "geoyws/secret"]);
+        }
+        args.push("--json");
+        estate.ok_json(&work_a, &args);
+    }
+    let raise = |body: &str, task: &str| -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--kind",
+                "decision",
+                "--as",
+                "seed",
+                "--task",
+                task,
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Four untagged rows on the secret task, one per operation under test, so
+    // a refusal on one cannot consume the state another needs.
+    let show_row = raise("by-id secret show body", "t-byid-secret");
+    let resolve_row = raise("by-id secret resolve body", "t-byid-secret");
+    let reopen_row = raise("by-id secret reopen body", "t-byid-secret");
+    let check_row = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "by-id secret check body",
+            "--kind",
+            "decision",
+            "--task",
+            "t-byid-secret",
+            "--check",
+            "By-id check question quorum?",
+            "--check-choice",
+            "bkey-alpha=First label",
+            "--check-choice",
+            "bkey-beta=Second label",
+            "--check-answer",
+            "bkey-alpha",
+            "--check-explain",
+            "By-id check explanation quorum",
+            "--check-about",
+            "rust/store.rs",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The control row lives on the visible task, so P's denials below prove a
+    // guard and not a broken route.
+    let visible_row = raise("by-id visible show body", "t-byid-visible");
+    // The owner settles the reopen row while still direct, so P's reopen
+    // meets a resolved row it may not read.
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-byid-task",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. Each CLI by-id surface: the denied row and the never-created id exit
+    //    with the same code and byte-identical stderr — the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied row succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied row and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied row and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["attention", "show", &show_row],
+        &["attention", "show", "att-never-raised"],
+        "attention show",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "resolve",
+            &resolve_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        &[
+            "attention",
+            "resolve",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        "attention resolve",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "reopen",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        &[
+            "attention",
+            "reopen",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        "attention reopen",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "check",
+            &check_row,
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+        ],
+        &[
+            "attention",
+            "check",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+        ],
+        "attention check",
+    );
+    // 2. The control row stays readable, so the refusals above came from the
+    //    task gate and not a broken route.
+    let control = estate.ok_json(&work_a, &["attention", "show", &visible_row, "--json"]);
+    assert_eq!(
+        control["id"].as_str(),
+        Some(visible_row.as_str()),
+        "the visible row lost its read: {control}"
+    );
+    // 3. The owner still runs every operation, which also proves the refused
+    //    writes recorded nothing: a recorded resolve would meet "already
+    //    resolved", a recorded reopen an open row, a recorded check "exactly
+    //    one answer".
+    estate.enforce("direct");
+    let owned = estate.ok_json(&work_a, &["attention", "show", &show_row, "--json"]);
+    assert_eq!(
+        owned["status"].as_str(),
+        Some("open"),
+        "the owner lost the denied show row: {owned}"
+    );
+    let settled = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &resolve_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        settled["status"].as_str(),
+        Some("resolved"),
+        "the owner lost the denied resolve row: {settled}"
+    );
+    let undone = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "reopen",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--note",
+            "owner undo",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        undone["status"].as_str(),
+        Some("open"),
+        "the owner lost the denied reopen row: {undone}"
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &check_row,
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+            "--json",
+        ],
+    );
+}
+
+/// ACC-14, subscription relation targets on read: the owner adds a
+/// subscription with no subject and `--relation parent:t-secret`, which the
+/// add path already gates like a subject. A managed caller holding board read
+/// and write but no `secret` scope must not see it in `subscription list`,
+/// and `show`, `pause` and `resume` must answer it exactly like a
+/// never-created id — the same exit code and byte-identical stderr carrying
+/// the existing non-enumerating denial, with nothing recorded — while the
+/// owner still sees it.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Sibling of
+/// `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`, which pins
+/// subject-gated subscriptions; this one pins the relation-target half the
+/// read paths used to skip.
+#[test]
+fn subscription_relation_targets_withhold_a_tag_denied_task_on_read() {
+    let estate = ManagedEstate::new("acc14-subscription-relation");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    for (id, title) in [
+        ("t-rel-secret", "the relation secret task"),
+        ("t-rel-visible", "the relation visible task"),
+    ] {
+        let mut args = vec!["task", "add", title, "--id", id, "--as", "seed"];
+        if id == "t-rel-secret" {
+            args.extend_from_slice(&["--tag", "geoyws/secret"]);
+        }
+        args.push("--json");
+        estate.ok_json(&work_a, &args);
+    }
+    // The owner subscribes with no subject, filtering only on the relation —
+    // the shape whose target the read paths used to ignore — once against the
+    // secret task and once against the visible control task.
+    let add_relation = |consumer: &str, target: &str| {
+        estate.ok_json(
+            &work_a,
+            &[
+                "subscription",
+                "add",
+                "--consumer",
+                consumer,
+                "--action",
+                "relation-action",
+                "--timeout-ms",
+                "100",
+                "--max-retries",
+                "1",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "seed",
+                "--relation",
+                target,
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let secret_sub = add_relation("rel-secret-consumer", "parent:t-rel-secret");
+    let visible_sub = add_relation("rel-visible-consumer", "parent:t-rel-visible");
+    assert_ne!(secret_sub, visible_sub, "the two seeds collided on one row");
+    estate.bind_self(
+        "p-rel-sub",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The list carries the visible subscription and no trace of the secret
+    //    one — neither its consumer nor its relation target.
+    let listed = estate.run(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        listed.status.success(),
+        "subscription list should succeed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        body.contains("rel-visible-consumer"),
+        "subscription list withheld the visible row, so an empty answer proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("rel-secret-consumer") && !body.contains("t-rel-secret"),
+        "subscription list served the denied relation target: {body}"
+    );
+    // 2. The by-id surfaces answer the denied subscription exactly like a
+    //    never-created one — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and record nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &["subscription", "show", &secret_sub, "--json"],
+        &["subscription", "show", "sub-never-created", "--json"],
+        "subscription show",
+    );
+    assert_by_id_identical(
+        &["subscription", "pause", &secret_sub, "--as", "seed"],
+        &["subscription", "pause", "sub-never-created", "--as", "seed"],
+        "subscription pause",
+    );
+    assert_by_id_identical(
+        &["subscription", "resume", &secret_sub, "--as", "seed"],
+        &[
+            "subscription",
+            "resume",
+            "sub-never-created",
+            "--as",
+            "seed",
+        ],
+        "subscription resume",
+    );
+    // 3. The owner still sees the subscription untouched, so the refusals
+    //    above came from the relation gate and not from missing rows — and
+    //    the refused pause and resume recorded nothing.
+    estate.enforce("direct");
+    let owned = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        owned.contains("rel-secret-consumer") && owned.contains("t-rel-secret"),
+        "the owner lost the secret subscription: {owned}"
+    );
+    let secret_shown = estate.ok_json(&work_a, &["subscription", "show", &secret_sub, "--json"]);
+    assert_eq!(
+        secret_shown["status"].as_str(),
+        Some("active"),
+        "a refused pause or resume moved the secret subscription: {secret_shown}"
+    );
+    let visible_shown = estate.ok_json(&work_a, &["subscription", "show", &visible_sub, "--json"]);
+    assert_eq!(
+        visible_shown["consumerID"].as_str(),
+        Some("rel-visible-consumer"),
+        "the visible subscription lost its row: {visible_shown}"
+    );
+}
+
+/// ACC-14 import gate, at the layer `process`: an import rewrites arbitrary
+/// rows, deletes claims and dependencies with `--reconcile`, and seizes live
+/// leases with `--force`, so only a principal holding the whole board may run
+/// it — including its previews, whose overlap listing names existing ids.
+///
+/// The fixture holds a live `secret` task beside an untagged-visible one. A
+/// read-only caller and a caller holding board write plus the `visible` tag
+/// scope — both without whole-board authority — are refused the one generic
+/// denial on `import atmux-json` with no flags and with `--reconcile`,
+/// `--dry-run` and `--verify`, and on one `atmux-sqlite` source, write
+/// nothing, and see neither live id on stderr. Granting the same principal
+/// the board tag wildcard turns the same source into a successful reconcile.
+#[test]
+fn import_requires_whole_board_write_and_names_no_denied_id() {
+    let estate = ManagedEstate::new("acc14-import-gate");
+    let work_a = estate.work_a.clone();
+    for tag in ["geoyws/secret", "geoyws/visible"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, title, tag) in [
+        ("t-imp-secret", "the import secret task", "geoyws/secret"),
+        ("t-imp-visible", "the import visible task", "geoyws/visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", tag, "--as", "seed", "--json",
+            ],
+        );
+    }
+    let source = estate.root.join("import-source.json");
+    fs::write(
+        &source,
+        serde_json::to_vec(&serde_json::json!({
+            "epics": [],
+            "stories": [],
+            "tasks": [
+                {"id": "t-imp-fresh", "subject": "a fresh import row", "status": "todo"},
+                {"id": "t-imp-secret", "subject": "an overwrite attempt", "status": "todo"},
+            ],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let source_arg = source.to_string_lossy().into_owned();
+    // The same rows through the sqlite mapping, so the refused loop below pins
+    // the gate for the second source kind as well: the tolerant mapper needs
+    // only these columns.
+    let sqlite_source = estate.root.join("import-source.db");
+    Connection::open(&sqlite_source)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE tasks(id TEXT,subject TEXT,status TEXT);
+             INSERT INTO tasks VALUES('t-imp-fresh','a fresh import row','todo');
+             INSERT INTO tasks VALUES('t-imp-secret','an overwrite attempt','todo');",
+        )
+        .unwrap();
+    let sqlite_arg = sqlite_source.to_string_lossy().into_owned();
+    let attempt = |sub: &str, path: &str, extra: &[&str]| {
+        let mut args = vec!["import", sub, path, "--as", "seed", "--json"];
+        args.extend_from_slice(extra);
+        estate.run(&work_a, &args)
+    };
+    let refused_silently = |output: &std::process::Output, what: &str| {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "{what} succeeded but must be refused\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains(DENIED),
+            "{what} was refused with the wrong message\nstderr: {stderr}"
+        );
+        for id in ["t-imp-secret", "t-imp-visible", "t-imp-fresh"] {
+            assert!(
+                !stderr.contains(id),
+                "{what} named an existing id on stderr: {stderr}"
+            );
+        }
+    };
+    // What "nothing is written" means here: the board file itself is
+    // byte-identical and holds no new row or event. The registry is out of
+    // scope for the byte comparison — resolving a board by working directory
+    // stamps `last_used_at` on every command, refused or not.
+    let board_bytes = || fs::read(&estate.board_a).unwrap();
+    let board_row_count = |sql: &str| -> i64 {
+        Connection::open(&estate.board_a)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    };
+    estate.bind_self("p-import", &[board_scope("read", &estate.id_a)]);
+    estate.enforce("managed");
+    let pristine = board_bytes();
+    // `--verify` stands alone: the CLI refuses to combine it with the write
+    // flags, so it is its own case rather than another flag in the loop.
+    for extra in [
+        &[][..],
+        &["--reconcile"][..],
+        &["--dry-run"][..],
+        &["--verify"][..],
+    ] {
+        let output = attempt("atmux-json", &source_arg, extra);
+        refused_silently(&output, &format!("read-only import {extra:?}"));
+    }
+    let output = attempt("atmux-sqlite", &sqlite_arg, &[]);
+    refused_silently(&output, "read-only import atmux-sqlite");
+    assert_eq!(
+        board_bytes(),
+        pristine,
+        "a refused read-only import wrote to the board file"
+    );
+
+    estate.enforce("direct");
+    estate.grant(
+        "p-import",
+        &[
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+    for extra in [
+        &[][..],
+        &["--reconcile"][..],
+        &["--dry-run"][..],
+        &["--verify"][..],
+    ] {
+        let output = attempt("atmux-json", &source_arg, extra);
+        refused_silently(&output, &format!("tag-scoped import {extra:?}"));
+    }
+    assert_eq!(
+        board_bytes(),
+        pristine,
+        "a refused tag-scoped import wrote to the board file"
+    );
+    assert_eq!(
+        board_row_count("SELECT COUNT(*) FROM tasks"),
+        2,
+        "a refused import added a task row"
+    );
+    assert_eq!(
+        board_row_count(
+            "SELECT COUNT(*) FROM events WHERE kind IN ('tasks_imported','lease_seized')"
+        ),
+        0,
+        "a refused import left an audit event"
+    );
+
+    estate.enforce("direct");
+    estate.grant(
+        "p-import",
+        &[
+            (
+                "read",
+                vec![format!("board:{}", estate.id_a), "*".to_owned()],
+            ),
+            (
+                "write",
+                vec![format!("board:{}", estate.id_a), "*".to_owned()],
+            ),
+        ],
+    );
+    estate.enforce("managed");
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-secret", "--json"])["title"],
+        serde_json::json!("the import secret task"),
+        "a refused import overwrote the secret row before the owner ran",
+    );
+    let receipt = estate.ok_json(
+        &work_a,
+        &[
+            "import",
+            "atmux-json",
+            &source_arg,
+            "--as",
+            "seed",
+            "--reconcile",
+            "--json",
+        ],
+    );
+    assert_eq!(receipt["created"], serde_json::json!(1), "{receipt}");
+    assert_eq!(receipt["updated"], serde_json::json!(1), "{receipt}");
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-secret", "--json"])["title"],
+        serde_json::json!("an overwrite attempt"),
+    );
+    assert_eq!(
+        estate.ok_json(&work_a, &["task", "show", "t-imp-fresh", "--json"])["title"],
+        serde_json::json!("a fresh import row"),
     );
 }

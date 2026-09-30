@@ -138,6 +138,12 @@ Usage:
              dependencies and blockingGates — the unfinished prerequisites
              this row inherits from itself and from every ancestor)
   kanban task move ID draft|backlog|todo|in_progress|blocked|review|done|cancelled --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
+  kanban task verdict add ID --reviewer ACTOR --sha SHA [--sha ...] --evidence ATTENTION-ID [--evidence ...] --attest-published --as WRITER [--json]
+             (with the gate on, a done-move needs this planner-written
+             foreign-actor pass covering the row's current head)
+  kanban task verdict gate on|off --as ACTOR [--json]
+             (only geoyws may toggle; every change is an audited event)
+  kanban task verdict list ID [--json]
   kanban task remove ID --as ACTOR [--force]
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
              [--priority P0|P1|P2|0-9] [--parent ID | --clear-parent]
@@ -343,7 +349,7 @@ unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 36] = [
+pub(crate) const BOOLEAN: [&str; 37] = [
     "help",
     "json",
     "version",
@@ -353,6 +359,7 @@ pub(crate) const BOOLEAN: [&str; 36] = [
     "next",
     "candidates",
     "keep-status",
+    "attest-published",
     "driver-only",
     "no-driver-only",
     "unassign",
@@ -436,21 +443,19 @@ pub(crate) const SPRINT_PLAN_REPEATABLE: [&str; 1] = ["candidate"];
 /// `task list` would be two filters for one listing.
 pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
 
-/// One operation's list-valued flags, keyed on the command AND the
-/// subcommand.
-///
-/// The command alone cannot express `attention`, whose `raise` takes a list
-/// of authored choices and whose `resolve` takes exactly one answer: a second
-/// `--choice` there is two answers to one question. `sub: None` means every
-/// subcommand of that command, which is what `watch`, `subscription` and
-/// `access` mean.
+/// The verdict-write flags, list-valued on the one subcommand they belong
+/// to: a `task verdict add` cites every reviewed SHA and every checked
+/// decision. Kept out of [`REPEATABLE`] because both flags are scalar
+/// everywhere else they appear — which is nowhere today, and that split is
+/// the reason this stays per-operation like the rest of [`LIST_VALUED`].
+pub(crate) const VERDICT_ADD_REPEATABLE: [&str; 2] = ["sha", "evidence"];
 struct ListValued {
     command: &'static str,
     sub: Option<&'static str>,
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 10] = [
+const LIST_VALUED: [ListValued; 11] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -500,6 +505,11 @@ const LIST_VALUED: [ListValued; 10] = [
         command: "task",
         sub: Some("update"),
         flags: &ALLOWED_MODEL_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("verdict add"),
+        flags: &VERDICT_ADD_REPEATABLE,
     },
 ];
 
@@ -1068,6 +1078,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id", "status"],
         false,
     ),
+    (
+        "task",
+        Some("verdict add"),
+        &["reviewer", "sha", "evidence", "as", "attest-published"],
+        &["id"],
+        false,
+    ),
+    ("task", Some("verdict gate"), &["as"], &["state"], false),
+    ("task", Some("verdict list"), &[], &["id"], true),
     ("task", Some("remove"), &["as", "force"], &["id"], false),
     (
         "task",
@@ -2865,7 +2884,7 @@ const BOARD_CREATORS: [(&str, Option<&str>); 1] = [("task", Some("add"))];
 /// and each of those call sites takes [`Store::open_for_read_as_caller`]
 /// directly for the same reason. `search-rebuild` is absent from both: it
 /// writes the index.
-const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 15] = [
+const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 16] = [
     ("attention", Some("list")),
     ("sprint", Some("list")),
     ("sprint", Some("show")),
@@ -2877,6 +2896,7 @@ const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 15] = [
     ("tag", Some("list")),
     ("task", Some("list")),
     ("task", Some("show")),
+    ("task", Some("verdict list")),
     // Four commands that take no subcommand. `context` spells its task id
     // where a subcommand would go (`kanban context t-1234`), so matching on
     // `sub` would miss every invocation; the other three are bare verbs.
@@ -5836,18 +5856,20 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     let rest = args.positionals.get(2..).unwrap_or(&[]);
     // The `access` surface's subcommands are two words ("principal show",
     // "sso map-sso", "breakglass registry-admin", "enforcement prepare"), so
-    // the full subcommand joins the first two words (ADR-038 clause 12). Every
-    // other command's subcommand is one word.
-    let spec_sub: Option<String> = if command == "access" {
-        match (sub, args.positionals.get(2)) {
-            (Some(first), Some(second)) => Some(format!("{first} {second}")),
-            (Some(first), None) => Some(first.to_owned()),
-            (None, _) => None,
-        }
-    } else {
-        sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command))
-            .map(str::to_owned)
-    };
+    // the full subcommand joins the first two words (ADR-038 clause 12), and
+    // so is `task verdict` ("verdict add", "verdict gate", "verdict list").
+    // Every other command's subcommand is one word.
+    let spec_sub: Option<String> =
+        if command == "access" || (command == "task" && sub == Some("verdict")) {
+            match (sub, args.positionals.get(2)) {
+                (Some(first), Some(second)) => Some(format!("{first} {second}")),
+                (Some(first), None) => Some(first.to_owned()),
+                (None, _) => None,
+            }
+        } else {
+            sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command))
+                .map(str::to_owned)
+        };
 
     // Ahead of the selector refusal below, because a flag that no longer
     // exists is the more actionable complaint about the same command line:
@@ -6343,9 +6365,16 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
             let task_links = store.orphaned_task_links()?;
+            let reused_links = store.reused_task_links()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
+            // `reusedTaskLinks` is advisory and stays out of `healthy`: it
+            // names a known historical residual — a NULL-linked row whose
+            // creation event names a removed-but-live-again id, left by
+            // ordinary pre-V34 product behaviour — that no verb can clear, so
+            // failing on it would hold every such board red permanently.
+            // `orphanedTaskLinks` still fails: a dangling link is corruption.
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
                 && task_links.is_empty()
@@ -6363,6 +6392,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             value.insert("integrity".into(), json!(check));
             value.insert("orphanedRows".into(), json!(orphans));
             value.insert("orphanedTaskLinks".into(), json!(task_links));
+            value.insert("reusedTaskLinks".into(), json!(reused_links));
             value.insert("futureDatedTasks".into(), json!(future));
             value.insert("searchIndex".into(), json!(search_index));
             value.insert("audit".into(), json!(audit));
@@ -6714,7 +6744,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     // arms below; a read-only connection carries `PRAGMA query_only`, so a
     // command mis-filed in `READ_ONLY_BOARD_COMMANDS` fails loudly on its
     // first write rather than silently dropping it.
-    let mut store = if reads_only_one_board(command, sub) {
+    let mut store = if reads_only_one_board(command, spec_sub.as_deref().or(sub)) {
         open_store_for_read(&args)?
     } else {
         open_store(&args, creation)?
@@ -6967,6 +6997,37 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             .unwrap_or_else(|| json!({}));
         let task = store.move_task(id, status, args.require("as")?, patch, args.has("force"))?;
         return print(&task, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict add") {
+        // `rest` still counts the joined subcommand word: [verdict, add, ID].
+        let id = rest.get(1).context("task id is required")?.clone();
+        let shas = args.many("sha");
+        if shas.is_empty() {
+            bail!("--sha is required");
+        }
+        let verdict = store.add_verdict(crate::model::VerdictInput {
+            task_id: id,
+            reviewer: args.require("reviewer")?.to_owned(),
+            shas,
+            evidence: args.many("evidence"),
+            writer: args.require("as")?.to_owned(),
+            attest_published: args.has("attest-published"),
+        })?;
+        return print(&verdict, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict gate") {
+        let state = rest.get(1).context("state is required")?;
+        let on = match state.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => bail!("task verdict gate takes on or off, got {state:?}"),
+        };
+        let receipt = store.set_done_gate(on, args.require("as")?)?;
+        return print(&receipt, args.has("json"));
+    }
+    if command == "task" && spec_sub.as_deref() == Some("verdict list") {
+        let id = rest.get(1).context("task id is required")?;
+        return print(&store.list_verdicts(id)?, args.has("json"));
     }
     if command == "task" && sub == Some("remove") {
         let id = rest.first().context("task id is required")?;

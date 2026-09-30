@@ -122,6 +122,8 @@ pub const BOARD_EVENT_KINDS: &[&str] = &[
     "deployment_abandoned",
     "deployment_finished",
     "deployment_started",
+    "done_gate_override",
+    "done_gate_toggled",
     "epic_advanced",
     "handoff_accepted",
     "handoff_created",
@@ -483,6 +485,32 @@ pub struct Claim {
     pub model: Option<String>,
 }
 
+/// One stored review verdict (DG-02, DG-11): the planner-written foreign-actor
+/// `pass` a gated done-move must cite. Append-only: rows are never updated
+/// and never deleted, and a newer verdict is a newer row. The writer is the
+/// actor from `--as` at write time and is immutable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub writer: String,
+    pub reviewer: String,
+    /// Full 40-character commit SHAs the writer attested as published on
+    /// origin (DG-13). The ledger records the attestation; it does not check
+    /// origin itself.
+    pub shas: Vec<String>,
+    /// Always `pass`: a review that fails records nothing (DG-12).
+    pub verdict: String,
+    /// Attention decision IDs the reviewer checked (DG-04).
+    pub evidence: Vec<String>,
+    /// Who attested that every cited SHA is published on origin, and when
+    /// (DG-13): always the writer, at write time.
+    pub published_attested_by: String,
+    pub published_attested_at: i64,
+    pub created_at: i64,
+}
+
 /// A newly granted lease plus the active rules that frame its work.
 ///
 /// Flattening preserves the existing top-level claim wire shape. This is not a
@@ -837,6 +865,28 @@ pub struct CheckpointInput {
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
     pub root_head: Option<String>,
+}
+
+/// The planner-written `pass` verdict `task verdict add` stores (DG-12).
+#[derive(Debug, Clone)]
+pub struct VerdictInput {
+    pub task_id: String,
+    pub reviewer: String,
+    pub shas: Vec<String>,
+    pub evidence: Vec<String>,
+    pub writer: String,
+    /// `--attest-published`: the writer states every cited SHA is on origin.
+    pub attest_published: bool,
+}
+
+/// The receipt `task verdict gate` prints (DG-15).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoneGateState {
+    pub board: String,
+    pub done_gate: String,
+    pub old_value: String,
+    pub changed_by: String,
 }
 
 /// The one actor who may settle or reopen anyone's attention item and whom
@@ -1868,8 +1918,8 @@ pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verifica
 /// ("Deployment tiers" section): `@_bdt` and `@_bd` are MBP tiers, hosted on
 /// `geoywsMBP` (or the thin client `geoywsMBA`); `@_bst`, `@_bs`, `@_s`,
 /// `@_uat` and `@_p` are Hetzner tiers. Every other canonical tier is Hetzner
-/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table — no other
-/// pairing is hard-coded anywhere.
+/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table, apart from
+/// the one exception [`DEV_TIER_HAX_HOST`] names.
 pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
 
 /// The only hostnames that are MBP. Everything else is treated as a Hetzner
@@ -1877,6 +1927,17 @@ pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
 /// host (`@_bdt` on `hig`, measured in the field) is refused, while a Hetzner
 /// tier on `geoywsMBP` is refused as the mirror image.
 pub const MBP_HOSTS: [&str; 2] = ["geoywsMBP", "geoywsMBA"];
+
+/// The one Hetzner host where the MBP tiers may also run, and only for boards
+/// in [`DEV_TIER_HAX_ESTATES`] (George, 2026-09-28: "`@_bdt` and `@_bd` run on
+/// `@@hax` for the Unum and geoyws estates"; docs/specs/deploy.md DEPLOY-05).
+/// Compared byte-exact: an alias or another spelling is not this host.
+pub const DEV_TIER_HAX_HOST: &str = "hax";
+
+/// The board estates whose MBP-tier attempts may record host
+/// [`DEV_TIER_HAX_HOST`]. IFCA boards and boards no estate claims keep the
+/// MBP hosts only (DEPLOY-06).
+pub const DEV_TIER_HAX_ESTATES: [&str; 2] = ["unum", "geoyws"];
 
 /// A full Git commit: 40 lowercase hexadecimal characters, and nothing
 /// shorter.

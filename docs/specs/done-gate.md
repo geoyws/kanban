@@ -2,11 +2,11 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `DG`. Requirement IDs are `DG-01` .. `DG-16`, stable across wording
+- **Slice ID:** `DG`. Requirement IDs are `DG-01` .. `DG-18`, stable across wording
   refinements; numbering is by creation, grouping is by topic.
 - **Baseline:** `2026-09-29` at commit `f8e1719` on branch `wt/t-7038c70a-spec`. Every
   "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria
+- **Status:** `SPEC-READY` on 2026-09-30 after the DG-13 amendment (George, `a-8b3467aa`; see §9), confirmed by an independent reviewer over the amended DG-02, DG-08, DG-12, DG-13, A2, A3, A8 and §5–§8. Prior: `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria
   over three rounds: one material finding (DG-16 misstated the epic direct-move baseline) and
   four stale line citations, all fixed in-tree and re-verified against the cited lines.
   Specification readiness only — it authorises neither implementation, nor rollout, nor release.)
@@ -87,12 +87,14 @@ reviewer and 7 defects found later — cannot recur by the same path.
 - George (`geoyws`): the only actor who may override the gate past a refusal, and
   whose override is audited.
 
-**In scope.** `task move ID done` under the gate: the append-only `verdicts`
+**In scope.** Reaching `done` under the gate: the append-only `verdicts`
 table (DG-11), the verdict-write verb (DG-12), the SHA shape, publication and
 staleness rules (DG-13, DG-14), the foreign-actor rule (DG-03, DG-07), the seven
 named refusals (DG-08), the `geoyws`-only `--force` override and its audit event
-(DG-05, DG-06), the per-board flag (DG-15), and the task-only boundary with the
-story/epic projection (DG-16).
+(DG-05, DG-06), the per-board flag (DG-15), the task-only boundary with the
+story/epic projection (DG-16), the every-write cover (DG-17: `task move`,
+`checkpoint --state done`, `task add --status done`, import), and the
+verdict-list evidence visibility (DG-18).
 
 **Boundaries.**
 
@@ -143,11 +145,12 @@ history unchanged.
 **DG-02** — require the verdict record's five fields.
 Strength: MUST · Layer: process · Source: kb `t-7038c70a` ask point 1.
 A verdict record carries exactly: writer actor, reviewer actor, reviewed SHA(s),
-verdict `pass`, and evidence. The writer is the actor from `--as` at write time
+verdict `pass`, and evidence — plus the publication attestation DG-13 records
+(who attested, when). The writer is the actor from `--as` at write time
 and is immutable. A record missing any of the five, with an empty writer, an
 empty reviewer, an empty SHA list, or a verdict other than `pass`, does not
-satisfy DG-01. The reviewed SHAs are full 40-character commit SHAs published on
-origin (DG-13).
+satisfy DG-01. The reviewed SHAs are full 40-character commit SHAs whose
+publication on origin the writer attested (DG-13).
 *Data rules:* the record is durable ledger state and survives a restart; it is
 never silently dropped by a later move, retag or metadata patch.
 
@@ -229,7 +232,8 @@ retag, metadata patch and migration.
 Strength: MUST · Layer: process · Source: George 2026-09-29 (attention
 `a-741f1212`, OQ-2).
 The grammar is `task verdict add ID --reviewer ACTOR --sha SHA [--sha ...]
---evidence ATTENTION-ID [--evidence ...] --as WRITER`. It records a `pass`
+--evidence ATTENTION-ID [--evidence ...] --attest-published --as WRITER`
+(`--attest-published` is DG-13's attestation). It records a `pass`
 verdict and nothing else: there is no fail verdict, and a review that fails
 records nothing. The write is refused with DG-08 sentence 3 when the writer or
 the reviewer is the claim holder of record for the task or holds its work lease
@@ -237,20 +241,28 @@ at write time; the closing-actor half of the collision is enforced at move time
 by DG-03, since the closer is not yet known at write time. `--as` is mandatory.
 *Failure behaviour:* a refused write stores no verdict row and advances no head
 (DG-14); DG-01 still refuses the done-move.
+*2026-09-29 — the read half of the verdict store is DG-18: `task verdict list` omits evidence ids the caller cannot read.*
 
 ### SHAs and staleness (OQ-3)
 
-**DG-13** — cite only full published commit SHAs.
+**DG-13** — cite only full commit SHAs whose publication the writer attests.
 Strength: MUST · Layer: process · Source: George 2026-09-29 (attention
-`a-741f1212`, OQ-3).
+`a-741f1212`, OQ-3); amended by George 2026-09-30 (attention `a-8b3467aa`,
+choice `attest`).
 Each reviewed SHA is a full 40-character lowercase-hex commit SHA. A verdict
-citing a short, malformed or empty SHA is refused with DG-08 sentence 5. A
-verdict citing a SHA the ledger cannot confirm as published on origin — unknown
-or unpublished, wherever the check runs — is refused with DG-08 sentence 6. A
-host that cannot confirm publication refuses every citing write with DG-08
-sentence 6, without retry or queue.
+citing a short, malformed or empty SHA is refused with DG-08 sentence 5.
+Publication on origin is a recorded attestation, not a check: the writer passes
+`--attest-published`, stating every cited SHA is on origin, and the stored row
+records who attested (always the writer) and when (the write time). A write
+without `--attest-published` is refused with DG-08 sentence 6. **The ledger
+records the attestation; it does not verify origin itself** — it holds no git
+checkouts and makes no network call on a verdict write, so a false attestation
+is caught by the foreign-actor rule (the attester is the writer, and DG-03,
+DG-07 and DG-12 bar the claim holder, the lease holder and the closer from
+writing), never by git.
 *Failure behaviour:* a refused write stores nothing (DG-11); a stored verdict
-whose SHAs fail these rules does not satisfy DG-01.
+whose SHAs are not full commit SHAs, or that carries no attestation, does not
+satisfy DG-01.
 
 **DG-14** — a stale verdict does not open the gate.
 Strength: MUST · Layer: process · Source: George 2026-09-29 (attention
@@ -323,7 +335,7 @@ varying. The seven sentences, verbatim:
 3. Self-review (writer or reviewer is the claim holder or the closing actor): `task {id} verdict is self-review: {actor} is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict`
 4. Non-`geoyws` force: `task {id} done-move past the gate needs `--force --as geoyws` — only geoyws may override, and the override is recorded`
 5. Malformed or short SHA: `task {id} verdict refused: `{sha}` is not a full 40-character commit SHA — cite the published commit the reviewer checked`
-6. Unknown or unpublished SHA: `task {id} verdict refused: `{sha}` is not published on origin — the verdict must cite a commit SHA published on origin`
+6. Publication not attested: `task {id} verdict refused: publication on origin is not attested — check every cited SHA is on origin, then pass --attest-published`
 7. Non-`geoyws` gate toggle: `done_gate on board {board} unchanged — only geoyws may turn the gate on or off; run `task verdict gate on|off --as geoyws```
 
 Each sentence says what is wrong and the fix. Until an independent reviewer
@@ -344,6 +356,21 @@ The gate fires only on moves to status `done`. Moves to `in_progress`, `review`,
 and the prerequisite gate (`rust/store.rs:5417`-`rust/store.rs:5427`) is
 otherwise unchanged. Stories and epics are DG-16, not an exception to this
 requirement.
+*2026-09-29 — path coverage extended by DG-17: this requirement keeps the status half (only transitions to `done` consult verdict state); which writes count as reaching `done` is enumerated there.*
+
+### Every write that reaches done (adversarial cover)
+
+**DG-17** — gate every write that makes a task done, not just the move.
+Strength: MUST · Layer: process · Source: adversarial review 2026-09-29 of the SPEC-READY slice (George's principle: the ledger makes the verdict path the only way a task reaches done).
+With the gate on (DG-15), every write whose resulting status is `done` on a task-type row consults verdict state exactly as `task move ID done` does (DG-01..DG-04, DG-13, DG-14), carrying the DG-08 sentence the move would carry; a refused write lands nothing — no row, no status flip, no `completed_at`, no event beyond the existing denial audit, if any:
+- `checkpoint --state done`: the same `enforce_done_gate`, the checkpoint author as the closing actor, no `--force` on this verb. The check runs after the checkpoint row is inserted — the verdict must cover the head this checkpoint records — but before the status flip, inside the one transaction, so a refusal rolls the checkpoint row back too.
+- `task add --status done`: a task-type add at `done` is refused with DG-08 sentence 1 (a new row has no holder and no head, and `task add` carries no override grammar).
+- import (`import atmux-json|atmux-sqlite`): a task-type row at `done` — inserted or flipped by the upsert — is refused with DG-08 sentence 1 naming the row id, and the whole import rolls back. Import takes any `--as` actor (it is not `geoyws`-only by design), so it fails closed.
+Stories and epics stay DG-16: the story-projection advance takes no verdict, and neither does a story- or epic-type row reaching `done` by any of the paths above. `transact`/`batch` items run the same dispatch as the bare commands, so the same store methods — and the same gate — answer them (import and `search-rebuild` are not transactable and keep their own paths, import gated above). File-level `restore --from DIR --force` (operator disaster recovery, replacing board files wholesale) and schema seed migrations stand outside `every write` above: they restore or create the files the gate reads rather than writing through the gated store paths. No new refusal wording: every refusal on these paths is a DG-08 sentence, so DG-08 is byte-identical.
+
+**DG-18** — hide evidence the caller cannot read from the verdict list.
+Strength: MUST · Layer: process · Source: adversarial review 2026-09-29 (attention rows are tag-scoped; see `attention_tags`).
+`task verdict list ID` answers the stored verdict rows oldest-first. Under managed enforcement, an evidence id whose attention row the caller cannot read is omitted from its evidence array, so the list never enumerates hidden attention ids; the verdict rows themselves stay — the task read that authorized them is unchanged — and on an unenforcing board the rows answer verbatim. Fail closed: a missing row, denied tags, or a lookup error omits the id. Move-time citation checks (DG-04) still judge every cited id regardless of who is asking.
 
 ## 4. Acceptance examples
 
@@ -359,7 +386,7 @@ lease and event count are unchanged.
 
 *Given* the gate on, `t-x` worked by `lane-e`, reviewer `lane-r` spawned by the
 planner, attention rows `a-1` and `a-2` resolved against `t-x`,
-*when* the planner runs `task verdict add t-x --reviewer lane-r --sha <40-char head> --evidence a-1 --evidence a-2 --as planner` and any actor then runs `task move t-x done`,
+*when* the planner runs `task verdict add t-x --reviewer lane-r --sha <40-char head> --evidence a-1 --evidence a-2 --attest-published --as planner` and any actor then runs `task move t-x done`,
 *then* the write stores one `verdicts` row, the move succeeds, the row is `done`
 with `completed_at` set, and the verdict record is still attached to the row.
 
@@ -381,7 +408,7 @@ with `--as lane-e --force`, *then* it is refused with `task t-x done-move past t
 ### A5 (DG-07, DG-12, DG-08 — executor cannot write the verdict)
 
 *Given* the gate on and `t-x` claimed by `lane-e`,
-*when* `lane-e` runs `task verdict add t-x --reviewer lane-r --sha <40-char head> --evidence a-1 --as lane-e`,
+*when* `lane-e` runs `task verdict add t-x --reviewer lane-r --sha <40-char head> --evidence a-1 --attest-published --as lane-e`,
 *then* the write is refused with `task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict`, no
 verdict is stored, no head advances, and a later `task move t-x done --as lane-e` is still refused.
 
@@ -399,12 +426,13 @@ evidence list,
 *when* any actor runs `task move t-x done`,
 *then* the move is refused with `task t-x has no foreign-actor pass verdict — record one with `task verdict add t-x --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done`, and the row is unchanged.
 
-### A8 (DG-13, DG-08 — SHA shape and publication)
+### A8 (DG-13, DG-08 — SHA shape and publication attestation)
 
 *Given* the gate on and `t-x` worked by `lane-e`,
-*when* the planner runs `task verdict add t-x --reviewer lane-r --sha abc123 --evidence a-1 --as planner`,
-*then* the write is refused with `task t-x verdict refused: `abc123` is not a full 40-character commit SHA — cite the published commit the reviewer checked` and nothing is stored; *when* the planner cites a well-formed but unpublished SHA,
-*then* the write is refused with `task t-x verdict refused: `{sha}` is not published on origin — the verdict must cite a commit SHA published on origin` and nothing is stored.
+*when* the planner runs `task verdict add t-x --reviewer lane-r --sha abc123 --evidence a-1 --attest-published --as planner`,
+*then* the write is refused with `task t-x verdict refused: `abc123` is not a full 40-character commit SHA — cite the published commit the reviewer checked` and nothing is stored; *when* the planner cites a well-formed SHA without `--attest-published`,
+*then* the write is refused with `task t-x verdict refused: publication on origin is not attested — check every cited SHA is on origin, then pass --attest-published` and nothing is stored; *when* the same write passes `--attest-published`,
+*then* it succeeds and the stored row records `publishedAttestedBy` `planner` and `publishedAttestedAt` equal to its `createdAt`.
 
 ### A9 (DG-14, DG-08 — stale verdict)
 
@@ -487,13 +515,35 @@ verdict on `t-x` naming reviewer `lane-e`,
 *when* any actor runs `task move t-x done`,
 *then* the move is refused with `task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict` and the row is unchanged.
 
+### A17 (DG-17, DG-08 — every write that makes a task done is gated)
+
+*Given* the gate on, task `t-x` claimed and worked by executor `lane-e`, with no
+verdict record,
+*when* `lane-e` runs `checkpoint t-x --state done`,
+*then* the checkpoint is refused with `task t-x has no foreign-actor pass verdict — record one with `task verdict add t-x --reviewer <actor> --sha <sha> --evidence <a-id> --as <planner>` before moving it to done`, and the row status, lease, checkpoints and event history are unchanged; *when* the planner records a foreign-actor `pass` verdict covering the checkpoint's head and `lane-e` retries the `done` checkpoint, *then* it succeeds and the row is `done`.
+*Given* the gate on,
+*when* any actor runs `task add "w" --id t-y --status done`,
+*then* it is refused with the DG-08 sentence 1 wording naming `t-y` and no row `t-y` exists afterwards.
+*Given* the gate on,
+*when* `import atmux-json` runs over a source containing a task-type row at `done`,
+*then* it is refused with the DG-08 sentence 1 wording naming that row id and the whole import rolls back, so no row from the source lands.
+*Given* a twin board where the gate was never turned on,
+*when* each of the three writes runs there,
+*then* each succeeds exactly as at the baseline (the checkpoint closes to `done`, the add lands `done`, the import lands the `done` row).
+
+### A18 (DG-18 — the verdict list hides evidence the caller cannot read)
+
+*Given* the gate on, task `t-x` carrying a tag the caller can read, a resolved attention row the caller cannot read (a tag outside its grants), and a stored verdict on `t-x` citing that row,
+*when* the caller runs `task verdict list t-x`,
+*then* the verdict row answers with its writer, reviewer, SHAs and verdict intact and the unreadable id absent from its evidence array; *when* a caller granted the hidden tag runs the same list, *then* the id is present.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** `task move ID done --as ACTOR [--force]` CLI
   grammar, unchanged in shape; the gate adds refusal sentences (DG-08) and the
   DG-05 actor constraint on `--force`. New grammar: `task verdict add ID
   --reviewer ACTOR --sha SHA [--sha ...] --evidence ATTENTION-ID [--evidence ...]
-  --as WRITER` (DG-12) and `task verdict gate on|off --as ACTOR` (DG-15).
+  --attest-published --as WRITER` (DG-12, DG-13) and `task verdict gate on|off --as ACTOR` (DG-15).
 - **Data invariants:** a row that reached `done` under the gate always carries,
   or is accompanied by, the latest stored planner-written foreign-actor `pass`
   verdict covering the current head and citing resolved attention decisions — or
@@ -525,7 +575,9 @@ verdict on `t-x` naming reviewer `lane-e`,
 - **Security:** a self-review or executor-written verdict MUST NOT be upgradeable
   into a pass by rewording (DG-03, DG-07 and DG-12 are actor/lease checks, not
   string checks); the override is confined to exactly `geoyws` (DG-05), matching
-  the attention resolve/reopen precedent; unpublished SHAs fail closed (DG-13).
+  the attention resolve/reopen precedent; an unattested publication fails
+  closed, and the ledger does not verify origin itself — the attestation is
+  trusted as far as the foreign-actor rule reaches (DG-13).
 - **Operability:** every override is one auditable event (DG-06) and every flag
   change is one auditable event (DG-15); gate refusals name the holder- and
   force-shaped way out the way the lease refusal does
@@ -539,7 +591,7 @@ verdict on `t-x` naming reviewer `lane-e`,
 | --- | --- | --- | --- | --- |
 | OQ-1 | Where does the verdict live: new table, new `tasks` columns (`BOARD_V36`), or metadata JSON? | George | answered 2026-09-29 | none — pinned in DG-11: new append-only `verdicts` table |
 | OQ-2 | What is the verdict-write grammar: new CLI subcommand, planner-only store call, or attention-like resolve path — and how is "spawned by the planner" attested on the ledger? | George | answered 2026-09-29 | none — pinned in DG-12: `task verdict add`, attested by actor and lease-hold (DG-07) |
-| OQ-3 | What exactly is a "reviewed SHA": worktree diff hash, commit SHA, or board revision — and when does newer work after the verdict make it stale? | George | answered 2026-09-29 | none — pinned in DG-13 (full 40-char commit SHAs published on origin) and DG-14 (stale once a newer head is recorded; stale never opens the gate) |
+| OQ-3 | What exactly is a "reviewed SHA": worktree diff hash, commit SHA, or board revision — and when does newer work after the verdict make it stale? | George | answered 2026-09-29 | none — pinned in DG-13 (full 40-char commit SHAs published on origin; since 2026-09-30 publication is the writer's recorded attestation, `a-8b3467aa`) and DG-14 (stale once a newer head is recorded; stale never opens the gate) |
 | OQ-4 | How is the gate enabled: per-board flag, global default-on, or epic-scoped — and what is the default for existing boards? | George | answered 2026-09-29 | none — pinned in DG-15: per-board audited flag, off by default, acies first |
 | OQ-5 | How does the gate compose with the story-status projection (`rust/store.rs:5400`-`rust/store.rs:5410`): does a story's `done` projection require a verdict per child story, per epic, or both? | George | answered 2026-09-29 | none — pinned in DG-16: per task only, stories and epics project done from children with no extra verdict |
 | OQ-6 | What is the measured cost of the gate check on `task move` (observation, not a budget)? | slice implementer | open | rollout, not the spec gate |
@@ -566,10 +618,12 @@ surface here is CLI, so every row does. Test names are proposed, not enumerated
 | DG-10 | MUST | process | planned: `done_gate_fires_only_on_done` | no e2e coverage |
 | DG-11 | MUST | process | planned: `done_gate_verdicts_table_is_append_only_across_migration` | new table, forward-only step; no e2e coverage |
 | DG-12 | MUST | process | planned: `done_gate_verdict_add_verb_records_pass_only` | writer/reviewer holder check; no e2e coverage |
-| DG-13 | MUST | process | planned: `done_gate_refuses_short_and_unpublished_shas` | sentences 5 and 6; no e2e coverage |
+| DG-13 | MUST | process | planned: `done_gate_refuses_short_and_unattested_shas` | sentences 5 and 6; attestation recorded; no e2e coverage |
 | DG-14 | MUST | process | planned: `done_gate_stale_verdict_does_not_open_gate` | sentence 2; no e2e coverage |
 | DG-15 | MUST | process | planned: `done_gate_flag_defaults_off_and_audits_changes` | acies first; no e2e coverage |
 | DG-16 | MUST | process | planned: `done_gate_story_and_epic_project_done_without_verdict` | no extra verdict; no e2e coverage |
+| DG-17 | MUST | process | `a17_done_gate_checkpoint_done_is_gated`, `a17_done_gate_task_add_done_is_refused`, `a17_done_gate_import_done_is_refused` | each refuses with sentence 1 on the gated board with nothing written and succeeds on the ungated twin; no e2e coverage |
+| DG-18 | MUST | process | `a18_done_gate_verdict_list_hides_unreadable_evidence` | tag-scoped managed estate: unreadable evidence ids omitted, readable rows intact; no e2e coverage |
 
 ## 9. Change log
 
@@ -600,3 +654,7 @@ surface here is CLI, so every row does. Test names are proposed, not enumerated
   `rust/store.rs:5870` (lease seize), `rust/store.rs:5896` (`task_moved` event)
   and `rust/store.rs:5842`-`rust/store.rs:5852` (projection refusal, also §2 and
   DG-16). Status stamped `SPEC-READY`; no requirement ID changed meaning.
+- `2026-09-29` — adversarial cover of the SPEC-READY slice (George's principle: the verdict path is the only way a task reaches done): new DG-17 gates every write that makes a task done (`task move`, `checkpoint --state done`, `task add --status done`, import; stories and epics stay DG-16, `transact`/`batch` inherit the same store methods) reusing the DG-08 sentences with no new wording (DG-08 byte-identical); new DG-18 omits unreadable evidence ids from `task verdict list`; DG-10 keeps its ID with a dated pointer to DG-17 for path coverage; new A17, A18 and §8 rows.
+- `2026-09-29` — independent review of DG-17: file-level `restore --from DIR --force` (operator disaster recovery) and schema seed migrations stand outside `every write`; checkpoint refusal asserts the rolled-back checkpoint row and the stale-head leg proves the gate judges the recorded head (A17).
+- `2026-09-30` — George resolved attention `a-8b3467aa` with choice `attest`: DG-13's publication check becomes a recorded attestation by the verdict writer. DG-13 now states that the ledger records the attestation and does not verify origin itself; the `KANBAN_PUBLISHED_SHAS` environment allowlist of the draft implementation is removed. DG-08 sentence 6 is reworded from "not published on origin" to "publication on origin is not attested" (the only sentence changed); DG-12 and §5 grammar and examples A2 and A3 gain `--attest-published`; DG-02 names the recorded attestation; A8 and the §8 DG-13 row follow. Shape (sentence 5) and staleness (DG-14) are unchanged. No requirement ID changed; DG-13 keeps its ID with an amended obligation, recorded here against the 2026-09-29 baseline.
+- `2026-09-30` — independent review of the DG-13 amendment: `SPEC-READY`, no spec finding; DG-08 sentence 1's short fix hint stays as it is (it is an abbreviated pointer like sentence 2; the full grammar is DG-12). Code finding applied: the move-time gate skips a stored verdict with an empty attester, so a row lacking the attestation never satisfies DG-01 (DG-13 failure behaviour).

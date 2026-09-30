@@ -1,6 +1,6 @@
 use crate::model::{TASK_STATUSES, TASK_TYPES};
 use crate::registry::now_ms;
-use crate::store::{Store, event, live_claims, refuse_reused_task_id};
+use crate::store::{Store, event, live_claims, refuse_reused_task_id, whole_board_write_on};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -392,6 +392,16 @@ fn normalize_and_insert(
     counts: ImportCounts,
     options: ImportOptions,
 ) -> Result<ImportReceipt> {
+    // Whole-board write before any work (ACC-14): an import rewrites arbitrary
+    // rows, deletes claims and dependencies on `--reconcile`, and seizes live
+    // leases with `--force`, so only a principal holding the whole board may
+    // run it. The gate sits ahead of the overlap listing, the dry-run receipt
+    // and the reuse refusal alike: each of those names existing ids, and none
+    // of them is reachable without this authority. Unmanaged boards stay
+    // unchanged — the gate is a no-op where nothing enforces. This early call
+    // is the fast refusal; the authorizing read repeats inside the IMMEDIATE
+    // transaction below, in the snapshot the overwrite sweeps.
+    store.require_whole_board_write()?;
     if actor.trim().is_empty() {
         bail!("actor is required");
     }
@@ -453,6 +463,11 @@ fn normalize_and_insert(
     let transaction = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Inside the mutation lock, before the first id-revealing read: the early
+    // gate above is a fast refusal, but the tag universe is read here, in the
+    // same snapshot the overwrite sweeps, so a concurrent retag cannot slip
+    // between the check and the write (ACC-14, like `archive_settled`).
+    whole_board_write_on(&authz, &transaction)?;
     let existing = {
         let mut statement = transaction.prepare("SELECT id FROM tasks")?;
         statement
@@ -528,6 +543,18 @@ fn normalize_and_insert(
             || !TASK_STATUSES.contains(&input.status.as_str())
         {
             bail!("invalid imported task {}", input.id);
+        }
+        // The done gate covers every write that makes a task done (DG-17):
+        // a task-type row at `done` — inserted or flipped by the upsert below
+        // — is refused on a gated board with sentence 1 naming the row, and
+        // the bail rolls the whole import back so nothing is written. Import
+        // takes any `--as` actor, so it is not geoyws-only by design and fails
+        // closed here; stories and epics are DG-16 and take no verdict.
+        if input.task_type == "task"
+            && input.status == "done"
+            && crate::store::done_gate_on(&transaction)?
+        {
+            bail!("{}", crate::store::no_verdict_sentence(&input.id));
         }
         let completed = if input.status == "done" {
             input.completed_at.or(Some(input.updated_at))
@@ -628,6 +655,11 @@ fn verify(
     source: String,
     counts: ImportCounts,
 ) -> Result<ParityReceipt> {
+    // The same whole-board write gate as the import itself (ACC-14): the
+    // receipt names missing and differing ids and carries board field values,
+    // read across every tag the source happens to name, so a caller who may
+    // not run the import may not preview its answers either.
+    store.require_whole_board_write()?;
     const FIELDS: [&str; 16] = [
         "type",
         "parentID",

@@ -261,6 +261,68 @@ unchecked, known and unknown rows.
   existing board scope. Requirement wording is unchanged: this restores the
   authorize-as-the-containing-row rule the tag-checked writes already applied.
 
+- 2026-09-25 — replacing a task's dependency list keeps the edges the caller
+  cannot read (`update_task` in `rust/store.rs`): the new edges are still
+  authorized one by one as task-attach writes, but the delete drops only the
+  edges the caller could see and re-inserts the hidden ones beside the new
+  list, so a writer on the row cannot silently remove a gate the owner set.
+  Refusing the replacement instead would confirm a hidden edge exists, so the
+  write succeeds — keep over refuse. The receipt and the dependency listing
+  still withhold the kept edges while the gate keeps honouring every edge, so
+  a kept gate still blocks claims. `--clear-dependencies` arrives as an empty
+  list and keeps them the same way. Requirement wording is unchanged: this
+  restores the authorize-as-the-containing-row rule for the replacement the
+  whole-row delete had silently left.
+
+- 2026-09-25 — every write that links a row to a task (`add_note`,
+  `raise_attention` with `--task`, `post_sitrep` with `--task`, `checkpoint`,
+  `create_handoff` with a task, the parent and dependency edges on task add
+  and update, subscription subjects and relations, `start_deployment` with
+  `--task`) is authorized against that task's own tags at both read and write
+  (`authorize_task_attach` in `rust/store.rs`), with an absent id answering
+  the same `DeniedOrNotFound` error the denied path uses when enforcement is
+  managed — so success no longer confirms a tag-denied row exists, and a
+  refusal writes nothing. A lanewide sitrep, a session handoff and a taskless
+  deployment keep their existing board scope. Requirement wording is unchanged:
+  this restores the authorize-as-the-containing-row rule the tag-checked
+  writes (claim, sprint attachment, deployment finish) already applied.
+
+- 2026-09-25 — paged listings whose rows are filtered per row
+  (`events_with_bounds`, `events_since_filtered`, `deployments`) apply the
+  caller's bound to the rows the caller may READ, not to the raw rows: under
+  managed enforcement the SQL `LIMIT` ran before the tag test, so a denied
+  row consumed a slot and the page came back short — `events --task
+  t-visible --limit 1` answered `[]` while newer visible history waited,
+  leaking hidden activity and its timing — and every caller's `+1`
+  truncation probe with it. The scan now pages through the SQL in chunks
+  until the bound is filled (`scan_visible` in `rust/store.rs`, following
+  the attention listing's pattern), keeping the probe correct; unmanaged
+  boards keep the SQL bound, byte-identical. `current_deployments` takes no
+  bound and is unchanged. Requirement wording is unchanged: this restores
+  the filter-before-truncate rule the attention, sitrep, handoff and
+  resolved listings already apply (`t-b694bc83`).
+
+- 2026-09-25 — every by-id attention operation (`show_attention`,
+  `update_attention`, `resolve_attention`, `reopen_attention`,
+  `answer_check_with_authorization`) and `Store::require_task` map an absent
+  id to the same `DeniedOrNotFound` error the denied path uses when
+  enforcement is managed (`absent_as_denied` in `rust/store.rs`), so the
+  CLI/MCP named reads answer a denied id and an unknown one identically.
+  Refusals past the guard keep their sentences; unmanaged boards
+  keep the plain `not found` messages. Requirement wording is unchanged: this
+  restores the indistinguishability for known and unknown rows it already
+  states. Follow-up the same day: the same collapse reaches every task route
+  that names a row — one authorized helper (`require_task_authorized`, with
+  the still-active variant for mutations) serves the events history gate,
+  move, remove, patch-metadata, update, story signoff and advance, sprint
+  attach and detach, a named claim, and the `notes` and `checkpoints` reads;
+  task-filtered attention, sitrep and handoff listings proceed for an unknown
+  task exactly as they do for a denied one (`require_task_filter`); and an
+  absent deployment answers the same denial as a denied subject's attempt.
+  `add_note` still returns its just-written receipt without re-gating, so an
+  authorized-at-board-scope write is never an error after commit. Writes that
+  merely reference a task keep their behaviour.
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -548,13 +610,17 @@ every row is readable there, so the divisor is still taken over the whole match 
 
 ### A21 — task-attach writes inherit the task's tags (`ACC-14`)
 
-*Given* a managed caller holding board read and write but no `secret` tag scope, *when* it
-attaches a note, an `attention raise --task` or a `sitrep post --task` to a `secret` task,
-*then* each write is refused with the existing non-enumerating denial — byte-identical in
-exit code and stderr to the same write naming a never-created id — and nothing is recorded:
-an owner re-read shows each task-scoped ledger holding only its birth event, with no
-attention row and no sitrep created. *When* no enforcement applies, *then* an unknown id
-keeps its plain `not found` message and authorized attaches work as before.
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it attaches to a `secret` task through `note`, `attention raise
+--task`, `sitrep post --task`, `checkpoint`, `handoff create` with a task,
+`task add --parent` or `--depends-on`, `task update --parent` or `--depends-on`,
+`subscription add --subject` or `--relation`, or `deploy start --task`, *then*
+each write is refused with the existing non-enumerating denial — byte-identical
+in exit code and stderr to the same write naming a never-created id — and nothing
+is recorded: an owner re-read shows each task-scoped ledger holding only its birth
+event, the phantom children absent, and no subscription created. *When* no
+enforcement applies, *then* an unknown id keeps its plain `not found` message and
+authorized attaches work as before.
 
 ### A22 — a removed task's trail stays tag-gated on every tail (`ACC-14`)
 
@@ -569,7 +635,11 @@ keeps its plain `not found` message and authorized attaches work as before.
 *Removal never loosens a tag: a removed task's events authorize against
 *the task's last-known tags from its `task_removed` snapshots plus each
 *event's own snapshot, so the tails and the index agree instead of the
-*index dropping what the tails serve.
+*index dropping what the tails serve. `events --task` on the gone row is
+refused for every caller, a holder of the tag included, because the row the
+filter would authorize against is gone; `watch --task` and `subscription
+add` naming a removed task authorize against the same last-known tags and
+fail closed when no removal record names the id.
 
 ### A23 — a removed task's linked rows stay tag-gated on every surface (`ACC-14`)
 
@@ -611,7 +681,134 @@ live id answers `task X already exists`, replacing the raw `UNIQUE
 constraint failed`. Removed ids stay unreusable on every board, managed or
 not, through `task add` and through import, because the rows that outlive a
 removal keep the orphaned id and would otherwise re-parent under the new
-row's tags.
+row's tags. An unreadable id is indistinguishable from any other unreadable
+id, but not from a free one, which succeeds: that residual is inherent while
+callers may choose ids in a shared namespace, and each such probe leaves an
+audited row.
+
+*Given* a managed caller without whole-board write — read-only, or holding
+board write plus a tag scope that does not cover the board — *when* the
+caller runs `import atmux-json` or `import atmux-sqlite`, with no flags or
+with `--reconcile`, `--dry-run` or `--verify` (`--verify` stands alone and
+cannot be combined with the write flags), *then* the command is refused with
+the generic denial before any work: nothing is written and stderr names no
+existing id. The `--dry-run` preview and the `--verify` comparison answer the
+same gate, because their receipts list ids too. An owner holding the whole
+board still imports. The import gate is read inside the `IMMEDIATE`
+transaction it protects, in the snapshot the overwrite sweeps, so a
+concurrent retag cannot slip between the check and the write. A NULL-linked
+row whose creation event names a task id that was removed and is live again
+is not re-linked: `doctor` reports it for the owner under `reusedTaskLinks`
+as an advisory that does not affect `healthy` or the exit code, because it
+describes a known historical residual that no verb can clear. Each reported
+line is filtered by read on the live task's tags and on the removal union of
+the prior incarnation, failing closed under enforcement, so the report never
+discloses an incarnation the caller cannot read. The owner can review the
+named rows by hand; no verb removes or re-links them.
+
+### A25 — a dependency replacement keeps the edges the caller cannot read (`ACC-14`)
+
+*Given* the owner gates a `visible` task `t-visible` on a `secret` task
+`t-secret` and on an `ops` task `t-ops`, *when* a managed caller holding board
+read and write but no `secret` tag scope and only `ops` read runs `task update
+t-visible --depends-on t-other` for a readable `t-other`, *then* the write
+succeeds — refusing would confirm a hidden edge exists — but both kept edges
+survive: the caller's own `task show` still lists `t-ops` beside `t-other`
+while withholding `t-secret`, the update receipt names no hidden id, and
+`blockingGates` still carries both `t-secret` (with its title blanked) and
+`t-ops` as `todo`, so `claim t-visible` is still refused while either is open.
+Re-listing `t-ops` beside `t-other` is accepted — a readable edge already on
+the row needs no new authority, as with the unchanged parent — while
+naming `t-secret` in the new list is refused byte-identically to naming an
+id that was never an edge (the same exit code and stderr, nothing written):
+the skip applies only to edges the caller can read, so guessing a hidden
+prerequisite confirms nothing, and the kept loop still preserves the hidden
+edge on every accepted replacement. `--clear-dependencies` keeps both the
+hidden and the read-only edges while dropping the writable `t-other` edge,
+because removing a gate is a write
+against the prerequisite's scope as much as the dependent's. The owner still
+reads every surviving edge and can still drop any of them. *When* no
+enforcement applies, *then* a replacement rewrites the whole list as before,
+because there is no hidden or read-only edge to keep.
+
+### A26 — pages are bound by readable rows, not raw rows (`ACC-14`)
+
+*Given* a managed caller holding board read and the `visible` tag but no
+`secret` scope, *when* the two newest events
+concern a `secret` attention row raised and settled on the readable task
+`t-visible` and the newest deployment attempts name the denied task
+`t-secret`, *then* `events --task t-visible --limit 1` and board-wide
+`events --limit 1` each return the newest visible event with the `showing 1
+of more than 1` truncation notice, and `deploy list --status started --limit 1`
+and `--status failed --limit 1` each return the newest visible attempt —
+none of them naming the hidden rows — while the owner still reads the
+denied rows first on every listing, and granting
+`secret` restores exactly those rows to the caller. *When* three hundred
+denied events sit ahead of the visible history, *then* board-wide `events
+--limit 5` still returns the five newest visible events newest-first, with
+no duplicates and the `showing 5 of more than 5` notice. *When* a restricted
+follower polls the tail over that denied stretch, *then* each scan examines
+a bounded page, the poll's static walk starts at the scan frontier so even a
+`--limit 1` follower advances by the scan floor, the cursor advances past
+the denied rows already read, and the visible event waiting past the stretch
+is still delivered — a delay, never a skip, and never a re-read of the whole
+stretch. *When* a one-shot (non-follow) watch lands behind a denied stretch
+longer than the raw cap, *then* it emits one `advanced` heartbeat carrying
+the scan frontier, so a polling consumer re-running from the persisted
+cursor walks the next page instead of re-reading the same rows. Authorization is at scan
+time throughout: rows denied under the authority and tags current at the
+scan stay behind the adopted cursor, and a later grant or retag does not
+replay history already passed. *When* no enforcement applies, *then* the
+listings keep their SQL bound and read exactly what they asked for,
+byte-identical.
+
+### A27 — denied and unknown ids answer identically on every by-id surface (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it addresses a `secret` attention id and a never-created id on
+CLI `attention show`,
+`attention resolve`, `attention reopen`, `attention check` and `task show`,
+*then* each pair answers byte-identically — the same exit code and stderr —
+with the existing
+non-enumerating denial, and nothing is recorded. *When* the same caller
+answers a readable row's check with an undeclared key, *then* the refusal
+names the key rather than collapsing into the denial; *when* no enforcement
+applies, *then* an unknown id keeps its plain `not found` message.
+
+### A28 — denied and unknown task ids answer identically on task routes (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it addresses a `secret` task id and a never-created one on
+`task move`, `task update`, `task remove`, `claim`, `events --task` and
+`deploy show`, *then* each pair fails with the same exit code and
+byte-identical stderr carrying the existing non-enumerating denial, and
+nothing is recorded. *Given* a managed caller holding board write only,
+*when* it addresses a leased `secret` task and a never-created one on
+`heartbeat` and `release`, a `secret` candidate or parent epic and a
+never-created one on `sprint plan`, a denied deployment attempt and a
+never-started one on `deploy finish`, `deploy abandon` and `deploy start
+--retry-of`, and a removed `secret` task and a never-created one on `watch
+--task` and `subscription add --subject`, *then* each pair likewise fails
+with the same exit code and byte-identical stderr carrying the denial, and
+nothing is recorded — while the lease holder's own heartbeat and release
+still move the lease. *When* it filters `sitrep list --task`, `handoff list
+--task` or `attention list --task` by either id, *then* each pair succeeds
+with byte-identical stdout handing over no row: a sitrep, handoff,
+subscription or attention row naming a task is listed only for a caller who
+can read that task — a live task against its tags, a removed task against
+the union of its `task_removed` snapshots, failing closed with no record —
+and an attention row additionally needs its own tags, as in search. The
+unfiltered listings, the attention and handoff counts and `handoff retire`
+obey the same rule: the rows leave no trace for the
+denied caller while an owner still sees them all. `notes`, `checkpoints` and
+a named `claim` have no standalone CLI read — every command reaches them only
+past `require_task` — so a store-level case pins the same denial for both ids
+there. *When* no enforcement applies, *then* an unknown task keeps its plain
+`not found` message. An attention row read or changed by id is additionally
+gated on the task it was raised against, a subscription list, show, pause or
+resume on every relation target besides its subject, and a `task_removed`
+snapshot that records no `_semanticV1.tags` array fails closed with the
+stale-entry tag rather than authorizing as untagged.
 
 ## 5. Contracts and data
 
@@ -713,7 +910,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe`; `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`; `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`; `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`; `attention_by_id_withholds_rows_on_a_tag_denied_task`; `subscription_relation_targets_withhold_a_tag_denied_task_on_read`; `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`; `import_requires_whole_board_write_and_names_no_denied_id`; `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -878,3 +1075,190 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   refuses any id naming a live row, a `task_removed` record or any event
   history — read-gated under enforcement so a caller who cannot read the
   id's tags gets the generic denial — on `task add` and on import alike.
+
+- 2026-09-25 — ACC-14 dependency-replacement evidence landed (`t-c718c024`):
+  replacing a task's dependency list keeps the edges the caller cannot read
+  instead of deleting them, so a writer on the row cannot silently remove a
+  gate the owner set; the write still succeeds, because refusing would confirm
+  a hidden edge exists. The receipt and the listing still withhold the kept
+  edges while the gate keeps honouring every edge — pinned by
+  `dependency_replacement_keeps_a_tag_denied_prerequisite` (A25). The parent
+  edge needs no such treatment — the row's own `parentID` carries it, so a
+  replacement drops an edge the caller already sees — and subscription
+  relations are create-only, with each target gated at add and no rewrite
+  path.
+
+- 2026-09-25 — ACC-14 dependency-replacement follow-up (`t-c718c024`): the
+  keep now covers every edge the caller cannot write, not just the unreadable
+  ones — removing a gate is a write against the prerequisite's scope as much
+  as the dependent's — and re-listing an edge already on the row needs no new
+  authority, as with the unchanged parent. A readable but read-only kept edge
+  stays visible in the listing as usual while the gate keeps honouring it;
+  `--clear-dependencies` keeps the hidden and read-only edges the same way.
+  Pinned by the extended `dependency_replacement_keeps_a_tag_denied_prerequisite`
+  (A25): the owner gates `t-visible` on the unreadable `t-secret` and the
+  read-only `t-ops`, and the caller keeps both across `--depends-on t-other`,
+  a re-list of `t-ops`, and `--clear-dependencies`, while the owner can still
+  drop any edge.
+
+- 2026-09-25 — ACC-14 dependency-replacement oracle closed (`t-c718c024`
+  review): the re-list skip in `update_task` applies only to existing edges
+  the caller can read — re-listing the hidden `t-secret` is refused
+  byte-identically to naming `t-nonexistent` (same exit code and stderr,
+  nothing written), so guessing a hidden prerequisite confirms nothing,
+  while re-listing the readable but read-only `t-ops` still needs no new
+  authority and the kept loop still preserves the hidden edge. Pinned by the
+  extended `dependency_replacement_keeps_a_tag_denied_prerequisite` (A25).
+
+- 2026-09-25 — ACC-14 search-restriction evidence landed (`t-5f7daa1b`):
+  `restricted_match_agrees_with_filter_afterwards_on_both_branches` now also
+  covers a large mixed permitted set past the old 900-row chunk boundary
+  (more than one old batch). The landing removes the `rowid IN` restriction
+  it once pinned: a throwaway probe on the bundled SQLite 3.50.2 showed
+  EXPLAIN QUERY PLAN printing a full `SCAN ... INDEX 0:=M1` for `MATCH ?
+  AND rowid IN (...)` — FTS5 has no rowid seek to push a restriction into
+  — and measured one MATCH execution per IN element (~2.7s for 2000
+  permitted + 5000 denied, ~562ms for 500 permitted, against ~3–4.5ms for a
+  single walk; `rowid = ?` per id and a VALUES join scaled the same way),
+  so batching the restriction would run the denied-driven walk once per id
+  instead of once per call. The probe was deleted afterwards.
+  `fts_match_permitted` now runs exactly one rowid-only MATCH walk on every
+  path with the permitted intersect in Rust: denied seqs are materialised as
+  bare i64 rowids — MATCH time still grows with the denied rows holding the
+  query's terms, one shared walk being the minimum FTS5 permits — while no
+  denied content, snippet, or bm25 is ever read and the served strengths
+  still come from the permitted-only recomputation. The three comments that
+  said denied rows are "never materialised" now state exactly what is and is
+  not materialised.
+
+- 2026-09-25 — ACC-14 page-fill evidence landed (`t-b694bc83`):
+  `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` seeds
+  a `secret` attention row raised and settled on the readable `t-visible`
+  plus newer-denied deployment attempts beside older visible ones: a caller
+  holding board read and the `visible` tag gets a full page of visible rows
+  from `events --task`, board-wide `events` and `deploy list` with a true
+  `+1` truncation probe — while the owner still reads the denied rows first
+  and granting `secret` restores them (A26). The landing fixed the leak as a bug; requirement wording is
+  unchanged. The SQL `LIMIT` ran before the per-row tag test, so a denied
+  row consumed a page slot and `events --task t-visible --limit 1` answered
+  `[]` while visible history waited. The three listings now scan in chunks
+  until the readable bound is filled, following the attention listing's
+  filter-first pattern; unmanaged boards keep the SQL bound, byte-identical,
+  and the unbound `current_deployments` is unchanged.
+
+- 2026-09-25 — ACC-14 page-fill follow-up (`t-b694bc83` review): the chunked
+  scans now page by keyset instead of LIMIT/OFFSET — `seq < last` newest-first
+  and `seq > last` on the ascending tails, `(created_at, id)` on deployments —
+  inside one read snapshot per page, so each chunk is an indexed seek and a
+  write between chunks can neither duplicate nor skip a row. The
+  cursor-driven tails (`events_since_filtered` and the watch poll) cap the raw rows examined per scan and advance the cursor past
+  denied rows already read, so a long denied tail is walked a bounded page
+  per scan instead of re-read whole on every revision; advancing past denied
+  rows cannot skip a row that is visible under the authority and tags current
+  at scan time, because the ascending cursor moves only over rows its own
+  snapshot examined — a later grant or retag does not replay history already
+  passed. Pinned by the extended
+  `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe` (three
+  hundred denied events ahead of the visible history, with a five-row
+  no-duplicates page) and the new
+  `store::tests::managed_ascending_tail_walks_a_denied_stretch_in_bounded_scans`
+  (A26).
+
+- 2026-09-25 — ACC-14 tail-liveness follow-up (`t-b694bc83` review): the watch
+  poll starts its static walk at the scan frontier instead of the cursor, so a
+  `--limit 1` follower advances by the scan floor instead of one row per poll;
+  a one-shot watch behind a denied stretch longer than the raw cap emits one
+  `advanced` heartbeat carrying the frontier (ADR-031 already obliges
+  consumers to persist it) instead of stalling its polling consumer, while an
+  empty poll at the head stays silent — and off enforcement an empty one-shot
+  stays silent too, since only a capped scan can hide a denied stretch worth
+  walking. Pinned by
+  `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`,
+  `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`
+  and `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`
+  (A26).
+
+- 2026-09-25 — ACC-14 task-linked-row evidence landed (`t-565de30e`):
+  `task_linked_rows_withhold_a_tag_denied_task_on_every_listing` seeds a
+  sitrep, a handoff, an untagged attention row and a subscription on a
+  `secret` task and on an untagged control task: a caller holding only board
+  read and write gets byte-identical stdout for `sitrep list --task`,
+  `handoff list --task` and `attention list --task` filtered by the denied id
+  and by a never-created id, sees no trace of the secret rows in the
+  unfiltered listings, and gets the one generic
+  denial with identical stderr for `handoff retire` on the denied handoff and
+  on an unknown id — while the owner still sees every row (A28). The landing
+  fixed the leak as a bug; the A28 wording now states the listing contract it
+  pins. The listings authorized these rows at board scope only, so `--task
+  t-secret` served the secret task's rows while `--task t-never-created`
+  answered `[]` — the existence oracle with the rows' content. Every such
+  row now passes `task_linked_row_visible`: visible only to a caller who can
+  read its task, live against `task_tags` and removed against the union of
+  its `task_removed` snapshots, failing closed with no record — with the
+  attention row keeping its own-tag check so listings and search agree — in
+  `sitreps`, `handoffs`, `count_pending_handoffs`, `subscriptions`, the
+  attention listing and its counts, applied before any bound; `retire_handoff`
+  authorizes against the handoff's task the way `accept_handoff` does, with an
+  unknown handoff answering the generic denial under enforcement. The same
+  landing closed the by-id residuals on these rows: `subscription show`,
+  `pause` and `resume` withhold a subscription whose subject task the caller
+  cannot read, and `handoff accept` maps an unknown id to the generic denial
+  — each byte-identical to a never-created id under enforcement, with notes
+  and checkpoints already gated past `require_task_authorized` and
+  `has_open_attention` left as the internal write-path boolean it is.
+
+- 2026-09-25 — ACC-14 residual-oracle evidence landed (`t-565de30e`):
+  `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`
+  addresses a leased `secret` task and a never-created one on `heartbeat` and
+  `release`, a `secret` candidate or parent epic and a never-created one on
+  `sprint plan`, a denied deployment attempt and a never-started one on
+  `deploy finish`, `deploy abandon` and `deploy start --retry-of`, and a
+  removed `secret` task and a never-created one on `watch --task` and
+  `subscription add --subject`, as a caller holding board write only: each
+  pair answers the existing non-enumerating denial with the same exit code
+  and byte-identical stderr, and nothing is recorded, while the lease
+  holder's own heartbeat and release still move the lease (A28). The landing
+  fixed the leaks as bugs and corrected two wordings: `events --task` on a
+  removed row is refused for every caller, holder included, because the row
+  the filter would authorize against is gone (A22) — and the attach test now
+  also pairs `task update --depends-on` (A21).
+
+- 2026-09-25 — ACC-14 by-id and relation-target evidence landed (`t-565de30e`):
+  `attention_by_id_withholds_rows_on_a_tag_denied_task` raises untagged
+  attention rows on a `secret` task: a caller holding only board read and
+  write gets the one generic denial with identical exit codes and stderr on
+  `attention show`, `resolve`, `reopen` and `check` against a never-created
+  id, while the owner still runs every operation (A28).
+  `subscription_relation_targets_withhold_a_tag_denied_task_on_read` adds a
+  subscription with no subject and `--relation parent:t-secret`: the same
+  caller sees no trace of it in `subscription list` and gets the generic
+  denial on `show`, `pause` and `resume` exactly like a never-created id,
+  while the owner still sees it (A28). The landing fixed the leaks as bugs:
+  the by-id attention paths checked only the row's own tags, and the
+  subscription read paths gated only the subject, although the add path
+  already gates every relation target. `removed_task_tag_union` now fails
+  closed with the stale-entry tag when any removal payload lacks a
+  `_semanticV1.tags` array — `Some([])` is reserved for an explicitly empty
+  array — pinned at store level by
+  `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`.
+
+- 2026-09-25 — ACC-14 import gate and reuse-report evidence landed
+  (`t-565de30e`): an import rewrites arbitrary rows, deletes claims and
+  dependencies with `--reconcile` and seizes live leases with `--force`, so
+  `normalize_and_insert` and the `--verify` comparison now require
+  whole-board write before any work, ahead of the overlap listing, the dry-run
+  receipt and the reuse refusal; every other authority answers the generic
+  denial with nothing written and no id on stderr, and unmanaged boards are
+  unchanged. The whole-board read repeats inside the `IMMEDIATE` transaction,
+  in the snapshot the overwrite sweeps, so a concurrent retag cannot slip
+  between the check and the write. The reuse-refusal comment now says what
+  holds: an unreadable id is indistinguishable from any other unreadable id,
+  but not from a free one. `doctor` reports NULL-linked rows whose creation
+  event names a removed-but-live-again task id under `reusedTaskLinks` as an
+  advisory that does not affect `healthy` or the exit code — a known
+  historical residual no verb can clear — each line filtered by read on the
+  live task's tags and on the prior incarnation's removal union, failing
+  closed under enforcement, so the owner can review the named rows by hand —
+  pinned by `import_requires_whole_board_write_and_names_no_denied_id`
+  and `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id`
+  (A24).

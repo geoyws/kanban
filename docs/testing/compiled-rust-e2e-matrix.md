@@ -133,6 +133,7 @@ Instrumentation does not change any test's evidence layer.
 | Handoff lane-address compatibility cutover | `handoff_create_refuses_bare_driver_lanes_but_not_non_lane_identities` runs the compiled CLI and proves `driver`, `driver-2`, and `driver-3` are refused before a row is written with the full typed-actor remedy, while `driverless`, `driver-two`, `driver-0`, and an ordinary untyped identity still create. `typed_lane_actor_accepts_only_its_matching_legacy_bare_lane_target` seeds released-format pending rows and proves a matching typed actor accepts a bare final lane segment without rewriting `toAgent`, `acceptedBy` keeps the full actor, a wrong typed lane and an untyped non-target are refused, and an already typed target remains exact. |
 | Read-only scheduler inspection | A compiled `claim --candidates --project` process excludes dependency-blocked, draft-ancestor, container, leased, incompatible-assignee and driver-only rows; byte, timestamp and row-count receipts prove no board or registry write, and every returned row is then accepted by the atomic claim path. |
 | Story lifecycle | Separate processes exercise planning through done, child-lane gates, epic activation, review signoff/revocation, reviewer/committer dispatch, and merge completion. |
+| Related-row IDs under tag scope (`t-a3928b36`, George `a-daa231b3`) | `story_advance_names_tag_denied_child_id_without_exposing_its_row` runs the compiled CLI against managed board and tag scopes: the visible child's row is readable, the hidden child's direct read is denied, and advancing their visible story refuses with both open child IDs but no hidden title or tag; the story remains in-progress. The removed web event projection is historical (ADR-053). |
 | Bounded projections | Long append-only history is rendered within the requested context bound while preserving the newest next action; generated TODO output declares SQLite authority. |
 | SQLite-native RAG retrieval | Separate processes prove exact-ID top-one, the five-query paraphrase corpus, filters, cold-history opt-in, cross-board isolation, bounded cited results, explicit vector rebuild, and V12-to-V13 knowledge preservation. |
 | MCP search parity | The generated `search` read tool and `search_rebuild` write tool execute the real CLI over stdio and return a cited source. |
@@ -339,7 +340,7 @@ migration remain `PLANNED`; no row below claims those later slices.
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | the POST carries one key through the same Store operation the CLI resolve uses; the recorded answer then settles a later resolve with no second flag; the loser-of-two-submissions conflict half is exercised at store level by the one-answer refusal and remains browser-unexercised by design (one tab, one answer) |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | digits answer the check pre-unlock and the decision after it, keyboard and pointer paths both decide, focus lands on the produced explanation/choice, pass and miss read as words with colour behind them, and Undo keeps working on the decided rows |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its linked rows removal-tag-gated across listings, search, lanes, watch and by-id surfaces with taskless controls readable (t-2cffbe08, A23); orphaned handoffs stay deniable yet acceptable without a lease, archivable, and doctor-healthy with orphan links reported (t-2cffbe08, A23); removed and live denied ids probe identically on `task add --id` with plain refusals unmanaged (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `dependency_replacement_keeps_a_tag_denied_prerequisite`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe`; `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`; `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`; `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`; `attention_by_id_withholds_rows_on_a_tag_denied_task`; `subscription_relation_targets_withhold_a_tag_denied_task_on_read`; `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`; `import_requires_whole_board_write_and_names_no_denied_id`; `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its linked rows removal-tag-gated across listings, search, lanes, watch and by-id surfaces with taskless controls readable (t-2cffbe08, A23); orphaned handoffs stay deniable yet acceptable without a lease, archivable, and doctor-healthy with orphan links reported (t-2cffbe08, A23); removed and live denied ids probe identically on `task add --id` with plain refusals unmanaged (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -415,17 +416,19 @@ worktree.
 note-kind predicate bound to the opaque cursor, with an additive four-key envelope shared
 field-for-field with Ord; board schema stands at 35 and no migration rides this slice.
 
-## Requirements trace — docs/specs/cli.md CLI-01..CLI-06
+## Requirements trace — docs/specs/cli.md CLI-01..CLI-07
 
 `tag add` registers only namespaced tags, refused with the board's estate, and `task add
 --id` is refused unless it is the kind's own shape, on branch `wt/t-7f596f45-tagns` at
 2026-09-25 for `CLI-01`..`CLI-05` and on branch `wt/t-6148c0ba-idshape` at 2026-09-25 for
-`CLI-06` (board row `t-6148c0ba`). Every test these rows name exists in that build,
+`CLI-06` (board row `t-6148c0ba`); the attach refusal names the board's estate form on
+branch `wt/t-7f596f45-map` at 2026-09-29 for `CLI-07` (attention `a-9254741a`). Every test
+these rows name exists in that build,
 enumerated with `cargo test --locked --lib -- --list` (unit rows) and
 `cargo test --locked --test e2e -- --list` (process rows). `Layer` uses the specification's
 own vocabulary, where `unit` is an in-process Rust `#[test]` and `process` is a
 compiled-binary process-boundary exchange in `tests/e2e.rs` with no HTTP and no browser.
-Of the 6 requirements — all `MUST` — 5 are proved at `process` and 1 at `unit`, and none
+Of the 7 requirements — all `MUST` — 6 are proved at `process` and 1 at `unit`, and none
 carries browser evidence: the slice changes no served markup (the chip half is retired
 with the web view, ADR-053), so each row says `no e2e coverage` plainly.
 
@@ -437,8 +440,9 @@ with the web view, ADR-053), so each row says `no e2e coverage` plainly.
 | `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, attaches, reads back. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
 | `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence and an empty listing; `t-1234abcd` accepted; the duplicate refused as before (`task t-1234abcd already exists`). The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. no e2e coverage |
+| `CLI-07` | MUST | process | `tag_attach_refusal_names_the_boards_estate_form` | `task add --tag assistant` on `prjx` refused with the exact `tag add ifca/assistant` repair and no row written; the named repair then registers and attaches; the unmapped board carries the estate list with the `<estate>/` placeholder and no single form. no e2e coverage |
 
-6 requirements: 6 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
+7 requirements: 7 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
 legacy tags already registered stay registered and migrate with `tag rename`; rows keep
 their ids and a refused `task add` writes no row and no event.
 
@@ -508,6 +512,55 @@ tests, re-run unchanged; the remaining 23 active requirements carry `none` rows,
 `t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states (`LINKED-23` withdrawn with the
 served surface, owned by no implementation row).
 
+## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
+
+The claim-routing slice is implemented by row `t-8c698a02` on branch `wt/t-8c698a02-impl`
+(base `448d722`), where the specification is `SPEC-READY` on 2026-09-29. `Layer` uses the
+specification's vocabulary: `process` is a compiled-binary process-boundary exchange in
+`tests/e2e.rs`. All 8 requirements are `MUST` and all 8 are proved at `process`; every name was
+enumerated with `cargo test --test e2e -- --list`. Four tests (`CLAIM-01`, `CLAIM-04`,
+`CLAIM-05`, `CLAIM-08`) fail on the baseline and pass with the change; the other four pin the
+refusals and the `--allow-reassign` bypass the change must not widen. This slice changes no
+served markup, so there is no browser surface to drive.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `CLAIM-01` | MUST | process | `claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane` | bare, harness and typed spellings of lane `driver-2` (and trunk `driver`) see each other's rows in both directions; `driver-20`, `driver-02`, `driver-two`, `driverless` do not |
+| `CLAIM-02` | MUST | process | `claim_routing_falls_back_to_exact_strings_without_a_lane` | `geoyws`, `superdriver`, `a@b@driver-2` and `@:px/px/superdriver` match only their exact string; the named claim is refused in the existing words and writes nothing |
+| `CLAIM-03` | MUST | process | `claim_routing_refuses_a_typed_lane_from_another_board` | three typed forms for `driver-2` in another team or board are refused and not offered; the board is untouched |
+| `CLAIM-04` | MUST | process | `claim_candidates_show_same_lane_rows_to_the_callers_own_lane` | the measured case: `claude@driver-2` is offered, and handed by `--next`, the row assigned to `@:px/px/driver-2` |
+| `CLAIM-05` | MUST | process | `named_claim_takes_a_same_lane_row` | bare `driver-2` takes the typed row; the model refusal still comes before the assignee check |
+| `CLAIM-06` | MUST | process | `named_claim_refuses_a_different_lane_in_the_existing_words` | `claude@driver-3`, `codex@driver`, `driver-3` and `geoyws` get `task t-lane is assigned to @:px/px/driver-2`, are not offered it by `--candidates` or `--next`, and the board is untouched |
+| `CLAIM-07` | MUST | process | `allow_reassign_still_bypasses_every_assignee_spelling` | `--allow-reassign` offers and claims rows assigned in typed, harness and lane-less spellings |
+| `CLAIM-08` | MUST | process | `successful_claim_stores_the_caller_string_verbatim` | after `claim --as claude@driver-2` the stored assignee reads `claude@driver-2` |
+
+8 requirements: 8 MUST, 8 proved at `process`, no SHOULD or MAY.
+
+## Requirements trace — `docs/specs/deploy.md` DEPLOY-01..DEPLOY-08
+
+The DEPLOY slice is `SPEC-READY` on 2026-09-30 (commit `93103f8`) and implemented by row
+`t-1220f80f` on branch `wt/t-c720eb6b-deploy`. `Layer` uses the specification's vocabulary:
+`process` is a compiled-binary process-boundary exchange in `tests/e2e.rs`. All 8 requirements
+are `MUST` and all 8 are proved at `process`; every name was enumerated with
+`cargo test --test e2e -- --list`. Two of the four new tests
+(`deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` and
+`deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards`) fail on the baseline and
+pass with the change; the other two pin the pairings the change must not move. The slice has no
+browser surface.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `DEPLOY-01` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_bdt` on `geoywsMBP` and `@_bd` on `geoywsMBA`; `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` covers an unmapped board |
+| `DEPLOY-02` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_bdt` and `@_bd` on `hig` for board `kanban` get the baseline MBP-tier sentence, compared byte-for-byte; nothing is written |
+| `DEPLOY-03` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_p` on `geoywsMBP` and `geoywsMBA` get the baseline Hetzner-tier sentence, compared byte-for-byte |
+| `DEPLOY-04` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_p` on `hax` and `@_uat` on `hig`; the existing test covers an unmapped board |
+| `DEPLOY-05` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | boards `kanban`, `acies`, `unum` and `unum-web` record `@_bdt` and `@_bd` on `hax` |
+| `DEPLOY-06` | MUST | process | `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards` | boards `px`, `prjx-root` (estate ifca) and `TIERHOST` (no estate) are refused on `hax` in the two exact sentences and write no attempt; `HAX` is not `hax` |
+| `DEPLOY-07` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | a repeated `--operation-id op-1` returns the same attempt with `idempotentReplay: true` and one attempt row |
+| `DEPLOY-08` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | after the `hax` attempts the board file reads `PRAGMA user_version` 36 |
+
+8 requirements: 8 MUST, 8 proved at `process`.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
@@ -517,3 +570,43 @@ served surface, owned by no implementation row).
   redaction, repeatable semantic filters, sparse matches before `--limit`,
   removed-subject replay, and historical relation-target replay.
 - This matrix does not claim deployment evidence or full-suite release status.
+
+## Requirements trace — `docs/specs/done-gate.md` DG-01..DG-18
+
+One row per requirement, on branch `wt/t-7038c70a-impl` at the implementation
+commit (dirty, uncommitted per the slice contract: no commit, branch or push
+from the implementation task). `Layer` uses the specification's own
+vocabulary, where `process` is a compiled-binary process-boundary exchange in
+`tests/done_gate_e2e.rs` and `unit` is an in-process `#[test]`. All eighteen
+requirements are `MUST` at `process`; the `process` names below are the
+specification §8 plan, proved by the sibling e2e slice in
+`tests/done_gate_e2e.rs` and enumerated with
+`cargo test --locked --test done_gate_e2e -- --list` on integration — they do
+not exist in this change, following the `MODEL` precedent of landing the
+trace with the fixed test set. Every row carries `no e2e coverage` plainly:
+the whole surface is CLI, so no row has browser evidence. Where an in-process
+unit test in `rust/store.rs` (`mod tests`) or `rust/db.rs` (`mod tests`)
+already pins the same obligation in this change, the Note names it; those
+`unit` names were enumerated with `cargo test --locked --lib -- --list`
+before the row landed.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `DG-01` | MUST | process | `done_gate_refuses_done_move_without_verdict` | no e2e coverage; unit `done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing` holds the sentence-1 wording byte-exact with row, lease and event count unchanged |
+| `DG-02` | MUST | process | `done_gate_rejects_incomplete_verdict_record` | no e2e coverage; unit `done_gate_empty_evidence_never_satisfies` holds the empty-evidence refusal as sentence 1, and `done_gate_opens_for_a_foreign_planner_verdict_covering_the_head` the stored five-field row surviving restart, retag-free moves and the citing move |
+| `DG-03` | MUST | process | `done_gate_refuses_self_review_verdict` | no e2e coverage; unit `done_gate_refuses_self_review_but_a_foreign_closer_passes` (A3 holder-as-reviewer plus A13 writer-as-closer, then the foreign closer succeeding) and `done_gate_released_holder_is_still_the_holder_of_record` (A16) hold sentence 3 byte-exact |
+| `DG-04` | MUST | process | `done_gate_requires_resolved_decision_citations` | no e2e coverage; unit `done_gate_cited_decisions_must_be_resolved_at_the_move` holds the open-refuses, resolved-opens, reopened-refuses lifecycle |
+| `DG-05` | MUST | process | `done_gate_force_requires_geoyws` | no e2e coverage; unit `done_gate_override_is_geoyws_only_and_audited` holds the sentence-4 refusal for a non-`geoyws` force with the row unchanged |
+| `DG-06` | MUST | process | `done_gate_override_writes_audited_event` | no e2e coverage; unit `done_gate_override_is_geoyws_only_and_audited` reads the `done_gate_override` row back: actor `geoyws`, task, prior status and the `missing-verdict` reason on the hash chain |
+| `DG-07` | MUST | process | `done_gate_refuses_executor_written_verdict` | no e2e coverage; unit `done_gate_refuses_an_executor_written_verdict` holds sentence 3 for the holder-written row, nothing stored, head unmoved, the later done-move still refused |
+| `DG-08` | MUST | process | `done_gate_refusals_carry_named_reasons` | no e2e coverage; the seven verbatim sentences are held byte-exact by the unit suite: 1 in `done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing`, 2 in `done_gate_stale_verdict_refuses_until_a_fresh_one_lands`, 3 in `done_gate_refuses_self_review_but_a_foreign_closer_passes`, 4 in `done_gate_override_is_geoyws_only_and_audited`, 5 and 6 in `done_gate_refuses_short_and_unattested_shas`, 7 in `done_gate_flag_defaults_off_and_audits_changes` |
+| `DG-09` | MUST | process | `done_gate_off_leaves_move_unchanged` | no e2e coverage; unit `done_gate_off_and_non_done_moves_are_untouched` moves `done` with the flag absent exactly as at the baseline |
+| `DG-10` | MUST | process | `done_gate_fires_only_on_done` | no e2e coverage; unit `done_gate_off_and_non_done_moves_are_untouched` moves to `review` under the gate with no verdict demanded; the writes that count as reaching `done` are enumerated in `DG-17` |
+| `DG-11` | MUST | process | `done_gate_verdicts_table_is_append_only_across_migration` | no e2e coverage; unit `board_v37_adds_an_append_only_verdicts_table_and_a_rewound_rerun_keeps_rows` (`rust/db.rs`) holds the forward-only step and the rewind-rerun, and `done_gate_migration_carries_verdicts_and_overrides_forward` holds pre-gate rows verdict-free with stored rows and override events surviving a reopen |
+| `DG-12` | MUST | process | `done_gate_verdict_add_verb_records_pass_only` | no e2e coverage; unit `done_gate_opens_for_a_foreign_planner_verdict_covering_the_head` records the `pass`-only row through the holder/lease write check, and `done_gate_refuses_an_executor_written_verdict` the refused half |
+| `DG-13` | MUST | process | `done_gate_refuses_short_and_unattested_shas` | no e2e coverage; unit `done_gate_refuses_short_and_unattested_shas` holds sentences 5 and 6 byte-exact with nothing stored; process test `a8_done_gate_refuses_short_and_unattested_shas` drives the compiled binary; publication is the writer's `--attest-published` attestation, recorded as `publishedAttestedBy`/`publishedAttestedAt` (asserted by `a2_done_gate_verdict_add_verb_records_pass_only`); the ledger does not verify origin (George, `a-8b3467aa`) |
+| `DG-14` | MUST | process | `done_gate_stale_verdict_does_not_open_gate` | no e2e coverage; unit `done_gate_stale_verdict_refuses_until_a_fresh_one_lands` holds sentence 2 byte-exact, `done_gate_head_ordering_prefers_newest_time_then_source_then_row`, `done_gate_head_tie_break_prefers_claims_then_checkpoints` and `done_gate_head_tie_within_checkpoints_prefers_the_newest_row` hold the newest-time plus tie-break ordering, `done_gate_heartbeat_at_an_unchanged_head_stales_nothing` the heartbeat and satisfy-again rules, `done_gate_no_head_opens_only_by_override` the no-head rule, and `done_gate_abbreviated_provenance_never_matches_a_full_sha` the exact-match rule |
+| `DG-15` | MUST | process | `done_gate_flag_defaults_off_and_audits_changes` | no e2e coverage; unit `done_gate_flag_defaults_off_and_audits_changes` holds absent-as-off, the `geoyws` on-toggle with its `off`-to-`on` audit event, the sentence-7 refused toggle changing nothing, and the off-toggle restoring the baseline |
+| `DG-16` | MUST | process | `done_gate_story_and_epic_project_done_without_verdict` | no e2e coverage; unit `done_gate_story_and_epic_moves_take_no_verdict` holds the story-projection refusal with no gate sentence and the direct epic move succeeding with no verdict |
+| `DG-17` | MUST | process | `a17_done_gate_checkpoint_done_is_gated`, `a17_done_gate_task_add_done_is_refused`, `a17_done_gate_import_done_is_refused` | no e2e coverage; each refuses with DG-08 sentence 1 on the gated board with nothing written and succeeds on the ungated twin |
+| `DG-18` | MUST | process | `a18_done_gate_verdict_list_hides_unreadable_evidence` | no e2e coverage; tag-scoped managed estate: the verdict row answers with writer, reviewer, SHAs and verdict intact while unreadable evidence ids are omitted, and granting the hidden tag brings the id back |

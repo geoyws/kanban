@@ -2615,6 +2615,31 @@ UPDATE attention SET task_id=(
  AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
 );
 "#;
+/// Done-gate verdicts (DG-11). One row per stored `pass` verdict, carrying the
+/// writer from `--as` at write time alongside reviewer, SHAs, verdict,
+/// evidence and the publication attestation (DG-13: who attested the SHAs are
+/// on origin, and when); rows are never updated and never deleted, and a
+/// newer verdict is a newer row. A new table, so the step is re-run safe by
+/// `IF NOT EXISTS`:
+/// a board rewound past its own v37 shape re-runs to the same table rather
+/// than failing. No backfill: pre-gate boards open as "no verdict" and the
+/// gate refuses until one is earned. The `done_gate` board flag needs no
+/// schema step: it is a `board_meta` key, absent (off) until set.
+const BOARD_V37: &str = r#"
+CREATE TABLE IF NOT EXISTS verdicts (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+ task_id TEXT NOT NULL,
+ writer TEXT NOT NULL,
+ reviewer TEXT NOT NULL,
+ shas TEXT NOT NULL CHECK(json_valid(shas)),
+ verdict TEXT NOT NULL,
+ evidence TEXT NOT NULL CHECK(json_valid(evidence)),
+ published_attested_by TEXT NOT NULL,
+ published_attested_at INTEGER NOT NULL,
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
+"#;
 
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
@@ -2917,7 +2942,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 36;
+pub const BOARD_SCHEMA_VERSION: usize = 37;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -3481,7 +3506,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34, BOARD_V35, BOARD_V36,
+    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -5022,7 +5047,7 @@ mod tests {
             .expect("insert a pre-snooze row");
         migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
         assert_eq!(schema_version(&connection).unwrap(), 35);
-        assert_eq!(BOARD_SCHEMA_VERSION, 36);
+        assert_eq!(BOARD_SCHEMA_VERSION, 37);
         let trigger = |connection: &Connection, id: &str| -> Option<String> {
             connection
                 .query_row(
@@ -5182,6 +5207,38 @@ mod tests {
         // Re-running the ladder over the migrated shape is stable.
         migrate(&mut connection, BOARD_MIGRATIONS).expect("re-run the ladder");
         assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn board_v37_adds_an_append_only_verdicts_table_and_a_rewound_rerun_keeps_rows() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..36]).expect("migrate through v36");
+        assert_eq!(schema_version(&connection).unwrap(), 36);
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v37");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        connection
+            .execute(
+                "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,\
+                 published_attested_by,published_attested_at,created_at) \
+                 VALUES('t-x','planner','lane-r','[\"abc\"]','pass','[\"a-1\"]','planner',1,1)",
+                [],
+            )
+            .expect("store a verdict row");
+        // A board rewound past its own v37 shape re-runs to the same table
+        // rather than failing, and keeps what the table already holds.
+        connection
+            .pragma_update(None, "user_version", 36)
+            .expect("rewind past v37");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("rerun v37 after a rewind");
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+        let stored: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM verdicts WHERE task_id='t-x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "the rerun must keep stored verdict rows");
     }
     #[test]
     fn schema_36_backfills_pre_v36_nulled_links_from_creation_events() {

@@ -1540,9 +1540,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 36);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 36);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 36);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 37);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 37);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 37);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -10865,6 +10865,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "search" => vec!["search", "Some work"],
             "task list" => vec!["task", "list"],
             "task show" => vec!["task", "show", "t-1"],
+            "task verdict list" => vec!["task", "verdict", "list", "t-1"],
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
             "attention show" => vec!["attention", "show", &attention_id],
@@ -17562,7 +17563,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
 }
 
@@ -18332,7 +18333,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -19700,7 +19701,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -24260,6 +24261,115 @@ fn tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only() 
         fixture.ok_json(&fixture.main, &["tag", "list", "--json"]),
         json!([]),
         "a refused registration must leave the master file empty"
+    );
+}
+
+/// CLI-07 — attaching an unregistered tag refuses with the board's estate
+/// form, and the named repair is a working one: it registers, and the tag
+/// then attaches. An unmapped board carries the estate list and suggests no
+/// single form.
+#[test]
+fn tag_attach_refusal_names_the_boards_estate_form() {
+    // Mapped board: the refusal names `tag add ifca/assistant`.
+    let fixture = Fixture::new("tag-attach-repair");
+    fixture.ok_json(&fixture.main, &["init", "--name", "prjx", "--json"]);
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unregistered tag was attached"
+    );
+    assert_eq!(
+        refusal_object(&refused),
+        "tag assistant is not in this board's master file — \
+         register it first with `tag add ifca/assistant`",
+        "the attach refusal must name the estate form"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused attach must write no row"
+    );
+    // The suggested repair registers, and the tag then attaches.
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "ifca/assistant", "--as", "geoyws", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "ifca/assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-chat", "--json"])["tags"],
+        json!(["ifca/assistant"]),
+        "the repaired tag must attach and read back"
+    );
+
+    // Unmapped board: the estate list, no single suggestion.
+    let unmapped = Fixture::new("tag-attach-repair-unmapped");
+    unmapped.ok_json(&unmapped.main, &["init", "--name", "SCRATCH", "--json"]);
+    let refused = unmapped.run(
+        &unmapped.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "assistant",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unregistered tag was attached"
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("register it first with `tag add <estate>/assistant`"),
+        "the unmapped attach refusal must name the estate placeholder: {message}"
+    );
+    assert!(
+        message.contains("(estates: ifca, unum, geoyws)"),
+        "the unmapped attach refusal must carry the estate list: {message}"
+    );
+    for estate in ["ifca", "unum", "geoyws"] {
+        assert!(
+            !message.contains(&format!("tag add {estate}/assistant")),
+            "an unmapped board must suggest no single form: {message}"
+        );
+    }
+    assert_eq!(
+        unmapped.ok_json(&unmapped.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused attach must write no row"
     );
 }
 
@@ -31502,58 +31612,50 @@ fn hig_release_script_refuses_a_hig_install_when_the_activated_hax_release_is_no
     );
 }
 
-/// Split ownership (t-317647c9): an install root no service identity can
-/// traverse to is refused before anything is written, naming the blocking
-/// ancestor. The walk reads mode bits rather than effective access because
-/// the installer is usually root, for whom access() never fails. Roots
-/// under the child's $TMPDIR are scratch by convention and skip the walk,
-/// so the dark parent lives in a scratch dir of its own with the child's
-/// TMPDIR pointed elsewhere; both are restored and removed first, so
-/// assertions never run against a 700 directory left behind.
+/// The live store sits under a root-only ancestor: `/root` is 0700 on hig and
+/// `/root/.local` is 0750 on hax, and George kept it there (a-e5391903,
+/// 2026-09-30) because only root reads it. An installer that demanded
+/// other-traverse on every ancestor refused the 102799b release on hax before
+/// writing anything (2026-10-01), so both targets must install and activate
+/// under an ancestor that grants other nothing.
 #[test]
-fn hig_release_script_install_refuses_a_release_root_no_service_identity_can_traverse() {
-    let harness = ReleaseGuardHarness::new("hig-release-dark-root");
-    // Two scratch dirs: the child's TMPDIR must NOT contain the dark root,
-    // or the scratch exemption skips the very walk this test exercises.
-    let tmp_home =
-        std::env::temp_dir().join(format!("kanban-rust-e2e-dark-tmp-{}", std::process::id()));
-    let elsewhere = std::env::temp_dir().join(format!(
-        "kanban-rust-e2e-dark-elsewhere-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&tmp_home).unwrap();
-    fs::create_dir_all(&elsewhere).unwrap();
-    let dark = elsewhere.join("dark-parent");
-    fs::create_dir_all(&dark).unwrap();
-    fs::set_permissions(&dark, fs::Permissions::from_mode(0o700)).unwrap();
-    let install_root = dark.join("store");
-    let bin_dir = harness.fixture.root.join("dark-root-bin");
-    let mut command = harness.install_command(
-        "hax",
-        &harness.package_dir,
-        &harness.hax_install_root,
-        &install_root,
-        &bin_dir,
-    );
-    command.env("TMPDIR", &tmp_home);
-    let refused = command.output().unwrap();
-    fs::set_permissions(&dark, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::remove_dir_all(&tmp_home).unwrap();
-    fs::remove_dir_all(&elsewhere).unwrap();
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        !refused.status.success(),
-        "install under a 700 parent succeeded"
-    );
-    assert!(
-        stderr.contains("grants no other-traverse") && stderr.contains(dark.to_str().unwrap()),
-        "expected the dark ancestor to be named in a traversal refusal:\n{stderr}"
-    );
-    assert!(
-        !install_root.exists(),
-        "a refused install created {}",
-        install_root.display()
-    );
+fn hig_release_script_installs_under_a_root_only_ancestor() {
+    let harness = ReleaseGuardHarness::new("hig-release-root-only-ancestor");
+    let private = harness.fixture.root.join("root-only-ancestor");
+    fs::create_dir_all(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    // Production's TMPDIR does not contain the store, so neither may this one.
+    let tmp = harness.fixture.root.join("root-only-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let mut outcomes = Vec::new();
+    for target in ["hax", "hig"] {
+        let install_root = private.join(format!("store-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("root-only-bin-{target}"));
+        let installed = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap();
+        let current = fs::read_link(install_root.join("current")).ok();
+        outcomes.push((target, installed, install_root, bin_dir, current));
+    }
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+    for (target, installed, install_root, bin_dir, current) in outcomes {
+        assert!(
+            installed.status.success(),
+            "{target}: install under a 0700 ancestor failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let release_dir = current.unwrap_or_else(|| panic!("{target}: no current link"));
+        assert_release_view(&install_root, &bin_dir, &release_dir);
+    }
 }
 
 /// Packaging is not the only way a binary reaches a release store: a package
@@ -32940,11 +33042,7 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
     for name in [
         "physical_dir",
         "ensure_managed_activation_receipt",
-        // The release-view gate and the traversability guard it calls: a
-        // remote copy that lost the 700-parent refusal would strand hig
-        // activations the local leg refuses (t-317647c9).
         "ensure_safe_release_view",
-        "require_shared_release_root_traversable",
         "reject_carried_release_identity",
         "require_release_platform",
         // The version probe and the release-set membership check it calls:
@@ -34170,15 +34268,11 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
 }
 
 /// A release directory is born from `mktemp -d`, which makes 0700, and `mv`
-/// carries that mode onto the release. That was invisible while root both
-/// installed the release and ran the service; since the hax identity cutover
-/// (2026-09-06) `kanban-serve` runs as the `kanban` user, and installing a
-/// 0700 release on 2026-09-07 09:27 CEST left systemd unable to reach the new
-/// binary at all: 203/EXEC, restart loop, loopback down for about three and a
-/// half minutes until the directory was chmod'ed by hand. The mode bits are
-/// exactly what the service identity sees, so they are what this asserts:
-/// this test cannot switch uid, but a directory missing its world execute bit
-/// is unreachable to every identity except its owner, whoever that is.
+/// carries that mode onto the release. Historically, while `kanban-serve` ran
+/// as the `kanban` user, a 0700 release caused 203/EXEC on 2026-09-07. Today
+/// only root reads the store (a-e5391903), but new release directories remain
+/// 0755 so a future service-traversed store needs no installer change. This
+/// test asserts the activated release's mode and its managed links.
 #[test]
 fn hig_release_script_installs_a_release_directory_another_identity_can_traverse() {
     let harness = ReleaseGuardHarness::new("hig-release-traversable");
@@ -41268,7 +41362,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 36, "the board did not migrate forward");
+    assert_eq!(migrated, 37, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -41300,7 +41394,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 36);
+    assert_eq!(again, 37);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any
@@ -42135,4 +42229,582 @@ fn compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it() {
                 == "deployments row d-orphan references missing task t-vanished"),
         "doctor did not report the dangling task link: {links}"
     );
+}
+
+#[test]
+fn compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id() {
+    let fixture = Fixture::new("reused-task-link");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ReusedLink", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "geoyws/secret", "--as", "seed", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "the reused secret task",
+            "--id",
+            "t-reused",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "reusedlink body on the removed secret task",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/reused-link-probe",
+            "--branch",
+            "main",
+            "--head",
+            "0000000000000000000000000000000000000000",
+            "--dirty",
+            "clean",
+            "--task",
+            "t-reused",
+            "--json",
+        ],
+    );
+    let removed = fixture.run(
+        &fixture.main,
+        &["task", "remove", "t-reused", "--as", "seed"],
+    );
+    assert!(
+        removed.status.success(),
+        "could not remove the secret task: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // What the reuse refusal now forbids, planted the way history left it: a
+    // pre-V34 removal nulled the sitrep link, and the id was re-added before
+    // the refusal existed, so the row is NULL-linked while its creation event
+    // names a removed-but-live-again id. The stale search documents go first:
+    // the delete trigger re-embeds surviving rows, so any re-INSERT would
+    // otherwise collide with the history index on its own documents.
+    let planted = Connection::open(&board).unwrap();
+    planted
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             UPDATE sitreps SET task_id=NULL WHERE task_id='t-reused';
+             DELETE FROM search_documents WHERE task_id='t-reused';
+             INSERT INTO tasks(id,type,title,status,created_at,updated_at)
+               VALUES('t-reused','task','reused incarnation','todo',1,1);",
+        )
+        .unwrap();
+    let sitrep_id: String = planted
+        .query_row("SELECT id FROM sitreps", [], |row| row.get(0))
+        .unwrap();
+    drop(planted);
+    // The plant is raw SQL, so it bypasses the inline embedding writer and
+    // leaves unembedded documents behind; rebuilding restores the "otherwise
+    // healthy" premise without touching the residual itself.
+    fixture.ok_json(&fixture.main, &["search-rebuild", "--as", "seed", "--json"]);
+    // The old key stays quiet — the id has a removal record — and the new key
+    // names the row for the owner to review. The residual is advisory: no verb
+    // can clear it, so it does not affect `healthy` or the exit code.
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        checked.status.success(),
+        "doctor failed on an otherwise healthy board over the advisory reused-task residual: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(
+        report["healthy"].as_bool().unwrap(),
+        "doctor marked an otherwise healthy board unhealthy over the advisory residual: {report}"
+    );
+    assert!(
+        report["projects"][0]["orphanedTaskLinks"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the reused id was reported as an orphan: {}",
+        report["projects"][0]["orphanedTaskLinks"]
+    );
+    let links = report["projects"][0]["reusedTaskLinks"].clone();
+    assert!(
+        links
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap()
+                == format!("sitreps row {sitrep_id} nulled from reused task t-reused")),
+        "doctor did not report the nulled row from the reused task id: {links}"
+    );
+}
+
+/// A fresh board holding one `todo` row `t-lane` assigned to `assignee`, with
+/// no `lane` column, so no `--lane`/`--role` filter removes it
+/// (docs/specs/claim-routing.md §4).
+fn claim_routing_board(label: &str, assignee: &str) -> Fixture {
+    let fixture = Fixture::new(label);
+    fixture.ok_json(&fixture.main, &["init", "--name", "ROUTE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Sweep the logs",
+            "--id",
+            "t-lane",
+            "--assignee",
+            assignee,
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture
+}
+
+fn claim_candidate_ids(fixture: &Fixture, agent: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["claim", "--candidates", "--as", agent];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    fixture
+        .ok_json(&fixture.main, &args)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The board a refused claim leaves behind: still `todo`, assignee unchanged,
+/// no lease and no `task_claimed` event.
+fn assert_claim_wrote_nothing(fixture: &Fixture, assignee: &str) {
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-lane", "--json"]);
+    assert_eq!(
+        shown["status"], "todo",
+        "a refused claim moved the row: {shown}"
+    );
+    assert_eq!(
+        shown["assignee"], assignee,
+        "a refused claim retargeted the row: {shown}"
+    );
+    assert!(
+        shown["claim"].is_null(),
+        "a refused claim left a lease: {shown}"
+    );
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "t-lane", "--json"]);
+    assert!(
+        !events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "task_claimed"),
+        "a refused claim appended task_claimed: {events}"
+    );
+}
+
+/// CLAIM-01: bare, harness and typed spellings of one lane are one worker, in
+/// both directions, and lane-word lookalikes are not.
+#[test]
+fn claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane() {
+    let lane = vec!["t-lane".to_owned()];
+    let typed = claim_routing_board("claim-routing-typed", "@:px/px/driver-2");
+    for agent in [
+        "driver-2",
+        "claude@driver-2",
+        "codex@driver-2",
+        "@:px/px/driver-2",
+    ] {
+        assert_eq!(
+            claim_candidate_ids(&typed, agent, &[]),
+            lane,
+            "{agent} did not see its own lane's row assigned to @:px/px/driver-2"
+        );
+    }
+    for agent in [
+        "claude@driver-20",
+        "claude@driver-02",
+        "driver-two",
+        "claude@driverless",
+    ] {
+        assert!(
+            claim_candidate_ids(&typed, agent, &[]).is_empty(),
+            "{agent} is not lane driver-2 but saw its row"
+        );
+    }
+    let harness = claim_routing_board("claim-routing-harness", "claude@driver-2");
+    for agent in ["driver-2", "codex@driver-2", "@:kanban/kanban/driver-2"] {
+        assert_eq!(
+            claim_candidate_ids(&harness, agent, &[]),
+            lane,
+            "{agent} did not see its own lane's row assigned to claude@driver-2"
+        );
+    }
+    let trunk = claim_routing_board("claim-routing-trunk", "driver");
+    assert_eq!(claim_candidate_ids(&trunk, "codex@driver", &[]), lane);
+    assert!(claim_candidate_ids(&trunk, "codex@driver-2", &[]).is_empty());
+}
+
+/// CLAIM-02: where either side names no lane, only the byte-identical string
+/// is the same worker.
+#[test]
+fn claim_routing_falls_back_to_exact_strings_without_a_lane() {
+    let lane = vec!["t-lane".to_owned()];
+    for assignee in [
+        "geoyws",
+        "superdriver",
+        "a@b@driver-2",
+        "@:px/px/superdriver",
+    ] {
+        let fixture = claim_routing_board("claim-routing-exact", assignee);
+        assert_eq!(claim_candidate_ids(&fixture, assignee, &[]), lane);
+        for agent in ["driver-2", "claude@driver-2", "@:px/px/driver-2", "Geoyws"] {
+            assert!(
+                claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+                "{agent} saw a row assigned to the lane-less {assignee}"
+            );
+        }
+        let refused = fixture.run(
+            &fixture.main,
+            &["claim", "t-lane", "--as", "claude@driver-2", "--json"],
+        );
+        assert_eq!(
+            refusal_object(&refused),
+            format!("task t-lane is assigned to {assignee}")
+        );
+        assert_claim_wrote_nothing(&fixture, assignee);
+    }
+    let lane_side = claim_routing_board("claim-routing-lane-vs-name", "driver-2");
+    assert!(claim_candidate_ids(&lane_side, "geoyws", &[]).is_empty());
+}
+
+/// CLAIM-03: two typed forms for the same lane word in different estates are
+/// different workers.
+#[test]
+fn claim_routing_refuses_a_typed_lane_from_another_board() {
+    let fixture = claim_routing_board("claim-routing-estate", "@:px/px/driver-2");
+    for agent in [
+        "@:other/kanban/driver-2",
+        "@:px/kanban/driver-2",
+        "@:other/px/driver-2",
+    ] {
+        assert!(
+            claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+            "{agent} saw another estate's row"
+        );
+        let refused = fixture.run(&fixture.main, &["claim", "t-lane", "--as", agent, "--json"]);
+        assert_eq!(
+            refusal_object(&refused),
+            "task t-lane is assigned to @:px/px/driver-2"
+        );
+    }
+    assert_claim_wrote_nothing(&fixture, "@:px/px/driver-2");
+}
+
+/// CLAIM-04: the measured case — a lane asking in its harness spelling sees and
+/// is handed its lane's row.
+#[test]
+fn claim_candidates_show_same_lane_rows_to_the_callers_own_lane() {
+    let fixture = claim_routing_board("claim-routing-candidates", "@:px/px/driver-2");
+    assert_eq!(
+        claim_candidate_ids(&fixture, "claude@driver-2", &[]),
+        vec!["t-lane".to_owned()]
+    );
+    let next = fixture.ok_json(
+        &fixture.main,
+        &["claim", "--next", "--as", "claude@driver-2", "--json"],
+    );
+    assert_eq!(next["taskID"], "t-lane");
+}
+
+/// CLAIM-05: a named claim takes a same-lane row, and the model check still
+/// refuses first.
+#[test]
+fn named_claim_takes_a_same_lane_row() {
+    let bare = claim_routing_board("claim-routing-named-bare", "@:px/px/driver-2");
+    let claimed = bare.ok_json(
+        &bare.main,
+        &["claim", "t-lane", "--as", "driver-2", "--json"],
+    );
+    assert_eq!(claimed["taskID"], "t-lane");
+
+    let fixture = Fixture::new("claim-routing-named-order");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ROUTE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "restricted",
+            "--id",
+            "t-lane",
+            "--assignee",
+            "@:px/px/driver-2",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let model_first = fixture.run(
+        &fixture.main,
+        &["claim", "t-lane", "--as", "claude@driver-3", "--json"],
+    );
+    assert_eq!(
+        refusal_object(&model_first),
+        "task t-lane is restricted to models [Astra]; pass --model with one of them to claim it"
+    );
+    let claimed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-lane",
+            "--as",
+            "claude@driver-2",
+            "--model",
+            "Astra",
+            "--json",
+        ],
+    );
+    assert_eq!(claimed["taskID"], "t-lane");
+}
+
+/// CLAIM-06: a different lane, or a lane-less caller, is refused in the
+/// existing words and the board is untouched.
+#[test]
+fn named_claim_refuses_a_different_lane_in_the_existing_words() {
+    let fixture = claim_routing_board("claim-routing-other-lane", "@:px/px/driver-2");
+    for agent in ["claude@driver-3", "codex@driver", "driver-3", "geoyws"] {
+        let refused = fixture.run(&fixture.main, &["claim", "t-lane", "--as", agent, "--json"]);
+        assert_eq!(
+            refusal_object(&refused),
+            "task t-lane is assigned to @:px/px/driver-2",
+            "{agent} was not refused in the existing words"
+        );
+        assert!(
+            claim_candidate_ids(&fixture, agent, &[]).is_empty(),
+            "{agent} was offered another lane's row"
+        );
+        let next = fixture.run(&fixture.main, &["claim", "--next", "--as", agent, "--json"]);
+        assert!(
+            !String::from_utf8_lossy(&next.stdout).contains("t-lane"),
+            "{agent} was handed another lane's row by --next"
+        );
+    }
+    assert_claim_wrote_nothing(&fixture, "@:px/px/driver-2");
+}
+
+/// CLAIM-07: `--allow-reassign` still bypasses the assignee gate for every
+/// spelling, on both paths.
+#[test]
+fn allow_reassign_still_bypasses_every_assignee_spelling() {
+    for assignee in ["@:px/px/driver-2", "claude@driver-2", "superdriver"] {
+        let fixture = claim_routing_board("claim-routing-reassign", assignee);
+        assert_eq!(
+            claim_candidate_ids(&fixture, "claude@driver-3", &["--allow-reassign"]),
+            vec!["t-lane".to_owned()],
+            "--allow-reassign did not offer the row assigned to {assignee}"
+        );
+        let claimed = fixture.ok_json(
+            &fixture.main,
+            &[
+                "claim",
+                "t-lane",
+                "--as",
+                "claude@driver-3",
+                "--allow-reassign",
+                "--json",
+            ],
+        );
+        assert_eq!(claimed["taskID"], "t-lane");
+    }
+}
+
+/// CLAIM-08: a successful same-lane claim stores the caller's own string,
+/// byte-for-byte, not a canonical spelling.
+#[test]
+fn successful_claim_stores_the_caller_string_verbatim() {
+    let fixture = claim_routing_board("claim-routing-verbatim", "@:px/px/driver-2");
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-lane", "--as", "claude@driver-2", "--json"],
+    );
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-lane", "--json"]);
+    assert_eq!(shown["assignee"], "claude@driver-2");
+    assert_eq!(shown["status"], "in_progress");
+}
+
+/// One board named `name` in its own fixture, and a `deploy start` against it
+/// (docs/specs/deploy.md §4 `START`).
+fn deploy_tier_board(test: &str, name: &str) -> Fixture {
+    let fixture = Fixture::new(&format!("deploy-{test}-{}", name.to_lowercase()));
+    fixture.ok_json(&fixture.main, &["init", "--name", name, "--json"]);
+    fixture
+}
+
+fn deploy_tier_start(fixture: &Fixture, tier: &str, host: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "deploy",
+        "start",
+        "--repo",
+        "geoyws/example",
+        "--commit",
+        "1111111111111111111111111111111111111111",
+        "--tier",
+        tier,
+        "--environment",
+        "env",
+        "--host",
+        host,
+        "--url",
+        "https://x",
+        "--as",
+        "e2e",
+    ];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    fixture.run(&fixture.main, &args)
+}
+
+fn deploy_tier_accepted(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "deploy start was refused: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn deploy_tier_attempt_count(fixture: &Fixture) -> usize {
+    fixture
+        .ok_json(&fixture.main, &["deploy", "list", "--all", "--json"])
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// DEPLOY-05, DEPLOY-07, DEPLOY-08: a Unum or geoyws board records the dev
+/// tiers on `hax`; a replay still returns before the pairing check; the board
+/// schema does not move.
+#[test]
+fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
+    for board in ["kanban", "acies", "unum", "unum-web"] {
+        let fixture = deploy_tier_board("hax-ok", board);
+        for tier in ["@_bdt", "@_bd"] {
+            let started = deploy_tier_accepted(&deploy_tier_start(&fixture, tier, "hax", &[]));
+            let attempt = &started;
+            assert_eq!(attempt["host"], "hax", "{board} {tier}: {started}");
+            assert_eq!(attempt["tier"], tier, "{board} {tier}: {started}");
+        }
+    }
+
+    let fixture = deploy_tier_board("hax-ok", "kanban");
+    let first = deploy_tier_accepted(&deploy_tier_start(
+        &fixture,
+        "@_bdt",
+        "hax",
+        &["--operation-id", "op-1"],
+    ));
+    let again = deploy_tier_accepted(&deploy_tier_start(
+        &fixture,
+        "@_bdt",
+        "hax",
+        &["--operation-id", "op-1"],
+    ));
+    assert_eq!(again["idempotentReplay"], true, "{again}");
+    assert_eq!(again["id"], first["id"]);
+    assert_eq!(deploy_tier_attempt_count(&fixture), 1);
+
+    let board = board_path_for_project(&fixture, &fixture.main, "kanban");
+    let schema = Connection::open(board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(
+        schema, 37,
+        "a dev-tier attempt on hax moved the board schema"
+    );
+}
+
+/// DEPLOY-06: an IFCA board, and a board no estate claims, keep the dev tiers
+/// off `hax`, in exactly the words the slice states, and write nothing.
+#[test]
+fn deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards() {
+    for (board, why) in [
+        ("px", "is in estate ifca"),
+        ("prjx-root", "is in estate ifca"),
+        ("TIERHOST", "maps to no estate"),
+    ] {
+        let fixture = deploy_tier_board("hax-no", board);
+        for tier in ["@_bdt", "@_bd"] {
+            assert_eq!(
+                refusal_object(&deploy_tier_start(&fixture, tier, "hax", &[])),
+                format!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {board} {why}, so deploy it from geoywsMBP (or geoywsMBA)"
+                )
+            );
+        }
+        assert_eq!(
+            deploy_tier_attempt_count(&fixture),
+            0,
+            "a refused dev-tier start on hax wrote an attempt for {board}"
+        );
+    }
+    // Byte-exact host: another spelling of hax is an ordinary Hetzner host.
+    let fixture = deploy_tier_board("hax-no", "kanban");
+    assert_eq!(
+        refusal_object(&deploy_tier_start(&fixture, "@_bdt", "HAX", &[])),
+        "tier @_bdt is an MBP tier (canonical row \"@_bdt -> geoywsMBP\"), but host is HAX; deploy it from geoywsMBP (or geoywsMBA)"
+    );
+}
+
+/// DEPLOY-02, DEPLOY-03: every other pairing refusal is byte-identical to the
+/// baseline, for a board the hax exception would otherwise favour.
+#[test]
+fn deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words() {
+    let fixture = deploy_tier_board("same-words", "kanban");
+    for tier in ["@_bdt", "@_bd"] {
+        assert_eq!(
+            refusal_object(&deploy_tier_start(&fixture, tier, "hig", &[])),
+            format!(
+                "tier {tier} is an MBP tier (canonical row \"{tier} -> geoywsMBP\"), but host is hig; deploy it from geoywsMBP (or geoywsMBA)"
+            )
+        );
+    }
+    for host in ["geoywsMBP", "geoywsMBA"] {
+        assert_eq!(
+            refusal_object(&deploy_tier_start(&fixture, "@_p", host, &[])),
+            format!(
+                "tier @_p is a Hetzner tier (canonical row \"@_p -> Hetzner host\"), but host is {host}; deploy it from a Hetzner host (e.g. hax or hig)"
+            )
+        );
+    }
+    assert_eq!(deploy_tier_attempt_count(&fixture), 0);
+}
+
+/// DEPLOY-01, DEPLOY-04: an IFCA board still records the dev tiers on the MBP
+/// and the Hetzner tiers on hax.
+#[test]
+fn deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board() {
+    let fixture = deploy_tier_board("ifca-pairs", "px");
+    for (tier, host) in [
+        ("@_bdt", "geoywsMBP"),
+        ("@_bd", "geoywsMBA"),
+        ("@_p", "hax"),
+        ("@_uat", "hig"),
+    ] {
+        let started = deploy_tier_accepted(&deploy_tier_start(&fixture, tier, host, &[]));
+        assert_eq!(started["host"], host, "{tier} {host}");
+    }
+    assert_eq!(deploy_tier_attempt_count(&fixture), 4);
 }

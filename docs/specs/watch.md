@@ -6,16 +6,22 @@
   refinements; numbering is by creation, grouping is by topic.
 - **Baseline:** `2026-09-28` at commit `edb07459d4bf1e36ffbb18cf621a7ddc15cfd1a7` (detached at
   `origin/kanban-geoyws-driver`) in `/Users/geoyws/work/wt/kanban-t-28dca81e-watch-41a533`. Every
-  "today" claim below cites the line that has it, as `<path>:<line>`, read in that worktree.
-  Board schema at the baseline is `34` (`rust/db.rs:2563`, `BOARD_SCHEMA_VERSION`), and neither
-  `watch --lane`, nor `watch --note-kind`, nor the envelope `lane`/`type`/`priority`/
-  `priorityLevel` keys exist yet: the specification is written before the implementation, as
-  ADR-047 §6 requires (per `docs/specs/README.md:15-22`).
-- **Status:** `DRAFT` — gate requested 2026-09-28. (SPEC-READY is stamped here by an independent
-  reviewer against the SDD reference's §1 exit criteria, not by the writer of this document. It
-  authorises neither implementation nor rollout nor release.)
+  "today" claim below cites the line that has it, as `<path>:<line>`, re-verified 2026-09-29 in
+  this worktree (branch `wt/t-28dca81e-ready` at `361d7e3`; the web view is retired per ADR-053,
+  so there is no `rust/serve.rs` here). Board schema in this worktree is `36`
+  (`rust/db.rs:2920`, `BOARD_SCHEMA_VERSION`), and neither `watch --lane`, nor
+  `watch --note-kind`, nor the envelope `lane`/`type`/`priority`/`priorityLevel` keys exist yet
+  (`rust/watch.rs` carries no `--lane`, no `--note-kind`, and no `lane`/`priorityLevel`
+  projection): the specification is written before the implementation, as ADR-047 §6 requires
+  (per `docs/specs/README.md:15-22`).
+- **Status:** `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria:
+  twelve MUST requirements each with a GWT example and exactly one §8 row, no material open
+  question (OQ-1 closed 2026-09-28, blocking the implementation gate only), all cited lines
+  spot-checked in this worktree, all layers `process` at the CLI boundary, Ord conformance held
+  as implementation gate GATE-ORD-READBACK per `a-97b3ab24`, no web-view dependence.
+  Specification readiness only — it authorises neither implementation, nor rollout, nor release.)
 - **Owner (product scope):** George. He alone resolves scope, whether a non-goal in §2 is
-  reinstated, and the open questions in §7.
+  reinstated, and the open question in §7 (OQ-1, closed 2026-09-28 — see §7).
 - **Decider (wording of this document):** slice row `t-28dca81e` under epic `e-c0852fe7`, approved
   on owner verdict `a-e240ed2d` (choice `watch`, outcome `approve`) — the approval ADR-047 §7
   requires for a slice outside the `WEB`/`SPA` rollout. (Read directly from the kb board:
@@ -23,8 +29,9 @@
   resolved by geoyws 2026-09-28: `WATCH slice approved; t-28dca81e promoted; t-fde5d91c proceeds once docs/specs/watch.md is SPEC-READY`.)
 - **Sources:**
   - Slice row `t-28dca81e` — the scope under approval: `watch --lane` cursor binding, note-kind
-    steer, envelope `lane`/`type`/`priority`, and shared kb/Ord conformance against Ord
-    `t-49703f52` as a read-only reference (conformance described, Ord untouched).
+    steer, envelope `lane`/`type`/`priority` with the kb side normative (WATCH-07), and Ord
+    `t-49703f52` as a read-only reference confirmed under GATE-ORD-READBACK at implementation
+    (Ord untouched).
   - Owner verdict `a-e240ed2d` (choice `watch`, `approve`) — the WATCH slice approved under
     ADR-047 §7.
   - Implementing row `t-fde5d91c` — the gated product code. It stays gated until this
@@ -36,36 +43,36 @@
   - `docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md` — why an unknown
     note kind, a mismatched cursor, and a board-semantic predicate on registry scope are refused
     with a sentence that names the accepted values, and why a refusal writes nothing.
-  - Shipped surface at the baseline: `rust/watch.rs:34-48` (`StreamKey`, the bound predicate
-    set), `rust/watch.rs:50-66` (`ScopeEnvelope`), `rust/watch.rs:66-90` (`CursorToken`,
+  - Shipped surface at the baseline: `rust/watch.rs:34-46` (`StreamKey`, the bound predicate
+    set), `rust/watch.rs:50-63` (`ScopeEnvelope`), `rust/watch.rs:66-87` (`CursorToken`,
     `deny_unknown_fields`, every newer field `#[serde(default)]`), `rust/watch.rs:156-157`
-    (`--follow` requires `--limit` of at least 1), `rust/watch.rs:493-549` (the `advanced`
-    heartbeat — the only place a cursor moves without an event), `rust/watch.rs:577-648`
+    (`--follow` requires `--limit` of at least 1), `rust/watch.rs:498-551` (the `advanced`
+    heartbeat — the only place a cursor moves without an event), `rust/watch.rs:594-645`
     (`project_event`: the additive protocol-v1 projection — `board`, `eventID`, `timestamp`,
     `subject`, `relations`, `priorStatus`, `currentStatus`, `tags`, bounded `metadata` — with
     `_semanticV1` hash-covered but never emitted and secrets redacted recursively),
-    `rust/watch.rs:672-730` (normalization: statuses, relations, the bound key), and
+    `rust/watch.rs:666-730` (normalization: statuses, relations, the bound key), and
     `rust/watch.rs:15-16` (`POLL_INTERVAL` 250ms, `METADATA_LIMIT` 16 KiB — observations, not
     budgets).
   - The values the new predicates range over: `NOTE_KINDS` with exactly six values
-    (`rust/model.rs:441-443`: `plan`, `progress`, `blocker`, `decision`, `evidence`, `done`),
-    selected today on `note` (`rust/lib.rs:1710-1715`); the task row's `lane`
-    (`rust/model.rs:492`), `type` (`rust/model.rs:486-487`), `priority` (`rust/model.rs:497`)
-    and its operator-facing projection `priority_level` (`rust/model.rs:472-479`: 0-2 `P0`,
-    3-5 `P1`, 6-9 `P2`); the stored event row (`rust/model.rs:713-724`).
+    (`rust/model.rs:361-363`: `plan`, `progress`, `blocker`, `decision`, `evidence`, `done`),
+    selected today on `note` (`rust/lib.rs:1701-1707`); the task row's `lane`
+    (`rust/model.rs:412`), `type` (`rust/model.rs:405-406`), `priority` (`rust/model.rs:417`)
+    and its operator-facing projection `priority_level` (`rust/model.rs:392-399`: 0-2 `P0`,
+    3-5 `P1`, 6-9 `P2`); the stored event row (`rust/model.rs:633-644`).
   - The existing evidence this slice preserves: nine `watch_*` cases plus one `the_watch_*` case in `tests/e2e.rs` plus
     `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` in
     `tests/authz_bypass_matrix_e2e.rs` — every name enumerated with
     `cargo test --locked --test e2e -- --list` and
     `cargo test --locked --test authz_bypass_matrix_e2e -- --list` on 2026-09-28 in this
-    worktree — and the coverage note at `docs/testing/compiled-rust-e2e-matrix.md:630-638`.
+    worktree — and the coverage note at `docs/testing/compiled-rust-e2e-matrix.md:445-453`.
   - Ord `t-49703f52` (read-only reference, unread from this worktree — no `acies` CLI and no
     `ACIES_*` environment here) via the `/ord` skill's `.result` envelope convention; the row-field
     shapes (`task list`/`task show` rows carrying the task's lane, type and priority,
-    `attention list` rows carrying the card's kind and lane) are assumptions for A6 to confirm,
-    not skill-documented shapes. The Ord column of the §5 table states expectations to be
-    verified against that row at implementation (OQ-1); the kb column states what the code does
-    today.
+    `attention list` rows carrying the card's kind and lane) are expectations GATE-ORD-READBACK
+    confirms at implementation (A6), not skill-documented shapes. The kb column of the §5 table
+    is normative (WATCH-07) and states what the code does today; the Ord column states the
+    expectation the gate reads back.
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries the slice's evidence
   table; the matrix section is the trace of record and the two are kept identical by the same
   change.
@@ -82,7 +89,8 @@ a second trace, a second cursor dialect, or a flag that silently means nothing.
   `--note-kind` and the existing predicates rather than filtering a firehose client-side.
 - The shared kb/Ord consumer (dispatcher adapters, queue bridges), which reads the envelope's
   `lane`/`type`/`priority` with identical names, casing, shapes and null rules on both boards.
-- George, who approves the slice (done, `a-e240ed2d`) and resolves the open question in §7.
+- George, who approves the slice (done, `a-e240ed2d`) and resolved the open question in §7
+  (OQ-1, closed on attention `a-97b3ab24`, choice `narrow`, 2026-09-28).
 
 **In scope.** The `watch` CLI grammar (`--lane`, `--note-kind`); their normalization and cursor
 binding; the four additive envelope keys on board scope and their explicit nulls on registry
@@ -90,8 +98,8 @@ scope and legacy events; the kb-vs-Ord conformance table; the refusals the new p
 
 **Boundaries.** The event ledger and its hashes (untouched — new keys are projected, never
 stored); the dispatcher and subscription rows (they keep their own `(subscriptionID,eventID)`
-identity; §2 of that surface is not re-specified here); the Ord board itself (read-only
-reference — OQ-1 — no Ord row is written by this slice); the browser and the served pages (no
+  identity; §2 of that surface is not re-specified here); the Ord board itself (read-only
+  reference — GATE-ORD-READBACK — no Ord row is written by this slice); the browser and the served pages (no
 served markup changes, so no browser evidence exists for any requirement below).
 
 **Non-goals.**
@@ -119,14 +127,14 @@ named lanes. Values within the lane family are ORed; the family is ANDed with ev
 predicate family (--kind, --note-kind, --relation, --prior-status, --current-status, --tag).
 Matching is literal against the task row's lane; a lane that matches nothing yields an empty
 stream, not an error.`
-`Permissions: the caller's board/tag read scopes gate the stream — revoking authority stops a live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1041); watch itself grants nothing and writes nothing.`
+`Permissions: the caller's board/tag read scopes gate the stream — revoking authority stops a live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1301); watch itself grants nothing and writes nothing.`
 `Failure behaviour: none beyond WATCH-04 on registry scope.`
 `Data rules: the predicate selects from stored rows; it writes nothing, archives nothing, and
 survives no restart beyond the persisted opaque cursor that carries it (WATCH-02).`
 
 **WATCH-02** — The lane set binds to the cursor.
 Strength: `MUST` · Layer: `process` · Source: the shipped cursor-binding rule
-(`rust/watch.rs:34-48`, `rust/watch.rs:66-90`, `rust/watch.rs:716-730`).
+(`rust/watch.rs:34-46`, `rust/watch.rs:66-87`, `rust/watch.rs:716-730`).
 `The normalized (sorted, deduplicated) lane set joins the bound predicate set in the StreamKey,
 the ScopeEnvelope and the CursorToken. Reusing a persisted cursor with any different normalized
 lane set fails closed before any row is read, exactly like a changed kind/relation/status/tag
@@ -152,7 +160,7 @@ naming the rejected flag. No partial stream precedes the refusal.`
 
 **WATCH-05** — `watch --note-kind` steers note delivery by note kind.
 Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e`; `NOTE_KINDS`
-(`rust/model.rs:441-443`).
+(`rust/model.rs:361-363`).
 `Repeatable --note-kind KIND restricts note_added events to notes whose kind is in the named
 set: plan, progress, blocker, decision, evidence, done. Values within the family are ORed; the
 family is ANDed with every other family, so under a note-kind predicate an event with no note
@@ -165,7 +173,7 @@ closed like WATCH-04.`
 
 **WATCH-06** — Board-scope envelopes carry the subject's lane, type and priority.
 Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e`; task row
-(`rust/model.rs:486-499`).
+(`rust/model.rs:403-419`).
 `The board-scope projection adds four top-level keys beside the existing v1 keys: lane (the
 subject task row's lane), type (its type: epic, story or task), priority (its 0-9 queue key)
 and priorityLevel (its P0/P1/P2 projection via priority_level). All four are additive — every
@@ -178,27 +186,30 @@ the same recursive redaction as the rest of the envelope (WATCH-10).`
 
 ### Shared kb/Ord conformance
 
-**WATCH-07** — One envelope dialect on kb and Ord.
-Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e` against Ord `t-49703f52`
-(read-only; OQ-1).
-`The §5 conformance table is normative: for every row it names, the kb envelope key, the Ord
-envelope key, the casing, the JSON shape and the null-vs-absent rule are identical, so one
-consumer parses both boards without a per-board branch. Any deviation found at implementation
-against Ord t-49703f52 is a failure of this requirement, not a dialect to document — the table
-is corrected or the projection is, in the same change.`
+**WATCH-07** — The kb envelope dialect is fixed; Ord readback is an implementation gate.
+Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e`; owner verdict
+`a-97b3ab24` (choice `narrow`, 2026-09-28: kb-only WATCH-07, Ord conformance at implementation).
+`The kb column of the §5 conformance table is normative: for every row it names, the kb envelope
+key, the casing, the JSON shape and the null-vs-absent rule are the requirement — the kb side's
+shapes govern, so one consumer parses kb output without a per-board branch. The Ord column states
+the expectation; confirming it field-for-field against Ord t-49703f52 (keys, casing, shapes, null
+rules) is implementation gate GATE-ORD-READBACK on row t-fde5d91c, proven by A6's side-by-side in
+that change. Any deviation found at the gate fails the gate: the same change corrects the
+projection where the kb column governs, or the Ord-column expectation where Ord governs itself —
+never a third dialect — and Ord stays untouched throughout.`
 
 ### Preserved mechanism
 
 **WATCH-08** — Cursors from before this slice still parse.
 Strength: `MUST` · Layer: `process` · Source: `CursorToken` `#[serde(default)]` convention
-(`rust/watch.rs:66-90`).
+(`rust/watch.rs:66-87`).
 `The new lane and note-kind cursor fields default when absent, so a cursor persisted by an older
 binary resumes under the new binary with those families empty (unfiltered). Unknown fields are
 still denied: a cursor minted by a newer binary fails closed on an older one rather than
 silently dropping its lane set.`
 
 **WATCH-09** — The v1 envelope stays byte-stable apart from the four keys.
-Strength: `MUST` · Layer: `process` · Source: `project_event` (`rust/watch.rs:577-648`).
+Strength: `MUST` · Layer: `process` · Source: `project_event` (`rust/watch.rs:594-645`).
 `No existing projected key is renamed, recased, reshaped, moved or dropped; _semanticV1 stays
 hash-covered and never emitted; the metadata bound (16 KiB, truncated with bytes beside it)
 still applies to the event payload as today and does not cover the four new top-level keys. A
@@ -206,14 +217,14 @@ consumer pinned to the pre-slice field set reads the new envelopes without a cha
 
 **WATCH-10** — New keys pass through the existing redaction.
 Strength: `MUST` · Layer: `process` · Source: the shipped redact-before-emission rule
-(`rust/watch.rs:577-648`).
+(`rust/watch.rs:594-645`).
 `Lane names, types and priorities are projected after redaction exactly like every other
 payload field; a value that matches a secret shape is redacted rather than emitted, and
 redaction still happens before the metadata bound is measured.`
 
 **WATCH-11** — The advanced heartbeat covers the new predicates.
 Strength: `MUST` · Layer: `process` · Source: `needs_advanced_heartbeat`
-(`rust/watch.rs:493-549`).
+(`rust/watch.rs:498-551`).
 `When the lane/note-kind predicates skip a committed unmatched tail, an advanced heartbeat moves
 the opaque cursor to the last scanned row, carrying the call's full normalized predicate set
 including lanes and note kinds. Idle heartbeats still do not advance the durable cursor. A
@@ -230,7 +241,7 @@ limit bounds the filtered result set, never the raw scan.`
 
 Concurrency needs no example: watch writes nothing, two streams share no mutable state, and
 one scope per stream (§2) keeps two consumers independent. Unauthorized access is read-authority gating rather
-than a write refusal: per-poll authority re-read stops a revoked live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1041).
+than a write refusal: per-poll authority re-read stops a revoked live stream without a reconnect (revoking_authority_stops_a_live_watch_stream_without_a_reconnect, tests/authz_bypass_matrix_e2e.rs:1301).
 
 ### A1 (WATCH-01, WATCH-02)
 
@@ -284,8 +295,8 @@ a `leaseToken` key.
 *when* the implementer places one kb envelope and one Ord envelope for the same logical event
 (a P1 task in a named lane receiving a decision note) side by side,
 *then* every table row matches field-for-field — same key, same casing, same shape, same
-null-vs-absent rule — or the mismatch is filed as a failure of WATCH-07 with the table and the
-projection corrected in the same change.
+null-vs-absent rule — or the mismatch is filed as a failure of GATE-ORD-READBACK with the
+Ord-column expectation or the projection corrected in the same change (kb column governs).
 
 ### A7 (WATCH-08, WATCH-11)
 
@@ -308,29 +319,31 @@ the scanned tail — the stream never re-loops those fifty rows.
 - **Data invariants:** watch writes no rows at any scope; predicates select from stored task,
   note and event rows; the opaque cursor remains bound to source, selector, normalized predicate
   set, archive state and last consumed seq. `priorityLevel` is derived at projection time via
-  `priority_level` (`rust/model.rs:472-479`), never stored.
+  `priority_level` (`rust/model.rs:392-399`), never stored.
 - **Migration:** none — no table changes, no schema version move. Cursors persist across the
   cutover by default (WATCH-08).
 - **Compatibility:** pre-slice consumers read new envelopes unchanged (WATCH-09); pre-slice
   cursors resume (WATCH-08); newer cursors fail closed on older binaries instead of dropping
   predicates.
 - **Ownership:** the board owns tasks, notes and events; the registry owns rules; Ord owns its
-  own rows — this slice writes to neither board and describes conformance only (OQ-1).
+  own rows — this slice writes to neither board; kb conformance is normative (WATCH-07) and Ord
+  readback rides GATE-ORD-READBACK on `t-fde5d91c`.
 
 ### Conformance table (normative for WATCH-07)
 
 `kb key` is the NDJSON envelope key this slice specifies; `Ord key` is the catalogue envelope
 key expected on Ord; `Shape` is the JSON shape both carry; `Absent rule` is what the key holds
-when there is no value. The kb column is observed in `rust/watch.rs:577-648` (existing rows)
-and §3 above (new rows); the Ord column states the expectation against `t-49703f52` to be
-verified at implementation (OQ-1, A6). Only the `.result` envelope convention is grounded in
-the `/ord` skill; the row-field shapes (task rows carrying lane, type, priority; attention
-rows carrying kind and lane) are assumptions A6 must confirm.
+when there is no value. The kb column is normative (WATCH-07): existing rows are observed in
+`rust/watch.rs:594-645` and new rows are specified in §3 above. The Ord column states the
+expectation against `t-49703f52` that GATE-ORD-READBACK confirms at implementation (A6). Only the
+`.result` envelope convention is grounded in the `/ord` skill; the row-field shapes (task rows
+carrying lane, type, priority; attention rows carrying kind and lane) are expectations the gate
+confirms, not skill-documented shapes.
 
 | # | Field | kb key | Ord key | Shape | Absent rule |
 | --- | --- | --- | --- | --- | --- |
 | 1 | lane | `lane` | `lane` | string, the subject task's lane (`driver-2`) | explicit `null`, never absent |
-| 2 | type | `type` | `type` | string, one of `epic`, `story`, `task` (`TASK_TYPES`, `rust/model.rs:440`) | explicit `null`, never absent |
+| 2 | type | `type` | `type` | string, one of `epic`, `story`, `task` (`TASK_TYPES`, `rust/model.rs:360`) | explicit `null`, never absent |
 | 3 | priority | `priority` | `priority` | integer 0-9 queue key | explicit `null`, never absent |
 | 4 | priority level | `priorityLevel` | `priorityLevel` | string `P0`/`P1`/`P2` via the published 0-2/3-5/6-9 mapping | explicit `null`, never absent |
 | 5 | subject | `subject` | `subject` | object `{"type":"task","id":"<id>"}` | explicit `null` (registry/taskless/legacy) |
@@ -370,7 +383,7 @@ rows carrying kind and lane) are assumptions A6 must confirm.
 
 | ID | Question | Owner | Status | Gate it blocks |
 | --- | --- | --- | --- | --- |
-| OQ-1 | Does every Ord-column expectation in the §5 table hold verbatim against Ord `t-49703f52` (keys, casing, shapes, null rules)? | `t-fde5d91c` implementer | open | implementation (not the spec gate: the kb column is observed in code, the acceptance bar is field-for-field in A6, and the mismatch rule in WATCH-07 makes any deviation a build failure rather than an unpriced surprise) |
+| OQ-1 | Does every Ord-column expectation in the §5 table hold verbatim against Ord `t-49703f52` (keys, casing, shapes, null rules)? | `t-fde5d91c` implementer | closed 2026-09-28 on attention `a-97b3ab24` (choice `narrow`): kb-only WATCH-07, Ord conformance at implementation — WATCH-07 is kb-normative and Ord conformance is implementation gate GATE-ORD-READBACK on `t-fde5d91c`, not a spec open question | implementation gate GATE-ORD-READBACK on `t-fde5d91c` (not the spec gate) |
 
 Closing note, in the manner of `docs/specs/complaint.md:17-21`: the board rows behind this
 document (`t-28dca81e`, `e-c0852fe7`, `a-e240ed2d`, Ord `t-49703f52`) were taken from the
@@ -396,7 +409,7 @@ enumerated with `cargo test --locked --test e2e -- --list` and
 | `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
 | `WATCH-05` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no note-kind predicate at the baseline. |
 | `WATCH-06` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: the four keys are not projected at the baseline. |
-| `WATCH-07` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with OQ-1 readback: A6's side-by-side is the evidence. |
+| `WATCH-07` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with GATE-ORD-READBACK readback: A6's side-by-side is the evidence. |
 | `WATCH-08` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no new cursor fields exist yet to default. |
 | `WATCH-09` | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes` | additive stability on the shipped surface; `t-fde5d91c` re-runs both against envelopes carrying the four new keys. |
 | `WATCH-10` | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes` | the redaction half of that case; re-run with lane/type/priority-bearing events. |
@@ -414,3 +427,25 @@ Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run)
 ## 9. Change log
 
 - `2026-09-28` — slice created at `WATCH-01` .. `WATCH-12`. No supersessions yet.
+- `2026-09-29` — OQ-1 closed on attention `a-97b3ab24` (choice `narrow`): WATCH-07 rewritten
+  kb-normative (the kb column of the §5 table is the requirement; Ord `t-49703f52` is a
+  read-only reference), Ord conformance restated as implementation gate GATE-ORD-READBACK on
+  `t-fde5d91c` wherever §1/§2/§5/§7/§8 named OQ-1. Citations re-verified in this worktree
+  (branch `wt/t-28dca81e-ready` at `361d7e3`): schema `36` (`rust/db.rs:2920`); `StreamKey`
+  `rust/watch.rs:34-46`; `ScopeEnvelope` `rust/watch.rs:50-63`; `CursorToken`
+  `rust/watch.rs:66-87`; heartbeat `rust/watch.rs:498-551`; `project_event`
+  `rust/watch.rs:594-645`; normalization `rust/watch.rs:666-730`; `NOTE_KINDS`
+  `rust/model.rs:361-363`; `note --kind` selection `rust/lib.rs:1701-1707`; task
+  `type`/`lane`/`priority` `rust/model.rs:405-406`/`412`/`417`, `priority_level`
+  `rust/model.rs:392-399`, task row `rust/model.rs:403-419`, event row
+  `rust/model.rs:633-644`, `TASK_TYPES` `rust/model.rs:360`; authz witness
+  `tests/authz_bypass_matrix_e2e.rs:1301`; coverage note
+  `docs/testing/compiled-rust-e2e-matrix.md:445-453`. Status stays `DRAFT`.
+- `2026-09-29` — independent review (SPEC-READY): every MUST (WATCH-01..WATCH-12) reachable
+  from a GWT example (A1..A7) with exactly one §8 row; cited lines re-verified in this
+  worktree (schema `36`, cursor/envelope/normalization sites, `NOTE_KINDS`, task row,
+  `priority_level`, all eleven `watch_*`/`revoking_*` test names enumerated with
+  `cargo test -- --list`); WATCH-07 holds the kb column normative with Ord conformance as
+  implementation gate GATE-ORD-READBACK per `a-97b3ab24` (choice `narrow`); no requirement
+  depends on the retired web view. Status stamped `SPEC-READY`; no requirement ID changed
+  meaning.

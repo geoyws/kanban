@@ -157,6 +157,17 @@ blockers are published rather than only enforced — `task show`, `context` and
 `gatedTasks` beside the raw status counts — because a queue that silently
 hides rows teaches an operator that the board is lying to them.
 
+**Amended 2026-09-30 (George, `a-daa231b3`, `t-a3928b36`):** A related
+row's ID is not secret when it is reached through a row the caller may read.
+The `claim` refusal and `blockingGates` may name an unreadable prerequisite
+ID and its gate status (for example, `t-secret is todo`); a `story advance`
+refusal may name an unreadable child task ID without its status. The gates
+still withhold the unreadable row's title and tags, and none grants direct
+read access to that row. The removed web event projection is historical
+(ADR-053); the compiled CLI's story refusal is the remaining process-level
+example. This decision keeps related IDs actionable instead of redacting
+them, without claiming that gate status is secret.
+
 Inheritance also creates a shape that dependency-cycle detection cannot see:
 an epic gated on a task **inside its own subtree** has no dependency cycle at
 all, and can still never be unblocked, because the descendant inherits the
