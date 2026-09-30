@@ -1540,9 +1540,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 36);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 36);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 36);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 37);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 37);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 37);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -10865,6 +10865,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "search" => vec!["search", "Some work"],
             "task list" => vec!["task", "list"],
             "task show" => vec!["task", "show", "t-1"],
+            "task verdict list" => vec!["task", "verdict", "list", "t-1"],
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
             "attention show" => vec!["attention", "show", &attention_id],
@@ -17562,7 +17563,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
 }
 
@@ -18332,7 +18333,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -19700,7 +19701,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        36
+        37
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -41377,7 +41378,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 36, "the board did not migrate forward");
+    assert_eq!(migrated, 37, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -41409,7 +41410,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 36);
+    assert_eq!(again, 37);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any
@@ -42746,7 +42747,7 @@ fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
     assert_eq!(
-        schema, 36,
+        schema, 37,
         "a dev-tier attempt on hax moved the board schema"
     );
 }
