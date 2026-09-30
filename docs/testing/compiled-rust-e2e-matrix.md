@@ -453,6 +453,13 @@ One row per requirement, on branch `wt/t-fe137b57-land` at 2026-09-29: commit
 specification is `SPEC-READY` on 2026-09-26 and ADR-051 is `Proposed`, so these
 rows land with the specification refresh and the gate reviewer reads the trace
 rather than a promise of one.
+
+The 2026-09-29 LINKED-23 withdrawal was a proposed scope change; George
+authorized it on 2026-09-30 (`a-53b18f9a`). The ID is reserved and its
+original obligation remains in the specification as historical text. The
+updated specification needs a fresh independent review before `SPEC-READY`
+applies to this revision.
+
 `Layer` uses the specification's own vocabulary, where `process` is a compiled-binary
 process-boundary exchange with no HTTP and no browser; `chrome` named only the
 withdrawn LINKED-23 and names no active LINKED requirement; `http` names no
@@ -502,7 +509,7 @@ set at creation (`cd55cbc`).
 | `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
 | `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
-| `LINKED-23` | WITHDRAWN 2026-09-29 | chrome (retired) | none | withdrawn with the served surface (ADR-053) — no test to be written, owned by no implementation row; ID reserved, never reused |
+| `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
 | `LINKED-25` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (companion moves no gate; two-board transact refused; ordered-pair compensation) |
 

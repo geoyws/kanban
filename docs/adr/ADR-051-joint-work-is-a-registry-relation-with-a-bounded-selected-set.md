@@ -10,6 +10,13 @@ stay epics), [ADR-041](ADR-041-transact-is-one-atomic-ordered-write-batch.md) (s
 atomic batches) stay in force unchanged for their own slices. This decision takes no
 implementation dependency on `e-df626704` (`todo`) — see §3 — and adds one relation beside them.
 
+**Scope correction (2026-09-30):** George withdrew `LINKED-23` under
+`a-53b18f9a` after ADR-053 retired the served web UI. Its ID remains
+reserved in `docs/specs/linked.md`; the original wording stays there for
+history. This proposed ADR describes the registry relation, bounded work
+set and delivery evidence only. It proposes no replacement UI requirement
+and grants no implementation or release authority.
+
 ## Context
 
 Epic `e-73bf760f` (status `todo`) asks for joint Unum/Acies features with three properties that

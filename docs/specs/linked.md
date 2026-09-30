@@ -7,6 +7,9 @@
 - **Baseline:** `2026-09-29` at commit `361d7e3` on branch
   `wt/t-fe137b57-land` (spec content merged at `3cb07ed`; code tree identical). Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-26 (independent gate by a reviewer applying the SDD §1 exit criteria over four rounds; eight findings closed — LINKED-09 merged to one trace row, resumption bound to the existing `claim --session`/`handoff accept --session` entry points, revocation stated as LINKED-14's authorized exit with audited UNFREEZE and release-only revoked leases, the ordered pair's order and compensation defined in LINKED-25 with no dependency on `e-df626704`, §7 heading restored, LINKED-02 repaired, `none`-row owners grounded in the parent's work packages with `--list` enumeration recorded, and the release citation corrected to `rust/lib.rs:169`). It authorises neither implementation nor release.
+- **Revision status (2026-09-30 owner decision `a-53b18f9a`):** the earlier
+  `SPEC-READY` gate predates the LINKED-23 withdrawal. This revision is pending
+  a fresh independent `/quality spec` review; the withdrawn ID remains reserved.
   <!-- SPEC-READY is stamped here by an independent reviewer against the SDD reference's §1 exit
   criteria, not by the writer of this document. It authorises neither implementation nor rollout
   nor release. -->
@@ -361,14 +364,15 @@ points (ADR-010's generated surface: one operation, one tool).`
 `Failure behaviour: a behaviour the CLI refuses and MCP accepts, or sentences that differ
 between the two, is a defect in the adapter, and the MCP side is fixed to match the CLI.`
 
-**LINKED-23** — Show the same joint state in the served web UI. WITHDRAWN 2026-09-29.
-Strength: `MUST` · Layer: `chrome` · Source: `e-73bf760f` scope (acceptance D).
-`WITHDRAWN with the surface it named: `kanban serve`, the `web/` SPA, and every HTTP route
-were deleted with no successor (ADR-053, accepted 2026-09-28), so there is no served page left
-to show the pairing, attribution, or evidence. The ID stays reserved and is never reused; the
-original 2026-09-26 wording is retained below the withdrawal line for review traceability and
-imposes no obligation. Re-homing this requirement onto any future exposure is George's
-decision, not an implementation inference.`
+**LINKED-23** — Show the same joint state in the served web UI. WITHDRAWN
+2026-09-30 by George (`a-53b18f9a`, choice `withdraw`); ID reserved.
+Original strength: `MUST` · Original layer: `chrome` · Original source:
+`e-73bf760f` scope (acceptance D).
+`The served surface this requirement named — kanban serve, the web SPA, and
+every HTTP route — was retired with no successor (ADR-053, 2026-09-28). George
+withdrew this obligation instead of re-homing it. The ID remains reserved and
+must not be reused; the original 2026-09-26 wording below remains historical
+trace, not a current requirement. A future exposure requires a new decision.`
 `Original (no force): the served UI shows the same pairing, attribution, and evidence the CLI
 reads: the same related item on both boards' pages, the same worker on each task, the same
 commits behind each deliverable. Where the UI cannot render a state, it says so rather than
@@ -619,7 +623,7 @@ tree, and every `none` says so.
 | `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
 | `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
-| `LINKED-23` | WITHDRAWN 2026-09-29 | chrome (retired) | `none` | withdrawn with the served surface (ADR-053) — no test to be written, owned by no implementation row; ID reserved, never reused |
+| `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
 | `LINKED-25` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (companion moves no gate; two-board transact refused; ordered-pair compensation) |
 
@@ -684,3 +688,8 @@ reachable from §4 and from §8.
   surface; the ID stays reserved. §2 actors/in-scope, the `http`/`chrome` layer notes, A7, §6
   Accessibility/Security, §8 counts/coverage, and the matrix LINKED-23 row move in the same
   change, kept verbatim-identical with the matrix section.
+- `2026-09-30` — George chose `withdraw` on `a-53b18f9a`: LINKED-23's
+  proposed 2026-09-29 withdrawal is authorized, not merely inferred from
+  ADR-053. The ID remains reserved; all 24 remaining MUST requirements keep
+  their IDs, scope and planned evidence. Fresh independent `/quality spec`
+  review is required before this revision may be stamped `SPEC-READY`.
