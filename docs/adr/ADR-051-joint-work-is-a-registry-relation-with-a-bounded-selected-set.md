@@ -128,7 +128,7 @@ release.
 - Epic `e-73bf760f` (`todo`) — the authoritative requirement source; task `t-fe137b57` commissioned this ADR and the LINKED specification
 - George, 2026-09-25 — bounded-scope approval in resolved attention `a-93efef34`
 - `e-df626704` (`todo`, cross-board readiness gates) — the COMPLEMENTED sibling: companion != depends-on, scope membership != either; shares only the commissioned `(boardID, id)` spelling, with authorization and serialization defined here
-- `docs/specs/linked.md` — the requirement-level statement of this decision (`LINKED-01`..`LINKED-25`)
+- `docs/specs/linked.md` — the requirement-level statement of this decision (`LINKED-01`..`LINKED-25`; `LINKED-23` withdrawn 2026-09-30, ID reserved by `a-53b18f9a`)
 - [ADR-013](ADR-013-plans-are-epics-and-drafts-are-not-yet-work.md) — why the selected set is not an epic
 - [ADR-041](ADR-041-transact-is-one-atomic-ordered-write-batch.md) — why the pair is ordered, not atomic
 - [ADR-045](ADR-045-sprints-are-proof-gated-version-boundaries.md) — why the selected set is not a sprint

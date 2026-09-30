@@ -4,8 +4,11 @@
 
 - **Slice ID:** `LINKED`. Requirement IDs are `LINKED-01` .. `LINKED-25`, stable across wording
   refinements; numbering is by creation, grouping is by topic.
-- **Baseline:** `2026-09-29` at commit `361d7e3` on branch
-  `wt/t-fe137b57-land` (spec content merged at `3cb07ed`; code tree identical). Every "today" claim below cites the line that has it, as `<path>:<line>`.
+- **Original baseline:** `2026-09-29` at commit `361d7e3` on branch
+  `wt/t-fe137b57-land` (spec content merged at `3cb07ed`; code tree identical
+  then). **Current citation baseline:** lane commit `521c19e` merged on
+  2026-10-01; present-tense source and test line citations below were
+  refreshed against that tree. Dated change-log entries retain their old lines.
 - **Status:** `SPEC-READY` on 2026-09-26 (independent gate by a reviewer applying the SDD §1 exit criteria over four rounds; eight findings closed — LINKED-09 merged to one trace row, resumption bound to the existing `claim --session`/`handoff accept --session` entry points, revocation stated as LINKED-14's authorized exit with audited UNFREEZE and release-only revoked leases, the ordered pair's order and compensation defined in LINKED-25 with no dependency on `e-df626704`, §7 heading restored, LINKED-02 repaired, `none`-row owners grounded in the parent's work packages with `--list` enumeration recorded, and the release citation corrected to `rust/lib.rs:169`). It authorises neither implementation nor release.
 - **Revision status (2026-09-30 owner decision `a-53b18f9a`):** the earlier
   `SPEC-READY` gate predates the LINKED-23 withdrawal. This revision is pending
@@ -47,10 +50,10 @@
 - `docs/PRD.md:9`-`docs/PRD.md:12` (one durable place to coordinate atomic ownership and
   preserve evidence) and `docs/PRD.md:32` (prevent concurrent ownership) — the product-level
   statements these requirements refine. Neither document changes for this slice (see §5).
-- Shipped surface at the baseline: `rust/lib.rs:152` (`claim [ID | --next] --as AGENT`),
-  `rust/lib.rs:161` (`claim --candidates`, read-only), `rust/lib.rs:180` (`handoff accept`),
+- Shipped surface at the current citation baseline: `rust/lib.rs:158` (`claim [ID | --next] --as AGENT`),
+  `rust/lib.rs:167` (`claim --candidates`, read-only), `rust/lib.rs:186` (`handoff accept`),
   `rust/lib.rs:125`-`rust/lib.rs:127` (`task add --depends-on`, local scalars),
-  `rust/lib.rs:325`-`rust/lib.rs:326` (`claim` has no `--force`), `rust/model.rs:378`
+  `rust/lib.rs:332` (`claim` has no `--force`), `rust/model.rs:380`
   (`RELATION_KINDS`, exactly `parent`, `ancestor`, `depends-on` — companion is none of them).
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries the slice's evidence
   table; the matrix section is the trace of record and the two are kept identical by the same
@@ -78,7 +81,7 @@ only the tasks explicitly selected for it.
 - **In scope.** The one stored companion relation and its two-sided exposure; the selected work
   set with audited membership revisions; the single claim gate across candidates, next/named
   claims, lease-taking handoffs, and session resumption through the existing `--session` entry
-  points (`rust/lib.rs:152`, `rust/lib.rs:180`); the append-only contributions and integration
+  points (`rust/lib.rs:158`, `rust/lib.rs:186`); the append-only contributions and integration
   receipts with their evidence roles; the CLI/MCP agreement over that surface.
 
 **Boundaries.**
@@ -204,10 +207,10 @@ granted claim's event.`
 
 **LINKED-08** — Hold one claim gate across every claim path.
 Strength: `MUST` · Layer: `process` · Source: `e-73bf760f` scope (acceptance B); ADR-051 §2.
-`Candidates (`rust/lib.rs:161`), `--next` and named claims (`rust/lib.rs:152`), lease-taking
-handoff acceptance (`rust/lib.rs:180`), and resumption share one selected-scope gate. Resumption
+`Candidates (`rust/lib.rs:167`), `--next` and named claims (`rust/lib.rs:158`), lease-taking
+handoff acceptance (`rust/lib.rs:186`), and resumption share one selected-scope gate. Resumption
 is exactly the two existing entry points presenting `--session`: a `claim` with `--session ID`
-(`rust/lib.rs:152`) and a `handoff accept` with `--session ID` (`rust/lib.rs:180`) — no new verb
+(`rust/lib.rs:158`) and a `handoff accept` with `--session ID` (`rust/lib.rs:186`) — no new verb
 exists for resuming, and the field shape is unchanged. What the gate refuses by one path it
 refuses by all of them, and the `claim --candidates` read never offers a row the atomic claim
 path would refuse.`
@@ -266,7 +269,7 @@ binding is the authorized exit in LINKED-14's third ending, recorded as an audit
 stating the reason; it ends taking immediately, while leases already granted keep their
 heartbeat until expiry or release — but those leases cannot take new work and cannot be handed
 to another lane. The only permitted ending for such a lease is `release ID --lease TOKEN`
-(`rust/lib.rs:165`), returning the task to its board's claimable set.`
+(`rust/lib.rs:171`), returning the task to its board's claimable set.`
 `Failure behaviour: a claim against a frozen set is refused naming the freeze; a new claim or a
 forward handoff on a revoked binding is refused naming the revocation; in both cases live leases
 are untouched.`
@@ -578,10 +581,10 @@ verbatim. `Layer` is named precisely and is never `e2e` for an in-process test.
 `Test name` is the **existing** test that observes the behaviour today, verified as
 `fn <name>(` in `tests/e2e.rs` at the baseline. Exactly one requirement — LINKED-09, the
 existing-gates-still-hold rule — has such tests, named semicolon-separated in its one row
-(`tests/e2e.rs:2854`, `:3375`, `:37865`, `:37612`, `:1370`, `:40330`, `:40433`, `:15889`,
+(`tests/e2e.rs:2854`, `:3375`, `:37959`, `:37706`, `:1370`, `:40424`, `:40527`, `:15890`,
 in row order): they prove today's gates on today's surface, and the implementation re-runs
-them unchanged beside the new scope gate. Each of the eight names was re-verified present
-exactly once as `fn <name>(` at the refreshed baseline. Full `cargo test --locked --test e2e
+them unchanged beside the new scope gate. Each of the eight names was verified present
+exactly once as `fn <name>(` at the 2026-10-01 citation baseline. Full `cargo test --locked --test e2e
 -- --list` enumeration ran 2026-09-26 in the Linux container (`kanban-gate:1.95-chrome-u501`,
 image `f542f975e2dc`, host gate slot): 439 tests, each of the eight names present exactly
 once — that count is the 2026-09-26 record; the web retirement (ADR-053) has since removed
@@ -693,3 +696,8 @@ reachable from §4 and from §8.
   ADR-053. The ID remains reserved; all 24 remaining MUST requirements keep
   their IDs, scope and planned evidence. Fresh independent `/quality spec`
   review is required before this revision may be stamped `SPEC-READY`.
+- `2026-10-01` — merged lane `521c19e` into the isolated candidate; the
+  LINKED and CLAIM trace sections both survive the matrix merge. Refreshed
+  present-tense `rust/lib.rs`, `rust/model.rs` and eight `tests/e2e.rs` line
+  citations against that tree. The dated 2026-09-26 enumeration (439 tests)
+  and 2026-09-29 baseline remain historical; no new test count is claimed.

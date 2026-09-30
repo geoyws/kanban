@@ -448,11 +448,12 @@ their ids and a refused `task add` writes no row and no event.
 
 ## Requirements trace — `docs/specs/linked.md` LINKED-01..LINKED-25
 
-One row per requirement, on branch `wt/t-fe137b57-land` at 2026-09-29: commit
-`361d7e3` (spec content merged at `3cb07ed`; code tree identical), where the
-specification is `SPEC-READY` on 2026-09-26 and ADR-051 is `Proposed`, so these
-rows land with the specification refresh and the gate reviewer reads the trace
-rather than a promise of one.
+One row per requirement. Original 2026-09-29 baseline: lane commit `361d7e3`
+(spec content merged at `3cb07ed`; code tree identical then), with a
+`SPEC-READY` stamp dated 2026-09-26 for the pre-withdrawal revision and
+ADR-051 `Proposed`. Current source/test line citations were refreshed after
+lane commit `521c19e` on 2026-10-01; the earlier stamp does not cover this
+revision. The gate reviewer reads this trace, not a promise of one.
 
 The 2026-09-29 LINKED-23 withdrawal was a proposed scope change; George
 authorized it on 2026-09-30 (`a-53b18f9a`). The ID is reserved and its
@@ -474,9 +475,10 @@ work-package title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff
 or `t-db6937ba` (exposure and workflow proof per its work-package title,
 `LINKED-22`, `LINKED-24`, `LINKED-25`; `LINKED-23` is withdrawn with the served
 surface and owned by no implementation row). LINKED-09 carries one row naming eight
-existing tests (`tests/e2e.rs:2854`, `:3375`, `:37865`, `:37612`, `:1370`, `:40330`,
-`:40433`, `:15889`, in row order), verified as `fn <name>(` in this build; they prove
-today's gates on today's surface and are re-run unchanged beside the new scope gate. Full
+existing tests (`tests/e2e.rs:2854`, `:3375`, `:37959`, `:37706`, `:1370`, `:40424`,
+`:40527`, `:15890`, in row order), verified as `fn <name>(` at the 2026-10-01
+citation baseline; they prove today's gates on today's surface and are
+re-run unchanged beside the new scope gate. Full
 `cargo test --locked --test e2e -- --list` enumeration ran 2026-09-26 in the Linux container
 (`kanban-gate:1.95-chrome-u501`, image `f542f975e2dc`, host gate slot): 439 tests, each of the
 eight names present exactly once — that count is the 2026-09-26 record; the web retirement
