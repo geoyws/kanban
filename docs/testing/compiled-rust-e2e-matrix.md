@@ -452,14 +452,15 @@ One row per requirement. Original 2026-09-29 baseline: lane commit `361d7e3`
 (spec content merged at `3cb07ed`; code tree identical then), with a
 `SPEC-READY` stamp dated 2026-09-26 for the pre-withdrawal revision and
 ADR-051 `Proposed`. Current source/test line citations were refreshed after
-lane commit `521c19e` on 2026-10-01; the earlier stamp does not cover this
-revision. The gate reviewer reads this trace, not a promise of one.
+lane commit `521c19e` on 2026-10-01. Independent reviewer
+`LinkedSpecFreshReview` stamped the current revision `SPEC-READY` on
+2026-10-01; this is specification readiness, not product readiness.
 
 The 2026-09-29 LINKED-23 withdrawal was a proposed scope change; George
 authorized it on 2026-09-30 (`a-53b18f9a`). The ID is reserved and its
 original obligation remains in the specification as historical text. The
-updated specification needs a fresh independent review before `SPEC-READY`
-applies to this revision.
+fresh independent review covers the 24 active MUST rows and reserved
+LINKED-23; no new test coverage is claimed.
 
 `Layer` uses the specification's own vocabulary, where `process` is a compiled-binary
 process-boundary exchange with no HTTP and no browser; `chrome` named only the

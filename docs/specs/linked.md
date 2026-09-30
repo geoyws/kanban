@@ -10,9 +10,14 @@
   2026-10-01; present-tense source and test line citations below were
   refreshed against that tree. Dated change-log entries retain their old lines.
 - **Status:** `SPEC-READY` on 2026-09-26 (independent gate by a reviewer applying the SDD §1 exit criteria over four rounds; eight findings closed — LINKED-09 merged to one trace row, resumption bound to the existing `claim --session`/`handoff accept --session` entry points, revocation stated as LINKED-14's authorized exit with audited UNFREEZE and release-only revoked leases, the ordered pair's order and compensation defined in LINKED-25 with no dependency on `e-df626704`, §7 heading restored, LINKED-02 repaired, `none`-row owners grounded in the parent's work packages with `--list` enumeration recorded, and the release citation corrected to `rust/lib.rs:169`). It authorises neither implementation nor release.
-- **Revision status (2026-09-30 owner decision `a-53b18f9a`):** the earlier
-  `SPEC-READY` gate predates the LINKED-23 withdrawal. This revision is pending
-  a fresh independent `/quality spec` review; the withdrawn ID remains reserved.
+- **Current revision status:** `SPEC-READY` on 2026-10-01 after George's
+  `a-53b18f9a` withdrawal of LINKED-23 (ID reserved). Independent
+  `/quality spec` reviewer `LinkedSpecFreshReview` checked SDD §1, all 24
+  active MUST obligations, A1–A8, the 25-row matrix, current citations and
+  the historical withdrawal; no blocking questions or findings. The earlier
+  2026-09-26 stamp is historical. Readiness authorises neither implementation
+  nor release. The reviewer supplied a prose receipt because the subagent
+  yield transport failed; no test execution is claimed by this review.
   <!-- SPEC-READY is stamped here by an independent reviewer against the SDD reference's §1 exit
   criteria, not by the writer of this document. It authorises neither implementation nor rollout
   nor release. -->
@@ -701,3 +706,9 @@ reachable from §4 and from §8.
   present-tense `rust/lib.rs`, `rust/model.rs` and eight `tests/e2e.rs` line
   citations against that tree. The dated 2026-09-26 enumeration (439 tests)
   and 2026-09-29 baseline remain historical; no new test count is claimed.
+- `2026-10-01` — independent `/quality spec` reviewer
+  `LinkedSpecFreshReview` returned `SPEC-READY` for this revision: 24 active
+  MUST, withdrawn/reserved LINKED-23, eight examples, 25 trace rows, and no
+  material open questions. The reviewer checked current CLI/model/test
+  citations; the yield transport failed, so its prose receipt is recorded on
+  board task `t-fe137b57`. This is specification readiness only.
