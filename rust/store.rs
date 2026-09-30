@@ -70,6 +70,11 @@ fn driver_lane_address(value: &str) -> Option<DriverLaneAddress<'_>> {
     if let Some(lane) = driver_lane_name(value) {
         return Some(DriverLaneAddress::Bare(lane));
     }
+    typed_driver_lane(value).map(|(_, _, lane)| DriverLaneAddress::Typed(lane))
+}
+
+/// Split a typed '@:team/project/lane' actor whose last segment is a lane word.
+fn typed_driver_lane(value: &str) -> Option<(&str, &str, &str)> {
     let mut segments = value.strip_prefix("@:")?.split('/');
     let team = segments.next()?;
     let project = segments.next()?;
@@ -77,7 +82,44 @@ fn driver_lane_address(value: &str) -> Option<DriverLaneAddress<'_>> {
     if team.is_empty() || project.is_empty() || segments.next().is_some() {
         return None;
     }
-    driver_lane_name(lane).map(DriverLaneAddress::Typed)
+    driver_lane_name(lane).map(|lane| (team, project, lane))
+}
+
+/// The lane a claim identity names, with the estate a typed form carries
+/// (docs/specs/claim-routing.md CLAIM-01): a bare lane word, a typed
+/// '@:team/project/lane', or a harness '<harness>@<lane>'. Anything else names
+/// no lane and is compared as an exact string (CLAIM-02).
+fn claim_lane(value: &str) -> Option<(&str, Option<(&str, &str)>)> {
+    if let Some(lane) = driver_lane_name(value) {
+        return Some((lane, None));
+    }
+    if value.starts_with("@:") {
+        return typed_driver_lane(value).map(|(team, project, lane)| (lane, Some((team, project))));
+    }
+    let (harness, lane) = value.split_once('@')?;
+    if harness.is_empty() || lane.contains('@') {
+        return None;
+    }
+    driver_lane_name(lane).map(|lane| (lane, None))
+}
+
+/// Whether a stored assignee is the claiming caller's own row: the same
+/// string, or the same lane in any spelling, except that two typed forms
+/// naming different estates stay different workers (CLAIM-01..CLAIM-03).
+fn same_claim_worker(assignee: &str, agent: &str) -> bool {
+    if assignee == agent {
+        return true;
+    }
+    match (claim_lane(assignee), claim_lane(agent)) {
+        (Some((left, left_estate)), Some((right, right_estate))) => {
+            left == right
+                && match (left_estate, right_estate) {
+                    (Some(left_estate), Some(right_estate)) => left_estate == right_estate,
+                    _ => true,
+                }
+        }
+        _ => false,
+    }
 }
 
 fn validate_rule_actor(value: &str) -> Result<&str> {
@@ -546,6 +588,78 @@ pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     Ok(name)
 }
 
+/// The estate a board files namespaced tags under: the compile-time
+/// board-to-estate map.
+///
+/// Boards follow durable product-estate ownership boundaries, and a bare tag
+/// carries no estate — so `tag add` builds the repair from this table rather
+/// than asking the caller to guess. An unmapped board gets the estate list
+/// with no suggestion, because there is no board truth to build one from.
+/// Adding a fourth estate, or moving a board, is a deliberate edit here —
+/// the one board vocabulary beside [`ESTATES`] — never a side effect of a
+/// mistyped tag.
+pub(crate) fn estate_for_board(board: &str) -> Option<&'static str> {
+    match board {
+        "px" | "fmx" | "hx" | "hrx" | "ix" | "mx-root" | "prjx-root" | "rentx-root"
+        | "auditx-root" | "ifca-docs" | "prjx" => Some("ifca"),
+        "kanban" | "omp" | "acies" | "dotfiles" | "geoyws" | "atmux" | "dash" | "gitea"
+        | "journal" | "orch" | "hax" => Some("geoyws"),
+        "memberx" => Some("unum"),
+        name if name.starts_with("unum") => Some("unum"),
+        _ => None,
+    }
+}
+
+/// Refuse a bare tag name on `tag add` with the board's namespaced form.
+///
+/// A slashed name is not bare — its estate was already checked by
+/// [`validate_tag_name`] — so this answers `Ok` for anything carrying `/`
+/// and for nothing else. The refusal writes nothing; it names the exact
+/// registration to run instead.
+pub(crate) fn refuse_bare_tag_name(board: &str, name: &str) -> Result<()> {
+    if name.contains('/') {
+        return Ok(());
+    }
+    let estates = ESTATES.join(", ");
+    match estate_for_board(board) {
+        Some(estate) => {
+            bail!("tag {name} is not namespaced: use {estate}/{name} (estates: {estates})")
+        }
+        None => bail!(
+            "tag {name} is not namespaced: no estate maps this board, so register it as \
+             <estate>/{name} (estates: {estates})"
+        ),
+    }
+}
+
+/// The `tag add` repair an attach refusal names, built from the same
+/// board-to-estate map `tag add` itself reads (CLI-01/CLI-02): one repair,
+/// one map, never a second board list.
+///
+/// A slashed tag already names its estate, so it is repeated unchanged —
+/// prefixing one would invent a different tag. A bare tag on a mapped board
+/// names that board's `{estate}/{tag}` form, which registers. A bare tag on
+/// an unmapped board names no single form — there is no board truth to build
+/// one from (CLI-03) — only the estate list, with the `<estate>/` placeholder
+/// the registration refusal itself uses. The board is the connection's stored
+/// name; a board with none is unmapped.
+fn attach_repair(connection: &Connection, tag: &str) -> String {
+    if tag.contains('/') {
+        return format!("`tag add {tag}`");
+    }
+    let board: Option<String> = connection
+        .query_row("SELECT value FROM board_meta WHERE key='name'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    match board.as_deref().and_then(estate_for_board) {
+        Some(estate) => format!("`tag add {estate}/{tag}`"),
+        None => format!("`tag add <estate>/{tag}` (estates: {})", ESTATES.join(", ")),
+    }
+}
+
 fn validate_registered_tags(
     connection: &Connection,
     tags: &[String],
@@ -567,9 +681,10 @@ fn validate_registered_tags(
             let suggestion = crate::nearest(&tag, &borrowed)
                 .map(|near| format!(", did you mean {near}?"))
                 .unwrap_or_default();
+            let repair = attach_repair(connection, &tag);
             bail!(
                 "{subject} tag {tag} is not in this board's master file{suggestion} — \
-                 register it first with `tag add {tag}`"
+                 register it first with {repair}"
             );
         }
         canonical.push(tag);
@@ -729,9 +844,10 @@ fn set_tags(connection: &Connection, id: &str, tags: &[String]) -> Result<()> {
             let suggestion = crate::nearest(&tag, &borrowed)
                 .map(|near| format!(", did you mean {near}?"))
                 .unwrap_or_default();
+            let repair = attach_repair(connection, &tag);
             bail!(
                 "tag {tag} is not in this board's master file{suggestion} — \
-                 register it first with `tag add {tag}`"
+                 register it first with {repair}"
             );
         }
         if applied.insert(tag.clone()) {
@@ -781,11 +897,11 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 
 /// An absent row under managed enforcement answers the same generic denial a
 /// denied row answers, so a tag-denied id and a never-created id are
-/// indistinguishable. The attach lookups below all read the row's tags first,
-/// which are empty for an absent row, so a caller holding board scope would
-/// otherwise get `not found` for the unknown id beside `denied or not found`
-/// for the denied one. Outside enforcement the guard cannot deny, so the
-/// plain `not found` message stays exactly as it was.
+/// indistinguishable (ACC-14). The by-id lookups below all read the row's
+/// tags first, which are empty for an absent row, so a caller holding board
+/// scope would otherwise get `not found` for the unknown id beside `denied
+/// or not found` for the denied one. Outside enforcement the guard cannot
+/// deny, so the plain `not found` message stays exactly as it was.
 fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContext) -> Result<T> {
     match row {
         Some(row) => Ok(row),
@@ -823,7 +939,10 @@ fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str
 /// the task's surviving rows. `Some(vec![])` means the task was removed while
 /// carrying no tag, which authorizes exactly like a live untagged task;
 /// `None` (no removal record: a partial restore, a hand edit) fails closed
-/// at the caller.
+/// at the caller. A removal payload that carries no tags ARRAY at
+/// `_semanticV1.tags` — missing, null or a non-array — is a malformed record
+/// and fails closed with [`crate::search::STALE_INDEX_TAG`], which no grant
+/// satisfies; only an explicitly empty array yields `Some(vec![])`.
 pub(crate) fn removed_task_tag_union(
     connection: &Connection,
     id: &str,
@@ -842,13 +961,19 @@ pub(crate) fn removed_task_tag_union(
         let value: Value = serde_json::from_str(payload).with_context(|| {
             format!("task {id} carries a task_removed payload that is not JSON")
         })?;
-        if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
-            union.extend(
-                frozen
-                    .iter()
-                    .filter_map(|tag| tag.as_str())
-                    .map(str::to_owned),
-            );
+        match value.pointer("/_semanticV1/tags") {
+            Some(Value::Array(frozen)) => {
+                union.extend(
+                    frozen
+                        .iter()
+                        .filter_map(|tag| tag.as_str())
+                        .map(str::to_owned),
+                );
+            }
+            // Every writer freezes the tags, so a record naming no tags array
+            // is legacy or hand-restored: it must not authorize as an
+            // untagged removal.
+            _ => return Ok(Some(vec![crate::search::STALE_INDEX_TAG.to_owned()])),
         }
     }
     union.sort();
@@ -991,12 +1116,13 @@ fn removed_aware_linked_task_tags(
     absent_task_tags_or_denied(connection, id, authz)
 }
 
-/// Whether a listing row linked to `task_id` stays visible (ACC-14): rows
-/// naming no task keep board scope, rows naming a live task read as their
-/// writers left them, and rows naming a removed task gate on the task's
-/// last-known removal union — hidden from a caller who cannot read it, and
-/// hidden from everyone when no removal record names it at all. Outside
-/// enforcement nothing can be denied and every row stays visible.
+/// Whether a listing row linked to `task_id` stays visible (ACC-14): a row
+/// linked to a task is visible only to a caller who can read that task. Rows
+/// naming no task keep board scope, rows naming a live task gate on its live
+/// tags, and rows naming a removed task gate on the task's last-known removal
+/// union — hidden from a caller who cannot read it, and hidden from everyone
+/// when no removal record names it at all. Outside enforcement nothing can be
+/// denied and every row stays visible.
 fn task_linked_row_visible(
     connection: &Connection,
     authz: &AuthzContext,
@@ -1009,12 +1135,42 @@ fn task_linked_row_visible(
         return Ok(true);
     };
     if get_task(connection, task_id)?.is_some() {
-        return Ok(true);
+        return Ok(authz.permits_read(&task_tags(connection, task_id)?));
     }
     match removed_task_tag_union(connection, task_id)? {
         Some(tags) => Ok(authz.permits_read(&tags)),
         None => Ok(false),
     }
+}
+
+/// One task row read through the caller's read authorization (ACC-14): the
+/// row's tags first, then the deny-preserving absent mapping, so under
+/// managed enforcement an unknown id answers exactly like a denied one.
+/// Outside enforcement the guard cannot deny and the plain `not found`
+/// stays. This is the helper every named task read and every task mutation's
+/// existence check goes through; internal traversals of related rows keep
+/// the raw `require_task` below.
+fn require_task_authorized(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Task> {
+    authz.check_read(&task_tags(connection, id)?)?;
+    absent_as_denied(get_task(connection, id)?, "task", id, authz)
+}
+
+/// The still-active variant for mutations: the same authorization, plus the
+/// archived-history refusal the raw `require_active_task` carries.
+fn require_active_task_authorized(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Task> {
+    let task = require_task_authorized(connection, id, authz)?;
+    if task.archived {
+        bail!("task {id} is archived history and cannot be changed");
+    }
+    Ok(task)
 }
 
 /// A task filter on a listing (ACC-14): under managed enforcement an unknown
@@ -1066,9 +1222,12 @@ fn check_orphaned_link_write(
 /// its id cannot be reused`, replacing the raw `UNIQUE constraint failed`.
 /// Under enforcement both answers are read-gated first, so a caller who
 /// cannot read the id's tags (the live tags, or the removal union for a
-/// removed id) gets the generic denial exactly like a never-created id,
-/// while a caller who can read keeps the plain message. Outside enforcement
-/// the guard cannot deny and the plain message stays.
+/// removed id) gets the generic denial — indistinguishable from any other
+/// unreadable id, but not from a free one, which succeeds: that residual is
+/// inherent while callers may choose ids in a shared namespace, and each
+/// such probe leaves an audited row. A caller who can read keeps the plain
+/// message. Outside enforcement the guard cannot deny and the plain message
+/// stays.
 pub(crate) fn refuse_reused_task_id(
     connection: &Connection,
     id: &str,
@@ -1149,6 +1308,57 @@ fn removed_task_snapshot(
         "priorStatus": prior_status,
         "currentStatus": current_status,
     }))
+}
+
+/// One attention row opened BY ID through the task it was raised against
+/// (ACC-14): the absent mapping first, so an unknown id answers the generic
+/// denial under enforcement, then `task_linked_row_visible` on the row's
+/// `task_id`, with a hidden row answering that same denial. The row's own-tag
+/// check stays at the call site — show reads it after this returns, the
+/// mutations wrote it before the row was opened — so listings, search and
+/// every by-id path agree on an untagged row hung on a denied task. A denied
+/// row and an unknown id are then byte-identical on every surface.
+fn require_attention_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    row: Option<Attention>,
+    id: &str,
+) -> Result<Attention> {
+    let existing = absent_as_denied(row, "attention", id, authz)?;
+    if !task_linked_row_visible(connection, authz, existing.task_id.as_deref())? {
+        return Err(crate::authz::DeniedOrNotFound.into());
+    }
+    Ok(existing)
+}
+
+/// Visibility of a subscription: the subject AND every relation target
+/// (ACC-14). A relation names a task its deliveries filter on — the add path
+/// already gates each target like the subject — so list, show and pause
+/// apply the same `task_linked_row_visible` test to the subject and to the id
+/// after the colon of every `KIND:ID` relation. A relation with no colon
+/// names no task and contributes nothing; an unparsable suffix simply fails
+/// its own visibility test. Outside enforcement every subscription stays
+/// visible, as before.
+fn subscription_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    row: &Subscription,
+) -> Result<bool> {
+    if !task_linked_row_visible(connection, authz, row.subject_task_id.as_deref())? {
+        return Ok(false);
+    }
+    for relation in &row.relations {
+        let Some((_, target)) = relation.split_once(':') else {
+            continue;
+        };
+        if target.is_empty() {
+            continue;
+        }
+        if !task_linked_row_visible(connection, authz, Some(target))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The tags one EVENT exposes, which is more than the tags its row carries
@@ -1411,7 +1621,7 @@ fn whole_board_read_on(authz: &AuthzContext, connection: &Connection) -> Result<
 /// The bulk-write gate: the same union, at `write`, on both sides — a
 /// board-wide mutation leaves every row's tag set where it found it, so the
 /// old and the resulting sets are the same set.
-fn whole_board_write_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
+pub(crate) fn whole_board_write_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
     if !authz.is_enforcing() {
         return Ok(());
     }
@@ -3575,6 +3785,28 @@ fn enforce_done_gate(
 /// distinction that makes bounding this safe.
 const CURRENT_SITREPS_PER_LANE: i64 = 10;
 
+/// How many raw rows one managed-enforcement scan page reads before filtering.
+///
+/// Listings that hide tag-denied rows apply the caller's bound to the rows the
+/// caller may READ, not to the raw rows — a `LIMIT` in SQL runs before the tag
+/// test, so a denied row would consume a slot and the page would come back
+/// short. Reading the whole table to serve one page would trade the short
+/// page for an unbounded read, so the scan goes in pages of this many rows
+/// and stops the moment the bound is filled.
+const MANAGED_SCAN_PAGE: i64 = 256;
+/// Fewest raw rows one managed ascending-tail scan examines before it may stop.
+///
+/// Cursor-driven tails ([`Store::events_since_filtered_tail`], and through it
+/// `watch --follow`) advance past denied rows they
+/// have already read, so a narrow cursor must still make progress through a
+/// denied stretch at a reasonable rate: a `--limit 1` follower capped at its
+/// own limit would otherwise walk one raw row per poll. The cap on any one
+/// scan is the caller's own `limit` when that is larger, so this floor never
+/// widens a scan the caller did not ask for — it only keeps a narrow one
+/// from stalling to a crawl. One scan's work stays bounded either way, which
+/// is the property the tail readers depend on.
+const MANAGED_TAIL_SCAN_FLOOR: usize = 500;
+
 // Nothing deletes a sitrep.
 //
 // A hard retention cap was written here and then removed. It would have been
@@ -4019,7 +4251,7 @@ fn eligible_claim_candidates(
             && (candidate
                 .assignee
                 .as_ref()
-                .is_none_or(|value| value == agent)
+                .is_none_or(|value| same_claim_worker(value, agent))
                 || options.allow_reassign);
         if routable && draft_ancestor(connection, &candidate.id)?.is_none() {
             eligible.push(candidate);
@@ -4209,6 +4441,26 @@ impl Drop for ReadSnapshot<'_> {
             let _ = connection.execute_batch("ROLLBACK");
         }
     }
+}
+
+/// What one bounded ascending-tail scan examined.
+///
+/// The cursor-driven tail — `watch --follow` — polls this on every ledger
+/// revision, so one scan must do bounded work and the cursor must still move
+/// when the scan delivers nothing: otherwise each follower re-reads a growing
+/// denied tail on every write. The scan therefore reports the range it
+/// covered as well as the rows it delivered.
+pub struct FilteredEventTail {
+    /// The visible rows, oldest first, at most the caller's `limit`.
+    pub events: Vec<Event>,
+    /// The furthest raw sequence this scan examined. When the delivery
+    /// filled, this is the last delivered row's sequence; otherwise it is
+    /// the last raw row read, denied rows included. A caller that stores
+    /// this as its cursor never re-reads denied rows it has already walked
+    /// past — and cannot step over a row it has not examined, because the
+    /// scan walks ascending `seq` inside one snapshot, so every row at or
+    /// below the new position passed through this scan's filter.
+    pub scanned_through: i64,
 }
 
 impl Store {
@@ -4502,6 +4754,84 @@ impl Store {
         Ok(out)
     }
 
+    /// Fill a page from raw rows this caller may READ, scanning by keyset.
+    ///
+    /// `base_sql` is the listing's SELECT with its filters but no ordering
+    /// and no bound; `order_by` is that listing's own `ORDER BY`, and
+    /// `cursor_predicate` re-states the ordering as a range off the last raw
+    /// row the previous chunk examined (`AND seq < ?` for a newest-first
+    /// event listing, `AND (created_at, id) < (?, ?)` for deployments).
+    /// `cursor_of` builds that predicate's parameters from such a row. The
+    /// first chunk has no previous row and reads without the predicate;
+    /// every later chunk seeks straight to it, so each chunk is an indexed
+    /// seek where OFFSET used to step over every earlier row again — and a
+    /// write landing between two chunks can neither duplicate nor skip a
+    /// row, where OFFSET counted positions that a head insert or a row
+    /// leaving the filter had just shifted. The whole scan holds a
+    /// [`ReadSnapshot`], a no-op inside a caller's wider scope as on the
+    /// watch poll path, so one page reads one consistent view.
+    ///
+    /// Each page of [`MANAGED_SCAN_PAGE`] raw rows passes through `keep` —
+    /// the listing's own visibility filter — and the scan stops the moment
+    /// `want` readable rows are held, so a page costs pages, not the table.
+    /// Only listings whose bound is the readable rows' call this; unmanaged
+    /// boards keep their SQL `LIMIT` at the call site and never reach here.
+    /// The cursor advances over RAW rows, denied ones included: `cursor_of`
+    /// runs on the page's last row before `keep` consumes it, so denied rows
+    /// already walked are never re-read by a later chunk of the same page.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_visible<T>(
+        &self,
+        base_sql: &str,
+        base: &[Box<dyn rusqlite::ToSql>],
+        order_by: &str,
+        cursor_predicate: &str,
+        want: usize,
+        map: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        mut keep: impl FnMut(Vec<T>) -> Result<Vec<T>>,
+        mut cursor_of: impl FnMut(&T) -> Vec<Box<dyn rusqlite::ToSql>>,
+    ) -> Result<Vec<T>> {
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let _snapshot = ReadSnapshot::open(&self.connection)?;
+        let mut out = Vec::new();
+        let mut cursor: Option<Vec<Box<dyn rusqlite::ToSql>>> = None;
+        loop {
+            let mut sql = String::from(base_sql);
+            if cursor.is_some() {
+                sql.push_str(cursor_predicate);
+            }
+            sql.push_str(order_by);
+            sql.push_str(" LIMIT ?");
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                base.iter().map(|value| value.as_ref()).collect();
+            if let Some(key) = &cursor {
+                refs.extend(key.iter().map(|value| value.as_ref()));
+            }
+            refs.push(&MANAGED_SCAN_PAGE);
+            let mut statement = self.connection.prepare(&sql)?;
+            let page = statement
+                .query_map(params_from_iter(refs), map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let fresh = page.len();
+            if fresh == 0 {
+                return Ok(out);
+            }
+            cursor = page.last().map(&mut cursor_of);
+            let mut kept = keep(page)?;
+            out.append(&mut kept);
+            if out.len() >= want {
+                out.truncate(want);
+                return Ok(out);
+            }
+            if fresh < MANAGED_SCAN_PAGE as usize {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Search reaches rows through an INDEX, so the guard cannot be applied
     /// here: `search_documents` carries a projected copy of each row's tags,
     /// and a stale copy is a bypass. The context goes down into
@@ -4561,12 +4891,30 @@ impl Store {
             .as_deref()
             .map(|value| nonempty(value, "subscription subject task id").map(str::to_owned))
             .transpose()?;
-        if let Some(subject) = subject_task_id.as_deref()
-            && !watch_subject_exists_on(&transaction, subject)?
-        {
-            bail!(
-                "subscription subject task {subject} not found in current or historical board state"
-            );
+        if let Some(subject) = subject_task_id.as_deref() {
+            // A subscription names the task its deliveries are about: a
+            // caller who cannot read that task must not subscribe to its
+            // events, nor learn it exists — so its tags are checked here,
+            // and an unknown subject answers as denied. A subject that
+            // survives only in history carries no live tags (tasks delete
+            // cascades them), so that case gates on its last-known removal
+            // tags and fails closed when no removal record names it —
+            // otherwise a removed secret task subscribes on empty tags.
+            let tags = if get_task(&transaction, subject)?.is_some() {
+                task_tags(&transaction, subject)?
+            } else {
+                absent_task_tags_or_denied(&transaction, subject, &self.authz)?
+            };
+            self.authz.check_read(&tags)?;
+            self.authz.check_write(&tags, &tags)?;
+            if !watch_subject_exists_on(&transaction, subject)? {
+                if self.authz.is_enforcing() {
+                    return Err(crate::authz::DeniedOrNotFound.into());
+                }
+                bail!(
+                    "subscription subject task {subject} not found in current or historical board state"
+                );
+            }
         }
 
         let mut relations = Vec::new();
@@ -4578,7 +4926,20 @@ impl Store {
             if target.trim().is_empty() || target != target.trim() {
                 bail!("subscription relation target is required");
             }
+            // A relation names a task its deliveries filter on: same gate as
+            // the subject, with the same collapse for an unknown target — and
+            // the same removal-history gate when the row is gone.
+            let target_tags = if get_task(&transaction, target)?.is_some() {
+                task_tags(&transaction, target)?
+            } else {
+                absent_task_tags_or_denied(&transaction, target, &self.authz)?
+            };
+            self.authz.check_read(&target_tags)?;
+            self.authz.check_write(&target_tags, &target_tags)?;
             if !watch_relation_target_exists_on(&transaction, kind, target)? {
+                if self.authz.is_enforcing() {
+                    return Err(crate::authz::DeniedOrNotFound.into());
+                }
                 bail!(
                     "subscription relation target {kind}:{target} not found in current or historical board state"
                 );
@@ -4700,14 +5061,27 @@ impl Store {
 
     pub fn require_subscription(&self, id: &str) -> Result<Subscription> {
         self.authz.check_read(&[])?;
-        self.connection
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))
+        let row = absent_as_denied(
+            self.connection
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // A subscription names the task its deliveries are about — the subject
+        // and every relation target, which the add path already gates alike:
+        // a caller who cannot read any one of them learns neither the row nor
+        // whether the id exists — the denied id answers exactly like a
+        // never-created one.
+        if !subscription_visible(&self.connection, &self.authz, &row)? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(row)
     }
 
     pub fn subscriptions(
@@ -4737,13 +5111,29 @@ impl Store {
         }
         sql.push_str(" ORDER BY created_at,id");
         let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params_from_iter(values.iter().map(|value| value.as_ref())),
-            subscription_row,
-        );
-        rows?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let rows = statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                subscription_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // A subscription names the task its deliveries are about — the subject
+        // and every relation target — so under managed enforcement each row
+        // passes `subscription_visible`: a caller who cannot read any one of
+        // those tasks never learns the subscription exists. There is no SQL
+        // bound here to move, only the filter. Outside enforcement every row
+        // stays visible.
+        if !self.authz.is_enforcing() {
+            return Ok(rows);
+        }
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if subscription_visible(&self.connection, &self.authz, &row)? {
+                visible.push(row);
+            }
+        }
+        Ok(visible)
     }
 
     fn set_subscription_paused(
@@ -4757,14 +5147,26 @@ impl Store {
         // Under the mutation lock: a concurrent write cannot slip between this
         // check and the UPDATE below.
         self.authz.check_write(&[], &[])?;
-        let current = transaction
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))?;
+        let current = absent_as_denied(
+            transaction
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // The row names the tasks its deliveries are about — the subject and
+        // every relation target: pausing or resuming a subscription on a task
+        // the caller cannot read is refused with the generic denial rather
+        // than confirming the id exists — the denied id answers exactly like
+        // a never-created one, and nothing is recorded.
+        if !subscription_visible(&transaction, &self.authz, &current)? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
         let desired = if paused { "paused" } else { "active" };
         if current.status == desired {
             transaction.commit()?;
@@ -5369,10 +5771,9 @@ impl Store {
         if let Some(id) = task {
             // A NAMED row: the caller asked about this task's history, so the
             // answer is the single generic denial before the row is opened —
-            // `require_task` below would otherwise say `task <id> not found`
-            // for a row that exists and is merely invisible.
-            self.authz.check_read(&task_tags(&self.connection, id)?)?;
-            require_task(&self.connection, id)?;
+            // `require_task_authorized` answers it for a row that exists and
+            // is merely invisible and for one that was never created alike.
+            require_task_authorized(&self.connection, id, &self.authz)?;
         }
         let mut sql = String::from("SELECT * FROM events WHERE 1=1");
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -5395,7 +5796,48 @@ impl Store {
         if !include_archived {
             sql.push_str(" AND archived=0");
         }
-        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        // The ordering stays out of the filter SQL: the managed scan appends
+        // it after each chunk's keyset predicate, and the direct estate
+        // appends it with its bound, so every path reads newest first.
+        let order_by = " ORDER BY seq DESC";
+        // Filtered by each row's REAL tags AND its own frozen snapshot, so an
+        // invisible row is not reconstructible from its trail and a retag
+        // event does not name the tag that hid it. See [`event_tags`].
+        if self.authz.is_enforcing() {
+            // The bound is the READABLE rows': a `LIMIT` in SQL runs before
+            // the tag test, so a denied row would consume a slot and the page
+            // would come back short — or empty, leaking hidden activity and
+            // its timing (`events --task t-visible --limit 1` answering `[]`
+            // when the newest event concerns a denied attention row). Scan by
+            // keyset until the bound is filled instead, so every caller's `+1`
+            // truncation probe still observes a next page. A negative bound is
+            // SQLite's "no bound" and stays one here. Outside managed
+            // enforcement nothing can be denied, so the direct estate keeps
+            // the SQL bound below and reads exactly what it asked for.
+            if limit < 0 {
+                sql.push_str(order_by);
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params_from_iter(values.iter().map(|value| value.as_ref())),
+                        board_event_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                return self.visible_events(rows);
+            }
+            return self.scan_visible(
+                &sql,
+                &values,
+                order_by,
+                " AND seq<?",
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                board_event_row,
+                |rows| self.visible_events(rows),
+                |event| vec![Box::new(event.seq) as Box<dyn rusqlite::ToSql>],
+            );
+        }
+        sql.push_str(order_by);
+        sql.push_str(" LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
@@ -5404,12 +5846,49 @@ impl Store {
                 board_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        // Filtered by each row's REAL tags AND its own frozen snapshot, so an
-        // invisible row is not reconstructible from its trail and a retag
-        // event does not name the tag that hid it. See [`event_tags`].
         self.visible_events(rows)
     }
 
+    /// Whether this store filters rows by caller authority.
+    ///
+    /// The watch poll gates its one-shot advancing heartbeat on this: only a
+    /// managed scan caps its raw work per poll, so only there can an empty
+    /// one-shot batch hide a denied stretch the consumer must walk. Anywhere
+    /// else an empty one-shot stays silent, byte-identical to before.
+    pub(crate) fn is_enforcing(&self) -> bool {
+        self.authz.is_enforcing()
+    }
+
+    /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
+    ///
+    /// Deliberately board-wide: it used to be the tail `watch::poll_once`
+    /// read to move a cursor past rows its filtered scan rejected, so it had
+    /// to see the rows that do not match. The poll now advances from the
+    /// filtered scan's own examined range instead — one scan, one snapshot —
+    /// and this stays as the unfiltered board tail its contract describes.
+    /// It used to take a `task` parameter the SQL never
+    /// bound, so a caller could pass a selector and silently receive board-wide
+    /// rows anyway; the parameter is removed rather than honoured, because a
+    /// task-scoped board tail would stall the cursor behind other tasks'
+    /// traffic. Subject-scoped reads belong in `events_since_filtered`.
+    ///
+    /// This reasoning is about the board tail only. The registry twin,
+    /// `Registry::rule_events_since`, does bind its selector, so a
+    /// `--rule R --follow` watch has exactly the rule-scoped tail argued
+    /// against here. That asymmetry is deliberate and pre-existing: rule trails
+    /// are sparse enough that a stalled cursor costs little, and narrowing a
+    /// tail is always safe. Do not "fix" the registry to match this one.
+    ///
+    /// Authorization: board scope only, and deliberately so. This is the one
+    /// event read whose PURPOSE is to see rows a filter would reject, so
+    /// per-row filtering here would stall a cursor driven from it behind
+    /// another task's traffic and re-scan the same window forever. The rows a
+    /// watcher is actually HANDED come from `events_since_filtered`, which
+    /// filters per row. A caller that returned these rows to a consumer
+    /// would be a new leak, and would need the filter that this one skips.
+    // Production reads go through the filtered tails; this stays as the
+    // unfiltered board tail above describes, pinned by its unit tests.
+    #[allow(dead_code)]
     pub fn events_since(
         &self,
         kind: Option<&str>,
@@ -5445,17 +5924,30 @@ impl Store {
 
     /// Ascending watch rows with semantic predicates applied before LIMIT.
     ///
-    /// Watch filters must bound delivered events rather than the raw ledger
-    /// page: a sparse match at sequence 500 is still the first event in a
-    /// `--limit 1` request. The JSON predicates deliberately require the
-    /// private semantic snapshot, so legacy rows never match a semantic
-    /// filter.
+    /// Watch filters bound delivered events rather than the raw ledger page:
+    /// a sparse match at sequence 500 is still the first event in a
+    /// `--limit 1` request — up to the raw cap below. The JSON predicates
+    /// deliberately require the private semantic snapshot, so legacy rows
+    /// never match a semantic filter.
     ///
     /// This is the watch DELIVERY path — every row it returns is handed to a
     /// subscriber — so it filters per row by each event's real tags, through
     /// [`Store::visible_events`]. Because `watch` re-opens its store on every
     /// poll, the authority this filter uses is re-minted every poll: a
     /// revocation stops the very next batch rather than the next reconnect.
+    ///
+    /// One call examines a bounded stretch of tail — the caller's `limit`
+    /// plus at most [`MANAGED_TAIL_SCAN_FLOOR`] raw rows — so a selective
+    /// filter with a longer denied stretch ahead comes back short though
+    /// matches wait beyond the cap. The cursor-driven tail (`watch --follow`)
+    /// adopts the examined range as its next
+    /// cursor and delivers those matches on later polls, instead of re-reading
+    /// the whole stretch on every revision. See
+    /// [`Store::events_since_filtered_tail`].
+    // The cursor-driven production tails call `events_since_filtered_tail`
+    // directly; this Vec form stays for one-shot delivery reads and its unit
+    // tests.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn events_since_filtered(
         &self,
@@ -5469,6 +5961,50 @@ impl Store {
         limit: i64,
         include_archived: bool,
     ) -> Result<Vec<Event>> {
+        Ok(self
+            .events_since_filtered_tail(
+                task,
+                kinds,
+                relations,
+                prior_statuses,
+                current_statuses,
+                tags,
+                cursor,
+                limit,
+                include_archived,
+            )?
+            .events)
+    }
+
+    /// The same tail with the examined range reported for cursor advancement.
+    ///
+    /// `watch --follow` polls this on every ledger
+    /// revision, so one scan must do bounded work even across a long denied
+    /// stretch, and the cursor must still move when the scan delivers
+    /// nothing: the [`FilteredEventTail`] they get back names the furthest
+    /// raw sequence examined, and adopting it as the next cursor walks the
+    /// denied stretch a bounded page per scan instead of re-reading it whole
+    /// on every revision. Advancing past denied rows cannot skip a row that
+    /// is visible under the authority and tags current at scan time: the
+    /// scan walks ascending `seq` inside one snapshot, so every row at or
+    /// below the new position passed through this scan's own filter —
+    /// delivered if visible, rejected if denied — and anything newer is
+    /// still past the cursor for the next scan to meet. A later grant or
+    /// retag does not replay history already passed: rows the scan rejected
+    /// stay behind the cursor it adopted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn events_since_filtered_tail(
+        &self,
+        task: Option<&str>,
+        kinds: &[String],
+        relations: &[String],
+        prior_statuses: &[String],
+        current_statuses: &[String],
+        tags: &[String],
+        cursor: i64,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<FilteredEventTail> {
         validate_event_limit(limit)?;
         let mut sql = String::from(
             "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
@@ -5489,6 +6025,19 @@ impl Store {
                 semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
             },
         );
+        // No ORDER BY or bound here: the managed scan appends its own keyset
+        // paging below, and the direct estate appends the bound after it.
+        // The tag filter runs before the bound for the reason
+        // [`Store::events_with_bounds`] gives: a denied row must not consume
+        // a delivery slot, or a watch page comes back short and the cursor a
+        // caller advances over it stalls behind rows it cannot see. Outside
+        // managed enforcement nothing can be denied, so the direct estate
+        // keeps the SQL bound below.
+        if self.authz.is_enforcing() {
+            let want = usize::try_from(limit).unwrap_or(usize::MAX);
+            let raw_cap = want.max(MANAGED_TAIL_SCAN_FLOOR);
+            return self.scan_event_tail(&sql, &values, cursor, want, raw_cap);
+        }
         sql.push_str(" ORDER BY seq ASC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
@@ -5498,7 +6047,96 @@ impl Store {
                 board_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.visible_events(rows)
+        let scanned_through = rows.last().map(|event| event.seq).unwrap_or(cursor);
+        let events = self.visible_events(rows)?;
+        Ok(FilteredEventTail {
+            events,
+            scanned_through,
+        })
+    }
+
+    /// One bounded ascending pass over newer raw rows, oldest first.
+    ///
+    /// `base_sql` is the tail's SELECT with its filters but no ordering and
+    /// no bound; chunks append `AND seq>?` off the last raw row examined —
+    /// `seq` is the rowid, so each chunk is an indexed seek — followed by
+    /// `ORDER BY seq ASC`. The whole scan holds a [`ReadSnapshot`], a no-op
+    /// inside a caller's wider scope as on the watch poll path, so the
+    /// examined range is one consistent view and the returned cursor is safe
+    /// to adopt: see [`Store::events_since_filtered_tail`].
+    ///
+    /// The scan stops at the first of: `want` visible rows held, `raw_cap`
+    /// raw rows examined, a short page. When the delivery fills mid-page the
+    /// cursor stops at the last DELIVERED row, not the page's end: rows past
+    /// it are re-examined by the next scan — at most one page of them, so
+    /// still bounded — and re-examination there can only delay a visible row,
+    /// never skip it, because the cursor still sits below it.
+    fn scan_event_tail(
+        &self,
+        base_sql: &str,
+        base: &[Box<dyn rusqlite::ToSql>],
+        cursor: i64,
+        want: usize,
+        raw_cap: usize,
+    ) -> Result<FilteredEventTail> {
+        if want == 0 {
+            return Ok(FilteredEventTail {
+                events: Vec::new(),
+                scanned_through: cursor,
+            });
+        }
+        let _snapshot = ReadSnapshot::open(&self.connection)?;
+        let mut out = Vec::new();
+        let mut frontier = cursor;
+        let mut raw: usize = 0;
+        loop {
+            let sql = format!("{base_sql} AND seq>? ORDER BY seq ASC LIMIT ?");
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                base.iter().map(|value| value.as_ref()).collect();
+            refs.push(&frontier);
+            refs.push(&MANAGED_SCAN_PAGE);
+            let mut statement = self.connection.prepare(&sql)?;
+            let page = statement
+                .query_map(params_from_iter(refs), board_event_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let fresh = page.len();
+            if fresh == 0 {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                });
+            }
+            raw += fresh;
+            let last_raw = page.last().map(|event| event.seq).unwrap_or(frontier);
+            let kept = self.visible_events(page)?;
+            let space = want - out.len();
+            if kept.len() >= space {
+                // The delivery filled inside this page. The cursor stops at
+                // the last row handed out; anything past it waits for the
+                // next scan.
+                out.extend(kept.into_iter().take(space));
+                let scanned = out.last().map(|event| event.seq).unwrap_or(frontier);
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: scanned,
+                });
+            }
+            out.extend(kept);
+            frontier = last_raw;
+            if fresh < MANAGED_SCAN_PAGE as usize {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                });
+            }
+            if raw >= raw_cap {
+                return Ok(FilteredEventTail {
+                    events: out,
+                    scanned_through: frontier,
+                });
+            }
+        }
     }
 
     /// Fan every new event out to the subscriptions that match it.
@@ -5650,10 +6288,25 @@ impl Store {
     /// Checked against the named task's REAL tags, so `watch --task T` on an
     /// invisible row answers `denied or not found` rather than confirming that
     /// T exists. A task that survives only in event history has no live tag
-    /// row, so that case falls back to board scope.
+    /// row, so that case authorizes against its last-known removal tags and
+    /// fails closed when no removal record names it: under enforcement a
+    /// removed-denied id, a live-denied id and a never-created id answer the
+    /// one generic denial, instead of the empty stream beside `not present`.
     pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
-        self.authz.check_read(&task_tags(&self.connection, id)?)?;
-        watch_subject_exists_on(&self.connection, id)
+        if get_task(&self.connection, id)?.is_some() {
+            self.authz.check_read(&task_tags(&self.connection, id)?)?;
+        } else {
+            self.authz.check_read(&absent_task_tags_or_denied(
+                &self.connection,
+                id,
+                &self.authz,
+            )?)?;
+        }
+        let exists = watch_subject_exists_on(&self.connection, id)?;
+        if !exists && self.authz.is_enforcing() {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(exists)
     }
 
     /// Relation predicates accept current task identities and exact targets
@@ -5661,10 +6314,24 @@ impl Store {
     /// parents and dependencies remain replayable.
     ///
     /// Same rule as [`Store::watch_subject_exists`]: the relation target is a
-    /// task id, so it is checked against that task's real tags.
+    /// task id, so it is checked against that task's real tags — or its
+    /// last-known removal tags when the row is gone — with nothing unnamed
+    /// answering `false` under enforcement.
     pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
-        self.authz.check_read(&task_tags(&self.connection, id)?)?;
-        watch_relation_target_exists_on(&self.connection, kind, id)
+        if get_task(&self.connection, id)?.is_some() {
+            self.authz.check_read(&task_tags(&self.connection, id)?)?;
+        } else {
+            self.authz.check_read(&absent_task_tags_or_denied(
+                &self.connection,
+                id,
+                &self.authz,
+            )?)?;
+        }
+        let exists = watch_relation_target_exists_on(&self.connection, kind, id)?;
+        if !exists && self.authz.is_enforcing() {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(exists)
     }
 
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
@@ -5707,14 +6374,19 @@ impl Store {
         if input.stale_minutes.is_some_and(|value| value < 0) {
             bail!("stale minutes must be non-negative");
         }
-        let id = input.id.unwrap_or_else(|| {
-            let prefix = match input.task_type.as_str() {
-                "epic" => "e",
-                "story" => "s",
-                _ => "t",
-            };
-            format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
-        });
+        let id = match input.id {
+            // An explicit id must already be the kind's own shape; the refusal
+            // runs before the write transaction opens, so it writes nothing.
+            Some(value) => task_id(&value, &input.task_type)?,
+            None => {
+                let prefix = match input.task_type.as_str() {
+                    "epic" => "e",
+                    "story" => "s",
+                    _ => "t",
+                };
+                format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
+            }
+        };
         let title = nonempty(&input.title, "title")?.to_owned();
         let transaction = self.begin_write()?;
         // A new row has no old tag set; the resulting set is what the caller
@@ -5733,7 +6405,10 @@ impl Store {
         refuse_reused_task_id(&transaction, &id, &self.authz)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
-            let parent = require_task(&transaction, parent)?;
+            // A child names its parent: authorized against the parent's own
+            // tags — read as well as write — with an absent id answering as
+            // denied, before the row exists.
+            let parent = authorize_task_attach(&transaction, &self.authz, parent)?;
             require_valid_nesting(&id, &input.task_type, &parent)?;
         }
         // The done gate covers every write that makes a task done (DG-17), not
@@ -5748,7 +6423,8 @@ impl Store {
             params![id,input.task_type,input.parent_id,title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,now,now,if input.status == "done" { Some(now) } else { None },input.metadata.to_string()],
         )?;
         for dependency in input.dependencies {
-            require_task(&transaction, &dependency)?;
+            // A dependency names its prerequisite: same gate as the parent.
+            authorize_task_attach(&transaction, &self.authz, &dependency)?;
             if dependency == id {
                 bail!("task cannot depend on itself");
             }
@@ -5811,10 +6487,9 @@ impl Store {
         // All-of-tag check BEFORE the row is opened: read the row's tags first,
         // then gate on them. An absent row yields no tags, so a caller without
         // board scope still receives the generic denial, never a difference
-        // between "invisible" and "absent".
-        let tags = task_tags(&self.connection, id)?;
-        self.authz.check_read(&tags)?;
-        let mut one = require_task(&self.connection, id)?;
+        // between "invisible" and "absent" — and under managed enforcement a
+        // caller WITH board scope does too, via `require_task_authorized`.
+        let mut one = require_task_authorized(&self.connection, id, &self.authz)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
         attach_allowed_models(&self.connection, std::iter::once(&mut one))?;
         apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
@@ -6307,7 +6982,7 @@ impl Store {
         // does not retag, so the old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         // A story's status column is a projection of its gate, not a field the
         // caller owns. Writing it directly leaves the row asserting one thing
         // and its gate another — and a direct move to `done` stamps
@@ -6397,7 +7072,7 @@ impl Store {
         // row, so the resulting tag set is empty.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &[])?;
-        let task = require_active_task(&transaction, id)?;
+        let task = require_active_task_authorized(&transaction, id, &self.authz)?;
         let seized = require_free_lease(&transaction, id, &actor, force, "remove")?;
         // Children have no ON DELETE CASCADE, so the raw foreign-key failure is
         // the only signal the operator would otherwise get. Name the children.
@@ -6457,7 +7132,7 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let object = patch
             .as_object()
@@ -6497,11 +7172,21 @@ impl Store {
         let old_tags = task_tags(&transaction, id)?;
         let resulting_tags = input.tags.clone().unwrap_or_else(|| old_tags.clone());
         self.authz.check_write(&old_tags, &resulting_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
-            let parent_task = require_task(&transaction, parent_id)?;
+            // Only a CHANGED edge is authorized against the other row: the
+            // unchanged parent was authorized when the edge was written, and
+            // a caller who may edit this row must not lose that to a parent
+            // it cannot see. A new edge names its parent, so that row's own
+            // tags are checked — read as well as write — with an absent id
+            // answering as denied.
+            let parent_task = if parent != previous_parent {
+                authorize_task_attach(&transaction, &self.authz, parent_id)?
+            } else {
+                require_task(&transaction, parent_id)?
+            };
             require_valid_nesting(id, &current.task_type, &parent_task)?;
             let mut cursor = Some(parent_id.clone());
             let mut seen = std::collections::HashSet::from([id.to_owned()]);
@@ -6552,8 +7237,36 @@ impl Store {
                     unique.push(dependency);
                 }
             }
+            // The edges already on the row, read before anything is
+            // authorized: re-listing a readable edge is not a new link, so —
+            // as with the unchanged parent above — it needs no new authority.
+            // An unreadable id is authorized either way, so probing a hidden
+            // edge answers exactly like probing an id that was never an edge.
+            let existing: Vec<String> = if self.authz.is_enforcing() {
+                let mut statement = transaction
+                    .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?")?;
+                let rows = statement
+                    .query_map([id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                rows
+            } else {
+                Vec::new()
+            };
             for dependency in &unique {
-                require_task(&transaction, dependency)?;
+                // Only a NEW edge, or an existing edge the caller can still
+                // read, skips the attach gate: re-listing a hidden edge would
+                // otherwise confirm it exists (an unreadable id succeeds when
+                // it is already an edge but is refused as denied-or-not-found
+                // when it is not), while re-listing a readable edge needs no
+                // new authority, as with the unchanged parent above.
+                let relisted_readable = existing.contains(dependency)
+                    && self
+                        .authz
+                        .permits_read(&task_tags(&transaction, dependency)?);
+                if !relisted_readable {
+                    authorize_task_attach(&transaction, &self.authz, dependency)?;
+                }
                 if dependency == id {
                     bail!("task cannot depend on itself");
                 }
@@ -6561,7 +7274,49 @@ impl Store {
                     bail!("dependency {dependency} would create a cycle");
                 }
             }
+            // A replacement keeps every edge this caller cannot write: deleting
+            // them would let a writer on this row silently remove a gate the
+            // owner set, and removing a gate is a write against the
+            // prerequisite's scope as much as the dependent's. The unwritable
+            // edges are a superset of the unreadable ones — a caller who cannot
+            // read an edge cannot write it either — so the hidden edges stay
+            // for the same reason as before, and a readable but read-only edge
+            // stays too. Refusing instead would confirm a hidden edge exists,
+            // so the kept edges stay and only the writable ones are replaced
+            // — keep over refuse. The listing still withholds the unreadable
+            // ones (`Store::dependencies` filters per row) while a readable
+            // kept edge stays visible as usual, and the gate keeps honouring
+            // every edge (`require_no_blocking_gates` reads the raw
+            // table), so a kept gate still blocks claims. `--clear-dependencies`
+            // arrives here as an empty list and keeps them the same way. The
+            // parent edge needs no such treatment: the row's own `parentID`
+            // carries it, so replacing or clearing the parent drops an edge the
+            // caller already sees. Subscription relations are create-only —
+            // `add_subscription` gates each target and nothing rewrites them —
+            // so there is no replacement path to keep through.
+            let mut kept: Vec<String> = Vec::new();
+            if self.authz.is_enforcing() {
+                for prerequisite in &existing {
+                    let tags = task_tags(&transaction, prerequisite)?;
+                    if !self.authz.permits_read(&tags)
+                        || self.authz.check_write(&tags, &tags).is_err()
+                    {
+                        kept.push(prerequisite.clone());
+                    }
+                }
+            }
             transaction.execute("DELETE FROM task_dependencies WHERE task_id=?", [id])?;
+            for prerequisite in &kept {
+                // A kept edge the caller also re-listed is inserted once,
+                // below, with the new edges.
+                if unique.contains(prerequisite) {
+                    continue;
+                }
+                transaction.execute(
+                    "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
+                    params![id, prerequisite],
+                )?;
+            }
             for dependency in unique {
                 transaction.execute(
                     "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
@@ -6683,7 +7438,7 @@ impl Store {
         let task = if let Some(id) = id {
             let tags = task_tags(&transaction, id)?;
             self.authz.check_write(&tags, &tags)?;
-            let task = require_active_task(&transaction, id)?;
+            let task = require_active_task_authorized(&transaction, id, &self.authz)?;
             if let Some(required_sprint) = sprint_filter.as_deref() {
                 let attached: Option<String> = transaction
                     .query_row(
@@ -6748,7 +7503,12 @@ impl Store {
             &allowed_models_of(&transaction, &task.id)?,
             options.model.as_deref(),
         )?;
-        if task.assignee.as_ref().is_some_and(|value| value != &agent) && !options.allow_reassign {
+        if task
+            .assignee
+            .as_deref()
+            .is_some_and(|value| !same_claim_worker(value, &agent))
+            && !options.allow_reassign
+        {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
         let token = Uuid::new_v4().to_string();
@@ -6849,8 +7609,15 @@ impl Store {
             bail!("lease must be at least 1000ms");
         }
         let transaction = self.begin_write()?;
-        // Board scope, under the lock: a heartbeat moves a claim row.
+        // Board scope, under the lock, then the task itself — but only where a
+        // guard can deny: a heartbeat on a tag-denied task answers the same
+        // denial as an unknown id, before `require_lease` can name the holder
+        // or the expiry. Outside enforcement the plain `has no active lease`
+        // stays exactly as it was.
         self.authz.check_write(&[], &[])?;
+        if self.authz.is_enforcing() {
+            require_active_task_authorized(&transaction, id, &self.authz)?;
+        }
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
         // A live lease is never revoked by a gate, but renewing one asserts
@@ -6893,8 +7660,13 @@ impl Store {
 
     pub fn release(&mut self, id: &str, token: &str, keep_status: bool) -> Result<()> {
         let transaction = self.begin_write()?;
-        // Board scope, under the lock: a release drops a claim row.
+        // Board scope, under the lock, then the task itself — but only where a
+        // guard can deny, for the same reason as `heartbeat` above: outside
+        // enforcement the plain `has no active lease` stays exactly as it was.
         self.authz.check_write(&[], &[])?;
+        if self.authz.is_enforcing() {
+            require_active_task_authorized(&transaction, id, &self.authz)?;
+        }
         let claim = require_lease(&transaction, id, token, now_ms())?;
         transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         if !keep_status {
@@ -6958,12 +7730,24 @@ impl Store {
             json!({"kind":kind}),
         )?;
         transaction.commit()?;
-        self.notes(id, 1)?.pop().context("note was not created")
+        // The receipt is the row this write just committed, re-read directly
+        // rather than through `notes`: that gate answers the task's tags, and
+        // reaching it here would turn an authorized-at-board-scope write into
+        // an error after it was recorded (L2 owns what a write against a
+        // denied task may do; this receipt changes none of it).
+        self.connection
+            .query_row(
+                "SELECT * FROM task_notes WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+                [id],
+                note_row,
+            )
+            .optional()?
+            .context("note was not created")
     }
 
     pub fn notes(&self, id: &str, limit: i64) -> Result<Vec<TaskNote>> {
         self.authz.check_read(&[])?;
-        let task = require_task(&self.connection, id)?;
+        let task = require_task_authorized(&self.connection, id, &self.authz)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
             "SELECT * FROM (SELECT * FROM task_notes WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
@@ -6977,7 +7761,7 @@ impl Store {
 
     pub fn checkpoints(&self, id: &str, limit: i64) -> Result<Vec<Checkpoint>> {
         self.authz.check_read(&[])?;
-        let task = require_task(&self.connection, id)?;
+        let task = require_task_authorized(&self.connection, id, &self.authz)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
             "SELECT * FROM (SELECT * FROM checkpoints WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
@@ -6992,12 +7776,13 @@ impl Store {
     pub fn checkpoint(&mut self, input: CheckpointInput) -> Result<Checkpoint> {
         validate(&input.state, &CHECKPOINT_STATES, "checkpoint state")?;
         let transaction = self.begin_write()?;
-        // Checkpoints carry no tags of their own: board scope, under the lock.
-        self.authz.check_write(&[], &[])?;
+        // Checkpoints carry no tags of their own, so they are authorized
+        // against the task they attach to — read as well as write — before
+        // the lease is even looked at, and an absent id answers as denied.
+        let prior = authorize_task_attach(&transaction, &self.authz, &input.task_id)?;
+        let prior_status = prior.status.clone();
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
-        let prior = require_task(&transaction, &input.task_id)?;
-        let prior_status = prior.status.clone();
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -7430,12 +8215,14 @@ impl Store {
     /// true now", and the newest update is the answer. Archived rows are
     /// excluded by default and readable on request — hidden, never gone.
     ///
-    /// Board scope is the whole check: a sitrep carries no tags, so there is
-    /// no per-row filter to apply and `&[]` is the entire subject. The guard
-    /// lives here rather than at each caller because `serve::lane_groups`
-    /// reaches this method with a store it opened for a board the caller may
-    /// never have been granted (`t-c84850a1`); with the check at the source
-    /// both the CLI and `/api/v1/lanes` are refused by construction.
+    /// Board scope is the first check; the per-row check follows in the body:
+    /// a sitrep names its task, so under managed enforcement each row passes
+    /// `task_linked_row_visible` and a caller who cannot read the task never
+    /// sees the row — its body, branch or worktree. The guard lives here
+    /// rather than at each caller because `serve::lane_groups` reaches this
+    /// method with a store it opened for a board the caller may never have
+    /// been granted (`t-c84850a1`); with the check at the source both the CLI
+    /// and `/api/v1/lanes` are refused by construction.
     pub fn sitreps(
         &self,
         lane: Option<&str>,
@@ -7695,14 +8482,11 @@ impl Store {
     /// caller-supplied actor string cannot unlock answer material (ACC-13).
     pub fn show_attention(&self, id: &str) -> Result<Attention> {
         self.authz.check_read(&[])?;
-        let mut item = absent_as_denied(
-            self.connection
-                .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-                .optional()?,
-            "attention",
-            id,
-            &self.authz,
-        )?;
+        let row = self
+            .connection
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?;
+        let mut item = require_attention_visible(&self.connection, &self.authz, row, id)?;
         let tags = attention_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate it on
@@ -8003,10 +8787,10 @@ impl Store {
             .map(|tags| tags.to_vec())
             .unwrap_or_else(|| old_tags.clone());
         self.authz.check_write(&old_tags, &resulting_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // rewrite on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not rewritable as board scope.
@@ -8222,10 +9006,10 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // settlement on the task's last-known removal tags as well, so a
         // secret task's untagged rows are not settleable as board scope.
@@ -8416,10 +9200,10 @@ impl Store {
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
         reject_secret_shaped_text(&note, "reopen note")?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // reopen on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not reopenable as board scope.
@@ -8501,10 +9285,10 @@ impl Store {
         // Answering does not retag: old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // answer on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not answerable as board scope.
@@ -8671,7 +9455,10 @@ impl Store {
             );
         }
         let transaction = self.begin_write()?;
-        // Handoffs carry no tags of their own: board scope, under the lock.
+        // Handoffs carry no tags of their own: board scope, under the lock. A
+        // task handoff additionally attaches to its task, so that row's own
+        // tags are checked — read as well as write — before the lease is
+        // looked at, with an absent id answering as denied.
         self.authz.check_write(&[], &[])?;
         for blocker in &input.blockers {
             reject_secret_shaped_text(blocker, "handoff blocker")?;
@@ -8683,7 +9470,9 @@ impl Store {
         let prior_status = input
             .task_id
             .as_deref()
-            .map(|task_id| require_task(&transaction, task_id).map(|task| task.status))
+            .map(|task_id| {
+                authorize_task_attach(&transaction, &self.authz, task_id).map(|task| task.status)
+            })
             .transpose()?;
         // A task and a lease travel together: a lease exists only over a task,
         // and handing a task over without one would let any caller move work
@@ -9007,9 +9796,22 @@ impl Store {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "retire note")?.to_owned();
         let transaction = self.begin_write()?;
-        // Board scope, under the lock.
+        // Board scope, under the lock — then the handoff's task, the way
+        // `accept_handoff` authorizes it: a pending handoff on a task the
+        // caller cannot write is refused with the generic denial rather than
+        // handing over the full row. A session handoff names no task, so
+        // board scope is the whole check there.
         self.authz.check_write(&[], &[])?;
         reject_secret_shaped_text(&note, "retire note")?;
+        let subject: Option<Option<String>> = transaction
+            .query_row("SELECT task_id FROM handoffs WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(Some(task_id)) = subject {
+            let tags = task_tags(&transaction, &task_id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
         let existing = absent_as_denied(
             transaction
                 .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
@@ -9071,7 +9873,7 @@ impl Store {
         // retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let story = require_active_task(&transaction, id)?;
+        let story = require_active_task_authorized(&transaction, id, &self.authz)?;
         require_story_type(id, &story.task_type, "takes signoff")?;
         if story.metadata.get("workflowStatus").and_then(Value::as_str) != Some("review") {
             bail!("story signoff is only valid in review");
@@ -9136,7 +9938,7 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let story = require_active_task(&transaction, id)?;
+        let story = require_active_task_authorized(&transaction, id, &self.authz)?;
         require_story_type(id, &story.task_type, "advances")?;
         let current = story
             .metadata
@@ -9569,6 +10371,63 @@ impl Store {
         Ok(get_task(&self.connection, id)?.is_some())
     }
 
+    /// NULL-linked rows whose creation event names a task id that was removed
+    /// and is live again, as `doctor` reports them (ACC-14 A24). The V34
+    /// backfill deliberately leaves these at board scope — re-linking to the
+    /// new incarnation would re-parent surviving rows under the new row's
+    /// tags — and no verb deletes these rows or re-links them, so the report
+    /// is advisory: it does not affect `healthy` or the exit code. Board
+    /// scope, in the `foreign_key_check` shape like `orphaned_task_links`:
+    /// the descriptions name tables and row ids, which is diagnostic rather
+    /// than row content, and a caller with no board read gets none of it.
+    /// Unlike an orphan, the named task is live, so under enforcement each
+    /// line is further filtered by the live row's real tags AND the removal
+    /// union of the prior incarnation the creation event names — a `doctor`
+    /// projection must not disclose that a board-scope row once belonged to
+    /// an incarnation the caller cannot read. A missing removal snapshot
+    /// fails closed: the line is withheld.
+    pub fn reused_task_links(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
+        let mut out = Vec::new();
+        for (table, kind, key) in [
+            ("sitreps", "sitrep_posted", "$.sitrepID"),
+            ("handoffs", "handoff_created", "$.handoffID"),
+            ("deployments", "deployment_started", "$.deploymentID"),
+            ("attention", "attention_raised", "$.attentionID"),
+        ] {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT {table}.id,e.task_id FROM {table} \
+                 JOIN events e ON e.kind='{kind}' AND json_extract(e.payload,'{key}')={table}.id \
+                 WHERE {table}.task_id IS NULL AND e.task_id IS NOT NULL \
+                 AND EXISTS (SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id) \
+                 AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=e.task_id) \
+                 ORDER BY {table}.id"
+            ))?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, task_id) = row?;
+                if self.authz.is_enforcing() {
+                    if !self
+                        .authz
+                        .permits_read(&task_tags(&self.connection, &task_id)?)
+                    {
+                        continue;
+                    }
+                    match removed_task_tag_union(&self.connection, &task_id)? {
+                        Some(prior) if self.authz.permits_read(&prior) => {}
+                        _ => continue,
+                    }
+                }
+                out.push(format!(
+                    "{table} row {id} nulled from reused task {task_id}"
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Tasks stamped after the moment they are read.
     ///
     /// Leases expire by comparing stamps, so a record from the future is not a
@@ -9620,10 +10479,26 @@ impl Store {
     /// so this guards only new records; a replay of one already written is
     /// returned before it is reached. Only [`MBP_TIERS`] on a non-MBP host and
     /// non-MBP tiers on an [`MBP_HOSTS`] host are refused, because every other
-    /// host is Hetzner by exclusion (see the constants in `model.rs`).
-    fn require_deploy_tier_host(tier: &str, host: &str) -> Result<()> {
+    /// host is Hetzner by exclusion (see the constants in `model.rs`) — with
+    /// one exception: an MBP tier on [`DEV_TIER_HAX_HOST`] is accepted for a
+    /// board whose estate is in [`DEV_TIER_HAX_ESTATES`], and refused by name
+    /// for any other board (docs/specs/deploy.md DEPLOY-05, DEPLOY-06). The
+    /// estate comes from the board's registered name, never from the caller.
+    fn require_deploy_tier_host(tier: &str, host: &str, board: Option<&str>) -> Result<()> {
         let mbp_tier = MBP_TIERS.contains(&tier);
         let mbp_host = MBP_HOSTS.contains(&host);
+        if mbp_tier && host == DEV_TIER_HAX_HOST {
+            let name = board.unwrap_or("(unnamed)");
+            return match board.and_then(estate_for_board) {
+                Some(estate) if DEV_TIER_HAX_ESTATES.contains(&estate) => Ok(()),
+                Some(estate) => bail!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {name} is in estate {estate}, so deploy it from geoywsMBP (or geoywsMBA)"
+                ),
+                None => bail!(
+                    "tier {tier} on host hax is a dev tier for the unum and geoyws estates only; board {name} maps to no estate, so deploy it from geoywsMBP (or geoywsMBA)"
+                ),
+            };
+        }
         if mbp_tier && !mbp_host {
             bail!(
                 "tier {tier} is an MBP tier (canonical row \"{tier} -> geoywsMBP\"), but host is {host}; deploy it from geoywsMBP (or geoywsMBA)"
@@ -9666,13 +10541,14 @@ impl Store {
         let url = nonempty(&input.url, "url")?.to_owned();
         let actor = nonempty(&input.actor, "actor")?.to_owned();
         let transaction = self.begin_write()?;
-        let subject_tags = match input.task_id.as_deref() {
-            Some(task_id) => task_tags(&transaction, task_id)?,
-            None => Vec::new(),
-        };
-        self.authz.check_write(&subject_tags, &subject_tags)?;
+        // A deployment names the task it proves: authorized against that
+        // task's own tags — read as well as write, because the attempt is a
+        // projection of the task and listings withhold unreadable subjects —
+        // with an absent id answering as denied.
         if let Some(task_id) = input.task_id.as_deref() {
-            require_task(&transaction, task_id)?;
+            authorize_task_attach(&transaction, &self.authz, task_id)?;
+        } else {
+            self.authz.check_write(&[], &[])?;
         }
         let deployment_target_version = if let Some(sprint_id) = input.sprint_id.as_deref() {
             let sprint = require_sprint_on(&transaction, sprint_id)?;
@@ -9684,15 +10560,11 @@ impl Store {
             None
         };
         if let Some(retry_of) = input.retry_of.as_deref() {
-            let status: Option<String> = transaction
-                .query_row(
-                    "SELECT status FROM deployments WHERE id=?",
-                    [retry_of],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let status = status.with_context(|| format!("deployment {retry_of} not found"))?;
-            if status == "started" {
+            // Authorized like a finish: a denied prior attempt answers the
+            // generic denial, an unknown id the same, instead of `not found`
+            // beside the prior's live status.
+            let prior = Self::require_deployment_authorized(&transaction, retry_of, &self.authz)?;
+            if prior.status == "started" {
                 bail!("deployment {retry_of} is still started and cannot be retried");
             }
         }
@@ -9751,7 +10623,12 @@ impl Store {
                 });
             }
         }
-        Self::require_deploy_tier_host(&input.tier, &host)?;
+        let board_name: Option<String> = transaction
+            .query_row("SELECT value FROM board_meta WHERE key='name'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Self::require_deploy_tier_host(&input.tier, &host, board_name.as_deref())?;
         let id = format!("d-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let capability_token = Uuid::new_v4().to_string();
         let now = now_ms();
@@ -9789,17 +10666,43 @@ impl Store {
     /// caller may have no authority over.
     pub fn require_deployment(&self, id: &str) -> Result<DeploymentAttempt> {
         self.authz.check_read(&[])?;
-        let attempt = absent_as_denied(
-            self.connection
+        let row = self
+            .connection
+            .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
+            .optional()?;
+        let attempt = absent_as_denied(row, "deployment", id, &self.authz)?;
+        self.authz
+            .check_read(&self.deployment_subject_tags(&attempt)?)?;
+        Ok(attempt)
+    }
+
+    /// The write-side deployment gate (ACC-14): board-scope write BEFORE the
+    /// row is read, so an unauthorized caller gets the generic denial rather
+    /// than `deployment <id> not found`, then the attempt's subject task at
+    /// write — its last-known removal tags when the task is gone — because
+    /// finishing, abandoning or retrying an attempt writes the
+    /// projection of work the caller may have no authority over. An absent id
+    /// answers the generic denial under enforcement through
+    /// `absent_as_denied` — `deployment {id} not found` word for word outside
+    /// it — so a denied attempt and a never-started one are indistinguishable.
+    /// Takes the connection so a write path reads inside its own
+    /// `BEGIN IMMEDIATE`. The read-side twin is [`Store::require_deployment`].
+    fn require_deployment_authorized(
+        connection: &Connection,
+        id: &str,
+        authz: &AuthzContext,
+    ) -> Result<DeploymentAttempt> {
+        authz.check_write(&[], &[])?;
+        let subject_tags = deployment_subject_tags_on(connection, id, authz)?;
+        authz.check_write(&subject_tags, &subject_tags)?;
+        absent_as_denied(
+            connection
                 .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
                 .optional()?,
             "deployment",
             id,
-            &self.authz,
-        )?;
-        self.authz
-            .check_read(&self.deployment_subject_tags(&attempt)?)?;
-        Ok(attempt)
+            authz,
+        )
     }
 
     /// The subject task's REAL tags for one deployment attempt, or none when
@@ -9883,19 +10786,54 @@ impl Store {
             sql.push_str(" AND tier=?");
             values.push(Box::new(value.to_owned()));
         }
-        // Under managed enforcement the bound is applied to the rows this
-        // caller may READ, not to the raw rows: a `LIMIT` bound in SQL runs
-        // before the tag test, so a denied row would consume a slot and the
-        // page would come back short. Outside enforcement nothing can be
-        // denied, so the direct estate keeps the SQL bound.
-        let enforcing = self.authz.is_enforcing();
-        if !enforcing {
-            values.push(Box::new(limit));
+        // The ordering stays out of the filter SQL: the managed scan appends
+        // it after each chunk's keyset predicate, and the direct estate
+        // appends it with its bound. `(created_at, id)` is this listing's
+        // total order — `id` breaks `created_at` ties — and the row-value
+        // range below seeks the status and task indexes that lead with those
+        // same columns.
+        let order_by = " ORDER BY created_at DESC,id DESC";
+        // The bound is the READABLE attempts': a `LIMIT` in SQL runs before
+        // the subject-tag test, so a denied attempt would consume a slot and
+        // the page would come back short — and `deploy list` over-fetches by
+        // one to observe its truncation, which a short page would hide while
+        // readable rows waited. Scan by keyset
+        // until the bound is filled instead, for the reason
+        // [`Store::events_with_bounds`] gives. A negative bound is SQLite's
+        // "no bound" and stays one here. Outside managed enforcement nothing
+        // can be denied, so the direct estate keeps the SQL bound below and
+        // reads exactly what it asked for.
+        if self.authz.is_enforcing() {
+            if limit < 0 {
+                sql.push_str(order_by);
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params_from_iter(values.iter().map(|value| value.as_ref())),
+                        deployment_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                return self.visible_deployments(rows);
+            }
+            return self.scan_visible(
+                &sql,
+                &values,
+                order_by,
+                " AND (created_at,id)<(?,?)",
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                deployment_row,
+                |rows| self.visible_deployments(rows),
+                |attempt| {
+                    vec![
+                        Box::new(attempt.created_at) as Box<dyn rusqlite::ToSql>,
+                        Box::new(attempt.id.clone()) as Box<dyn rusqlite::ToSql>,
+                    ]
+                },
+            );
         }
-        sql.push_str(" ORDER BY created_at DESC,id DESC");
-        if !enforcing {
-            sql.push_str(" LIMIT ?");
-        }
+        sql.push_str(order_by);
+        sql.push_str(" LIMIT ?");
+        values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement
             .query_map(
@@ -9904,12 +10842,7 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut visible = self.visible_deployments(rows)?;
-        if enforcing {
-            // A negative bound is SQLite's "no bound", and stays one here.
-            visible.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-        Ok(visible)
+        self.visible_deployments(rows)
     }
 
     /// The newest succeeded attempt per (repo, tier, environment) — the
@@ -10211,9 +11144,16 @@ impl Store {
         }
         let mut scope = candidates.to_vec();
         if let Some(parent) = parent_epic {
+            // Authorized before it is opened: a tag-denied epic answers the
+            // same denial as an unknown id, instead of `not found` from the
+            // raw lookup below. `attach_scope_on` keeps its raw lookup: its
+            // other callers (`add_task_in_sprint`, `update_task`) pass ids
+            // already authorized in their own paths — a fresh row and the row
+            // being edited — so authorizing inside it would only newly refuse
+            // a write-only creator, while every root here is authorized next.
+            let task = require_active_task_authorized(&transaction, parent, &self.authz)?;
             let parent_tags = task_tags(&transaction, parent)?;
             self.authz.check_write(&parent_tags, &parent_tags)?;
-            let task = require_active_task(&transaction, parent)?;
             if task.task_type != "epic" {
                 bail!(
                     "sprint plan --parent-epic requires an epic, but {parent} is a {}",
@@ -10242,6 +11182,9 @@ impl Store {
         let now = now_ms();
         let mut attached = Vec::new();
         for root in &scope {
+            // Same gate as the parent above, per root: the denied id answers
+            // as denied before `attach_scope_on` can answer `not found`.
+            require_active_task_authorized(&transaction, root, &self.authz)?;
             let root_tags = task_tags(&transaction, root)?;
             self.authz.check_write(&root_tags, &root_tags)?;
             attached.extend(attach_scope_on(&transaction, root, id, &actor, now)?);
@@ -10617,7 +11560,7 @@ impl Store {
         let transaction = self.begin_write()?;
         let root_tags = task_tags(&transaction, task_id)?;
         self.authz.check_write(&root_tags, &root_tags)?;
-        require_active_task(&transaction, task_id)?;
+        require_active_task_authorized(&transaction, task_id, &self.authz)?;
         require_attachable_sprint_on(&transaction, sprint_id)?;
         // The subtree, breadth-first so the receipt reads parent-first; the
         // seen-set terminates a malformed parent cycle the way the gate's
@@ -10722,7 +11665,7 @@ impl Store {
         let transaction = self.begin_write()?;
         let root_tags = task_tags(&transaction, task_id)?;
         self.authz.check_write(&root_tags, &root_tags)?;
-        require_active_task(&transaction, task_id)?;
+        require_active_task_authorized(&transaction, task_id, &self.authz)?;
         let old_sprint_id: Option<String> = transaction
             .query_row(
                 "SELECT sprint_id FROM task_sprints WHERE task_id=?",
@@ -10990,7 +11933,7 @@ mod tests {
 
         store.add_tag("old", None, Some(actor)).unwrap();
         store.add_tag("new", None, Some(actor)).unwrap();
-        let task_id = Uuid::new_v4().to_string();
+        let task_id = format!("t-{}", Uuid::new_v4().simple());
         store
             .add_task(task_input(
                 &task_id,
@@ -12443,6 +13386,200 @@ mod tests {
         }
     }
 
+    /// A restricted tail walks a long denied stretch in bounded scans and
+    /// still delivers the visible row after it.
+    ///
+    /// Six hundred plain events about the `secret` task sit between two
+    /// visible events — more than two scan pages, so every scan here crosses
+    /// a chunk boundary. The first tail scan delivers nothing but advances a
+    /// bounded stretch (no more than two 256-row pages for the 500-row
+    /// floor); the second delivers the visible row and reports the head
+    /// reached; the third is empty and stays put. No scan re-reads the whole
+    /// denied stretch, and no row is delivered twice or skipped: the union
+    /// of the three batches is exactly the later visible row.
+    ///
+    /// The one-shot read is capped the same way: it comes back empty though
+    /// a match waits beyond the cap. Before the cap it filled past all six
+    /// hundred denied rows and answered the visible one here, so that
+    /// assertion fails on the old code and passes on the new. The
+    /// cursor-driven tail (`watch --follow`) adopts
+    /// the examined range as its next cursor instead, and delivers that
+    /// same row on the very next poll — which is what the poll-by-poll
+    /// assertions prove. The newest-first page assert is the companion
+    /// guard: it passes on the old code too, and pins that the keyset
+    /// continuation fills the same page the OFFSET continuation did.
+    #[test]
+    fn managed_ascending_tail_walks_a_denied_stretch_in_bounded_scans() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-9999-4999-8999-999999999999";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-tail-walk-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let first_visible;
+        let last_visible;
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret row",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret");
+            let mut clock = 100_i64;
+            let mut append = |task: &str| -> i64 {
+                clock += 1;
+                crate::audit::append_board_event(
+                    &seed.connection,
+                    Some(task),
+                    "task_updated",
+                    "seed",
+                    "{}",
+                    clock,
+                )
+                .expect("append event");
+                seed.connection
+                    .query_row("SELECT max(seq) FROM events", [], |row| row.get(0))
+                    .expect("head after append")
+            };
+            first_visible = append("t-visible");
+            for _ in 0..600 {
+                append("t-secret");
+            }
+            last_visible = append("t-visible");
+        }
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+
+        // Newest-first page-fill crosses the denied stretch as well: the two
+        // visible rows lead, newest first, though six hundred denied rows sit
+        // above the older one.
+        let page = store
+            .events_with_bounds(None, None, None, None, 2, true)
+            .expect("newest-first page past denied rows");
+        assert_eq!(
+            board_event_seqs(&page),
+            vec![last_visible, first_visible],
+            "the newest-first page lost a visible row behind denied ones"
+        );
+
+        // The capped one-shot comes back empty though a match waits beyond
+        // the cap: bounded work per scan is the contract, and the
+        // cursor-driven tails advance past the examined rows instead.
+        let oneshot = store
+            .events_since_filtered(None, &[], &[], &[], &[], &[], first_visible, 2, true)
+            .expect("capped one-shot tail");
+        assert!(
+            oneshot.is_empty(),
+            "the one-shot tail read past its raw cap: {}",
+            board_event_seqs(&oneshot)
+                .iter()
+                .map(|seq| seq.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // First poll: nothing delivered, but the cursor moves past the
+        // denied rows the scan already read — and only those.
+        let first = store
+            .events_since_filtered_tail(None, &[], &[], &[], &[], &[], first_visible, 2, true)
+            .expect("first tail scan");
+        assert!(
+            first.events.is_empty(),
+            "the first scan delivered past its raw cap"
+        );
+        assert!(
+            first.scanned_through > first_visible,
+            "the cursor did not move past denied rows it already read"
+        );
+        assert!(
+            first.scanned_through - first_visible <= 512,
+            "one scan examined more than two pages over a denied stretch: {} rows",
+            first.scanned_through - first_visible
+        );
+
+        // Second poll: resumes where the first stopped and delivers the
+        // visible row waiting past the stretch, reaching the head.
+        let second = store
+            .events_since_filtered_tail(
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                first.scanned_through,
+                2,
+                true,
+            )
+            .expect("second tail scan");
+        assert_eq!(
+            board_event_seqs(&second.events),
+            vec![last_visible],
+            "the resumed scan lost the visible row past the denied stretch"
+        );
+        assert_eq!(
+            second.scanned_through, last_visible,
+            "the delivering scan did not stop at the row it handed out"
+        );
+
+        // Third poll: empty, and the cursor stays put — the denied stretch
+        // is never re-read.
+        let third = store
+            .events_since_filtered_tail(
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                second.scanned_through,
+                2,
+                true,
+            )
+            .expect("third tail scan");
+        assert!(
+            third.events.is_empty(),
+            "the settled tail delivered a row twice"
+        );
+        assert_eq!(
+            third.scanned_through, last_visible,
+            "the settled tail moved a cursor with nothing new to examine"
+        );
+    }
+
     /// The relations of a READABLE row: a prerequisite the caller may not read
     /// leaves the dependency listing, keeps its gate, and loses its title
     /// there; an ancestor it may not read truncates the chain instead of
@@ -12482,7 +13619,7 @@ mod tests {
             seed.add_tag("visible", None, Some("seed")).expect("tag");
             seed.add_tag("secret", None, Some("seed")).expect("tag");
 
-            let mut epic = task_input("t-epic", "secret epic", vec!["secret".to_owned()], vec![]);
+            let mut epic = task_input("e-epic", "secret epic", vec!["secret".to_owned()], vec![]);
             epic.task_type = "epic".to_owned();
             seed.add_task(epic).expect("seed epic");
             seed.add_task(task_input(
@@ -12501,21 +13638,21 @@ mod tests {
             .expect("seed open prerequisite");
 
             let mut story = task_input(
-                "t-visible",
+                "s-visible",
                 "visible row",
                 vec!["visible".to_owned()],
                 vec!["t-secret".to_owned(), "t-open".to_owned()],
             );
             story.task_type = "story".to_owned();
-            story.parent_id = Some("t-epic".to_owned());
+            story.parent_id = Some("e-epic".to_owned());
             seed.add_task(story).expect("seed visible row");
 
             let mut child =
                 task_input("t-child", "secret child", vec!["secret".to_owned()], vec![]);
-            child.parent_id = Some("t-visible".to_owned());
+            child.parent_id = Some("s-visible".to_owned());
             seed.add_task(child).expect("seed secret child");
             let mut leaf = task_input("t-leaf", "visible leaf", vec!["visible".to_owned()], vec![]);
-            leaf.parent_id = Some("t-visible".to_owned());
+            leaf.parent_id = Some("s-visible".to_owned());
             seed.add_task(leaf).expect("seed visible leaf");
         }
 
@@ -12543,15 +13680,15 @@ mod tests {
         // The control: the row whose relations are read IS readable, and the
         // rows hanging off it are not.
         store
-            .require_task("t-visible")
-            .expect("task show t-visible");
-        for hidden in ["t-secret", "t-epic", "t-child"] {
+            .require_task("s-visible")
+            .expect("task show s-visible");
+        for hidden in ["t-secret", "e-epic", "t-child"] {
             assert_denied(store.require_task(hidden), &format!("task show {hidden}"));
         }
 
         // 1. The dependency listing: the denied prerequisite is absent, the
         //    readable one is there in full.
-        let dependencies = store.dependencies("t-visible").expect("dependencies");
+        let dependencies = store.dependencies("s-visible").expect("dependencies");
         assert_eq!(
             dependencies
                 .iter()
@@ -12563,7 +13700,7 @@ mod tests {
 
         // 2. The gate: BOTH prerequisites, because the gate is what refuses
         //    the claim — with the denied one's title blanked and nothing else.
-        let gates = store.blocking_gates("t-visible").expect("blocking gates");
+        let gates = store.blocking_gates("s-visible").expect("blocking gates");
         assert_eq!(
             gates
                 .iter()
@@ -12575,15 +13712,15 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("t-visible", "t-open", Some("open prerequisite"), "todo"),
-                ("t-visible", "t-secret", None, "todo"),
+                ("s-visible", "t-open", Some("open prerequisite"), "todo"),
+                ("s-visible", "t-secret", None, "todo"),
             ],
             "the gate must keep the denied prerequisite and lose only its title"
         );
         // The listing form answers identically, including for a row that
         // INHERITS the gate from the readable story above it.
         let listed_gates = store
-            .blocking_gates_for(&["t-visible".to_owned(), "t-leaf".to_owned()])
+            .blocking_gates_for(&["s-visible".to_owned(), "t-leaf".to_owned()])
             .expect("blocking gates for a listing");
         assert_eq!(
             listed_gates[0], gates,
@@ -12599,8 +13736,8 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("t-visible", "t-open", Some("open prerequisite")),
-                ("t-visible", "t-secret", None),
+                ("s-visible", "t-open", Some("open prerequisite")),
+                ("s-visible", "t-secret", None),
             ],
             "the inherited gate must read the same way"
         );
@@ -12608,7 +13745,7 @@ mod tests {
         // 3. The chain: truncated at the denied epic, never refused, and the
         //    readable run nearest the row is intact.
         assert!(
-            store.ancestors("t-visible").expect("ancestors").is_empty(),
+            store.ancestors("s-visible").expect("ancestors").is_empty(),
             "a denied ancestor must not be in the chain"
         );
         assert_eq!(
@@ -12618,14 +13755,14 @@ mod tests {
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            ["t-visible"],
+            ["s-visible"],
             "the chain must keep the readable run and stop at the boundary"
         );
 
         // 4. The context packet reads all three through the store, so it is
         //    true by construction — asserted because it is the surface the
         //    finding was filed against.
-        let packet = store.context_packet("t-visible").expect("context packet");
+        let packet = store.context_packet("s-visible").expect("context packet");
         assert!(
             packet.ancestors.is_empty(),
             "the packet leaked the denied epic"
@@ -12650,7 +13787,7 @@ mod tests {
         let direct = Store::open(&path).expect("open direct");
         assert_eq!(
             direct
-                .dependencies("t-visible")
+                .dependencies("s-visible")
                 .expect("direct dependencies")
                 .len(),
             2,
@@ -12658,7 +13795,7 @@ mod tests {
         );
         assert_eq!(
             direct
-                .blocking_gates("t-visible")
+                .blocking_gates("s-visible")
                 .expect("direct gate")
                 .iter()
                 .map(|gate| gate.prerequisite_title.as_deref())
@@ -12668,12 +13805,12 @@ mod tests {
         );
         assert_eq!(
             direct
-                .ancestors("t-visible")
+                .ancestors("s-visible")
                 .expect("direct ancestors")
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            ["t-epic"],
+            ["e-epic"],
             "the direct estate must still see the whole chain"
         );
     }
@@ -15491,6 +16628,54 @@ mod tests {
     }
 
     #[test]
+    fn removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array() {
+        let store = test_store("removed-union-missing-tags");
+        let append = |id: &str, payload: &str| {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some(id),
+                "task_removed",
+                "test",
+                payload,
+                1,
+            )
+            .unwrap();
+        };
+        // A removal record with no `_semanticV1.tags` array — missing, null
+        // or a non-array — is malformed and fails closed with the stale-entry
+        // tag, never as an untagged removal; only an explicitly empty array
+        // records "removed while carrying no tag".
+        append("t-missing", r#"{"_semanticV1":{}}"#);
+        append("t-null", r#"{"_semanticV1":{"tags":null}}"#);
+        append("t-scalar", r#"{"_semanticV1":{"tags":"secret"}}"#);
+        append("t-empty", r#"{"_semanticV1":{"tags":[]}}"#);
+        append("t-tagged", r#"{"_semanticV1":{"tags":["secret"]}}"#);
+        let stale = vec![crate::search::STALE_INDEX_TAG.to_owned()];
+        for id in ["t-missing", "t-null", "t-scalar"] {
+            assert_eq!(
+                removed_task_tag_union(&store.connection, id).unwrap(),
+                Some(stale.clone()),
+                "{id} names no tags array and must fail closed",
+            );
+        }
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-empty").unwrap(),
+            Some(Vec::new()),
+            "an explicitly empty array stays an untagged removal",
+        );
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-tagged").unwrap(),
+            Some(vec!["secret".to_owned()]),
+            "a well-formed snapshot keeps its union",
+        );
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-never-removed").unwrap(),
+            None,
+            "no removal record stays no record",
+        );
+    }
+
+    #[test]
     fn filtered_watch_rows_apply_semantics_before_limit_and_fail_closed_on_legacy_rows() {
         let store = test_store("filtered-watch-sparse");
         let append = |kind: &str, payload: &str| {
@@ -16038,6 +17223,62 @@ mod tests {
             .to_string();
         assert!(estate.contains("acme"), "{estate}");
         assert!(estate.contains("ifca, unum, geoyws"), "{estate}");
+    }
+
+    /// CLI-02 — every named board files under its estate, and nothing else
+    /// files anywhere.
+    ///
+    /// The map is the repair `tag add` names, so a board filed wrong here
+    /// sends the operator to register under the wrong owner. One table,
+    /// because every row here is the same question.
+    #[test]
+    fn estate_for_board_maps_each_named_board_to_its_estate() {
+        for (board, estate) in [
+            ("px", "ifca"),
+            ("fmx", "ifca"),
+            ("hx", "ifca"),
+            ("hrx", "ifca"),
+            ("ix", "ifca"),
+            ("mx-root", "ifca"),
+            ("prjx-root", "ifca"),
+            ("rentx-root", "ifca"),
+            ("auditx-root", "ifca"),
+            ("ifca-docs", "ifca"),
+            ("prjx", "ifca"),
+            ("kanban", "geoyws"),
+            ("omp", "geoyws"),
+            ("acies", "geoyws"),
+            ("dotfiles", "geoyws"),
+            ("geoyws", "geoyws"),
+            ("atmux", "geoyws"),
+            ("dash", "geoyws"),
+            ("gitea", "geoyws"),
+            ("journal", "geoyws"),
+            ("orch", "geoyws"),
+            ("hax", "geoyws"),
+            ("unum", "unum"),
+            ("unum-ledger", "unum"),
+            ("memberx", "unum"),
+        ] {
+            assert_eq!(
+                estate_for_board(board),
+                Some(estate),
+                "board {board} must file under {estate}"
+            );
+        }
+        for board in ["scratch", "TAGS", "Alpha", "", "ifca"] {
+            assert_eq!(
+                estate_for_board(board),
+                None,
+                "board {board} must map to no estate"
+            );
+        }
+        // A slashed name is never bare, on any board: the estate half was
+        // already checked by `validate_tag_name`, so there is nothing left to
+        // refuse here.
+        for board in ["prjx", "kanban", "memberx", "scratch"] {
+            refuse_bare_tag_name(board, "ifca/assistant").expect("a namespaced name is never bare");
+        }
     }
 
     #[test]
@@ -17323,6 +18564,88 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), "denied or not found");
         }
+    }
+
+    /// ACC-14 at store level: `notes`, `checkpoints` and a named `claim`
+    /// answer a same-board tag-denied task and a never-created one with the
+    /// identical generic denial. These three reads have no standalone CLI
+    /// surface — every command reaches them only past `require_task`, which
+    /// already denies both alike — so they are pinned here rather than at
+    /// the process boundary. Outside enforcement the plain `not found`
+    /// stays.
+    #[test]
+    fn managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-1111-4111-8111-111111111111";
+        let dir = std::env::temp_dir().join(format!("kanban-task-reads-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret row",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret task");
+            seed.add_note("t-secret", "seed", "progress", "a secret note")
+                .expect("seed note");
+        }
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Write,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Write,
+                ),
+            ])
+        };
+        let mut store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+        for id in ["t-secret", "t-never-created"] {
+            assert_denied(store.notes(id, 10), &format!("notes of {id}"));
+            assert_denied(store.checkpoints(id, 10), &format!("checkpoints of {id}"));
+            assert_denied(
+                store.claim(Some(id), claim_options("agent")),
+                &format!("claim of {id}"),
+            );
+        }
+        let direct = Store::open(&path).expect("open the direct estate");
+        assert_eq!(
+            direct.notes("t-never-created", 10).unwrap_err().to_string(),
+            "task t-never-created not found",
+            "the direct estate lost its plain message"
+        );
     }
 
     /// One corrupt deployment link must not fail the whole listing (ACC-14):

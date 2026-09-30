@@ -850,8 +850,8 @@ search with `--all`.
 ## Deployment ledger
 
 ```bash
-kb deploy start --repo geoyws/kanban --commit "$FULL_SHA" \
-  --tier @_p --environment production --host hax --url https://kb.geoy.ws \
+kb deploy start --repo geoyws/acies --commit "$FULL_SHA" \
+  --tier @_p --environment production --host hax --url https://acies.geoy.ws \
   --task "$TASK_ID" --operation-id "$OPERATION_ID" --as codex@driver --json
 
 kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
@@ -1070,63 +1070,26 @@ The crate installs ten executables, and the HIG release package ships all ten:
 real binary rather than a shell alias because agents invoke it from
 non-interactive cages that never source a shell profile.
 
-Installing a release flips `current`, relinks all ten public binaries, then
-restarts `kanban-serve` and proves the process that came back is the release
-it just installed: the unit reports `active` with a `MainPID`, that pid's
-`/proc/<MainPID>/exe` IS the `kanban` executable retained in the new
-`releases/<id>` — not merely a path inside it, so `kb` and the kernel's
-`<path> (deleted)` are refused — and the listener its own `ExecStart` names,
-`--port N` or `--socket PATH`, answers 200. Every request is bounded by what
-is left of the deadline, and the pid and its exe are read once more after the
-200, because a 200 proves only that something answered. The measurement lands
-in the install receipt as
-`serve: {restarted, mainPid, exe, exeSource, listener, http}`, where
-`exeSource` is `/proc/<pid>/exe` on a host that has one and names the test
-override where it does not. A proof that fails is not a warning: the previous
-`current` and links are restored, the unit is restarted and the previous
-release PROVED back into service before the candidate's directory is removed
-— a first install with nothing to fall back to stops the unit first — and a
-recovery that cannot be proved reports both failures and keeps the candidate
-on disk to recover from. A host with no such unit prints
-`serve restart skipped: <reason>` and records `serve: {skipped: <reason>}`
-instead of claiming a restart that never happened; a host whose service
-manager cannot be asked is a failed install, because a skip is a claim about
-the unit and an unreachable manager supports none.
+Installing a release flips `current` and relinks all ten public binaries.
+Before it writes the release receipt, it checks every retained executable in
+the new `releases/<id>` (each one's version probe and platform), because the
+receipt is the commit: nothing after it rolls the install back. A check that
+fails restores the previous `current` and links and removes the candidate's
+directory; a first install with nothing to fall back to removes the links it
+made. No service is restarted, because the installer manages none: the web
+view and `kanban serve` were retired (ADR-053, epic `e-caeb1449`), and each
+`kb`/`kanban` invocation runs whatever binary the links point at when it
+starts.
 
-**A release receipt names both halves, or it names nothing.** One release is
-two facts, and each can be true while the other is false:
+A receipt from before that retirement may name a `bundleSha256`, the
+fingerprint of the operator UI the binary then embedded (ADR-048). The
+installer still honours it: such a receipt installs only if the installed
+`kanban --version` prints the same `bundle <sha256>` line. A release built
+after the retirement carries no bundle and its receipt names none, so it
+proves one thing less and installs exactly as before.
 
-- the **executable identity** — the `MainPID` exe path the install proof
-  above reads, `/proc/<MainPID>/exe`, and/or its sha256. This says WHICH
-  binary is serving.
-- the **bundle fingerprint** — the `bundle <sha256>` line the INSTALLED
-  executable's `--version` prints, cross-checked against the package
-  manifest's `bundleSha256`. This says WHICH operator UI that binary
-  actually carries. The UI is embedded by `include_bytes!` (ADR-048), so a
-  correct executable path proves nothing about the bytes a browser is
-  served, and a matching manifest proves nothing about the process that
-  came back from the restart.
-
-A receipt carrying one half is not a release receipt: it is half a
-measurement with the other half assumed.
-
-Where the bundle half lives is a deliberate, narrow answer. `deploy finish
---observed` takes only TYPED artifact identities, and
-`ARTIFACT_IDENTITY_KINDS` (`rust/model.rs`) is exactly two kinds —
-`docker-image-id` and `oci-manifest-digest` (ADR-043 §3). A bundle sha256 is
-neither: it is a digest of an embedded asset table, not of an image or of an
-image manifest, and offering it as either is refused by name. So the bundle
-fingerprint is recorded in the `--receipt` TEXT of the deployment row, beside
-the executable identity, and the typed kinds are NOT extended to hold it.
-That is the boundary, stated so the next reader does not re-derive it:
-adding a third kind is a model change, and nothing in the receipt law asks
-for one — the law asks that both facts be recorded where the surface already
-supports recording them, which for the bundle fingerprint is the receipt
-text.
-
-`hig-release.sh rollback` owes the same proof and now performs it: it restarts
-the unit and proves the release it rolled back to is the one serving, and its
-summary carries the same `serve` measurement.
+`hig-release.sh rollback` flips `current` and the links back to a retained
+release through the same checks.
 
 What none of this can undo is a schema migration. Rolling the CODE back does
 not roll a store back: a release that has already opened a board migrates it,

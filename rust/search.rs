@@ -265,11 +265,72 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
         .map_err(Into::into)
 }
 
+/// The FTS5 membership set restricted to rows the caller may read.
+///
+/// The unenforced path keeps the whole-index MATCH in [`fts_match_rows`]:
+/// every row is readable there, so its scores stay exactly what the
+/// unfiltered code produced. Under enforcement the MATCH still walks the
+/// whole index once, rowids only: FTS5 has no rowid seek to push a
+/// restriction into (EXPLAIN QUERY PLAN prints a full `SCAN ... INDEX
+/// 0:=M1` for `MATCH ? AND rowid IN (...)` on the bundled SQLite 3.50.2),
+/// and a throwaway probe measured the restricted shapes multiplying the
+/// walk — one MATCH execution per IN element, ~2.7s for 2000 permitted +
+/// 5000 denied against ~4.5ms for the single walk. So exactly one MATCH
+/// runs per call and the permitted intersect happens in Rust: denied seqs
+/// ARE materialised here, as bare i64 rowids, and MATCH time still grows
+/// with the denied rows holding the query's terms — one shared walk is the
+/// minimum FTS5 permits. What is never read for a denied row is any
+/// content, snippet, or bm25. The FTS
+/// table is external-content (`content='search_documents'`,
+/// `content_rowid='seq'`), so its `rowid` IS the document `seq` and the
+/// restriction needs no mapping.
+///
+/// A pure read throughout, by necessity: CLI search opens the board
+/// `SQLITE_OPEN_READ_ONLY` with `PRAGMA query_only`
+/// ([`crate::db::open_board_readonly`]), so a TEMP table — a write — is
+/// refused there. Nothing persists anywhere, so pooled or reused
+/// connections and concurrent searches cannot leak one request's permitted
+/// set into another: every call binds its own seqs and leaves no state.
+///
+/// Only membership is served from here: the strengths still come from
+/// [`permitted_bm25_scores`], so `lexicalScore`, `score`, order, truncation
+/// and snippets are byte-identical with the filter-afterwards path.
+fn fts_match_permitted(
+    connection: &Connection,
+    query: &str,
+    permitted: &HashSet<i64>,
+) -> Result<HashSet<i64>> {
+    let mut matched = HashSet::new();
+    if permitted.is_empty() {
+        return Ok(matched);
+    }
+    let Some(query) = fts_query(query) else {
+        return Ok(matched);
+    };
+    // Exactly one MATCH execution on every path: each execution walks the
+    // whole posting list for the query's terms (measured, not assumed —
+    // see the doc comment), so batching the permitted seqs into IN lists
+    // would run the denied-driven walk once per id instead of once per
+    // call. No bm25 is computed and no denied content is read here.
+    let mut statement =
+        connection.prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH ?")?;
+    let rows = statement.query_map([query], |row| row.get::<_, i64>(0))?;
+    for row in rows {
+        let seq = row?;
+        if permitted.contains(&seq) {
+            matched.insert(seq);
+        }
+    }
+    Ok(matched)
+}
+
 /// The raw FTS5 match strengths for one query: every indexed row the MATCH
-/// accepts, with its bm25 made non-negative. This decides only WHICH rows
-/// match — under enforcement the strengths are discarded and recomputed by
-/// [`permitted_bm25_scores`], because they fold whole-index statistics a
-/// denied row would otherwise leak through.
+/// accepts, with its bm25 made non-negative. Only the unenforced path uses
+/// this, through [`lexical_scores`]: every row is readable there, so the
+/// whole-index strengths are exactly what the unfiltered code served. Under
+/// enforcement [`search`] takes membership from [`fts_match_permitted`]
+/// instead and the strengths from [`permitted_bm25_scores`], because these
+/// fold whole-index statistics a denied row would otherwise leak through.
 fn fts_match_rows(connection: &Connection, query: &str) -> Result<Vec<(i64, f64)>> {
     let Some(query) = fts_query(query) else {
         return Ok(Vec::new());
@@ -705,17 +766,17 @@ pub fn search(
         }
         candidates.push(document);
     }
-    // Under enforcement FTS decides only WHICH rows match; the strengths
-    // come from [`permitted_bm25_scores`], whose N, df and avgdl range over
-    // the permitted candidates alone — FTS5's whole-index statistics would
-    // otherwise leak a denied row's text through the non-max scores and the
-    // order (M1).
+    // Under enforcement FTS decides only WHICH rows match, with one
+    // rowid-only MATCH walk per call (`t-5f7daa1b`): denied seqs are read
+    // as bare rowids and intersected away in Rust — never as content,
+    // snippets, or bm25 — so a guessed prefix they hold costs one shared
+    // walk, the minimum FTS5 permits, and no per-row scoring work. The
+    // strengths come from [`permitted_bm25_scores`], whose N, df
+    // and avgdl range over the permitted candidates alone — FTS5's
+    // whole-index statistics would otherwise leak a denied row's text
+    // through the non-max scores and the order (M1).
     let lexical = if authz.is_enforcing() {
-        let matched: HashSet<i64> = fts_match_rows(connection, &options.query)?
-            .into_iter()
-            .map(|(seq, _)| seq)
-            .filter(|seq| permitted.contains(seq))
-            .collect();
+        let matched = fts_match_permitted(connection, &options.query, &permitted)?;
         permitted_bm25_scores(&candidates, &matched, &options.query)
     } else {
         lexical_scores(connection, &options.query, None)?
@@ -1149,6 +1210,92 @@ pub fn health(connection: &Connection) -> Result<SearchIndexHealth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The restricted membership probe agrees with the filter-afterwards set
+    /// at every size (`t-5f7daa1b`): a small permitted set, a large mixed
+    /// set past the old 900-row chunk boundary (more than one old batch),
+    /// the whole index readable, the empty permitted set, and a query with
+    /// no indexable tokens. The probe runs one rowid-only MATCH walk with
+    /// the permitted intersect in Rust — FTS5 has no rowid seek for an IN
+    /// restriction (a batched IN measured ~600x slower), so the large sets
+    /// are the load-bearing cases here: without them a dropped or widened
+    /// match past the old chunk size would slip through every process test.
+    #[test]
+    fn restricted_match_agrees_with_filter_afterwards_on_both_branches() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE VIRTUAL TABLE search_fts USING fts5(\
+                 title, body, tags, \
+                 tokenize='porter unicode61 remove_diacritics 2', prefix='2 3')",
+            )
+            .unwrap();
+        // 1200 documents: even rows carry the `harbourq` prefix family the
+        // probe query guesses, odd rows do not.
+        {
+            let mut insert = connection
+                .prepare("INSERT INTO search_fts(rowid,title,body,tags) VALUES(?,?,?,?)")
+                .unwrap();
+            for seq in 1..=1200_i64 {
+                let body = if seq % 2 == 0 {
+                    format!("a short vault note harbourq{seq}vlt")
+                } else {
+                    format!("an unrelated manifest entry number {seq}")
+                };
+                insert
+                    .execute(rusqlite::params![seq, format!("note {seq}"), body, ""])
+                    .unwrap();
+            }
+        }
+        let full: HashSet<i64> = fts_match_rows(&connection, "harbourq")
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(
+            full.len(),
+            600,
+            "the fixture must match exactly the even rows"
+        );
+        // Small permitted set: only even rows 2..=20 are readable.
+        let permitted: HashSet<i64> = (1..=20_i64).filter(|seq| seq % 2 == 0).collect();
+        let restricted = fts_match_permitted(&connection, "harbourq", &permitted).unwrap();
+        let expected: HashSet<i64> = full.intersection(&permitted).copied().collect();
+        assert_eq!(restricted, expected);
+        assert_eq!(restricted.len(), 10);
+        // Denied rows are excluded even when they are the strongest matches.
+        let denied_only: HashSet<i64> = (1..=20_i64).filter(|seq| seq % 2 == 1).collect();
+        assert!(
+            fts_match_permitted(&connection, "harbourq", &denied_only)
+                .unwrap()
+                .is_empty()
+        );
+        // Empty permitted set and tokenless query short-circuit to empty.
+        assert!(
+            fts_match_permitted(&connection, "harbourq", &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fts_match_permitted(&connection, "!!!", &permitted)
+                .unwrap()
+                .is_empty()
+        );
+        // Large permitted set: every row is readable.
+        let all: HashSet<i64> = (1..=1200_i64).collect();
+        let restricted = fts_match_permitted(&connection, "harbourq", &all).unwrap();
+        assert_eq!(restricted, full);
+        // Large mixed set past the old 900-row chunk boundary — more than
+        // one old batch — with readable and denied rows interleaved.
+        let mixed: HashSet<i64> = (1..=1100_i64).collect();
+        let restricted = fts_match_permitted(&connection, "harbourq", &mixed).unwrap();
+        let mixed_expected: HashSet<i64> = full.intersection(&mixed).copied().collect();
+        assert_eq!(restricted, mixed_expected);
+        assert_eq!(restricted.len(), 550);
+        // Repeated calls agree: the probe leaves no per-connection state
+        // behind.
+        let again = fts_match_permitted(&connection, "harbourq", &permitted).unwrap();
+        assert_eq!(again, expected);
+    }
 
     #[test]
     fn domain_paraphrases_share_semantic_signal() {

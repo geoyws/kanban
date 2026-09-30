@@ -6364,9 +6364,16 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
             let task_links = store.orphaned_task_links()?;
+            let reused_links = store.reused_task_links()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
+            // `reusedTaskLinks` is advisory and stays out of `healthy`: it
+            // names a known historical residual — a NULL-linked row whose
+            // creation event names a removed-but-live-again id, left by
+            // ordinary pre-V34 product behaviour — that no verb can clear, so
+            // failing on it would hold every such board red permanently.
+            // `orphanedTaskLinks` still fails: a dangling link is corruption.
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
                 && task_links.is_empty()
@@ -6384,6 +6391,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             value.insert("integrity".into(), json!(check));
             value.insert("orphanedRows".into(), json!(orphans));
             value.insert("orphanedTaskLinks".into(), json!(task_links));
+            value.insert("reusedTaskLinks".into(), json!(reused_links));
             value.insert("futureDatedTasks".into(), json!(future));
             value.insert("searchIndex".into(), json!(search_index));
             value.insert("audit".into(), json!(audit));
@@ -7358,9 +7366,25 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "tag" && sub == Some("add") {
         let name = rest.first().context("tag name is required")?;
+        // The shape first, so a malformed name keeps `validate_tag_name`'s
+        // sentence; then the namespace, built from the board's own estate.
+        let name = crate::store::validate_tag_name(name)?;
+        // Inside a batch the board is the one transact opened: an item argv
+        // carries no board selector (`plan_transact` refuses one), so the
+        // registry selection would fall through to the cwd's workspace and
+        // name the wrong estate — or bail on a retired cwd board that has
+        // nothing to do with the batch.
+        let board = if store.in_batch() {
+            store.board_name()?.unwrap_or_default()
+        } else {
+            selected_board_name(&args)?
+                .or(store.board_name()?)
+                .unwrap_or_default()
+        };
+        crate::store::refuse_bare_tag_name(&board, &name)?;
         return print(
             &store.add_tag(
-                name,
+                &name,
                 args.one("description"),
                 Some(args.one("as").unwrap_or("system@cli")),
             )?,

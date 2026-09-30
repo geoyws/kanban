@@ -28,6 +28,14 @@ invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 compiled-process evidence. The gate as a whole is a
 unit/integration/process gate, not compiled-process E2E.
 
+**`authz_bypass_matrix_e2e` runs as non-root only.** The managed broker
+refuses root pairs by design (`rust/routing.rs` `local_authority` mints no
+authority for euid 0; `rust/policy.rs` refuses root bootstrap/prove-rebind
+pairs), so as uid 0 every managed command in that target answers
+`denied-or-not-found`. The suite fails fast with that sentence instead of
+failing test by test, and it never skips: run it as a normal user or in the
+Linux gate container.
+
 **Serialization is a rule, not a preference.** Each target runs as its own
 `cargo test --locked --test TARGET -- --test-threads=1`, and no cargo
 command runs concurrently with another. Some cases drive a real Chrome
@@ -331,7 +339,7 @@ migration remain `PLANNED`; no row below claims those later slices.
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | the POST carries one key through the same Store operation the CLI resolve uses; the recorded answer then settles a later resolve with no second flag; the loser-of-two-submissions conflict half is exercised at store level by the one-answer refusal and remains browser-unexercised by design (one tab, one answer) |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | digits answer the check pre-unlock and the decision after it, keyboard and pointer paths both decide, focus lands on the produced explanation/choice, pass and miss read as words with colour behind them, and Undo keeps working on the decided rows |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its linked rows removal-tag-gated across listings, search, lanes, watch and by-id surfaces with taskless controls readable (t-2cffbe08, A23); orphaned handoffs stay deniable yet acceptable without a lease, archivable, and doctor-healthy with orphan links reported (t-2cffbe08, A23); removed and live denied ids probe identically on `task add --id` with plain refusals unmanaged (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `dependency_replacement_keeps_a_tag_denied_prerequisite`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe`; `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`; `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`; `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`; `attention_by_id_withholds_rows_on_a_tag_denied_task`; `subscription_relation_targets_withhold_a_tag_denied_task_on_read`; `store::tests::removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array`; `import_requires_whole_board_write_and_names_no_denied_id`; `compiled_binary_doctor_reports_a_nulled_row_from_a_reused_live_task_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its linked rows removal-tag-gated across listings, search, lanes, watch and by-id surfaces with taskless controls readable (t-2cffbe08, A23); orphaned handoffs stay deniable yet acceptable without a lease, archivable, and doctor-healthy with orphan links reported (t-2cffbe08, A23); removed and live denied ids probe identically on `task add --id` with plain refusals unmanaged (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -406,6 +414,85 @@ worktree.
 12 requirements: 12 MUST, no SHOULD or MAY. The steered stream is a repeatable lane and
 note-kind predicate bound to the opaque cursor, with an additive four-key envelope shared
 field-for-field with Ord; board schema stands at 35 and no migration rides this slice.
+
+## Requirements trace — docs/specs/cli.md CLI-01..CLI-07
+
+`tag add` registers only namespaced tags, refused with the board's estate, and `task add
+--id` is refused unless it is the kind's own shape, on branch `wt/t-7f596f45-tagns` at
+2026-09-25 for `CLI-01`..`CLI-05` and on branch `wt/t-6148c0ba-idshape` at 2026-09-25 for
+`CLI-06` (board row `t-6148c0ba`); the attach refusal names the board's estate form on
+branch `wt/t-7f596f45-map` at 2026-09-29 for `CLI-07` (attention `a-9254741a`). Every test
+these rows name exists in that build,
+enumerated with `cargo test --locked --lib -- --list` (unit rows) and
+`cargo test --locked --test e2e -- --list` (process rows). `Layer` uses the specification's
+own vocabulary, where `unit` is an in-process Rust `#[test]` and `process` is a
+compiled-binary process-boundary exchange in `tests/e2e.rs` with no HTTP and no browser.
+Of the 7 requirements — all `MUST` — 6 are proved at `process` and 1 at `unit`, and none
+carries browser evidence: the slice changes no served markup (the chip half is retired
+with the web view, ADR-053), so each row says `no e2e coverage` plainly.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `CLI-01` | MUST | process | `tag_add_refuses_a_bare_name_with_the_boards_mapped_estate`; `tag_add_in_transact_refuses_against_the_batch_board_not_the_cwd` | table-driven over `prjx`/`ifca`, `kanban`/`geoyws`, `memberx`/`unum` and `unum-ledger`/`unum`; asserts the exact sentence, an empty `tag list` and no `tag_added` event; the batch case runs `transact --project prjx` from the `kanban` checkout and asserts the `ifca` repair with `rolledBack: true`. no e2e coverage |
+| `CLI-02` | MUST | unit | `estate_for_board_maps_each_named_board_to_its_estate` | every named board plus the `unum*` rule, unmapped names, and the slashed-name exemption. no e2e coverage |
+| `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
+| `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, attaches, reads back. no e2e coverage |
+| `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
+| `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence and an empty listing; `t-1234abcd` accepted; the duplicate refused as before (`task t-1234abcd already exists`). The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. no e2e coverage |
+| `CLI-07` | MUST | process | `tag_attach_refusal_names_the_boards_estate_form` | `task add --tag assistant` on `prjx` refused with the exact `tag add ifca/assistant` repair and no row written; the named repair then registers and attaches; the unmapped board carries the estate list with the `<estate>/` placeholder and no single form. no e2e coverage |
+
+7 requirements: 7 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
+legacy tags already registered stay registered and migrate with `tag rename`; rows keep
+their ids and a refused `task add` writes no row and no event.
+
+## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
+
+The claim-routing slice is implemented by row `t-8c698a02` on branch `wt/t-8c698a02-impl`
+(base `448d722`), where the specification is `SPEC-READY` on 2026-09-29. `Layer` uses the
+specification's vocabulary: `process` is a compiled-binary process-boundary exchange in
+`tests/e2e.rs`. All 8 requirements are `MUST` and all 8 are proved at `process`; every name was
+enumerated with `cargo test --test e2e -- --list`. Four tests (`CLAIM-01`, `CLAIM-04`,
+`CLAIM-05`, `CLAIM-08`) fail on the baseline and pass with the change; the other four pin the
+refusals and the `--allow-reassign` bypass the change must not widen. This slice changes no
+served markup, so there is no browser surface to drive.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `CLAIM-01` | MUST | process | `claim_routing_treats_bare_harness_and_typed_spellings_as_one_lane` | bare, harness and typed spellings of lane `driver-2` (and trunk `driver`) see each other's rows in both directions; `driver-20`, `driver-02`, `driver-two`, `driverless` do not |
+| `CLAIM-02` | MUST | process | `claim_routing_falls_back_to_exact_strings_without_a_lane` | `geoyws`, `superdriver`, `a@b@driver-2` and `@:px/px/superdriver` match only their exact string; the named claim is refused in the existing words and writes nothing |
+| `CLAIM-03` | MUST | process | `claim_routing_refuses_a_typed_lane_from_another_board` | three typed forms for `driver-2` in another team or board are refused and not offered; the board is untouched |
+| `CLAIM-04` | MUST | process | `claim_candidates_show_same_lane_rows_to_the_callers_own_lane` | the measured case: `claude@driver-2` is offered, and handed by `--next`, the row assigned to `@:px/px/driver-2` |
+| `CLAIM-05` | MUST | process | `named_claim_takes_a_same_lane_row` | bare `driver-2` takes the typed row; the model refusal still comes before the assignee check |
+| `CLAIM-06` | MUST | process | `named_claim_refuses_a_different_lane_in_the_existing_words` | `claude@driver-3`, `codex@driver`, `driver-3` and `geoyws` get `task t-lane is assigned to @:px/px/driver-2`, are not offered it by `--candidates` or `--next`, and the board is untouched |
+| `CLAIM-07` | MUST | process | `allow_reassign_still_bypasses_every_assignee_spelling` | `--allow-reassign` offers and claims rows assigned in typed, harness and lane-less spellings |
+| `CLAIM-08` | MUST | process | `successful_claim_stores_the_caller_string_verbatim` | after `claim --as claude@driver-2` the stored assignee reads `claude@driver-2` |
+
+8 requirements: 8 MUST, 8 proved at `process`, no SHOULD or MAY.
+
+## Requirements trace — `docs/specs/deploy.md` DEPLOY-01..DEPLOY-08
+
+The DEPLOY slice is `SPEC-READY` on 2026-09-30 (commit `93103f8`) and implemented by row
+`t-1220f80f` on branch `wt/t-c720eb6b-deploy`. `Layer` uses the specification's vocabulary:
+`process` is a compiled-binary process-boundary exchange in `tests/e2e.rs`. All 8 requirements
+are `MUST` and all 8 are proved at `process`; every name was enumerated with
+`cargo test --test e2e -- --list`. Two of the four new tests
+(`deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` and
+`deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards`) fail on the baseline and
+pass with the change; the other two pin the pairings the change must not move. The slice has no
+browser surface.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `DEPLOY-01` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_bdt` on `geoywsMBP` and `@_bd` on `geoywsMBA`; `deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids` covers an unmapped board |
+| `DEPLOY-02` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_bdt` and `@_bd` on `hig` for board `kanban` get the baseline MBP-tier sentence, compared byte-for-byte; nothing is written |
+| `DEPLOY-03` | MUST | process | `deploy_start_keeps_the_mbp_tier_refusal_off_hax_in_the_same_words` | `@_p` on `geoywsMBP` and `geoywsMBA` get the baseline Hetzner-tier sentence, compared byte-for-byte |
+| `DEPLOY-04` | MUST | process | `deploy_start_keeps_mbp_and_hetzner_pairings_for_an_ifca_board` | the `px` board records `@_p` on `hax` and `@_uat` on `hig`; the existing test covers an unmapped board |
+| `DEPLOY-05` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | boards `kanban`, `acies`, `unum` and `unum-web` record `@_bdt` and `@_bd` on `hax` |
+| `DEPLOY-06` | MUST | process | `deploy_start_refuses_dev_tiers_on_hax_for_ifca_and_unmapped_boards` | boards `px`, `prjx-root` (estate ifca) and `TIERHOST` (no estate) are refused on `hax` in the two exact sentences and write no attempt; `HAX` is not `hax` |
+| `DEPLOY-07` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | a repeated `--operation-id op-1` returns the same attempt with `idempotentReplay: true` and one attempt row |
+| `DEPLOY-08` | MUST | process | `deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards` | after the `hax` attempts the board file reads `PRAGMA user_version` 36 |
+
+8 requirements: 8 MUST, 8 proved at `process`.
 
 ## Watch coverage note
 

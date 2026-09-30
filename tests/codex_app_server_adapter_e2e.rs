@@ -617,12 +617,21 @@ impl Fixture {
             .adapter_command(client_request_hash, protocol_schema_hash, timeout_ms)
             .spawn()
             .unwrap();
-        child
+        // An adapter that refuses its probes or its schema exits without
+        // reading stdin, so this write races that exit: when the child wins,
+        // the pipe is closed and the write answers EPIPE. That is the child
+        // having already answered, not a failure — its exit code and stderr,
+        // read below, are what every caller asserts. Success paths read
+        // stdin, so EPIPE cannot occur there.
+        match child
             .stdin
             .as_mut()
             .unwrap()
             .write_all(serde_json::to_string(request).unwrap().as_bytes())
-            .unwrap();
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            result => result.unwrap(),
+        }
         drop(child.stdin.take());
         let output = child.wait_with_output().unwrap();
         assert_eq!(self.cwd_entries(), before);
@@ -691,6 +700,26 @@ fn assert_failure(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("Error:"));
     assert!(stderr.len() < 8192, "stderr too long: {}", stderr.len());
+}
+
+fn has_listen_stage(records: &[Value], stage: &str, phase: &str) -> bool {
+    records.iter().any(|record| {
+        record["mode"] == "listen-stage" && record["stage"] == stage && record["phase"] == phase
+    })
+}
+
+/// The fake writes its `listen` teardown record on clean EOF exit, which races
+/// with the adapter's SIGTERM/SIGKILL abort: a fail-closed run may or may not
+/// leave one behind. What the teardown record must never show is progress past
+/// the validation point, so bound its stage instead of forbidding it.
+fn assert_listen_teardown_at_most(records: &[Value], max_stage: u8) {
+    for record in records.iter().filter(|record| record["mode"] == "listen") {
+        let stage = record["stage"].as_str().unwrap().parse::<u8>().unwrap();
+        assert!(
+            stage <= max_stage,
+            "listen teardown advanced past stage {max_stage}: {record:?}"
+        );
+    }
 }
 
 fn pid_exists(pid: i32) -> bool {
@@ -1055,7 +1084,15 @@ fn compiled_process_rechecks_that_cwd_stays_empty_before_each_spawn() {
     );
     let request = serde_json::to_vec(&request()).unwrap();
     let mut child = command.spawn().unwrap();
-    child.stdin.as_mut().unwrap().write_all(&request).unwrap();
+    // The dirtied cwd fails this adapter inside its version probe, before it
+    // reads stdin, so this write races that exit: when the child wins, the
+    // pipe is closed and the write answers EPIPE. That is the child having
+    // already answered, not a failure — its exit code, asserted below, is
+    // what this test checks.
+    match child.stdin.as_mut().unwrap().write_all(&request) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        result => result.unwrap(),
+    }
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     writer.join().unwrap();
@@ -1105,7 +1142,14 @@ fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
     );
     assert_failure(&output);
     let records = fixture.capture_records();
-    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+    // Fail-closed at response1: the adapter sent `initialize`, rejected the
+    // drifted user agent, and never sent `thread/start`, so the fake never saw
+    // `turn/start` either. The trailing `listen` teardown record is left to a
+    // close-vs-kill race, so its stage is bounded instead of forbidden.
+    assert!(has_listen_stage(&records, "initialize", "received"));
+    assert!(!has_listen_stage(&records, "thread/start", "received"));
+    assert!(!has_listen_stage(&records, "turn/start", "received"));
+    assert_listen_teardown_at_most(&records, 1);
 }
 
 #[test]
@@ -1155,7 +1199,13 @@ fn compiled_process_thread_cli_version_drift_is_fail_closed() {
     );
     assert_failure(&output);
     let records = fixture.capture_records();
-    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+    // Fail-closed at response2: the adapter sent `thread/start`, rejected the
+    // drifted thread cliVersion, and never sent `turn/start`. The trailing
+    // `listen` teardown record is left to a close-vs-kill race, so its stage
+    // is bounded instead of forbidden.
+    assert!(has_listen_stage(&records, "thread/start", "received"));
+    assert!(!has_listen_stage(&records, "turn/start", "received"));
+    assert_listen_teardown_at_most(&records, 2);
 }
 
 #[test]
@@ -1791,8 +1841,11 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
             .collect::<Vec<_>>();
         match label {
             "init-codex-home-mismatch" => {
+                // The trailing `listen` teardown record is left to a close-vs-kill
+                // race, so it is excluded here and bounded below instead.
                 let modes = records
                     .iter()
+                    .filter(|record| record["mode"] != "listen")
                     .map(|record| record["mode"].as_str().unwrap())
                     .collect::<Vec<_>>();
                 assert!(
@@ -1842,8 +1895,11 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
                 }
             }
             "init-user-agent-missing" => {
+                // The trailing `listen` teardown record is left to a close-vs-kill
+                // race, so it is excluded here and bounded below instead.
                 let modes = records
                     .iter()
+                    .filter(|record| record["mode"] != "listen")
                     .map(|record| record["mode"].as_str().unwrap())
                     .collect::<Vec<_>>();
                 assert!(
@@ -1894,7 +1950,13 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
             }
             _ => unreachable!("unexpected case label {label}"),
         }
-        assert!(!records.iter().any(|record| record["mode"] == "listen"));
+        // Fail-closed at response1 in both cases: the adapter never sent
+        // `thread/start`, so the fake never saw `thread/start` or `turn/start`.
+        // The trailing `listen` teardown record is left to a close-vs-kill race,
+        // so its stage is bounded instead of forbidden.
+        assert!(!has_listen_stage(&records, "thread/start", "received"));
+        assert!(!has_listen_stage(&records, "turn/start", "received"));
+        assert_listen_teardown_at_most(&records, 1);
     }
 }
 
