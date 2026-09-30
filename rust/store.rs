@@ -4635,6 +4635,8 @@ impl Store {
             .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
                 row.get::<_, i64>(0)
             })?;
+        #[cfg(test)]
+        crate::watch::after_snapshot_before_mint(&self.connection);
         let authz = crate::routing::board_authz(path)?;
         authz.check_read(&[])?;
         self.authz = authz;

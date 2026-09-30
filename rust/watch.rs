@@ -622,6 +622,42 @@ fn install_before_snapshot(hook: BeforeSnapshotHook) -> BeforeSnapshot {
     BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
     BeforeSnapshot
 }
+/// Test-only seam inside Store's pinned snapshot, before the registry mint.
+/// The reader lets a test prove that a concurrent commit remains invisible.
+#[cfg(test)]
+type AfterSnapshotHook = Box<dyn FnMut(&Connection)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SNAPSHOT: std::cell::RefCell<Option<AfterSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn after_snapshot_before_mint(reader: &Connection) {
+    let hook = AFTER_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(reader);
+        AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
+
+#[cfg(test)]
+struct AfterSnapshot;
+
+#[cfg(test)]
+impl Drop for AfterSnapshot {
+    fn drop(&mut self) {
+        AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_after_snapshot(hook: AfterSnapshotHook) -> AfterSnapshot {
+    AFTER_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
+    AfterSnapshot
+}
 
 fn watch(spec: WatchSpec) -> Result<()> {
     stream(&spec, &mut emit)
@@ -2018,6 +2054,87 @@ mod tests {
         assert_eq!(
             raced.tail_seq, None,
             "the poll moved its cursor past a row it should have delivered"
+        );
+    }
+
+    /// A revocation and commit after the snapshot pin must not be read by the
+    /// snapshot, and already-pinned rows must use the new revoked mint.
+    #[test]
+    fn a_poll_pins_its_snapshot_before_refreshing_authority() {
+        const TAGGED: &str = r#"{"_semanticV1":{"tags":["live"]}}"#;
+        let estate = ManagedRoot::new("pin-before-mint-xdg");
+        let root = temp_watch_dir("pin-before-mint");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(&store.connection, None, "task_moved", "codex", TAGGED, 1)
+            .expect("append tagged seed event");
+        estate.bind_self("p-watcher");
+        let registry = estate.registry_path();
+        grant(
+            &registry,
+            "g-board-read",
+            "p-watcher",
+            "read",
+            &["board:board"],
+        );
+        grant(
+            &registry,
+            "g-tag-read",
+            "p-watcher",
+            "read",
+            &["board:board", "tag:live"],
+        );
+        let spec = follow_spec(&path, 0);
+
+        let called = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&called);
+        let writer_path = path.clone();
+        let raced = {
+            let _seam = install_after_snapshot(Box::new(move |reader| {
+                fired.set(true);
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(&writer, None, "task_moved", "codex", TAGGED, 2)
+                    .expect("commit after the snapshot pin");
+                assert_eq!(
+                    ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                assert_eq!(
+                    ledger_head(reader),
+                    1,
+                    "the poll did not pin before the commit"
+                );
+                Connection::open(&registry)
+                    .expect("open canonical registry")
+                    .execute(
+                        "UPDATE grants SET state='revoked' WHERE id='g-tag-read'",
+                        [],
+                    )
+                    .expect("revoke tag before authority refresh");
+            }));
+            poll_once(&spec, 0).expect("poll across snapshot-to-mint window")
+        };
+        assert!(called.get(), "the snapshot-to-mint seam never ran");
+        assert!(
+            raced.batch.is_empty(),
+            "revoked rows escaped under the open-time grant"
+        );
+        assert_eq!(
+            raced.tail_seq,
+            Some(1),
+            "cursor moved beyond the pinned snapshot"
+        );
+
+        let next = poll_once(&spec, 1).expect("poll the next snapshot while revoked");
+        assert!(
+            next.batch.is_empty(),
+            "revoked row escaped in the next poll"
+        );
+        assert_eq!(
+            next.tail_seq,
+            Some(2),
+            "the next snapshot missed the new row"
         );
     }
 

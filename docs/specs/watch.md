@@ -422,7 +422,7 @@ enumerated with `cargo test --locked --test e2e -- --list` and
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `WATCH-01` | MUST | process | `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` | PARTIAL: existing live watch revocation/re-grant and exact restored event ID at the compiled-process boundary; deterministic in-process seam `watch::tests::a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot` pins mint-after-snapshot ordering. No e2e coverage for the new `--lane` predicate; owed by `t-fde5d91c`. |
+| `WATCH-01` | MUST | process | `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` | PARTIAL: existing live watch revocation/re-grant and exact restored event ID at the compiled-process boundary; deterministic in-process seams `watch::tests::a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot` and `watch::tests::a_poll_pins_its_snapshot_before_refreshing_authority` separately prove delivery after an open-time mint and snapshot pin before a fresh revocation mint. No e2e coverage for the new `--lane` predicate; owed by `t-fde5d91c`. |
 | `WATCH-02` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
 | `WATCH-03` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
 | `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
