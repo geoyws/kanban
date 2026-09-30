@@ -2,3 +2,5 @@
 # in contains_pem_private_key_header. This Rust string is a detector marker,
 # not a private key or key body. Keep all other secret findings active.
 rust/store.rs:private-key:213
+# Same detector marker when commit 71efad8 introduced it at line 171.
+71efad8edd7655bb2c09f781480cf09435cd6271:rust/store.rs:private-key:171
