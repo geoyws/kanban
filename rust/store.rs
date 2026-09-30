@@ -3519,6 +3519,8 @@ fn verdict_row(row: &Row<'_>) -> rusqlite::Result<Verdict> {
         verdict: row.get("verdict")?,
         evidence: serde_json::from_str(row.get::<_, String>("evidence")?.as_str())
             .unwrap_or_default(),
+        published_attested_by: row.get("published_attested_by")?,
+        published_attested_at: row.get("published_attested_at")?,
         created_at: row.get("created_at")?,
     })
 }
@@ -3530,27 +3532,6 @@ fn is_full_sha(sha: &str) -> bool {
         && sha
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-/// The SHAs the ledger confirms as published on origin (DG-13).
-///
-/// The ledger has no git/origin channel, so publication is decided by an
-/// explicit allowlist, failing closed: `KANBAN_PUBLISHED_SHAS` holds the
-/// published set as comma- and/or whitespace-separated full SHAs. When the
-/// variable is SET (even empty), membership decides; when it is UNSET the
-/// host cannot confirm publication and `None` refuses every citing write
-/// with sentence 6, which the specification explicitly blesses. Tests
-/// control the decision by setting the variable per process (process layer)
-/// or under a lock (in-process unit tests).
-fn published_shas() -> Option<HashSet<String>> {
-    let raw = std::env::var("KANBAN_PUBLISHED_SHAS").ok()?;
-    Some(
-        raw.split([',', ' ', '\t', '\n'])
-            .map(str::trim)
-            .filter(|sha| !sha.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
 }
 
 /// The claim holder of record (DG-03): any actor named as holder in the
@@ -3684,7 +3665,6 @@ fn find_gate_miss(
     }
     let holders = claim_holders_of_record(connection, task_id)?;
     let head = current_task_head(connection, task_id)?;
-    let published = published_shas();
     let mut collision: Option<String> = None;
     let mut stale: Option<Vec<String>> = None;
     for verdict in &verdicts {
@@ -3706,11 +3686,8 @@ fn find_gate_miss(
         if verdict.verdict != "pass"
             || verdict.shas.is_empty()
             || !verdict.shas.iter().all(|sha| is_full_sha(sha))
-            || !verdict
-                .shas
-                .iter()
-                .all(|sha| published.as_ref().is_some_and(|set| set.contains(sha)))
             || verdict.evidence.is_empty()
+            || verdict.published_attested_by.is_empty()
         {
             continue;
         }
@@ -6830,14 +6807,14 @@ impl Store {
                 );
             }
         }
-        let published = published_shas();
-        for sha in &input.shas {
-            if !published.as_ref().is_some_and(|set| set.contains(sha)) {
-                bail!(
-                    "task {} verdict refused: `{sha}` is not published on origin — the verdict must cite a commit SHA published on origin",
-                    input.task_id
-                );
-            }
+        // Publication is attested, not verified (DG-13, George on
+        // a-8b3467aa): the ledger has no origin channel, so the writer states
+        // every cited SHA is on origin and the row records who said so, when.
+        if !input.attest_published {
+            bail!(
+                "task {} verdict refused: publication on origin is not attested — check every cited SHA is on origin, then pass --attest-published",
+                input.task_id
+            );
         }
         // The ledger distinguishes planner from executor by actor and
         // lease-hold, not by self-asserted role strings (DG-07): the writer
@@ -6861,7 +6838,7 @@ impl Store {
         }
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,created_at) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,published_attested_by,published_attested_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             params![
                 input.task_id,
                 writer,
@@ -6869,17 +6846,21 @@ impl Store {
                 serde_json::to_string(&input.shas)?,
                 "pass",
                 serde_json::to_string(&input.evidence)?,
+                writer,
+                now,
                 now,
             ],
         )?;
         transaction.commit()?;
         Ok(Verdict {
             task_id: input.task_id,
-            writer,
+            writer: writer.clone(),
             reviewer,
             shas: input.shas,
             verdict: "pass".to_owned(),
             evidence: input.evidence,
+            published_attested_by: writer,
+            published_attested_at: now,
             created_at: now,
         })
     }
@@ -19358,28 +19339,6 @@ mod tests {
     }
     // ---- Done gate (DG-01..DG-16) ----
     //
-    // Publication is process-global state (`KANBAN_PUBLISHED_SHAS`), so every
-    // test below sets it explicitly under one lock and restores it after:
-    // a suite running in parallel must never inherit another test's set.
-    static DONE_GATE_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    fn with_published_shas(shas: &[String], test: impl FnOnce()) {
-        // A panicking test must not poison the suite: recover the guard.
-        let _guard = DONE_GATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let prior = std::env::var("KANBAN_PUBLISHED_SHAS").ok();
-        // Held under the lock, restored below: the only env mutation in the
-        // gate tests, matching the adapter_process precedent.
-        unsafe { std::env::set_var("KANBAN_PUBLISHED_SHAS", shas.join(",")) };
-        test();
-        match prior {
-            Some(value) => unsafe { std::env::set_var("KANBAN_PUBLISHED_SHAS", value) },
-            None => unsafe { std::env::remove_var("KANBAN_PUBLISHED_SHAS") },
-        }
-    }
-
     fn done_gate_sha(fill: char) -> String {
         std::iter::repeat_n(fill, 40).collect()
     }
@@ -19470,6 +19429,7 @@ mod tests {
                 shas,
                 evidence,
                 writer: writer.to_owned(),
+                attest_published: true,
             })
             .expect("record verdict")
     }
@@ -19500,7 +19460,7 @@ mod tests {
     #[test]
     fn done_gate_refuses_a_done_move_with_no_verdict_and_changes_nothing() {
         // A1 (DG-01, DG-08, DG-15).
-        with_published_shas(&[], || {
+        {
             let mut store = gated_board("done-gate-no-verdict");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19523,14 +19483,14 @@ mod tests {
                     .is_some(),
                 "a gate refusal seizes no lease"
             );
-        });
+        }
     }
 
     #[test]
     fn done_gate_opens_for_a_foreign_planner_verdict_covering_the_head() {
         // A2 (DG-02, DG-04, DG-11, DG-12).
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-foreign-pass");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19562,14 +19522,14 @@ mod tests {
                 1,
                 "the verdict survives the move that cited it"
             );
-        });
+        }
     }
 
     #[test]
     fn done_gate_refuses_self_review_but_a_foreign_closer_passes() {
         // A3 + A13 (DG-03, DG-08).
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-self-review");
             seed_lane_task(&mut store, "t-x");
             seed_lane_task(&mut store, "t-y");
@@ -19618,13 +19578,13 @@ mod tests {
                 .move_task("t-y", "done", "lane-e", json!({}), true)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
     fn done_gate_override_is_geoyws_only_and_audited() {
         // A4 (DG-05, DG-06, DG-08).
-        with_published_shas(&[], || {
+        {
             let mut store = gated_board("done-gate-override");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19655,14 +19615,14 @@ mod tests {
             let payload: Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(payload["priorStatus"], json!("todo"));
             assert_eq!(payload["reason"], json!("missing-verdict"));
-        });
+        }
     }
 
     #[test]
     fn done_gate_refuses_an_executor_written_verdict() {
         // A5 (DG-07, DG-12, DG-08).
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-executor-write");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19675,6 +19635,7 @@ mod tests {
                     shas: vec![head.clone()],
                     evidence: vec![decision],
                     writer: "lane-e".to_owned(),
+                    attest_published: true,
                 })
                 .unwrap_err()
                 .to_string();
@@ -19691,13 +19652,13 @@ mod tests {
                 error.contains("has no foreign-actor pass verdict"),
                 "the refused write opened nothing: {error}"
             );
-        });
+        }
     }
 
     #[test]
     fn done_gate_off_and_non_done_moves_are_untouched() {
         // A6 (DG-09, DG-10).
-        with_published_shas(&[], || {
+        {
             let mut store = gated_board("done-gate-off");
             seed_lane_task(&mut store, "t-y");
             seed_lane_task(&mut store, "t-z");
@@ -19710,14 +19671,14 @@ mod tests {
                 .move_task("t-z", "review", "lane-e", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "review");
-        });
+        }
     }
 
     #[test]
     fn done_gate_empty_evidence_never_satisfies() {
         // A7 (DG-02, DG-08): an empty-evidence row is storable but opens nothing.
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-empty-evidence");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19738,15 +19699,14 @@ mod tests {
                 error.contains("has no foreign-actor pass verdict"),
                 "empty evidence refuses as no verdict: {error}"
             );
-        });
+        }
     }
 
     #[test]
-    fn done_gate_refuses_short_and_unpublished_shas() {
-        // A8 (DG-13, DG-08).
-        let published = done_gate_sha('1');
-        let unpublished = done_gate_sha('2');
-        with_published_shas(&[published], || {
+    fn done_gate_refuses_short_and_unattested_shas() {
+        // A8 (DG-13, DG-08): shape first, then the publication attestation.
+        let full = done_gate_sha('2');
+        {
             let mut store = gated_board("done-gate-shas");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19757,6 +19717,7 @@ mod tests {
                     shas: vec!["abc123".to_owned()],
                     evidence: vec!["a-1".to_owned()],
                     writer: "planner".to_owned(),
+                    attest_published: true,
                 })
                 .unwrap_err()
                 .to_string();
@@ -19768,20 +19729,19 @@ mod tests {
                 .add_verdict(VerdictInput {
                     task_id: "t-x".to_owned(),
                     reviewer: "lane-r".to_owned(),
-                    shas: vec![unpublished.clone()],
+                    shas: vec![full.clone()],
                     evidence: vec!["a-1".to_owned()],
                     writer: "planner".to_owned(),
+                    attest_published: false,
                 })
                 .unwrap_err()
                 .to_string();
             assert_eq!(
                 error,
-                format!(
-                    "task t-x verdict refused: `{unpublished}` is not published on origin — the verdict must cite a commit SHA published on origin"
-                )
+                "task t-x verdict refused: publication on origin is not attested — check every cited SHA is on origin, then pass --attest-published"
             );
             assert_eq!(verdict_row_count(&store), 0);
-        });
+        }
     }
 
     #[test]
@@ -19789,7 +19749,7 @@ mod tests {
         // A9 (DG-14, DG-08).
         let old = done_gate_sha('1');
         let head = done_gate_sha('2');
-        with_published_shas(&[old.clone(), head.clone()], || {
+        {
             let mut store = gated_board("done-gate-stale");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -19840,13 +19800,13 @@ mod tests {
                 .move_task("t-x", "done", "lane-e", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
     fn done_gate_flag_defaults_off_and_audits_changes() {
         // A10 (DG-15, DG-09).
-        with_published_shas(&[], || {
+        {
             let mut store = gated_board("done-gate-flag");
             seed_lane_task(&mut store, "t-y");
             // Absent key reads as off: the baseline move succeeds.
@@ -19901,13 +19861,13 @@ mod tests {
                 .move_task("t-x", "done", "lane-e", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
     fn done_gate_story_and_epic_moves_take_no_verdict() {
         // A11 (DG-16, DG-10).
-        with_published_shas(&[], || {
+        {
             let mut store = gated_board("done-gate-scope");
             store
                 .add_task(gate_row("s-1", "story", None))
@@ -19932,7 +19892,7 @@ mod tests {
                 .move_task("e-1", "done", "lane-e", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
@@ -19940,7 +19900,7 @@ mod tests {
         // A12 (DG-11, DG-06): pre-gate done rows gain no verdict, and stored
         // verdict rows and override events survive a reopen.
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let path = board_db_path("done-gate-migrate");
             let mut store = Store::open(&path).expect("open migrating board");
             store.initialize("migrate", "seed").expect("initialize");
@@ -19996,7 +19956,7 @@ mod tests {
             );
             drop(reopened);
             std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        });
+        }
     }
 
     #[test]
@@ -20007,7 +19967,7 @@ mod tests {
             .iter()
             .map(|fill| done_gate_sha(*fill))
             .collect();
-        with_published_shas(&heads, || {
+        {
             // Newest time wins across all four tables.
             let mut store = gated_board("done-gate-head-time");
             seed_lane_task(&mut store, "t-x");
@@ -20041,7 +20001,7 @@ mod tests {
                 .move_task("t-x", "done", "lane-x", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
@@ -20051,20 +20011,13 @@ mod tests {
         let checkpoint_head = done_gate_sha('2');
         let handoff_head = done_gate_sha('3');
         let sitrep_head = done_gate_sha('4');
-        with_published_shas(
-            &[
-                claim_head.clone(),
-                checkpoint_head.clone(),
-                handoff_head.clone(),
-                sitrep_head.clone(),
-            ],
-            || {
-                let mut store = gated_board("done-gate-head-tie");
-                seed_lane_task(&mut store, "t-x");
-                seed_lane_task(&mut store, "t-y");
-                gate_on(&mut store);
-                for task in ["t-x", "t-y"] {
-                    store
+        {
+            let mut store = gated_board("done-gate-head-tie");
+            seed_lane_task(&mut store, "t-x");
+            seed_lane_task(&mut store, "t-y");
+            gate_on(&mut store);
+            for task in ["t-x", "t-y"] {
+                store
                         .connection
                         .execute(
                             "INSERT INTO task_claims(task_id,agent_id,lease_token,claimed_at,heartbeat_at,expires_at,head_sha) \
@@ -20072,7 +20025,7 @@ mod tests {
                             params![task, task, claim_head],
                         )
                         .unwrap();
-                    store
+                store
                         .connection
                         .execute(
                             "INSERT INTO checkpoints(task_id,author,state,summary,intent,next_action,head_sha,created_at) \
@@ -20080,7 +20033,7 @@ mod tests {
                             params![task, checkpoint_head],
                         )
                         .unwrap();
-                    store
+                store
                         .connection
                         .execute(
                             "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,head_sha,created_at) \
@@ -20088,52 +20041,51 @@ mod tests {
                             params![task, task, handoff_head],
                         )
                         .unwrap();
-                    store
-                        .connection
-                        .execute(
-                            "INSERT INTO sitreps(id,lane,task_id,author,body,head_sha,created_at) \
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO sitreps(id,lane,task_id,author,body,head_sha,created_at) \
                              VALUES(? || '-sr','driver',?,'planter','b',?,500)",
-                            params![task, task, sitrep_head],
-                        )
-                        .unwrap();
-                }
-                // The live claim row wins the tie even though it is expired:
-                // holder-of-record history never moves the head by itself.
-                let decision = resolved_decision(&mut store, "t-x", "lane-r");
-                record_verdict(
-                    &mut store,
-                    "t-x",
-                    "lane-r",
-                    vec![claim_head.clone()],
-                    vec![decision],
-                    "planner",
-                );
-                let task = store
-                    .move_task("t-x", "done", "lane-x", json!({}), false)
-                    .unwrap();
-                assert_eq!(task.status, "done");
-                // The checkpoint head loses the same tie: stale, not missing.
-                let decision = resolved_decision(&mut store, "t-y", "lane-r");
-                record_verdict(
-                    &mut store,
-                    "t-y",
-                    "lane-r",
-                    vec![checkpoint_head.clone()],
-                    vec![decision],
-                    "planner",
-                );
-                let error = store
-                    .move_task("t-y", "done", "lane-x", json!({}), false)
-                    .unwrap_err()
-                    .to_string();
-                assert_eq!(
-                    error,
-                    format!(
-                        "task t-y verdict is stale: it covered {checkpoint_head} but the row now stands at {claim_head} — record a fresh verdict at the new head with `task verdict add t-y --as <planner>`"
+                        params![task, task, sitrep_head],
                     )
-                );
-            },
-        );
+                    .unwrap();
+            }
+            // The live claim row wins the tie even though it is expired:
+            // holder-of-record history never moves the head by itself.
+            let decision = resolved_decision(&mut store, "t-x", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-x",
+                "lane-r",
+                vec![claim_head.clone()],
+                vec![decision],
+                "planner",
+            );
+            let task = store
+                .move_task("t-x", "done", "lane-x", json!({}), false)
+                .unwrap();
+            assert_eq!(task.status, "done");
+            // The checkpoint head loses the same tie: stale, not missing.
+            let decision = resolved_decision(&mut store, "t-y", "lane-r");
+            record_verdict(
+                &mut store,
+                "t-y",
+                "lane-r",
+                vec![checkpoint_head.clone()],
+                vec![decision],
+                "planner",
+            );
+            let error = store
+                .move_task("t-y", "done", "lane-x", json!({}), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "task t-y verdict is stale: it covered {checkpoint_head} but the row now stands at {claim_head} — record a fresh verdict at the new head with `task verdict add t-y --as <planner>`"
+                )
+            );
+        }
     }
 
     #[test]
@@ -20141,7 +20093,7 @@ mod tests {
         // DG-14: same table, same instant — the greatest row id wins.
         let older = done_gate_sha('1');
         let newer = done_gate_sha('2');
-        with_published_shas(&[older.clone(), newer.clone()], || {
+        {
             let mut store = gated_board("done-gate-head-seq");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -20168,7 +20120,7 @@ mod tests {
                 .move_task("t-x", "done", "lane-x", json!({}), false)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
@@ -20178,7 +20130,7 @@ mod tests {
         // later work satisfies again with no new write.
         let first = done_gate_sha('1');
         let second = done_gate_sha('2');
-        with_published_shas(&[first.clone(), second.clone()], || {
+        {
             let mut store = gated_board("done-gate-heartbeat");
             seed_lane_task(&mut store, "t-a");
             seed_lane_task(&mut store, "t-b");
@@ -20217,14 +20169,14 @@ mod tests {
                 .move_task("t-b", "done", "lane-e", json!({}), true)
                 .unwrap();
             assert_eq!(task.status, "done");
-        });
+        }
     }
 
     #[test]
     fn done_gate_no_head_opens_only_by_override() {
         // A15 (DG-14, DG-06).
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-no-head");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -20258,14 +20210,14 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(reason, "missing-verdict");
-        });
+        }
     }
 
     #[test]
     fn done_gate_released_holder_is_still_the_holder_of_record() {
         // A16 (DG-03, DG-08).
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-released");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -20294,7 +20246,7 @@ mod tests {
                 error,
                 "task t-x verdict is self-review: lane-e is the claim holder or the closing actor and may be neither the writer nor the reviewer — have the planner loop record a foreign-actor verdict"
             );
-        });
+        }
     }
 
     #[test]
@@ -20302,7 +20254,7 @@ mod tests {
         // DG-04: an open citation refuses; resolving it opens; reopening it
         // refuses again.
         let head = done_gate_sha('1');
-        with_published_shas(std::slice::from_ref(&head), || {
+        {
             let mut store = gated_board("done-gate-evidence");
             seed_lane_task(&mut store, "t-a");
             seed_lane_task(&mut store, "t-c");
@@ -20371,7 +20323,7 @@ mod tests {
                 error.contains("has no foreign-actor pass verdict"),
                 "a reopened citation refuses again: {error}"
             );
-        });
+        }
     }
 
     #[test]
@@ -20380,7 +20332,7 @@ mod tests {
         // against the 40-char verdict SHA it abbreviates.
         let full = done_gate_sha('1');
         let abbreviated = full[..7].to_owned();
-        with_published_shas(std::slice::from_ref(&full), || {
+        {
             let mut store = gated_board("done-gate-abbrev");
             seed_lane_task(&mut store, "t-x");
             gate_on(&mut store);
@@ -20404,6 +20356,6 @@ mod tests {
                     "task t-x verdict is stale: it covered {full} but the row now stands at {abbreviated} — record a fresh verdict at the new head with `task verdict add t-x --as <planner>`"
                 )
             );
-        });
+        }
     }
 }

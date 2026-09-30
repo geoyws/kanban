@@ -138,7 +138,7 @@ Usage:
              dependencies and blockingGates — the unfinished prerequisites
              this row inherits from itself and from every ancestor)
   kanban task move ID draft|backlog|todo|in_progress|blocked|review|done|cancelled --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
-  kanban task verdict add ID --reviewer ACTOR --sha SHA [--sha ...] --evidence ATTENTION-ID [--evidence ...] --as WRITER [--json]
+  kanban task verdict add ID --reviewer ACTOR --sha SHA [--sha ...] --evidence ATTENTION-ID [--evidence ...] --attest-published --as WRITER [--json]
              (with the gate on, a done-move needs this planner-written
              foreign-actor pass covering the row's current head)
   kanban task verdict gate on|off --as ACTOR [--json]
@@ -349,7 +349,7 @@ unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 36] = [
+pub(crate) const BOOLEAN: [&str; 37] = [
     "help",
     "json",
     "version",
@@ -359,6 +359,7 @@ pub(crate) const BOOLEAN: [&str; 36] = [
     "next",
     "candidates",
     "keep-status",
+    "attest-published",
     "driver-only",
     "no-driver-only",
     "unassign",
@@ -1080,7 +1081,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "task",
         Some("verdict add"),
-        &["reviewer", "sha", "evidence", "as"],
+        &["reviewer", "sha", "evidence", "as", "attest-published"],
         &["id"],
         false,
     ),
@@ -7010,6 +7011,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             shas,
             evidence: args.many("evidence"),
             writer: args.require("as")?.to_owned(),
+            attest_published: args.has("attest-published"),
         })?;
         return print(&verdict, args.has("json"));
     }

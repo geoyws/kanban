@@ -16,26 +16,27 @@
 //! Contract with the implementation (`IMPL-NOTES.md` in the impl worktree,
 //! read 2026-09-29; where it and the spec disagree, the spec wins):
 //! - Grammar `task verdict add ID --reviewer ACTOR --sha SHA [--sha ...]
-//!   --evidence ATT-ID [--evidence ...] --as WRITER` (records `pass` only;
+//!   --evidence ATT-ID [--evidence ...] --attest-published --as WRITER`
+//!   (records `pass` only;
 //!   `--evidence` may be empty at write time but never satisfies),
 //!   `task verdict gate on|off --as ACTOR` (geoyws-only), plus the extra
 //!   read-only `task verdict list ID` (no `--as`) answering the stored rows
 //!   oldest-first — the process-layer observation point for the verdict list.
 //! - Verdict record shape: `{"taskID","writer","reviewer","shas","verdict":
-//!   "pass","evidence","createdAt"}`; toggle receipt shape:
+//!   "pass","evidence","publishedAttestedBy","publishedAttestedAt",
+//!   "createdAt"}`; toggle receipt shape:
 //!   `{"board","doneGate","oldValue","changedBy"}`.
 //! - Events: `done_gate_override` (task-scoped; payload
 //!   `{"priorStatus","reason"}` with `reason` in
 //!   `missing-verdict|self-review|stale`) and `done_gate_toggled`
 //!   (board-scoped, `task_id` null; payload `{"board","oldValue","newValue"}`).
 //!   No event for a stored verdict, none for a refused write or move.
-//! - Publication (DG-13) is an allowlist: env `KANBAN_PUBLISHED_SHAS`
-//!   (comma/whitespace-separated full SHAs; when set, membership decides;
-//!   when unset, every citing write is refused sentence 6). Shape first:
-//!   anything not exactly 40 lowercase-hex chars is sentence 5. The gate
-//!   re-validates stored SHAs at move time, so every child — add and move —
-//!   gets the same env. The single hook is [`Estate::run`]; SHAs are
-//!   [`H1`]/[`H2`] (published) and [`UNPUB`] (well-formed, never listed).
+//! - Publication (DG-13) is a recorded attestation, not a check: the writer
+//!   passes `--attest-published` and the row records who attested, when; a
+//!   write without it is refused sentence 6. The ledger never contacts
+//!   origin. Shape first: anything not exactly 40 lowercase-hex chars is
+//!   sentence 5. [`Estate::verdict`] attests; [`Estate::verdict_unattested`]
+//!   omits the flag. SHAs are [`H1`]/[`H2`].
 //! - No-head moves are refused with sentence 1; only `geoyws --force` opens
 //!   them. Sentence 2's `{old}` is the newest stored verdict's SHA list.
 //! - DG-08 sentence 7's `{board}` is read off the toggle receipt's `board`
@@ -77,17 +78,11 @@ const PLANNER: &str = "planner";
 const THIRD: &str = "lane-q";
 const GEO: &str = "geoyws";
 
-/// Full 40-char lowercase-hex SHAs. H1/H2 are "published" (see header);
-/// UNPUB is well-formed but never published; SHORT/MALFORMED fail the shape.
+/// Full 40-char lowercase-hex SHAs; SHORT/MALFORMED fail the shape.
 const H1: &str = "1111111111111111111111111111111111111111";
 const H2: &str = "2222222222222222222222222222222222222222";
-const UNPUB: &str = "3333333333333333333333333333333333333333";
 const SHORT: &str = "abc123";
 const MALFORMED: &str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-
-/// Space-separated SHAs every child treats as published on origin (hook).
-const PUBLISHED: &str =
-    "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222";
 
 // ---------------------------------------------------------------------------
 // DG-08 sentence builders, verbatim from the spec (only bracketed values vary).
@@ -129,10 +124,10 @@ fn s5_bad_sha(id: &str, sha: &str) -> String {
     )
 }
 
-fn s6_unpublished(id: &str, sha: &str) -> String {
+fn s6_unattested(id: &str) -> String {
     format!(
-        "task {id} verdict refused: `{sha}` is not published on origin — \
-         the verdict must cite a commit SHA published on origin"
+        "task {id} verdict refused: publication on origin is not attested — \
+         check every cited SHA is on origin, then pass --attest-published"
     )
 }
 
@@ -183,7 +178,6 @@ impl Estate {
             .current_dir(&self.work)
             .args(args)
             .env("KANBAN_DATA_DIR", &self.data)
-            .env("KANBAN_PUBLISHED_SHAS", PUBLISHED)
             .env_remove("KANBAN_DB")
             .env_remove("KANBAN_PROJECT")
             .stdout(Stdio::piped())
@@ -389,6 +383,30 @@ impl Estate {
         evidence: &[&str],
         writer: &str,
     ) -> Output {
+        self.verdict_args(id, reviewer, shas, evidence, writer, true)
+    }
+
+    /// The same write without `--attest-published` (DG-13 sentence 6).
+    fn verdict_unattested(
+        &self,
+        id: &str,
+        reviewer: &str,
+        shas: &[&str],
+        evidence: &[&str],
+        writer: &str,
+    ) -> Output {
+        self.verdict_args(id, reviewer, shas, evidence, writer, false)
+    }
+
+    fn verdict_args(
+        &self,
+        id: &str,
+        reviewer: &str,
+        shas: &[&str],
+        evidence: &[&str],
+        writer: &str,
+        attest: bool,
+    ) -> Output {
         let mut args: Vec<String> = vec![
             "task".into(),
             "verdict".into(),
@@ -404,6 +422,9 @@ impl Estate {
         for aid in evidence {
             args.push("--evidence".into());
             args.push((*aid).into());
+        }
+        if attest {
+            args.push("--attest-published".into());
         }
         args.push("--as".into());
         args.push(writer.into());
@@ -553,6 +574,9 @@ fn a2_done_gate_verdict_add_verb_records_pass_only() {
     assert_eq!(stored["shas"], serde_json::json!([H1]));
     assert_eq!(stored["verdict"], "pass");
     assert_eq!(stored["evidence"], serde_json::json!([&a1, &a2]));
+    // DG-13: the attestation is recorded — the writer, at write time.
+    assert_eq!(stored["publishedAttestedBy"], PLANNER);
+    assert_eq!(stored["publishedAttestedAt"], stored["createdAt"]);
     assert!(stored["createdAt"].is_number(), "no createdAt: {stored}");
     let listed = estate.verdicts("t-x");
     assert_eq!(
@@ -802,11 +826,11 @@ fn a7_done_gate_rejects_incomplete_verdict_record() {
 }
 
 // ---------------------------------------------------------------------------
-// A8 (DG-13, DG-08): short/malformed → sentence 5; unpublished → sentence 6.
+// A8 (DG-13, DG-08): short/malformed → sentence 5; unattested → sentence 6.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a8_done_gate_refuses_short_and_unpublished_shas() {
+fn a8_done_gate_refuses_short_and_unattested_shas() {
     let estate = Estate::new("a8");
     estate.gate_on();
     estate.add_task("sha work", "t-x", &[]);
@@ -821,13 +845,10 @@ fn a8_done_gate_refuses_short_and_unpublished_shas() {
         let value: Value = serde_json::from_slice(&refused.stdout).unwrap();
         assert_eq!(value["error"].as_str().unwrap(), s5_bad_sha("t-x", bad));
     }
-    let refused = estate.verdict("t-x", REVIEWER, &[UNPUB], &[&aid], PLANNER);
-    assert!(!refused.status.success(), "unpublished SHA was accepted");
+    let refused = estate.verdict_unattested("t-x", REVIEWER, &[H1], &[&aid], PLANNER);
+    assert!(!refused.status.success(), "unattested SHA was accepted");
     let value: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(
-        value["error"].as_str().unwrap(),
-        s6_unpublished("t-x", UNPUB)
-    );
+    assert_eq!(value["error"].as_str().unwrap(), s6_unattested("t-x"));
 
     // Refused writes store nothing: row and event history are untouched.
     estate.assert_unchanged("t-x", &before);
@@ -1483,7 +1504,7 @@ fn done_gate_refusals_carry_named_reasons() {
         &s4_force("t-1"),
     );
 
-    // 5 + 6. Bad SHA shapes and unpublished SHAs (same-task evidence).
+    // 5 + 6. Bad SHA shapes and an unattested publication (same-task evidence).
     let a1 = estate.resolved_attention("t-1");
     let bad5 = estate.verdict("t-1", REVIEWER, &[SHORT], &[&a1], PLANNER);
     assert!(!bad5.status.success());
@@ -1493,13 +1514,13 @@ fn done_gate_refusals_carry_named_reasons() {
             .unwrap(),
         s5_bad_sha("t-1", SHORT)
     );
-    let bad6 = estate.verdict("t-1", REVIEWER, &[UNPUB], &[&a1], PLANNER);
+    let bad6 = estate.verdict_unattested("t-1", REVIEWER, &[H1], &[&a1], PLANNER);
     assert!(!bad6.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&bad6.stdout).unwrap()["error"]
             .as_str()
             .unwrap(),
-        s6_unpublished("t-1", UNPUB)
+        s6_unattested("t-1")
     );
 
     // 7. Non-geoyws gate toggle.
@@ -1768,7 +1789,6 @@ impl ManagedEstate {
             .current_dir(&self.work)
             .args(args)
             .env("XDG_DATA_HOME", &self.xdg)
-            .env("KANBAN_PUBLISHED_SHAS", PUBLISHED)
             .env_remove("KANBAN_DATA_DIR")
             .env_remove("KANBAN_DB")
             .env_remove("KANBAN_PROJECT")
@@ -1926,6 +1946,7 @@ fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
         H1,
         "--evidence",
         &aid,
+        "--attest-published",
         "--as",
         PLANNER,
         "--json",

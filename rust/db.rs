@@ -2616,9 +2616,11 @@ UPDATE attention SET task_id=(
 );
 "#;
 /// Done-gate verdicts (DG-11). One row per stored `pass` verdict, carrying the
-/// writer from `--as` at write time alongside reviewer, SHAs, verdict and
-/// evidence; rows are never updated and never deleted, and a newer verdict is
-/// a newer row. A new table, so the step is re-run safe by `IF NOT EXISTS`:
+/// writer from `--as` at write time alongside reviewer, SHAs, verdict,
+/// evidence and the publication attestation (DG-13: who attested the SHAs are
+/// on origin, and when); rows are never updated and never deleted, and a
+/// newer verdict is a newer row. A new table, so the step is re-run safe by
+/// `IF NOT EXISTS`:
 /// a board rewound past its own v37 shape re-runs to the same table rather
 /// than failing. No backfill: pre-gate boards open as "no verdict" and the
 /// gate refuses until one is earned. The `done_gate` board flag needs no
@@ -2632,6 +2634,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
  shas TEXT NOT NULL CHECK(json_valid(shas)),
  verdict TEXT NOT NULL,
  evidence TEXT NOT NULL CHECK(json_valid(evidence)),
+ published_attested_by TEXT NOT NULL,
+ published_attested_at INTEGER NOT NULL,
  created_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
@@ -5214,8 +5218,9 @@ mod tests {
         assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
         connection
             .execute(
-                "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,created_at) \
-                 VALUES('t-x','planner','lane-r','[\"abc\"]','pass','[\"a-1\"]',1)",
+                "INSERT INTO verdicts(task_id,writer,reviewer,shas,verdict,evidence,\
+                 published_attested_by,published_attested_at,created_at) \
+                 VALUES('t-x','planner','lane-r','[\"abc\"]','pass','[\"a-1\"]','planner',1,1)",
                 [],
             )
             .expect("store a verdict row");

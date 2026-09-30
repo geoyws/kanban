@@ -496,12 +496,18 @@ pub struct Verdict {
     pub task_id: String,
     pub writer: String,
     pub reviewer: String,
-    /// Full 40-character commit SHAs published on origin (DG-13).
+    /// Full 40-character commit SHAs the writer attested as published on
+    /// origin (DG-13). The ledger records the attestation; it does not check
+    /// origin itself.
     pub shas: Vec<String>,
     /// Always `pass`: a review that fails records nothing (DG-12).
     pub verdict: String,
     /// Attention decision IDs the reviewer checked (DG-04).
     pub evidence: Vec<String>,
+    /// Who attested that every cited SHA is published on origin, and when
+    /// (DG-13): always the writer, at write time.
+    pub published_attested_by: String,
+    pub published_attested_at: i64,
     pub created_at: i64,
 }
 
@@ -869,6 +875,8 @@ pub struct VerdictInput {
     pub shas: Vec<String>,
     pub evidence: Vec<String>,
     pub writer: String,
+    /// `--attest-published`: the writer states every cited SHA is on origin.
+    pub attest_published: bool,
 }
 
 /// The receipt `task verdict gate` prints (DG-15).
