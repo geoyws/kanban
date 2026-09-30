@@ -1873,8 +1873,8 @@ fn id_output(args: &[&str]) -> String {
 fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
     let estate = ManagedEstate::new("a18");
     // Seeded direct, the way a real estate reaches managed with boards in it.
-    estate.ok(&["tag", "add", "visible", "--as", "seed", "--json"]);
-    estate.ok(&["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok(&["tag", "add", "geoyws/visible", "--as", "seed", "--json"]);
+    estate.ok(&["tag", "add", "geoyws/secret", "--as", "seed", "--json"]);
     estate.ok_json(&[
         "task",
         "add",
@@ -1882,7 +1882,7 @@ fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
         "--id",
         "t-x",
         "--tag",
-        "visible",
+        "geoyws/visible",
         "--json",
     ]);
     let aid = estate.ok_json(&[
@@ -1896,7 +1896,7 @@ fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
         "--task",
         "t-x",
         "--tag",
-        "secret",
+        "geoyws/secret",
         "--json",
     ])["id"]
         .as_str()
@@ -1942,8 +1942,8 @@ fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
         &[
             board_scope("read", &id),
             board_scope("write", &id),
-            tag_scope("read", &id, "visible"),
-            tag_scope("write", &id, "visible"),
+            tag_scope("read", &id, "geoyws/visible"),
+            tag_scope("write", &id, "geoyws/visible"),
         ],
     );
     estate.enforce("managed");
@@ -1965,7 +1965,7 @@ fn a18_done_gate_verdict_list_hides_unreadable_evidence() {
 
     // Granting the hidden tag brings the id back: the omission is authz, not
     // data loss.
-    estate.grant("p-limited", &[tag_scope("read", &id, "secret")]);
+    estate.grant("p-limited", &[tag_scope("read", &id, "geoyws/secret")]);
     let relisted = estate.ok_json(&["task", "verdict", "list", "t-x", "--json"]);
     assert_eq!(relisted[0]["evidence"], serde_json::json!([&aid]));
 }
