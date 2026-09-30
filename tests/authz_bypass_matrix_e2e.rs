@@ -3034,6 +3034,111 @@ fn an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable() {
     );
 }
 
+/// George a-daa231b3: a child ID in a readable story's advance refusal is
+/// not secret, but the child row's content remains tag-gated. Exercise the
+/// compiled CLI across process boundaries with one visible and one hidden
+/// open child, then prove the refused advance left the story unchanged.
+#[test]
+fn story_advance_names_tag_denied_child_id_without_exposing_its_row() {
+    let estate = ManagedEstate::new("story-hidden-child-id");
+    let work = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret"] {
+        estate.ok_json(&work, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    estate.ok_json(
+        &work,
+        &[
+            "task",
+            "add",
+            "visible story",
+            "--id",
+            "s-visible",
+            "--type",
+            "story",
+            "--tag",
+            "geoyws/visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    for (id, title, tag) in [
+        ("t-visible-child", "visible child", "geoyws/visible"),
+        ("t-secret-child", "secret payload headline", "geoyws/secret"),
+    ] {
+        estate.ok_json(
+            &work,
+            &[
+                "task",
+                "add",
+                title,
+                "--id",
+                id,
+                "--parent",
+                "s-visible",
+                "--type",
+                "task",
+                "--lane",
+                "driver",
+                "--tag",
+                tag,
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+    }
+    // planning -> ready -> in-progress; the next step is gated by open children.
+    for _ in 0..2 {
+        estate.ok_json(
+            &work,
+            &["story", "advance", "s-visible", "--as", "seed", "--json"],
+        );
+    }
+    estate.bind_self(
+        "visible-reader",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+            tag_scope("write", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+    assert_eq!(
+        estate.ok_json(&work, &["task", "show", "t-visible-child", "--json"])["id"],
+        "t-visible-child"
+    );
+    estate.denied(&work, &["task", "show", "t-secret-child", "--json"]);
+
+    let refused = estate.run(
+        &work,
+        &[
+            "story",
+            "advance",
+            "s-visible",
+            "--as",
+            "visible-reader",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "the open children were ignored");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("non-test-lane tasks still open:"),
+        "{message}"
+    );
+    assert!(message.contains("t-visible-child"), "{message}");
+    assert!(message.contains("t-secret-child"), "{message}");
+    assert!(!message.contains("secret payload headline"), "{message}");
+    assert!(!message.contains("geoyws/secret"), "{message}");
+    assert_eq!(
+        estate.ok_json(&work, &["task", "show", "s-visible", "--json"])["metadata"]["workflowStatus"],
+        "in-progress",
+        "the refused advance changed the story"
+    );
+}
+
 /// ACC-14, dependency replacement keeps the edges the caller cannot read — and
 /// the ones it can read but not write: the owner gates `t-visible` on
 /// `t-secret` (unreadable to the caller) and on `t-ops` (readable but
