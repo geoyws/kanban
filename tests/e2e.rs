@@ -24510,6 +24510,71 @@ fn tag_add_registers_a_namespaced_tag() {
     );
 }
 
+/// CLI-09 (A11) — a tag name is at most 64 bytes whole: `tag add` refuses 67
+/// bytes with the length sentence and writes nothing, accepts exactly 64, and
+/// `tag rename` refuses a 67-byte NEW name, leaving the old name in place.
+#[test]
+fn tag_add_and_rename_refuse_a_name_over_64_bytes() {
+    let fixture = Fixture::new("tag-name-bound");
+    fixture.ok_json(&fixture.main, &["init", "--name", "kanban", "--json"]);
+    let at_bound = format!("geoyws/{}", "a".repeat(57));
+    let over = format!("geoyws/{}", "a".repeat(60));
+    assert_eq!((at_bound.len(), over.len()), (64, 67));
+    let sentence = format!(
+        "tag {over} is not a usable name: at most 64 bytes in all, every segment and slash \
+         counted, so a tag stays one readable handle"
+    );
+    let names = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .ok_json(&fixture.main, &["tag", "list", "--json"])
+            .as_array()
+            .expect("tag list is an array")
+            .iter()
+            .map(|tag| tag["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let tag_added = |fixture: &Fixture| -> usize {
+        fixture
+            .ok_json(&fixture.main, &["events", "--kind", "tag_added", "--json"])
+            .as_array()
+            .expect("events is an array")
+            .len()
+    };
+    let before = (names(&fixture), tag_added(&fixture));
+
+    let refused = fixture.run(
+        &fixture.main,
+        &["tag", "add", &over, "--as", "geoyws", "--json"],
+    );
+    assert_eq!(refusal_object(&refused), sentence);
+    assert_eq!(
+        (names(&fixture), tag_added(&fixture)),
+        before,
+        "a refused add wrote"
+    );
+
+    let added = fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", &at_bound, "--as", "geoyws", "--json"],
+    );
+    assert_eq!(added["name"], at_bound.as_str());
+    assert!(names(&fixture).contains(&at_bound));
+
+    let renamed = fixture.run(
+        &fixture.main,
+        &[
+            "tag", "rename", &at_bound, &over, "--as", "geoyws", "--json",
+        ],
+    );
+    assert_eq!(refusal_object(&renamed), sentence);
+    let after = names(&fixture);
+    assert!(
+        after.contains(&at_bound),
+        "the refused rename moved the tag: {after:?}"
+    );
+    assert!(!after.contains(&over), "{after:?}");
+}
+
 /// CLI-05 — the `--tag` filters refuse unknown names exactly as today: the
 /// master-file sentence on the two listings, the registry sentence on rules,
 /// and never the `tag add` namespace sentence, which registers rather than

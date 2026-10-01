@@ -548,6 +548,10 @@ fn can_contain(parent_type: &str, child_type: &str) -> bool {
 /// deliberate edit rather than a side effect of a mistyped filter.
 pub(crate) const ESTATES: [&str; 3] = ["ifca", "unum", "geoyws"];
 
+/// The longest tag name the master file accepts, in bytes, the whole name:
+/// every segment and every slash (George, 2026-09-18; CLI-09).
+pub(crate) const TAG_NAME_MAX_BYTES: usize = 64;
+
 /// A tag name the master file will accept.
 ///
 /// Lowercase, digits and hyphens. The point of a registry is that one concept
@@ -574,6 +578,14 @@ pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
         bail!(
             "tag {name} is not a usable name: lowercase letters, digits and \
              inner hyphens only, so one concept cannot arrive under two spellings"
+        );
+    }
+    // CLI-09: one readable handle, measured in bytes like a sprint id. After
+    // the shape check, so a misshapen long name keeps the shape sentence.
+    if name.len() > TAG_NAME_MAX_BYTES {
+        bail!(
+            "tag {name} is not a usable name: at most {TAG_NAME_MAX_BYTES} bytes in all, \
+             every segment and slash counted, so a tag stays one readable handle"
         );
     }
     if let Some((estate, _)) = name.split_once('/')
@@ -17183,6 +17195,40 @@ mod tests {
             .to_string();
         assert!(epic.contains("e-1"), "{epic}");
         assert!(epic.contains("children"), "{epic}");
+    }
+
+    /// CLI-09: 64 bytes is the whole-name bound, slash included; one byte
+    /// more is refused with the length sentence, and a long name that is
+    /// also misshapen keeps the shape sentence.
+    #[test]
+    fn a_tag_name_is_at_most_64_bytes() {
+        let at_bound = format!("geoyws/{}", "a".repeat(57));
+        assert_eq!(at_bound.len(), 64);
+        assert_eq!(
+            validate_tag_name(&at_bound).expect("64 bytes is usable"),
+            at_bound
+        );
+        let bare_at_bound = "a".repeat(64);
+        assert!(validate_tag_name(&bare_at_bound).is_ok());
+
+        for over in [format!("geoyws/{}", "a".repeat(58)), "a".repeat(65)] {
+            let error = validate_tag_name(&over)
+                .expect_err(&format!("{} bytes must be refused", over.len()))
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "tag {over} is not a usable name: at most 64 bytes in all, every segment \
+                     and slash counted, so a tag stays one readable handle"
+                )
+            );
+        }
+
+        let long_and_misshapen = format!("Geoyws/{}", "a".repeat(80));
+        let error = validate_tag_name(&long_and_misshapen)
+            .expect_err("a misshapen name is refused")
+            .to_string();
+        assert!(error.contains("one concept"), "{error}");
     }
 
     #[test]
