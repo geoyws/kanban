@@ -679,3 +679,35 @@ that implements it, so every row says `no e2e coverage` (or `no unit coverage`) 
 
 15 requirements: 15 MUST, no SHOULD or MAY. No board or registry migration rides this slice;
 `dispatchers.json` gains version 2.
+
+## Requirements trace — docs/specs/identity.md IDENT-01..IDENT-18
+
+One row per requirement, written with the specification on branch `wt/t-026ece7c-identity` at
+2026-10-01 (base `60e5327`). `Layer` uses the specification's vocabulary: `process` is a
+compiled-binary process-boundary exchange with no HTTP and no browser; managed cases run under a
+non-root UID against a managed registry. No test exists yet; the implementing row `t-2aafd55c`
+writes each one in the change that implements it, so every row says `no e2e coverage` plainly.
+
+| Requirement | Strength | Layer | Test name | Note |
+| --- | --- | --- | --- | --- |
+| `IDENT-01` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+| `IDENT-02` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2). |
+| `IDENT-03` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A3). |
+| `IDENT-04` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
+| `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
+| `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
+| `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
+| `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
+| `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
+| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
+| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7). |
+| `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
+| `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
+| `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |
+| `IDENT-18` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+
+18 requirements: 18 MUST, no SHOULD or MAY. Registry schema 14 → 15 and board schema 37 → 38
+ride this slice (`IDENT-17`).
