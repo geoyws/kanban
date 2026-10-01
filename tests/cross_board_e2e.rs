@@ -985,3 +985,132 @@ fn a_managed_declaration_needs_source_row_read_and_refuses_without_confirming() 
 fn strs(owned: &[String]) -> Vec<&str> {
     owned.iter().map(String::as_str).collect()
 }
+
+fn incarnation(estate: &Estate, board_id: &str, task: &str) -> String {
+    readonly(&estate.board_file(board_id))
+        .query_row("SELECT incarnation FROM tasks WHERE id=?", [task], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn event_count(estate: &Estate, board: &str, task: &str) -> usize {
+    estate
+        .ok_json(
+            &estate.workspace(board),
+            &["events", "--task", task, "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn a_reconcile_import_that_replaces_content_rotates_the_incarnation() {
+    let estate = Estate::new("reconcile");
+    let source = estate.board("Source");
+    let target = estate.board("Target");
+    let file = estate.root.join("atmux.json");
+    let write = |subject: &str, status: &str| {
+        fs::write(
+            &file,
+            serde_json::to_vec(&json!({
+                "epics": [],
+                "stories": [],
+                "tasks": [{
+                    "id": "t-imp", "subject": subject, "status": status,
+                    "createdAt": 1700000000
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    let path = file.to_str().unwrap().to_owned();
+    let import = |reconcile: bool| {
+        let mut args = vec![
+            "import",
+            "atmux-json",
+            path.as_str(),
+            "--as",
+            ACTOR,
+            "--json",
+        ];
+        if reconcile {
+            args.push("--reconcile");
+        }
+        estate.ok_json(&estate.workspace("Source"), &args);
+    };
+    write("Original", "todo");
+    import(false);
+    estate.add_ok(
+        "Target",
+        "t-w",
+        &["--depends-on-json", &edge_json(&source, "t-imp")],
+    );
+    let pinned = pins(&estate, &target, "t-w")[0].3.clone();
+    assert_eq!(incarnation(&estate, &source, "t-imp"), pinned);
+
+    // A state-only reconcile is the same item: the token stays.
+    write("Original", "done");
+    import(true);
+    assert_eq!(incarnation(&estate, &source, "t-imp"), pinned);
+
+    // Replacing the content makes a different item: a fresh token, and the
+    // stored pin keeps naming the old one, so it can never match again.
+    write("Replaced", "done");
+    import(true);
+    let rotated = incarnation(&estate, &source, "t-imp");
+    assert_ne!(rotated, pinned);
+    assert_eq!(rotated.len(), 32);
+    assert_eq!(
+        pins(&estate, &target, "t-w")[0].3,
+        pinned,
+        "the pin never rebinds"
+    );
+}
+
+#[test]
+fn a_refused_foreign_entry_leaves_an_update_completely_unwritten() {
+    let estate = Estate::new("update-atomic");
+    let target = estate.board("Target");
+    estate.add_ok("Target", "t-a", &[]);
+    estate.add_ok("Target", "t-b", &[]);
+    estate.add_ok("Target", "t-row", &["--depends-on", "t-a"]);
+    let before = event_count(&estate, "Target", "t-row");
+    let unknown = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    // The own-UUID half is valid on its own; the foreign half is not.
+    let set = json!([
+        { "boardID": target, "id": "t-b" },
+        { "boardID": unknown, "id": "t-x" }
+    ])
+    .to_string();
+    let refusal = estate.refused(
+        &estate.workspace("Target"),
+        &[
+            "task",
+            "update",
+            "t-row",
+            "--as",
+            ACTOR,
+            "--title",
+            "renamed",
+            "--depends-on-json",
+            &set,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal,
+        format!("prerequisite boardID {unknown} id t-x {UNAVAILABLE}")
+    );
+    assert_eq!(local_edges(&estate, &target, "t-row"), ["t-a"]);
+    assert!(pins(&estate, &target, "t-row").is_empty());
+    let title: String = readonly(&estate.board_file(&target))
+        .query_row("SELECT title FROM tasks WHERE id='t-row'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "t-row", "no half of the update landed");
+    assert_eq!(event_count(&estate, "Target", "t-row"), before);
+}

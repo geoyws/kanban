@@ -127,16 +127,16 @@ None about product scope: George’s accepted parent epic and `a-2980be50` settl
 
 ## 8. Verification
 
-The trace of record is the matrix section for this slice; this table mirrors it. Rows naming `none` have **no e2e coverage**. Row `t-e87d4704` added `tests/cross_board_e2e.rs` (in `scripts/release-gate.sh`), whose ten names were enumerated with `cargo test --locked --test cross_board_e2e -- --list`; they are written and compiled but not yet run, because e2e runs once per deployment batch, so those rows still say `no e2e coverage` until that run inside the required Linux container. `/quality spec` reviews the planned examples and contract, not imaginary executed tests.
+The trace of record is the matrix section for this slice; this table mirrors it. Rows naming `none` have **no e2e coverage**. Row `t-e87d4704` added `tests/cross_board_e2e.rs` (in `scripts/release-gate.sh`), whose twelve names were enumerated with `cargo test --locked --test cross_board_e2e -- --list`; they are written and compiled but not yet run, because e2e runs once per deployment batch, so those rows still say `no e2e coverage` until that run inside the required Linux container. `/quality spec` reviews the planned examples and contract, not imaginary executed tests.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
 | `CROSS-01` | MUST | process | `a_json_entry_naming_this_board_is_the_legacy_local_edge`, `mixed_or_malformed_forms_refuse_before_any_write`, `a_scratch_db_refuses_json_and_keeps_local_scalars`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: managed-estate hidden local gate parity (`a-b63e7b50`) has no process case yet |
-| `CROSS-02` | MUST | process | `a_foreign_edge_pins_the_source_registration_and_item_incarnation`, `a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file`, `owner_init_never_overwrites_a_different_incarnation` | no e2e coverage (written, not yet run); partial: recreate/restore cases need gate evaluation (`t-a31b8d4f`) |
+| `CROSS-02` | MUST | process | `a_foreign_edge_pins_the_source_registration_and_item_incarnation`, `a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file`, `owner_init_never_overwrites_a_different_incarnation`, `a_reconcile_import_that_replaces_content_rotates_the_incarnation` | no e2e coverage (written, not yet run); partial: recreate/restore cases need gate evaluation (`t-a31b8d4f`) |
 | `CROSS-03` | MUST | process | `none` | no e2e coverage; A1 done/reopen/archive cases |
 | `CROSS-04` | MUST | process | `none` | no e2e coverage; A1/A5 lifecycle cases |
 | `CROSS-05` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_managed_declaration_needs_source_row_read_and_refuses_without_confirming`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: masked read surfaces (`t-d8cc65c9`) |
-| `CROSS-06` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder` | no e2e coverage (written, not yet run); partial: gate-time evaluation and corrupt/token-mismatch sources (`t-a31b8d4f`) |
+| `CROSS-06` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_refused_foreign_entry_leaves_an_update_completely_unwritten`, `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder` | no e2e coverage (written, not yet run); partial: gate-time evaluation and corrupt/token-mismatch sources (`t-a31b8d4f`) |
 | `CROSS-07` | MUST | process | `none` | no e2e coverage; A4 reciprocal/ancestry cycles |
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
 | `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
