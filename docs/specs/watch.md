@@ -2,7 +2,7 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `WATCH`. Requirement IDs are `WATCH-01` .. `WATCH-12`, stable across wording
+- **Slice ID:** `WATCH`. Requirement IDs are `WATCH-01` .. `WATCH-13`, stable across wording
   refinements; numbering is by creation, grouping is by topic.
 - **Baseline:** `2026-09-28` at commit `edb07459d4bf1e36ffbb18cf621a7ddc15cfd1a7` (detached at
   `origin/kanban-geoyws-driver`) in `/Users/geoyws/work/wt/kanban-t-28dca81e-watch-41a533`. Every
@@ -19,7 +19,9 @@
   question (OQ-1 closed 2026-09-28, blocking the implementation gate only), all cited lines
   spot-checked in this worktree, all layers `process` at the CLI boundary, Ord conformance held
   as implementation gate GATE-ORD-READBACK per `a-97b3ab24`, no web-view dependence.
-  Specification readiness only — it authorises neither implementation, nor rollout, nor release.)
+  Specification readiness only — it authorises neither implementation, nor rollout, nor release.
+  The 2026-10-01 delta (WATCH-13, A9, the WATCH-08 clarification, conformance row 12) is
+  re-reviewed under the same criteria; see §9.)
 - **Owner (product scope):** George. He alone resolves scope, whether a non-goal in §2 is
   reinstated, and the open question in §7 (OQ-1, closed 2026-09-28 — see §7).
 - **Decider (wording of this document):** slice row `t-28dca81e` under epic `e-c0852fe7`, approved
@@ -54,8 +56,9 @@
     `rust/watch.rs:666-730` (normalization: statuses, relations, the bound key), and
     `rust/watch.rs:15-16` (`POLL_INTERVAL` 250ms, `METADATA_LIMIT` 16 KiB — observations, not
     budgets).
-  - The values the new predicates range over: `NOTE_KINDS` with exactly six values
-    (`rust/model.rs:361-363`: `plan`, `progress`, `blocker`, `decision`, `evidence`, `done`),
+  - The values the new predicates range over: `NOTE_KINDS`, six values at the baseline
+    (`rust/model.rs:361-363`: `plan`, `progress`, `blocker`, `decision`, `evidence`, `done`) and
+    seven once WATCH-13 adds `steer`,
     selected today on `note` (`rust/lib.rs:1701-1707`); the task row's `lane`
     (`rust/model.rs:412`), `type` (`rust/model.rs:405-406`), `priority` (`rust/model.rs:417`)
     and its operator-facing projection `priority_level` (`rust/model.rs:392-399`: 0-2 `P0`,
@@ -167,12 +170,24 @@ naming the rejected flag. No partial stream precedes the refusal.`
 Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e`; `NOTE_KINDS`
 (`rust/model.rs:361-363`).
 `Repeatable --note-kind KIND restricts note_added events to notes whose kind is in the named
-set: plan, progress, blocker, decision, evidence, done. Values within the family are ORed; the
-family is ANDed with every other family, so under a note-kind predicate an event with no note
-kind does not pass. The normalized set binds to the cursor exactly like WATCH-02.`
+set: plan, progress, blocker, decision, evidence, done, steer (WATCH-13). Values within the
+family are ORed; the family is ANDed with every other family, so under a note-kind predicate an
+event with no note kind does not pass. The normalized set binds to the cursor exactly like
+WATCH-02.`
 `Failure behaviour: an unknown note kind fails closed with the ADR-008 sentence that names all
-six accepted values; the refusal writes nothing. A note-kind predicate on registry scope fails
+seven accepted values; the refusal writes nothing. A note-kind predicate on registry scope fails
 closed like WATCH-04.`
+
+**WATCH-13** — `steer` is a note kind.
+Strength: `MUST` · Layer: `process` · Source: slice row `t-28dca81e` ("note kind steer", the
+scope approved on `a-e240ed2d`); implementing row `t-fde5d91c` item 2; Ord `t-49703f52` item 3,
+confirmed at GATE-ORD-READBACK on 2026-10-01.
+`steer is a planner's urgent pointer to a lane, distinct from progress. note --kind steer is
+accepted and stored like every other note kind; its note_added event carries kind steer in its
+payload and the writer's actor on the envelope, so --note-kind steer selects exactly those notes
+and a consumer can attribute each to the lane actor that wrote it.`
+`Failure behaviour: none new; an unknown note kind on note or watch is refused naming all seven
+accepted kinds and writes nothing.`
 
 ### Envelope lane, type and priority
 
@@ -209,9 +224,11 @@ never a third dialect — and Ord stays untouched throughout.`
 Strength: `MUST` · Layer: `process` · Source: `CursorToken` `#[serde(default)]` convention
 (`rust/watch.rs:66-87`).
 `The new lane and note-kind cursor fields default when absent, so a cursor persisted by an older
-binary resumes under the new binary with those families empty (unfiltered). Unknown fields are
-still denied: a cursor minted by a newer binary fails closed on an older one rather than
-silently dropping its lane set.`
+binary resumes under the new binary: a family the old token never carried adopts the call's own
+set (empty when the call names none, so unfiltered). Every cursor minted by the new binary
+carries both sets, even empty ones, so WATCH-02 binds it. Unknown fields are still denied: a
+cursor minted by a newer binary fails closed on an older one rather than silently dropping its
+lane set.`
 
 **WATCH-09** — The v1 envelope stays byte-stable apart from the four keys.
 Strength: `MUST` · Layer: `process` · Source: `project_event` (`rust/watch.rs:594-645`).
@@ -285,8 +302,17 @@ caller can check, not as silence.
 *when* the consumer replays `watch --task <id> --cursor 0 --note-kind blocker`,
 *then* only the `blocker` note's `note_added` event is emitted; and
 *when* the consumer passes `--note-kind urgent`,
-*then* the command fails closed with a sentence naming all six accepted kinds and writes
+*then* the command fails closed with a sentence naming all seven accepted kinds and writes
 nothing.
+
+### A9 (WATCH-13)
+
+*Given* a task holding a `blocker` note, a `progress` note, and a `steer` note written by
+`@:geoyws/kanban/planner`,
+*when* the consumer replays `watch --task <id> --cursor 0 --note-kind steer`,
+*then* exactly one `note_added` envelope is emitted, its payload `kind` is `steer` and its
+`actor` is `@:geoyws/kanban/planner`; and `note --kind urgent` is refused naming `steer` among
+the accepted kinds.
 
 ### A5 (WATCH-06, WATCH-09, WATCH-10)
 
@@ -329,7 +355,7 @@ stream test pins revocation, recovery and event identity at the user boundary.
 ## 5. Contracts and data
 
 - **Interface version or schema:** the `watch` CLI grammar gains two repeatable flags,
-  `--lane LANE` and `--note-kind plan|progress|blocker|decision|evidence|done`, on board and
+  `--lane LANE` and `--note-kind plan|progress|blocker|decision|evidence|done|steer`, on board and
   task scope; registry/rule scope rejects both (WATCH-04, WATCH-05). The NDJSON envelope stays
   protocol version 1 with four additive top-level keys (`lane`, `type`, `priority`,
   `priorityLevel`); `CursorToken.version` does not move and the two new cursor fields ride
@@ -370,8 +396,9 @@ confirms, not skill-documented shapes.
 | 7 | prior status | `priorStatus` | `priorStatus` | string task status | explicit `null` |
 | 8 | current status | `currentStatus` | `currentStatus` | string task status | explicit `null` |
 | 9 | tags | `tags` | `tags` | sorted string array of registered tags | `[]` when none |
-| 10 | kind | `kind` | `kind` | string event/note kind from the board's published enum | always present on events; note-kind steer values are the six `NOTE_KINDS` on both sides |
+| 10 | kind | `kind` | `kind` | string event/note kind from the board's published enum | always present on events; note-kind steer values are the seven `NOTE_KINDS` (WATCH-13 adds `steer`) on both sides; Ord's contract spells the filter `kind=note:steer`, kb spells it `--kind note_added --note-kind steer` — kb dialect governs (WATCH-07) |
 | 11 | cursor | `cursor` (envelope) | `cursor` (envelope) | opaque string, bound to the normalized predicate set | never absent on backlog/follow frames; idle heartbeats do not advance it |
+| 12 | actor | `actor` | `actor` | string, the writing lane actor (`@:<team>/<board>/<lane>`) | explicit `null` on events with no recorded actor |
 
 ## 6. Quality and security
 
@@ -414,26 +441,28 @@ corrected.
 ## 8. Verification
 
 Planned evidence for every mandatory requirement. The matrix section
-(`## Requirements trace — docs/specs/watch.md WATCH-01..WATCH-12`) is the trace of record;
-this table is its draft and the two land identical. `none` says `no e2e coverage` plainly and
-names the row that must write it: the gated implementation `t-fde5d91c`. Every other name was
-enumerated with `cargo test --locked --test e2e -- --list` and
-`cargo test --locked --test authz_bypass_matrix_e2e -- --list` on 2026-09-28 in this worktree.
+(`## Requirements trace — docs/specs/watch.md WATCH-01..WATCH-13`) is the trace of record;
+this table is its draft and the two land identical. Row `t-fde5d91c` wrote the four
+`watch_lane_*`/`watch_note_kind_*`/`watch_envelopes_*` cases in `tests/e2e.rs`; their names
+were enumerated with `cargo test --locked --test e2e -- --list` on 2026-10-01. They are written
+and compiled but not yet run, because e2e runs once per deployment batch, so those rows still
+say `no e2e coverage` until that run inside the required Linux container.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `WATCH-01` | MUST | process | `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` | PARTIAL: existing live watch revocation/re-grant and exact restored event ID at the compiled-process boundary; deterministic in-process seams `watch::tests::a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot` and `watch::tests::a_poll_pins_its_snapshot_before_refreshing_authority` separately prove delivery after an open-time mint and snapshot pin before a fresh revocation mint. No e2e coverage for the new `--lane` predicate; owed by `t-fde5d91c`. |
-| `WATCH-02` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: cursor carries no lane set at the baseline. |
-| `WATCH-03` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
-| `WATCH-04` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`. |
-| `WATCH-05` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no note-kind predicate at the baseline. |
-| `WATCH-06` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: the four keys are not projected at the baseline. |
-| `WATCH-07` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c` with GATE-ORD-READBACK readback: A6's side-by-side is the evidence. |
-| `WATCH-08` | MUST | process | `none` | no e2e coverage. Owed by `t-fde5d91c`: no new cursor fields exist yet to default. |
-| `WATCH-09` | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes` | additive stability on the shipped surface; `t-fde5d91c` re-runs both against envelopes carrying the four new keys. |
-| `WATCH-10` | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes` | the redaction half of that case; re-run with lane/type/priority-bearing events. |
-| `WATCH-11` | MUST | process | `watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats` | the heartbeat half; extended to lane/note-kind-skipped tails by `t-fde5d91c`. |
-| `WATCH-12` | MUST | process | `watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits`, `watch_follow_still_refuses_a_zero_limit` | limit-before/after-filtering and the at-least-1 refusal; re-run under steered predicates. |
+| `WATCH-01` | MUST | process | `watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set`, `revoking_authority_stops_a_live_watch_stream_without_a_reconnect` | no e2e coverage for `--lane` (written, not yet run). The revocation witness is shipped and unchanged; the in-process seams `watch::tests::a_poll_judges_its_snapshot_under_authority_read_after_the_snapshot` and `watch::tests::a_poll_pins_its_snapshot_before_refreshing_authority` still pin the mint ordering. |
+| `WATCH-02` | MUST | process | `watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set` | no e2e coverage (written, not yet run); unit `watch::tests::steering_sets_bind_new_cursors_and_pre_watch_cursors_adopt_them` holds normalization and the named-mismatch sentence. |
+| `WATCH-03` | MUST | process | `watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set` | no e2e coverage (written, not yet run). |
+| `WATCH-04` | MUST | process | `watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set` | no e2e coverage (written, not yet run); `--lane` and `--note-kind` each refused by name on `--registry`. |
+| `WATCH-05` | MUST | process | `watch_note_kind_steers_notes_and_a_steer_note_round_trips_with_its_actor` | no e2e coverage (written, not yet run). |
+| `WATCH-06` | MUST | process | `watch_envelopes_carry_subject_lane_type_and_priority_with_explicit_nulls` | no e2e coverage (written, not yet run); unit `watch::tests::event_projection_strips_private_snapshot_and_adds_semantic_fields` holds the unread, lane-less and other-task null rules. |
+| `WATCH-07` | MUST | process | `watch_note_kind_steers_notes_and_a_steer_note_round_trips_with_its_actor`, `watch_envelopes_carry_subject_lane_type_and_priority_with_explicit_nulls` | no e2e coverage (written, not yet run) for the kb column. PARTIAL GATE-ORD-READBACK: read back 2026-10-01 against the Ord `t-49703f52` contract text only — Ord is `todo`, so no Ord envelope exists for A6's side-by-side. That readback added WATCH-13 and conformance row 12; the live side-by-side stays open on `t-fde5d91c` until Ord ships its stream. |
+| `WATCH-08` | MUST | process | `watch_lane_follow_advances_over_an_unmatched_tail_and_resumes_a_pre_watch_cursor` | no e2e coverage (written, not yet run); unit `watch::tests::steering_sets_bind_new_cursors_and_pre_watch_cursors_adopt_them`. |
+| `WATCH-09` | MUST | process | `the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it`, `watch_emits_truthful_bounded_semantic_envelopes`, `watch_envelopes_carry_subject_lane_type_and_priority_with_explicit_nulls` | the first two are shipped; the third is written, not yet run. |
+| `WATCH-10` | MUST | process | `watch_emits_truthful_bounded_semantic_envelopes`, `watch_envelopes_carry_subject_lane_type_and_priority_with_explicit_nulls` | the lease-token half of the new case is written, not yet run. |
+| `WATCH-11` | MUST | process | `watch_lane_follow_advances_over_an_unmatched_tail_and_resumes_a_pre_watch_cursor`, `watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats` | no e2e coverage for the steered tail (written, not yet run). |
+| `WATCH-12` | MUST | process | `watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set`, `watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits`, `watch_follow_still_refuses_a_zero_limit` | steered limit and `--follow --limit 0` written, not yet run. |
+| `WATCH-13` | MUST | process | `watch_note_kind_steers_notes_and_a_steer_note_round_trips_with_its_actor` | no e2e coverage (written, not yet run). |
 
 Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run):
 `watch_replays_resumes_and_respects_selector_boundaries`,
@@ -475,3 +504,12 @@ Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run)
   the exact restored event ID, and a deterministic unit seam pins the race.
   The future `--lane` predicate still has no e2e coverage and remains owed
   by `t-fde5d91c`; no requirement ID or implementation approval changed.
+- `2026-10-01` — implementation delta for `t-fde5d91c`, after GATE-ORD-READBACK against the Ord
+  `t-49703f52` contract text. The approved slice scope (`t-28dca81e`, "note kind steer") and the
+  Ord contract (item 3) both name a `steer` note kind that the 2026-09-28 text had read as
+  note-kind steering only. Added: WATCH-13 (`steer` is a note kind) with A9; WATCH-05 and A4 now
+  name seven kinds; conformance row 10 records Ord's `kind=note:steer` spelling against kb's
+  governing `--note-kind steer`, and row 12 adds `actor`, which kb already emits. WATCH-08 is
+  clarified to match A7: a family a pre-slice token never carried adopts the call's own set,
+  while every newer token carries both sets. No existing requirement changed meaning. The live
+  Ord side-by-side (A6) remains open on `t-fde5d91c` until Ord ships its stream.

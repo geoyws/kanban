@@ -627,10 +627,21 @@ impl SystemBackend {
         claim: &SubscriptionDeliveryClaim,
         resolved: &ResolvedDispatch,
     ) -> std::result::Result<(AdapterRequest, Vec<u8>), DeliveryFailure> {
+        let subject = match claim.event.task_id.as_deref() {
+            Some(id) => self
+                .store
+                .watch_subject_row(id)
+                .map_err(|_| DeliveryFailure {
+                    code: "adapter_request_invalid",
+                    timed_out: false,
+                })?,
+            None => None,
+        };
         let event = crate::watch::project_board_event(
             claim.event.clone(),
             &self.context.board_path,
             self.context.board_name.as_deref(),
+            subject.as_ref(),
         )
         .map_err(|_| DeliveryFailure {
             code: "adapter_request_invalid",

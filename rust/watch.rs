@@ -1,12 +1,13 @@
 use crate::db::read_snapshot;
-use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
+use crate::model::{BOARD_EVENT_KINDS, Event, NOTE_KINDS, TASK_STATUSES, priority_level};
 use crate::registry::{BoardPathState, Registry, data_root, retired_board_message};
-use crate::store::Store;
+use crate::store::{Store, WatchSubjectRow};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
@@ -42,6 +43,8 @@ struct StreamKey {
     prior_statuses: Vec<String>,
     current_statuses: Vec<String>,
     tags: Vec<String>,
+    lanes: Vec<String>,
+    note_kinds: Vec<String>,
     archived: bool,
 }
 
@@ -59,6 +62,8 @@ struct ScopeEnvelope {
     prior_statuses: Vec<String>,
     current_statuses: Vec<String>,
     tags: Vec<String>,
+    lanes: Vec<String>,
+    note_kinds: Vec<String>,
     archived: bool,
 }
 
@@ -82,6 +87,14 @@ struct CursorToken {
     current_statuses: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
+    /// `None` only on a cursor minted before WATCH (WATCH-08): such a token
+    /// adopts the call's lane set. Every newer token carries the set, even
+    /// an empty one, so reusing it under another set fails closed.
+    #[serde(default)]
+    lanes: Option<Vec<String>>,
+    /// Same rule as `lanes`, for `--note-kind`.
+    #[serde(default)]
+    note_kinds: Option<Vec<String>>,
     archived: bool,
     seq: i64,
 }
@@ -146,6 +159,8 @@ fn resolve_with_source(
     let prior_statuses = normalize_statuses(args.many("prior-status"), "--prior-status")?;
     let current_statuses = normalize_statuses(args.many("current-status"), "--current-status")?;
     let tags = normalized(args.many("tag"));
+    let lanes = normalized(args.many("lane"));
+    let note_kinds = normalize_note_kinds(args.many("note-kind"))?;
     let follow = args.has("follow");
     // `Args::limit` holds this to LIMIT_CEILING like every other surface; a
     // batch is a SQL `LIMIT`, not a preallocated buffer, so a caller who asks
@@ -165,6 +180,18 @@ fn resolve_with_source(
         {
             bail!(
                 "--relation, --prior-status, --current-status and --tag apply only to board watch events"
+            );
+        }
+        // WATCH-04/05: lanes and note kinds are board-row semantics; the
+        // registry trail has neither, so a predicate there would mean nothing.
+        if !lanes.is_empty() {
+            bail!(
+                "--lane applies only to board watch events; registry and rule events carry no lane"
+            );
+        }
+        if !note_kinds.is_empty() {
+            bail!(
+                "--note-kind applies only to board watch events; registry and rule events carry no notes"
             );
         }
         if args.has("all") {
@@ -200,6 +227,8 @@ fn resolve_with_source(
                 prior_statuses: Vec::new(),
                 current_statuses: Vec::new(),
                 tags: Vec::new(),
+                lanes: Vec::new(),
+                note_kinds: Vec::new(),
                 archived: false,
             },
         )?;
@@ -220,6 +249,8 @@ fn resolve_with_source(
                 prior_statuses: Vec::new(),
                 current_statuses: Vec::new(),
                 tags: Vec::new(),
+                lanes: Vec::new(),
+                note_kinds: Vec::new(),
                 archived: false,
             },
             cursor,
@@ -301,6 +332,8 @@ fn resolve_with_source(
             prior_statuses: prior_statuses.clone(),
             current_statuses: current_statuses.clone(),
             tags: tags.clone(),
+            lanes: lanes.clone(),
+            note_kinds: note_kinds.clone(),
             archived,
         },
     )?;
@@ -322,6 +355,8 @@ fn resolve_with_source(
             prior_statuses,
             current_statuses,
             tags,
+            lanes,
+            note_kinds,
             archived,
         },
         cursor,
@@ -342,6 +377,10 @@ fn resolve_with_source(
 struct Poll {
     batch: Vec<Event>,
     tail_seq: Option<i64>,
+    /// Each delivered event's subject row (WATCH-06), read in the poll's
+    /// snapshot under the poll's authority. Absent for registry polls, for
+    /// taskless events, and for rows that are gone or unreadable.
+    subjects: HashMap<String, WatchSubjectRow>,
 }
 
 /// Read one poll's batch and advance from one board snapshot, under authority
@@ -387,7 +426,11 @@ fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
                 } else {
                     None
                 };
-                Ok(Poll { batch, tail_seq })
+                Ok(Poll {
+                    batch,
+                    tail_seq,
+                    subjects: HashMap::new(),
+                })
             })
         }
     }
@@ -419,6 +462,8 @@ fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll>
         &spec.key.prior_statuses,
         &spec.key.current_statuses,
         &spec.key.tags,
+        &spec.key.lanes,
+        &spec.key.note_kinds,
         cursor,
         spec.limit,
         spec.key.archived,
@@ -435,13 +480,21 @@ fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll>
     // not reached — so the cursor only ever covers ruled-out rows.
     let mut advance = tail.scanned_through;
     if tail.events.is_empty() {
+        let mut lanes = HashMap::new();
         for event in store.events_since(
             None,
             between_scans(&store.connection, tail.scanned_through),
             spec.limit,
             spec.key.archived,
         )? {
-            if statically_rejected(&spec.key, &event) {
+            if statically_rejected(&spec.key, &event, &mut |id| {
+                if let Some(lane) = lanes.get(id) {
+                    return Ok(Clone::clone(lane));
+                }
+                let lane = store.watch_subject_row(id)?.and_then(|row| row.lane);
+                lanes.insert(id.to_owned(), lane.clone());
+                Ok(lane)
+            })? {
                 advance = event.seq;
             } else {
                 break;
@@ -465,36 +518,74 @@ fn poll_board_once(store: &Store, spec: &WatchSpec, cursor: i64) -> Result<Poll>
         } else {
             None
         };
+    let mut subjects = HashMap::new();
+    for id in tail
+        .events
+        .iter()
+        .filter_map(|event| event.task_id.as_deref())
+    {
+        if !subjects.contains_key(id)
+            && let Some(row) = store.watch_subject_row(id)?
+        {
+            subjects.insert(id.to_owned(), row);
+        }
+    }
     Ok(Poll {
         batch: tail.events,
         tail_seq,
+        subjects,
     })
 }
 
 /// Whether this row can never match the poll's static predicates.
 ///
-/// Only the equality predicates the SQL binds verbatim — kinds, task and
-/// archival — are answered here, from the same key the SQL was built from,
-/// so the two cannot disagree. The semantic predicates (relations, statuses,
-/// tags) stay SQL-side: a row those alone would reject is NOT reported
-/// rejected here, and the advance walk stops instead. That is conservative —
-/// the cursor may wait one more poll for the filtered scan's own examined
-/// range to carry it past such a row — and conservatism there is correctness,
-/// because guessing a JSON predicate in Rust is how a visible row gets
-/// skipped.
-fn statically_rejected(key: &StreamKey, event: &Event) -> bool {
+/// Only predicates answered exactly from the same snapshot are judged here:
+/// kinds, task and archival, which the SQL binds verbatim; the note kind,
+/// which is the payload's own top-level `kind` (the SQL reads the same key);
+/// and the lane, which is the subject task row's live lane read through
+/// `lane_of` in this poll's snapshot. Without the last two, a lane- or
+/// note-kind-steered follow over a long unmatched tail would never emit its
+/// `advanced` heartbeat (WATCH-11). The semantic predicates (relations,
+/// statuses, tags) stay SQL-side: a row those alone would reject is NOT
+/// reported rejected here, and the advance walk stops instead. That is
+/// conservative — the cursor may wait one more poll for the filtered scan's
+/// own examined range to carry it past such a row — and conservatism there
+/// is correctness, because guessing a JSON predicate in Rust is how a
+/// visible row gets skipped.
+fn statically_rejected(
+    key: &StreamKey,
+    event: &Event,
+    lane_of: &mut dyn FnMut(&str) -> Result<Option<String>>,
+) -> Result<bool> {
     if !key.kinds.is_empty() && !key.kinds.iter().any(|kind| kind == &event.kind) {
-        return true;
+        return Ok(true);
     }
     if let Some(task) = key.selector_value.as_deref()
         && event.task_id.as_deref() != Some(task)
     {
-        return true;
+        return Ok(true);
     }
     if event.archived && !key.archived {
-        return true;
+        return Ok(true);
     }
-    false
+    if !key.note_kinds.is_empty() {
+        let note_kind = (event.kind == "note_added")
+            .then(|| event.payload.get("kind").and_then(Value::as_str))
+            .flatten();
+        if !note_kind.is_some_and(|kind| key.note_kinds.iter().any(|wanted| wanted == kind)) {
+            return Ok(true);
+        }
+    }
+    if !key.lanes.is_empty() {
+        let lane = match event.task_id.as_deref() {
+            Some(id) => lane_of(id)?,
+            None => None,
+        };
+        if !lane.is_some_and(|lane| key.lanes.contains(&lane)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Runs after a poll's filtered scan and before its tail walk, inside the
@@ -729,12 +820,16 @@ fn stream_with(
         for event in poll.batch {
             cursor = event.seq;
             cursor_token = encode_cursor(&spec.key, cursor)?;
+            let subject = event
+                .task_id
+                .as_deref()
+                .and_then(|id| poll.subjects.get(id));
             sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
                 scope: scope_envelope(&spec.key, board_name(&spec.source)),
                 cursor: cursor_token.clone(),
                 kind: "event",
-                payload: event_payload(event, &spec.source)?,
+                payload: event_payload(event, &spec.source, subject)?,
             })?;
         }
         if !spec.follow {
@@ -767,28 +862,43 @@ fn scope_envelope(key: &StreamKey, board_name: Option<String>) -> ScopeEnvelope 
         prior_statuses: key.prior_statuses.clone(),
         current_statuses: key.current_statuses.clone(),
         tags: key.tags.clone(),
+        lanes: key.lanes.clone(),
+        note_kinds: key.note_kinds.clone(),
         archived: key.archived,
     }
 }
 
-fn event_payload(event: Event, source: &Source) -> Result<Value> {
+fn event_payload(
+    event: Event,
+    source: &Source,
+    subject: Option<&WatchSubjectRow>,
+) -> Result<Value> {
     match source {
         Source::Board { path, board_name } => {
-            project_board_event(event, path, board_name.as_deref())
+            project_board_event(event, path, board_name.as_deref(), subject)
         }
-        Source::Registry { .. } => project_event(event, None),
+        Source::Registry { .. } => project_event(event, None, None),
     }
 }
 
+/// `subject` is the event's task row as the caller's snapshot sees it; the
+/// projection only uses it when the event's own semantic snapshot names that
+/// same task as its subject (WATCH-06).
 pub(crate) fn project_board_event(
     event: Event,
     path: &Path,
     board_name: Option<&str>,
+    subject: Option<&WatchSubjectRow>,
 ) -> Result<Value> {
-    project_event(event, Some((path, board_name)))
+    project_event(event, Some((path, board_name)), subject)
 }
 
-fn project_event(event: Event, board_source: Option<(&Path, Option<&str>)>) -> Result<Value> {
+fn project_event(
+    event: Event,
+    board_source: Option<(&Path, Option<&str>)>,
+    subject: Option<&WatchSubjectRow>,
+) -> Result<Value> {
+    let task_id = event.task_id.clone();
     let mut value = serde_json::to_value(event)?;
     let payload = value
         .get_mut("payload")
@@ -837,6 +947,26 @@ fn project_event(event: Event, board_source: Option<(&Path, Option<&str>)>) -> R
     value["priorStatus"] = field("priorStatus");
     value["currentStatus"] = field("currentStatus");
     value["tags"] = field("tags");
+    // WATCH-06: lane, type, priority and priorityLevel are explicit null
+    // unless the event's semantic subject is the task whose row was read.
+    let subject_is_task = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("subject"))
+        .is_some_and(|named| {
+            named.get("type").and_then(Value::as_str) == Some("task")
+                && named.get("id").and_then(Value::as_str) == task_id.as_deref()
+        });
+    let row = subject.filter(|_| subject_is_task);
+    // WATCH-10: the four keys go through the same redaction as the payload.
+    let projected = redact(json!({
+        "lane": row.and_then(|row| row.lane.clone()),
+        "type": row.map(|row| row.task_type.clone()),
+        "priority": row.map(|row| row.priority),
+        "priorityLevel": row.and_then(|row| priority_level(row.priority)),
+    }));
+    for key in ["lane", "type", "priority", "priorityLevel"] {
+        value[key] = projected.get(key).cloned().unwrap_or(Value::Null);
+    }
     value["metadata"] = bounded_metadata(payload)?;
     Ok(value)
 }
@@ -872,6 +1002,19 @@ fn normalize_statuses(values: Vec<String>, flag: &str) -> Result<Vec<String>> {
             bail!(
                 "{flag} must be one of {}, got {value:?}",
                 TASK_STATUSES.join(", ")
+            );
+        }
+    }
+    Ok(normalized(values))
+}
+
+/// WATCH-05: an unknown note kind fails closed naming every accepted kind.
+fn normalize_note_kinds(values: Vec<String>) -> Result<Vec<String>> {
+    for value in &values {
+        if !NOTE_KINDS.contains(&value.as_str()) {
+            bail!(
+                "--note-kind must be one of {}, got {value:?}",
+                NOTE_KINDS.join(", ")
             );
         }
     }
@@ -923,6 +1066,8 @@ fn normalize_key(key: &StreamKey) -> StreamKey {
     result.prior_statuses = normalized(result.prior_statuses);
     result.current_statuses = normalized(result.current_statuses);
     result.tags = normalized(result.tags);
+    result.lanes = normalized(result.lanes);
+    result.note_kinds = normalized(result.note_kinds);
     result
 }
 
@@ -1055,6 +1200,8 @@ fn encode_cursor(key: &StreamKey, seq: i64) -> Result<String> {
         prior_statuses: key.prior_statuses.clone(),
         current_statuses: key.current_statuses.clone(),
         tags: key.tags.clone(),
+        lanes: Some(key.lanes.clone()),
+        note_kinds: Some(key.note_kinds.clone()),
         archived: key.archived,
         seq,
     };
@@ -1098,9 +1245,37 @@ fn decode_cursor(raw: &str, expected: &StreamKey) -> Result<i64> {
         prior_statuses: token.prior_statuses,
         current_statuses: token.current_statuses,
         tags: token.tags,
+        // A pre-WATCH token never carried these sets; it adopts the call's
+        // (WATCH-08). A newer token always carries them (WATCH-02).
+        lanes: token.lanes.unwrap_or_else(|| expected.lanes.clone()),
+        note_kinds: token
+            .note_kinds
+            .unwrap_or_else(|| expected.note_kinds.clone()),
         archived: token.archived,
     };
-    if normalize_key(&actual) != normalize_key(expected) {
+    let actual = normalize_key(&actual);
+    let expected = normalize_key(expected);
+    if actual != expected {
+        // WATCH-02: name the mismatch when it is the steering set alone.
+        let rest_matches = StreamKey {
+            lanes: expected.lanes.clone(),
+            note_kinds: expected.note_kinds.clone(),
+            ..actual.clone()
+        } == expected;
+        if rest_matches && actual.lanes != expected.lanes {
+            bail!(
+                "--cursor belongs to a different watch stream: it was minted for --lane {:?}, this call asks for {:?}",
+                actual.lanes,
+                expected.lanes
+            );
+        }
+        if rest_matches {
+            bail!(
+                "--cursor belongs to a different watch stream: it was minted for --note-kind {:?}, this call asks for {:?}",
+                actual.note_kinds,
+                expected.note_kinds
+            );
+        }
         bail!("--cursor belongs to a different watch stream");
     }
     Ok(token.seq)
@@ -1193,6 +1368,8 @@ mod tests {
             prior_statuses: Vec::new(),
             current_statuses: Vec::new(),
             tags: Vec::new(),
+            lanes: Vec::new(),
+            note_kinds: Vec::new(),
             archived: true,
         }
     }
@@ -1231,6 +1408,8 @@ mod tests {
                 prior_statuses: Vec::new(),
                 current_statuses: Vec::new(),
                 tags: Vec::new(),
+                lanes: Vec::new(),
+                note_kinds: Vec::new(),
                 archived: false,
             },
             cursor,
@@ -1281,6 +1460,8 @@ mod tests {
             prior_statuses: expected.prior_statuses.clone(),
             current_statuses: expected.current_statuses.clone(),
             tags: expected.tags.clone(),
+            lanes: Some(expected.lanes.clone()),
+            note_kinds: Some(expected.note_kinds.clone()),
             archived: expected.archived,
             seq: 42,
         })
@@ -1301,6 +1482,8 @@ mod tests {
             prior_statuses: expected.prior_statuses.clone(),
             current_statuses: expected.current_statuses.clone(),
             tags: expected.tags.clone(),
+            lanes: Some(expected.lanes.clone()),
+            note_kinds: Some(expected.note_kinds.clone()),
             archived: expected.archived,
             seq: 42,
         })
@@ -1320,6 +1503,8 @@ mod tests {
             prior_statuses: Vec::new(),
             current_statuses: Vec::new(),
             tags: Vec::new(),
+            lanes: Vec::new(),
+            note_kinds: Vec::new(),
             archived: false,
         };
         assert!(decode_cursor(&token, &mismatch).is_err());
@@ -1335,6 +1520,8 @@ mod tests {
             prior_statuses: expected.prior_statuses.clone(),
             current_statuses: expected.current_statuses.clone(),
             tags: expected.tags.clone(),
+            lanes: Some(expected.lanes.clone()),
+            note_kinds: Some(expected.note_kinds.clone()),
             archived: expected.archived,
             seq: -1,
         })
@@ -1342,6 +1529,65 @@ mod tests {
         let negative = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&negative).unwrap());
         assert!(decode_cursor(&negative, &expected).is_err());
         assert!(parse_cursor(Some("7"), &expected).is_err());
+    }
+
+    #[test]
+    fn steering_sets_bind_new_cursors_and_pre_watch_cursors_adopt_them() {
+        let mut steered = identity();
+        steered.lanes = vec![
+            "driver-3".to_owned(),
+            "driver-2".to_owned(),
+            "driver-2".to_owned(),
+        ];
+        steered.note_kinds = vec!["blocker".to_owned()];
+        let token = encode_cursor(&steered, 9).unwrap();
+        // Order and duplicates are normalized away (WATCH-02).
+        let mut same = identity();
+        same.lanes = vec!["driver-2".to_owned(), "driver-3".to_owned()];
+        same.note_kinds = vec!["blocker".to_owned()];
+        assert_eq!(decode_cursor(&token, &same).unwrap(), 9);
+
+        let mut other_lane = same.clone();
+        other_lane.lanes = vec!["driver-3".to_owned()];
+        let refusal = decode_cursor(&token, &other_lane).unwrap_err().to_string();
+        assert!(refusal.contains("--lane"), "{refusal}");
+        assert!(refusal.contains("driver-2"), "{refusal}");
+
+        let mut other_kind = same.clone();
+        other_kind.note_kinds = vec!["steer".to_owned()];
+        let refusal = decode_cursor(&token, &other_kind).unwrap_err().to_string();
+        assert!(refusal.contains("--note-kind"), "{refusal}");
+
+        // An unsteered new cursor still binds its empty sets.
+        let plain = encode_cursor(&identity(), 4).unwrap();
+        assert!(decode_cursor(&plain, &same).is_err());
+
+        // A cursor minted before WATCH carries neither field and resumes
+        // under any steering set (WATCH-08).
+        let mut legacy = serde_json::to_value(CursorToken {
+            version: PROTOCOL_VERSION,
+            source_kind: same.source_kind.clone(),
+            source: same.source.clone(),
+            selector_kind: same.selector_kind.clone(),
+            selector_value: same.selector_value.clone(),
+            kind: same.kind.clone(),
+            kinds: same.kinds.clone(),
+            relations: same.relations.clone(),
+            prior_statuses: same.prior_statuses.clone(),
+            current_statuses: same.current_statuses.clone(),
+            tags: same.tags.clone(),
+            lanes: None,
+            note_kinds: None,
+            archived: same.archived,
+            seq: 5,
+        })
+        .unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("lanes");
+        object.remove("noteKinds");
+        let legacy = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy).unwrap());
+        assert_eq!(decode_cursor(&legacy, &same).unwrap(), 5);
+        assert_eq!(decode_cursor(&legacy, &identity()).unwrap(), 5);
     }
 
     #[test]
@@ -1416,10 +1662,16 @@ mod tests {
             "token": "private",
             "note": "visible"
         }));
-        let projected = event_payload(fixture.clone(), &source).unwrap();
+        let row = WatchSubjectRow {
+            lane: Some("driver-2".to_owned()),
+            task_type: "task".to_owned(),
+            priority: 4,
+        };
+        let projected = event_payload(fixture.clone(), &source, Some(&row)).unwrap();
         let direct = match &source {
             Source::Board { path, board_name } => {
-                project_board_event(fixture, path, board_name.as_deref()).unwrap()
+                project_board_event(fixture.clone(), path, board_name.as_deref(), Some(&row))
+                    .unwrap()
             }
             Source::Registry { .. } => unreachable!(),
         };
@@ -1431,10 +1683,48 @@ mod tests {
         assert_eq!(projected["subject"]["id"], "t-1");
         assert_eq!(projected["currentStatus"], "done");
         assert_eq!(projected["tags"], json!(["infra"]));
+        assert_eq!(projected["lane"], "driver-2");
+        assert_eq!(projected["type"], "task");
+        assert_eq!(projected["priority"], 4);
+        assert_eq!(projected["priorityLevel"], "P1");
         assert!(projected["payload"].get("_semanticV1").is_none());
         assert!(projected["payload"].get("token").is_none());
         assert_eq!(projected["metadata"]["value"]["note"], "visible");
         assert_eq!(projected["metadata"]["truncated"], false);
+
+        // A row the poll could not read, and a lane-less row, project
+        // explicit nulls rather than dropping the keys.
+        let unread = event_payload(fixture.clone(), &source, None).unwrap();
+        let laneless = event_payload(
+            fixture.clone(),
+            &source,
+            Some(&WatchSubjectRow {
+                lane: None,
+                ..row.clone()
+            }),
+        )
+        .unwrap();
+        for field in ["lane", "type", "priority", "priorityLevel"] {
+            assert_eq!(
+                unread.get(field),
+                Some(&Value::Null),
+                "unread field {field}"
+            );
+        }
+        assert_eq!(laneless.get("lane"), Some(&Value::Null));
+        assert_eq!(laneless["type"], "task");
+
+        // A row for some other task never lends its fields to this subject.
+        let mut other = fixture;
+        other.task_id = Some("t-2".to_owned());
+        let other = event_payload(other, &source, Some(&row)).unwrap();
+        for field in ["lane", "type", "priority", "priorityLevel"] {
+            assert_eq!(
+                other.get(field),
+                Some(&Value::Null),
+                "mismatched field {field}"
+            );
+        }
     }
 
     #[test]
@@ -1454,6 +1744,11 @@ mod tests {
             &Source::Registry {
                 root: PathBuf::from("/tmp/kanban-watch-registry"),
             },
+            Some(&WatchSubjectRow {
+                lane: Some("driver-2".to_owned()),
+                task_type: "task".to_owned(),
+                priority: 4,
+            }),
         )
         .unwrap();
         assert_eq!(projected["board"], Value::Null);
@@ -1463,8 +1758,16 @@ mod tests {
             "priorStatus",
             "currentStatus",
             "tags",
+            "lane",
+            "type",
+            "priority",
+            "priorityLevel",
         ] {
-            assert_eq!(projected[field], Value::Null, "registry field {field}");
+            assert_eq!(
+                projected.get(field),
+                Some(&Value::Null),
+                "registry field {field}"
+            );
         }
         assert!(projected["payload"].get("_semanticV1").is_none());
         assert!(projected["payload"].get("token").is_none());
@@ -1476,6 +1779,11 @@ mod tests {
         let projected = event_payload(
             event(json!({"large": "x".repeat(METADATA_LIMIT)})),
             &board_source(),
+            Some(&WatchSubjectRow {
+                lane: Some("driver-2".to_owned()),
+                task_type: "task".to_owned(),
+                priority: 4,
+            }),
         )
         .unwrap();
         for field in [
@@ -1484,8 +1792,16 @@ mod tests {
             "priorStatus",
             "currentStatus",
             "tags",
+            "lane",
+            "type",
+            "priority",
+            "priorityLevel",
         ] {
-            assert_eq!(projected[field], Value::Null, "legacy field {field}");
+            assert_eq!(
+                projected.get(field),
+                Some(&Value::Null),
+                "legacy field {field}"
+            );
         }
         assert_eq!(projected["metadata"]["value"], Value::Null);
         assert_eq!(projected["metadata"]["truncated"], true);
@@ -1744,6 +2060,8 @@ mod tests {
             prior_statuses: Vec::new(),
             current_statuses: Vec::new(),
             tags: Vec::new(),
+            lanes: Vec::new(),
+            note_kinds: Vec::new(),
             archived: false,
         };
         let cursor = encode_cursor(&key, 2).expect("encode future cursor");
@@ -2473,6 +2791,8 @@ mod tests {
                 prior_statuses: Vec::new(),
                 current_statuses: Vec::new(),
                 tags: Vec::new(),
+                lanes: Vec::new(),
+                note_kinds: Vec::new(),
                 archived: false,
             },
             cursor,
@@ -2655,6 +2975,8 @@ mod tests {
                 prior_statuses: Vec::new(),
                 current_statuses: Vec::new(),
                 tags: Vec::new(),
+                lanes: Vec::new(),
+                note_kinds: Vec::new(),
                 archived: false,
             },
             cursor: 1,

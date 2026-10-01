@@ -1750,6 +1750,8 @@ struct EventFilterSpec<'a> {
     prior_statuses: &'a [String],
     current_statuses: &'a [String],
     tags: &'a [String],
+    lanes: &'a [String],
+    note_kinds: &'a [String],
     include_archived: bool,
     semantic_payload: &'a str,
 }
@@ -1865,6 +1867,40 @@ fn append_event_filters(
             ));
             values.push(Box::new(tag.to_owned()));
         }
+    }
+    // WATCH-01: the subject task row's lane, read live, so an event whose
+    // task is gone or carries no lane cannot pass a lane predicate.
+    if !spec.lanes.is_empty() {
+        sql.push_str(" AND task_id IN (SELECT id FROM tasks WHERE lane IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", spec.lanes.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push_str("))");
+        values.extend(
+            spec.lanes
+                .iter()
+                .cloned()
+                .map(|lane| Box::new(lane) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    // WATCH-05: only `note_added` carries a note kind, so under this
+    // predicate every other event kind is excluded outright.
+    if !spec.note_kinds.is_empty() {
+        sql.push_str(" AND kind='note_added' AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.kind') IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", spec.note_kinds.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+        values.extend(
+            spec.note_kinds
+                .iter()
+                .cloned()
+                .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
+        );
     }
 }
 
@@ -4420,6 +4456,14 @@ impl Drop for ReadSnapshot<'_> {
     }
 }
 
+/// The three subject-row columns a watch envelope projects (WATCH-06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchSubjectRow {
+    pub lane: Option<String>,
+    pub task_type: String,
+    pub priority: i64,
+}
+
 /// What one bounded ascending-tail scan examined.
 ///
 /// The cursor-driven tail — `watch --follow` — polls this on every ledger
@@ -5981,6 +6025,8 @@ impl Store {
                 prior_statuses,
                 current_statuses,
                 tags,
+                &[],
+                &[],
                 cursor,
                 limit,
                 include_archived,
@@ -6013,6 +6059,8 @@ impl Store {
         prior_statuses: &[String],
         current_statuses: &[String],
         tags: &[String],
+        lanes: &[String],
+        note_kinds: &[String],
         cursor: i64,
         limit: i64,
         include_archived: bool,
@@ -6033,6 +6081,8 @@ impl Store {
                 prior_statuses,
                 current_statuses,
                 tags,
+                lanes,
+                note_kinds,
                 include_archived,
                 semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
             },
@@ -6206,6 +6256,8 @@ impl Store {
                     prior_statuses: &subscription.prior_statuses,
                     current_statuses: &subscription.current_statuses,
                     tags: &subscription.tags,
+                    lanes: &[],
+                    note_kinds: &[],
                     include_archived: true,
                     semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
                 },
@@ -6344,6 +6396,24 @@ impl Store {
             return Err(crate::authz::DeniedOrNotFound.into());
         }
         Ok(exists)
+    }
+
+    /// The subject task row's lane, type and priority for a watch envelope
+    /// (WATCH-06), or `None` when the row is gone or this caller may not
+    /// read it. Only those three columns leave this method: no lease, no
+    /// metadata, no body.
+    pub fn watch_subject_row(&self, id: &str) -> Result<Option<WatchSubjectRow>> {
+        let Some(task) = get_task(&self.connection, id)? else {
+            return Ok(None);
+        };
+        if !self.authz.permits_read(&task_tags(&self.connection, id)?) {
+            return Ok(None);
+        }
+        Ok(Some(WatchSubjectRow {
+            lane: task.lane,
+            task_type: task.task_type,
+            priority: task.priority,
+        }))
     }
 
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
@@ -13547,7 +13617,19 @@ mod tests {
         // First poll: nothing delivered, but the cursor moves past the
         // denied rows the scan already read — and only those.
         let first = store
-            .events_since_filtered_tail(None, &[], &[], &[], &[], &[], first_visible, 2, true)
+            .events_since_filtered_tail(
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                first_visible,
+                2,
+                true,
+            )
             .expect("first tail scan");
         assert!(
             first.events.is_empty(),
@@ -13573,6 +13655,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
                 first.scanned_through,
                 2,
                 true,
@@ -13593,6 +13677,8 @@ mod tests {
         let third = store
             .events_since_filtered_tail(
                 None,
+                &[],
+                &[],
                 &[],
                 &[],
                 &[],
