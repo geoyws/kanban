@@ -9,7 +9,12 @@
   Every "today" claim below cites `<path>:<line>` in that worktree. At the baseline no type, field,
   module or verb named plugin exists in `rust/`; the only mentions are prose (`rust/lib.rs:2719-2720`,
   ADR-001 §6, ADR-010, ADR-031 §8).
-- **Status:** `DRAFT` — gate requested 2026-10-01.
+- **Status:** `SPEC-READY` on 2026-10-01 (independent reviewer agent `ReviewPluginSpec1` at commit
+  `79d3408`, applying the SDD §1 exit criteria: fifteen MUST requirements, each testable and
+  reached by an acceptance example and one §8 row; both material owner choices taken on
+  `a-9056d954` and `a-5f631e1d`; cited lines spot-checked in this worktree. Its three wording
+  findings are applied as recorded in §9. Specification readiness only — it authorises neither
+  implementation, nor rollout, nor release.)
 - **Owner (product scope):** George. He alone resolves scope and the open questions in §7.
 - **Decider (wording of this document):** slice row `t-374806ea` under epic `e-c0852fe7`,
   admitted on owner verdict `a-843bb89d` (kind `approval`, resolved by geoyws 2026-09-30:
@@ -125,7 +130,8 @@ Strength: `MUST` · Layer: `process` · Source: `a-9056d954`; `rust/dispatch.rs:
 carry "kind": "plugin" ("kind" absent or "delivery" keeps today's meaning). A plugin action
 requires "revision" (1-128 ASCII characters, starting with a letter or digit, then letters,
 digits, dot, underscore or hyphen), "sha256" (exactly 64 lowercase hexadecimal characters) and
-"timeoutMs" (an integer in 1..300000), and may carry "secret" (the id of one entry in its
+"timeoutMs" (an integer from 1 to 300000 inclusive, matching rust/adapter_process.rs:237), and
+may carry "secret" (the id of one entry in its
 consumer's "secrets" map). A delivery action takes its secret from the subscription row's
 secret reference (rust/dispatch.rs:553-562); a plugin call has no subscription, so the action
 names its own. "kind", "revision", "sha256", "timeoutMs" and "secret" are refused in a version 1
@@ -200,8 +206,10 @@ sha256 <found> does not match pinned <pinned>" — and nothing is spawned.`
 Strength: `MUST` · Layer: `unit` · Source: `t-f73a81ae` ("bounded fields and errors");
 `rust/adapter_protocol.rs:5`, `:9-44`, `:100-123`.
 `Kanban writes one request to the plugin's stdin and reads one response from its stdout, both
-JSON objects of at most 1 MiB, field names camelCase, unknown fields refused, nothing but
-whitespace after the object. Request: {"protocolVersion":1,"target":{"consumerID":..,
+JSON objects of at most 1 MiB, nothing but whitespace after the object. The envelope fields are
+exactly those below, named in camelCase; an envelope with a missing or unknown field is refused.
+The "input" and "output" objects are opaque to these rules: any keys, in any case, at any
+depth. Request: {"protocolVersion":1,"target":{"consumerID":..,
 "actionID":..},"revision":<pinned revision>,"input":<object>}. Response:
 {"protocolVersion":1,"revision":<string>,"output":<object>}. A response that breaks any rule is
 refused with "plugin <consumer>/<action> returned an invalid response: <rule>", and its output is
@@ -232,8 +240,10 @@ JSON"); `t-f73a81ae` ("outputs carry provider revision ... schema version").
 `On success plugin call prints exactly one line, with or without --json:
 {"action":..,"consumer":..,"output":<the plugin's output object>,"revision":..,"schemaVersion":1,
 "sha256":..} in canonical form — object keys sorted by their UTF-8 bytes at every depth, no
-insignificant whitespace, numbers as the plugin sent them, one trailing newline — and exits 0.
-Two calls whose plugin outputs are equal as JSON values print byte-identical lines.`
+insignificant whitespace, numbers re-serialized from their parsed value (an integer that fits in
+64 bits in plain decimal; any other number as the shortest decimal that parses back to the same
+IEEE-754 double, so 1.0 and 1E0 both print 1.0), one trailing newline — and exits 0. Two calls
+whose plugin outputs are equal as JSON values print byte-identical lines.`
 `Failure behaviour: with --json a refusal prints {"error":"<sentence>"} on stdout and the sentence
 on stderr, exits non-zero, and prints no partial output (the refusal shape at
 tests/e2e.rs refusal_object).`
@@ -458,3 +468,9 @@ table is its draft and the two land identical. No test exists yet: the implement
 - `2026-10-01` — slice created at `PLUGIN-01` .. `PLUGIN-15` under row `t-374806ea`, after owner
   verdicts `a-843bb89d` (slice admitted), `a-9056d954` (reuse `dispatchers.json`, synchronous
   entry point) and `a-5f631e1d` (shape at load, recheck per call). No supersessions yet.
+- `2026-10-01` — independent `/quality spec` review (`ReviewPluginSpec1`, commit `79d3408`):
+  SPEC-READY with three wording findings, applied without changing any requirement's meaning.
+  PLUGIN-01 states the `timeoutMs` bound inclusively (1 to 300000, as the cited process rule
+  accepts). PLUGIN-08 scopes the camelCase and unknown-field rules to the envelope fields and
+  makes `input`/`output` opaque. PLUGIN-11 fixes number serialization to the parsed value, so
+  "equal as JSON values" and "byte-identical" cannot disagree.
