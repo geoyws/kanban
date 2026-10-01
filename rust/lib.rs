@@ -4220,50 +4220,56 @@ struct TaskListQuery<'a> {
     include_archived: bool,
 }
 
+/// One task listing, read inside one snapshot (`t-eca9df35`): the rows, their
+/// gates and their prerequisites all come from the same board state, and the
+/// read takes SQLite's lock once instead of once per statement — thousands of
+/// times for a large board, which is what made a listing crawl while other
+/// lanes were writing.
 fn list_json(
     store: &Store,
     query: TaskListQuery<'_>,
     claims: bool,
     relations: bool,
 ) -> Result<Value> {
-    let listed = store.list_tasks_with_claims(
-        query.status,
-        query.tag,
-        query.lane,
-        query.allowed_model,
-        query.include_archived,
-    )?;
-    // Every row's gate in one read, because the lapsed-lease projection it
-    // applies is board-wide: asking row by row put that read on the listing
-    // once per row.
-    let mut gates = if relations {
-        store.blocking_gates_for(
-            &listed
+    store.read_consistent(|store| {
+        let listed = store.list_tasks_with_claims(
+            query.status,
+            query.tag,
+            query.lane,
+            query.allowed_model,
+            query.include_archived,
+        )?;
+        // Every row's gates and prerequisites in one read each, because both
+        // projections are board-wide: asking row by row put a whole-board
+        // scan on the listing once per row.
+        let (mut gates, mut dependencies) = if relations {
+            let ids = listed
                 .iter()
                 .map(|(task, _)| task.id.clone())
-                .collect::<Vec<_>>(),
-        )?
-    } else {
-        Vec::new()
-    }
-    .into_iter();
-    let mut out = Vec::with_capacity(listed.len());
-    for (task, claim) in listed {
-        let related = if relations {
-            Some((
-                store
-                    .dependencies(&task.id)?
-                    .into_iter()
-                    .map(|dependency| dependency.id)
-                    .collect(),
-                gates.next().context("one gate list per listed row")?,
-            ))
+                .collect::<Vec<_>>();
+            (
+                store.blocking_gates_for(&ids)?.into_iter(),
+                store.dependency_ids_for(&ids)?.into_iter(),
+            )
         } else {
-            None
+            (Vec::new().into_iter(), Vec::new().into_iter())
         };
-        out.push(task_list_row(&task, claim, claims, related)?);
-    }
-    Ok(Value::Array(out))
+        let mut out = Vec::with_capacity(listed.len());
+        for (task, claim) in listed {
+            let related = if relations {
+                Some((
+                    dependencies
+                        .next()
+                        .context("one prerequisite list per listed row")?,
+                    gates.next().context("one gate list per listed row")?,
+                ))
+            } else {
+                None
+            };
+            out.push(task_list_row(&task, claim, claims, related)?);
+        }
+        Ok(Value::Array(out))
+    })
 }
 
 /// One `task list` row: the task's own keys, whether it is held, and what

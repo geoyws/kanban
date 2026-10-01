@@ -2713,7 +2713,8 @@ fn blocking_gates(
     task_id: &str,
     lapsed: &LapsedLeases,
 ) -> Result<Vec<GateBlocker>> {
-    let mut statement = connection.prepare(
+    // Cached: a listing asks this of every row (`t-eca9df35`).
+    let mut statement = connection.prepare_cached(
         "WITH RECURSIVE owners(id,depth,path) AS (\
              SELECT id,0,json_array(id) FROM tasks WHERE id=?1 \
              UNION ALL \
@@ -6709,6 +6710,84 @@ impl Store {
         Ok(rows)
     }
 
+    /// The readable prerequisite ids of every listed row, in `ids` order and,
+    /// within a row, in [`Store::dependencies`] order.
+    ///
+    /// The same answer `dependencies(id)` gives row by row, read once for the
+    /// listing (`t-eca9df35`): asked per row, each call re-scanned every tag,
+    /// model and lapsed lease on the board, so a thousand-row
+    /// `task list --with-relations` did a thousand whole-table scans. The
+    /// listing rule is unchanged — a prerequisite this caller may not read is
+    /// absent here exactly as it is absent from `dependencies`.
+    pub fn dependency_ids_for(&self, ids: &[String]) -> Result<Vec<Vec<String>>> {
+        self.authz.check_read(&[])?;
+        let mut by_task: HashMap<String, Vec<String>> = HashMap::new();
+        let mut prerequisites: HashSet<String> = HashSet::new();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT d.task_id,t.id FROM task_dependencies d \
+                 JOIN tasks t ON t.id=d.depends_on ORDER BY d.task_id,t.created_at,t.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (task_id, prerequisite) = row?;
+                prerequisites.insert(prerequisite.clone());
+                by_task.entry(task_id).or_default().push(prerequisite);
+            }
+        }
+        let readable: HashSet<String> = if self.authz.is_enforcing() {
+            let mut tags: HashMap<String, Vec<String>> = HashMap::new();
+            let mut statement = self
+                .connection
+                .prepare("SELECT task_id,tag FROM task_tags ORDER BY task_id,tag")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (task_id, tag) = row?;
+                if prerequisites.contains(&task_id) {
+                    tags.entry(task_id).or_default().push(tag);
+                }
+            }
+            prerequisites
+                .into_iter()
+                .filter(|id| {
+                    self.authz
+                        .permits_read(tags.get(id).map_or(&[][..], Vec::as_slice))
+                })
+                .collect()
+        } else {
+            prerequisites
+        };
+        Ok(ids
+            .iter()
+            .map(|id| {
+                by_task
+                    .remove(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|prerequisite| readable.contains(prerequisite))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Run a multi-query read inside one deferred read snapshot, so every
+    /// query sees the same board and the whole read takes the SQLite read
+    /// lock once rather than once per statement (`t-eca9df35`). Inside a
+    /// transaction the caller already opened, the read joins it.
+    pub fn read_consistent<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.connection.is_autocommit() {
+            return read(self);
+        }
+        let snapshot = crate::db::begin_read_snapshot(&self.connection)?;
+        let value = read(self)?;
+        snapshot.finish()?;
+        Ok(value)
+    }
+
     /// Every unfinished prerequisite standing between this row and work on it,
     /// whether declared here or inherited from a plan above it.
     ///
@@ -6738,12 +6817,15 @@ impl Store {
     ///
     /// The lapsed-lease projection every blocker is read through is
     /// board-wide (see `LapsedLeases`), so a listing reads it once here
-    /// rather than once per row.
+    /// rather than once per row. Each row gets the same named-read check as
+    /// [`Store::blocking_gates`], without the tag and model attachment
+    /// `require_task` adds, which scans both whole tables and which a gate
+    /// never reads (`t-eca9df35`).
     pub fn blocking_gates_for(&self, ids: &[String]) -> Result<Vec<Vec<GateBlocker>>> {
         let lapsed = lapsed_leases(&self.connection)?;
         ids.iter()
             .map(|id| {
-                self.require_task(id)?;
+                require_task_authorized(&self.connection, id, &self.authz)?;
                 let mut blockers = blocking_gates(&self.connection, id, &lapsed)?;
                 self.redact_denied_gate_titles(&mut blockers)?;
                 Ok(blockers)
