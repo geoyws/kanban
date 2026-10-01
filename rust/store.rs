@@ -2013,6 +2013,22 @@ fn subscription_row(row: &Row<'_>) -> rusqlite::Result<Subscription> {
     })
 }
 
+/// Raise a task's claim attempt counter by one and answer the new value
+/// (docs/specs/identity.md IDENT-09).
+///
+/// Called only inside the transaction that creates the lease, after every
+/// refusal has passed, so a refused claim never moves the counter and the
+/// counter never decreases: there is no other write to `tasks.attempt`.
+fn next_attempt(connection: &Connection, task_id: &str) -> Result<i64> {
+    connection
+        .query_row(
+            "UPDATE tasks SET attempt=attempt+1 WHERE id=? RETURNING attempt",
+            [task_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("task {task_id} has no row to count a claim attempt on"))
+}
+
 fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
     Ok(Claim {
         task_id: row.get("task_id")?,
@@ -2028,6 +2044,9 @@ fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
         head_sha: row.get("head_sha")?,
         root_head: row.get("root_head")?,
         model: row.get("model")?,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -2061,6 +2080,9 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
         dirty_summary: row.get("dirty_summary")?,
         root_head: row.get("root_head")?,
         created_at: row.get("created_at")?,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -2313,6 +2335,9 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         retired_by: row.get("retired_by")?,
         retire_note: row.get("retire_note")?,
         archived: row.get::<_, i64>("archived")? != 0,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -4494,6 +4519,55 @@ impl Store {
         Ok(())
     }
 
+    /// The stored receipt for one idempotent request, if any: the digest of
+    /// its normalized arguments and the exact bytes it answered with
+    /// (docs/specs/identity.md IDENT-14).
+    pub(crate) fn request_receipt(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        command: &str,
+        request_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT arguments_sha256,response FROM request_receipts \
+                 WHERE principal_id=? AND worker_id=? AND command=? AND request_id=?",
+                params![principal_id, worker_id, command, request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Record a request's receipt. Called only inside the write scope that
+    /// made the request's change, so the receipt lands with the write or not
+    /// at all.
+    pub(crate) fn record_request_receipt(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        command: &str,
+        request_id: &str,
+        arguments_sha256: &str,
+        response: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO request_receipts(principal_id,worker_id,command,request_id,arguments_sha256,response,created_at) \
+             VALUES(?,?,?,?,?,?,?)",
+            params![
+                principal_id,
+                worker_id,
+                command,
+                request_id,
+                arguments_sha256,
+                response,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Open a board file DIRECTLY: POSIX file permission is the only
     /// authorization, no policy row is consulted, and the guard no-ops. That
     /// is ADR-038 clause 9's direct open, stated as a constructor.
@@ -6583,7 +6657,9 @@ impl Store {
         let sql = format!(
             "SELECT t.*, c.agent_id AS claim_agent_id, c.session_id AS claim_session_id, \
              c.claimed_at AS claim_claimed_at, c.heartbeat_at AS claim_heartbeat_at, \
-             c.expires_at AS claim_expires_at, c.model AS claim_model \
+             c.expires_at AS claim_expires_at, c.model AS claim_model, \
+             c.attempt AS claim_attempt, c.worker_id AS claim_worker_id, \
+             c.principal_id AS claim_principal_id \
              FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?\
              {where_clause} ORDER BY t.priority,t.created_at,t.id"
         );
@@ -6603,6 +6679,9 @@ impl Store {
                             heartbeat_at: row.get("claim_heartbeat_at")?,
                             expires_at: row.get("claim_expires_at")?,
                             model: row.get("claim_model")?,
+                            attempt: row.get("claim_attempt")?,
+                            worker_id: row.get("claim_worker_id")?,
+                            principal_id: row.get("claim_principal_id")?,
                         })
                     })
                     .transpose()?;
@@ -7545,8 +7624,9 @@ impl Store {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
         let token = Uuid::new_v4().to_string();
+        let attempt = next_attempt(&transaction, &task.id)?;
         transaction.execute(
-            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 task.id,agent,options.session_id,token,now,now,now+options.lease_ms,
                 options.git.as_ref().map(|g| g.worktree.clone()),
@@ -7555,6 +7635,7 @@ impl Store {
                 options.git.as_ref().map(|g| g.head.clone()),
                 options.git.as_ref().and_then(|g| g.root_head.clone()),
                 options.model,
+                attempt,
             ],
         )?;
         transaction.execute(
@@ -7847,9 +7928,12 @@ impl Store {
         for validation in &input.validations {
             reject_secret_shaped_text(validation, "checkpoint validation")?;
         }
+        // The checkpoint carries the attempt, worker and principal of the
+        // lease it was written under (IDENT-08, IDENT-09), read from that
+        // lease rather than from the caller.
         transaction.execute(
-            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
+            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,claim.attempt,claim.worker_id,claim.principal_id],
         )?;
         let seq = transaction.last_insert_rowid();
         // A `done` checkpoint closes the row exactly as a done-move does, so
@@ -9554,11 +9638,22 @@ impl Store {
         // resumes from the durable record rather than the handoff's prose. A
         // session handoff has no task to checkpoint, and inventing one would
         // put a checkpoint on a row that was never worked.
+        // Both rows carry the attempt, worker and principal of the lease
+        // being handed over (IDENT-08, IDENT-09); a session handoff holds no
+        // lease and records none.
+        let (attempt, worker_id, principal_id) = match &claim {
+            Some(claim) => (
+                Some(claim.attempt),
+                claim.worker_id.clone(),
+                claim.principal_id.clone(),
+            ),
+            None => (None, None, None),
+        };
         let checkpoint_seq = match (&input.task_id, claim) {
             (Some(task_id), claim) => {
                 transaction.execute(
-                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?,?)",
-                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
+                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,attempt,worker_id,principal_id],
                 )?;
                 Some(transaction.last_insert_rowid())
             }
@@ -9566,8 +9661,8 @@ impl Store {
         };
         let id = format!("h-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
-            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,input.priority],
+            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session,priority,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?)",
+            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,input.priority,attempt,worker_id,principal_id],
         )?;
         // Releasing the lease and returning the task to the queue is the point
         // of a task handoff. A session handoff holds nothing and releases
@@ -9778,7 +9873,8 @@ impl Store {
             );
         }
         let token = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
+        let attempt = next_attempt(&transaction, &task.id)?;
+        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
             task.id,agent,session,token,now,now,now+lease_ms,
             git.as_ref().map(|g| g.worktree.clone()),
             git.as_ref().map(|g| g.worktree_kind.to_owned()),
@@ -9786,6 +9882,7 @@ impl Store {
             git.as_ref().map(|g| g.head.clone()),
             git.as_ref().and_then(|g| g.root_head.clone()),
             model,
+            attempt,
         ])?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",

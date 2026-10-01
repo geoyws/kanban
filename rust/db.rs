@@ -2641,6 +2641,124 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
 "#;
 
+/// Claim attempts, worker stamps and request receipts (docs/specs/identity.md
+/// IDENT-09, IDENT-14, IDENT-17).
+///
+/// `tasks.attempt` counts every successful claim and accepted handoff and
+/// never decreases; each lease, checkpoint and handoff records the attempt it
+/// belongs to. `worker_id` and `principal_id` name who held the lease under
+/// managed enforcement and stay null everywhere else, so every existing row
+/// keeps them null. A task that already has a lease starts at attempt 1, as
+/// does that lease; every other task starts at 0, so its next claim is 1.
+///
+/// `request_receipts` holds one row per accepted `--request-id`, keyed by who
+/// asked (principal and worker, the empty string standing for none) and by
+/// command, with the digest of the normalized arguments and the exact bytes
+/// of the answer, written in the same transaction as the write it describes.
+///
+/// The columns are added by [`apply_board_v38_columns`], one at a time and
+/// only where missing, rather than by ALTERs in this batch: a board rewound
+/// past v38 can carry some of them and not others, because an earlier step
+/// that rebuilds `task_claims` drops the lease columns while `tasks` keeps
+/// its counter. Each backfill runs only when its column was just added, so a
+/// rerun never resets a counter. The receipts table is `IF NOT EXISTS` for
+/// the same reason.
+const BOARD_V38: &str = r#"
+CREATE TABLE IF NOT EXISTS request_receipts (
+ principal_id TEXT NOT NULL,
+ worker_id TEXT NOT NULL,
+ command TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ arguments_sha256 TEXT NOT NULL,
+ response TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(principal_id,worker_id,command,request_id)
+) STRICT;
+"#;
+
+/// The v38 columns, each with the backfill that runs when it is added.
+const BOARD_V38_COLUMNS: [(&str, &str, &str, Option<&str>); 10] = [
+    (
+        "tasks",
+        "attempt",
+        "ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0)",
+        Some("UPDATE tasks SET attempt=1 WHERE id IN (SELECT task_id FROM task_claims)"),
+    ),
+    (
+        "task_claims",
+        "attempt",
+        "ALTER TABLE task_claims ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0)",
+        Some("UPDATE task_claims SET attempt=1"),
+    ),
+    (
+        "task_claims",
+        "worker_id",
+        "ALTER TABLE task_claims ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "task_claims",
+        "principal_id",
+        "ALTER TABLE task_claims ADD COLUMN principal_id TEXT",
+        None,
+    ),
+    (
+        "checkpoints",
+        "attempt",
+        "ALTER TABLE checkpoints ADD COLUMN attempt INTEGER",
+        None,
+    ),
+    (
+        "checkpoints",
+        "worker_id",
+        "ALTER TABLE checkpoints ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "checkpoints",
+        "principal_id",
+        "ALTER TABLE checkpoints ADD COLUMN principal_id TEXT",
+        None,
+    ),
+    (
+        "handoffs",
+        "attempt",
+        "ALTER TABLE handoffs ADD COLUMN attempt INTEGER",
+        None,
+    ),
+    (
+        "handoffs",
+        "worker_id",
+        "ALTER TABLE handoffs ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "handoffs",
+        "principal_id",
+        "ALTER TABLE handoffs ADD COLUMN principal_id TEXT",
+        None,
+    ),
+];
+
+/// Add every v38 column the board lacks, backfilling each one it adds.
+fn apply_board_v38_columns(connection: &Connection) -> Result<()> {
+    for (table, column, alter, backfill) in BOARD_V38_COLUMNS {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        if present {
+            continue;
+        }
+        connection.execute_batch(alter)?;
+        if let Some(backfill) = backfill {
+            connection.execute_batch(backfill)?;
+        }
+    }
+    Ok(())
+}
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
@@ -2942,7 +3060,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 37;
+pub const BOARD_SCHEMA_VERSION: usize = 38;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -3420,6 +3538,11 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
         // The v35 ALTER, for the same reason and by the same guard.
         let board_v35_step = current + 1 == 35;
         let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
+        // The v38 columns are added one by one where missing, ahead of the
+        // step's own batch (see `BOARD_V38`).
+        if current + 1 == 38 {
+            apply_board_v38_columns(&transaction)?;
+        }
         if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
             if v31_columns {
                 transaction.execute_batch(
@@ -3506,7 +3629,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37,
+    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37, BOARD_V38,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -5058,7 +5181,7 @@ mod tests {
             .expect("insert a pre-snooze row");
         migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
         assert_eq!(schema_version(&connection).unwrap(), 35);
-        assert_eq!(BOARD_SCHEMA_VERSION, 37);
+        assert_eq!(BOARD_SCHEMA_VERSION, 38);
         let trigger = |connection: &Connection, id: &str| -> Option<String> {
             connection
                 .query_row(

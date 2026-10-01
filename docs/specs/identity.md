@@ -539,9 +539,9 @@ in ADR-059.
 
 Planned evidence for every mandatory requirement. The matrix section
 (`## Requirements trace — docs/specs/identity.md IDENT-01..IDENT-18`) is the trace of record; this
-table is its draft and the two land identical. No test exists yet: the implementing row
-`t-2aafd55c` writes each named test in the change that implements it, so every row says
-`no e2e coverage` plainly.
+table is its draft and the two land identical. The implementing row `t-2aafd55c` writes each named
+test in the change that implements it; a row with no test says `no e2e coverage` plainly, and a
+row covered in part says `partial` and names what is still owed.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
@@ -553,16 +553,16 @@ table is its draft and the two land identical. No test exists yet: the implement
 | `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
 | `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
 | `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
-| `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
+| `IDENT-09` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`, `a_session_handoff_records_no_attempt`, `a_schema_37_board_migrates_with_leases_at_attempt_one` | partial: direct mode only. Managed-mode A4 owed by `t-2aafd55c` Part B. |
 | `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
 | `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
 | `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
 | `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
-| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7, A10). |
+| `IDENT-14` | MUST | process | `tests/identity_e2e.rs`: `a_claim_request_id_replays_byte_identically_and_refuses_other_arguments`, `a_refused_request_stores_no_receipt_and_a_malformed_key_is_refused`, `a_checkpoint_request_id_replays_without_a_second_row` | partial: direct mode, receipts keyed with no principal and no worker. A7 under `k1` and A10 owed by `t-2aafd55c` Part B. |
 | `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
 | `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
-| `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |
-| `IDENT-18` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+| `IDENT-17` | MUST | process | `tests/identity_e2e.rs`: `a_schema_37_board_migrates_with_leases_at_attempt_one` | partial: board 37 → 38 only, and the newer-schema refusal is proved on this binary (39 against 38), not on a baseline binary. Registry 14 → 15 owed by `t-2aafd55c` Part B. |
+| `IDENT-18` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one` | partial: no `workerId` or `principalId` on direct claim, checkpoint and handoff output. The A1 worker-verb refusals owed by `t-2aafd55c` Part B. |
 
 ## 9. Change log
 

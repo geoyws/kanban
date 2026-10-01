@@ -158,9 +158,13 @@ Usage:
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role ROLE] [--caller-scope driver]
              [--no-cross-lane] [--allow-reassign]
-             [--sprint sp-… | --any-sprint] [--model NAME] [--json]
+             [--sprint sp-… | --any-sprint] [--model NAME] [--request-id KEY] [--json]
              (a task restricted to models refuses a claim whose --model is
              missing or outside its list, and the refusal prints the list)
+             (--request-id makes a retry safe: the same KEY with the same
+             arguments prints the first answer again and writes nothing; the
+             same KEY with other arguments is refused. Also on checkpoint and
+             handoff create. KEY is 16-128 of A-Z a-z 0-9 . _ -)
              (when a current sprint exists, claims are scoped to it; the
              override is recorded on the task_claim event; unattached rows
              are NOT offered — outside the boundary, not inside it)
@@ -173,12 +177,12 @@ Usage:
   kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT
              --next-action TEXT [--session ID] [--model NAME] [--state continue|blocked|done]
              [--blocker TEXT ...] [--validation TEXT ...]
-             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--request-id KEY] [--json]
   kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
              --next-action TEXT [--priority P0|P1|P2|0-9] [--to AGENT]
              [--reason token_pressure|provider_limit|session_end|manual] [--session ID] [--model NAME]
              [--blocker TEXT ...] [--validation TEXT ...]
-             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--request-id KEY] [--json]
              (without ID: a session handoff, about no one task)
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
@@ -1155,6 +1159,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "model",
             "sprint",
             "any-sprint",
+            "request-id",
         ],
         &["?id"],
         false,
@@ -1186,6 +1191,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "branch",
             "head",
             "dirty",
+            "request-id",
         ],
         &["id"],
         false,
@@ -1210,6 +1216,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "head",
             "dirty",
             "priority",
+            "request-id",
         ],
         &["?id"],
         false,
@@ -2559,6 +2566,138 @@ fn lease_ms(args: &Args) -> Result<i64> {
 
 fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
     emit(&serde_json::to_string_pretty(value)?)
+}
+
+/// An idempotent request in flight (docs/specs/identity.md IDENT-14): the
+/// key it was sent under, the digest of its normalized arguments, and whether
+/// this call opened the write scope the receipt must land in.
+struct PendingRequest {
+    command: &'static str,
+    key: String,
+    digest: String,
+    owns_scope: bool,
+}
+
+/// What `begin_request` decided before the command ran.
+enum RequestStart {
+    /// Run the command; record a receipt afterwards when one is pending.
+    Run(Option<PendingRequest>),
+    /// The same request already ran: these are its exact answer bytes.
+    Replay(String),
+}
+
+/// A request id is 16-128 ASCII letters, digits, dots, underscores or
+/// hyphens: long enough not to collide by accident, short and plain enough to
+/// sit in a log line.
+fn valid_request_id(key: &str) -> bool {
+    (16..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// The SHA-256 of a request's normalized arguments: every positional in
+/// order and every flag in name order, minus `--json`, which changes nothing
+/// the request does, and `--request-id`, which names the request rather than
+/// describing it.
+fn request_digest(args: &Args) -> Result<String> {
+    let flags: std::collections::BTreeMap<&str, &Vec<String>> = args
+        .flags
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "json" | "request-id"))
+        .map(|(name, values)| (name.as_str(), values))
+        .collect();
+    let normalized = json!({"positionals": args.positionals, "flags": flags});
+    Ok(audit::bytes_sha256(
+        serde_json::to_string(&normalized)?.as_bytes(),
+    ))
+}
+
+/// Open an idempotent request when the caller named one.
+///
+/// With no `--request-id` the command runs exactly as it always has. With
+/// one, the write scope is taken here, before the receipt lookup, so the
+/// lookup, the command's own write and the new receipt are one transaction:
+/// two concurrent retries serialize on the board's write lock and the second
+/// one finds the first one's receipt. Inside `transact` the batch already
+/// holds that scope and keeps owning it.
+fn begin_request(store: &Store, args: &Args, command: &'static str) -> Result<RequestStart> {
+    let Some(key) = args.one("request-id") else {
+        return Ok(RequestStart::Run(None));
+    };
+    if !valid_request_id(key) {
+        bail!(
+            "--request-id must be 16 to 128 ASCII letters, digits, '.', '_' or '-', got {} characters",
+            key.len()
+        );
+    }
+    let digest = request_digest(args)?;
+    let owns_scope = !store.in_batch();
+    if owns_scope {
+        store.begin_batch()?;
+    }
+    let stored = match store.request_receipt("", "", command, key) {
+        Ok(stored) => stored,
+        Err(error) => {
+            if owns_scope {
+                store.rollback_batch()?;
+            }
+            return Err(error);
+        }
+    };
+    if let Some((stored_digest, response)) = stored {
+        if owns_scope {
+            store.rollback_batch()?;
+        }
+        if stored_digest != digest {
+            bail!("request {key} was already used for a different {command} request");
+        }
+        return Ok(RequestStart::Replay(response));
+    }
+    Ok(RequestStart::Run(Some(PendingRequest {
+        command,
+        key: key.to_owned(),
+        digest,
+        owns_scope,
+    })))
+}
+
+/// Finish a command opened by [`begin_request`]: on success record the
+/// receipt in the same scope as the write, land it, and print the answer; on
+/// refusal undo everything, so a refused call stores no receipt.
+fn finish_request(
+    store: &Store,
+    pending: Option<PendingRequest>,
+    outcome: Result<String>,
+) -> Result<()> {
+    let Some(pending) = pending else {
+        return emit(&outcome?);
+    };
+    let landed = outcome.and_then(|text| {
+        store.record_request_receipt(
+            "",
+            "",
+            pending.command,
+            &pending.key,
+            &pending.digest,
+            &text,
+        )?;
+        Ok(text)
+    });
+    match landed {
+        Ok(text) => {
+            if pending.owns_scope {
+                store.commit_batch()?;
+            }
+            emit(&text)
+        }
+        Err(error) => {
+            if pending.owns_scope {
+                store.rollback_batch()?;
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Set once anything has reached stdout. `doctor` and `audit verify` print
@@ -7167,25 +7306,32 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         if id.is_none() && !args.has("next") {
             bail!("task id or --next is required");
         }
-        let mut value = store.claim(
-            id,
-            ClaimOptions {
-                git: here(),
-                agent_id: args.require("as")?.into(),
-                session_id: option_string(&args, "session"),
-                lease_ms: lease_ms(&args)?,
-                caller_lane: option_string(&args, "lane"),
-                role_filter: option_string(&args, "role"),
-                caller_scope: option_string(&args, "caller-scope"),
-                cross_lane: !args.has("no-cross-lane"),
-                allow_reassign: args.has("allow-reassign"),
-                sprint_override: claim_sprint_override(&args)?,
-                model: option_string(&args, "model"),
-            },
-        )?;
-        value.rules =
-            effective_rule_summaries(&args, &store, Some(&value.claim.task_id), None, None)?;
-        return print(&value, args.has("json"));
+        let pending = match begin_request(&store, &args, "claim")? {
+            RequestStart::Replay(text) => return emit(&text),
+            RequestStart::Run(pending) => pending,
+        };
+        let outcome = (|| -> Result<String> {
+            let mut value = store.claim(
+                id,
+                ClaimOptions {
+                    git: here(),
+                    agent_id: args.require("as")?.into(),
+                    session_id: option_string(&args, "session"),
+                    lease_ms: lease_ms(&args)?,
+                    caller_lane: option_string(&args, "lane"),
+                    role_filter: option_string(&args, "role"),
+                    caller_scope: option_string(&args, "caller-scope"),
+                    cross_lane: !args.has("no-cross-lane"),
+                    allow_reassign: args.has("allow-reassign"),
+                    sprint_override: claim_sprint_override(&args)?,
+                    model: option_string(&args, "model"),
+                },
+            )?;
+            value.rules =
+                effective_rule_summaries(&args, &store, Some(&value.claim.task_id), None, None)?;
+            Ok(serde_json::to_string_pretty(&value)?)
+        })();
+        return finish_request(&store, pending, outcome);
     }
     if command == "heartbeat" {
         let id = sub.context("task id is required")?;
@@ -7222,52 +7368,66 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         // Provenance is refused rather than stored blank (ADR-008): an explicit
         // flag still wins, but a write that would leave one field empty bails.
         let provenance = required_provenance(&args, here().as_ref())?;
-        let value = store.checkpoint(CheckpointInput {
-            task_id: id.into(),
-            lease_token: args.require("lease")?.into(),
-            author: args.require("as")?.into(),
-            session_id: option_string(&args, "session"),
-            model: option_string(&args, "model"),
-            state: args.one("state").unwrap_or("continue").into(),
-            summary: args.require("summary")?.into(),
-            intent: args.require("intent")?.into(),
-            next_action: args.require("next-action")?.into(),
-            blockers: args.many("blocker"),
-            validations: args.many("validation"),
-            repo_path: Some(provenance.repo_path),
-            branch: Some(provenance.branch),
-            head_sha: Some(provenance.head_sha),
-            dirty_summary: Some(provenance.dirty_summary),
-            root_head: provenance.root_head,
-        })?;
-        return print(&value, args.has("json"));
+        let pending = match begin_request(&store, &args, "checkpoint")? {
+            RequestStart::Replay(text) => return emit(&text),
+            RequestStart::Run(pending) => pending,
+        };
+        let outcome = (|| -> Result<String> {
+            let value = store.checkpoint(CheckpointInput {
+                task_id: id.into(),
+                lease_token: args.require("lease")?.into(),
+                author: args.require("as")?.into(),
+                session_id: option_string(&args, "session"),
+                model: option_string(&args, "model"),
+                state: args.one("state").unwrap_or("continue").into(),
+                summary: args.require("summary")?.into(),
+                intent: args.require("intent")?.into(),
+                next_action: args.require("next-action")?.into(),
+                blockers: args.many("blocker"),
+                validations: args.many("validation"),
+                repo_path: Some(provenance.repo_path),
+                branch: Some(provenance.branch),
+                head_sha: Some(provenance.head_sha),
+                dirty_summary: Some(provenance.dirty_summary),
+                root_head: provenance.root_head,
+            })?;
+            Ok(serde_json::to_string_pretty(&value)?)
+        })();
+        return finish_request(&store, pending, outcome);
     }
     if command == "handoff" && sub == Some("create") {
         // No task id makes it a session handoff: about the work as a whole
         // rather than one row of it. The store refuses an id without its lease
         // and a lease without its id, since neither half means anything alone.
         let provenance = required_provenance(&args, here().as_ref())?;
-        let value = store.create_handoff(HandoffInput {
-            task_id: rest.first().map(|id| (*id).to_owned()),
-            lease_token: args.one("lease").map(str::to_owned),
-            from_agent: args.require("as")?.into(),
-            from_session: option_string(&args, "session"),
-            from_model: option_string(&args, "model"),
-            to_agent: option_string(&args, "to"),
-            reason: args.one("reason").unwrap_or("token_pressure").into(),
-            priority: args.priority(6)?,
-            summary: args.require("summary")?.into(),
-            intent: args.require("intent")?.into(),
-            next_action: args.require("next-action")?.into(),
-            blockers: args.many("blocker"),
-            validations: args.many("validation"),
-            repo_path: Some(provenance.repo_path),
-            branch: Some(provenance.branch),
-            head_sha: Some(provenance.head_sha),
-            dirty_summary: Some(provenance.dirty_summary),
-            root_head: provenance.root_head,
-        })?;
-        return print(&value, args.has("json"));
+        let pending = match begin_request(&store, &args, "handoff create")? {
+            RequestStart::Replay(text) => return emit(&text),
+            RequestStart::Run(pending) => pending,
+        };
+        let outcome = (|| -> Result<String> {
+            let value = store.create_handoff(HandoffInput {
+                task_id: rest.first().map(|id| (*id).to_owned()),
+                lease_token: args.one("lease").map(str::to_owned),
+                from_agent: args.require("as")?.into(),
+                from_session: option_string(&args, "session"),
+                from_model: option_string(&args, "model"),
+                to_agent: option_string(&args, "to"),
+                reason: args.one("reason").unwrap_or("token_pressure").into(),
+                priority: args.priority(6)?,
+                summary: args.require("summary")?.into(),
+                intent: args.require("intent")?.into(),
+                next_action: args.require("next-action")?.into(),
+                blockers: args.many("blocker"),
+                validations: args.many("validation"),
+                repo_path: Some(provenance.repo_path),
+                branch: Some(provenance.branch),
+                head_sha: Some(provenance.head_sha),
+                dirty_summary: Some(provenance.dirty_summary),
+                root_head: provenance.root_head,
+            })?;
+            Ok(serde_json::to_string_pretty(&value)?)
+        })();
+        return finish_request(&store, pending, outcome);
     }
     if command == "handoff" && sub == Some("list") {
         return print(
@@ -9902,6 +10062,9 @@ mod tests {
             heartbeat_at: 1,
             expires_at: 2,
             model: None,
+            attempt: 1,
+            worker_id: None,
+            principal_id: None,
         };
         let mut expected = TASK_FIELDS.to_vec();
         expected.extend(TASK_GATED_FIELDS.iter().map(|(key, _)| *key));
