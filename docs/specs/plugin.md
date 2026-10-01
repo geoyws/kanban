@@ -459,7 +459,7 @@ runs at the deployment batch.
 | `PLUGIN-09` | MUST | process | `plugin_e2e::a_misbehaving_plugin_is_refused_and_its_output_discarded` | A5. Passed in a Linux container dev run 2026-10-01. |
 | `PLUGIN-10` | MUST | process | `plugin_e2e::a_misbehaving_plugin_is_refused_and_its_output_discarded` | A5. Passed in a Linux container dev run 2026-10-01. |
 | `PLUGIN-11` | MUST | process | `plugin_e2e::a_call_prints_one_canonical_line_and_writes_nothing` | A3; numbers also by unit `the_envelope_is_canonical_at_every_depth`. Passed in a Linux container dev run 2026-10-01. |
-| `PLUGIN-12` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-12` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4; sort order by `the_listing_is_sorted_by_consumer_then_action`. Passed in a Linux container dev run 2026-10-01. |
 | `PLUGIN-13` | MUST | process | `plugin_e2e::both_verbs_are_read_only_mcp_tools_with_cli_answers` | A7. Passed in a Linux container dev run 2026-10-01. |
 | `PLUGIN-14` | MUST | unit | `plugin::tests::the_public_tree_carries_no_plugin_and_no_private_dependency` | A1's tree half. Passed in a Linux container dev run 2026-10-01. |
 | `PLUGIN-15` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4. Passed in a Linux container dev run 2026-10-01. |

@@ -174,12 +174,35 @@ impl Fixture {
         let _ = fs::remove_file(self.scratch.join("started"));
     }
 
-    /// The board's bytes, including any write-ahead log, as one digest.
-    fn board_digest(&self) -> String {
-        let mut hasher = Sha256::new();
+    /// Every byte Kanban owns on disk — the board and everything under the
+    /// data root (registry, locks, journals) — as one digest. Excludes only
+    /// the operator's `dispatchers.json` and SQLite's shared-memory files.
+    fn state_digest(&self) -> String {
+        fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        collect(&self.data, &mut files);
         for suffix in ["", "-wal"] {
-            let path = PathBuf::from(format!("{}{suffix}", self.board.display()));
+            files.push(PathBuf::from(format!("{}{suffix}", self.board.display())));
+        }
+        files.sort();
+        files.dedup();
+        let mut hasher = Sha256::new();
+        for path in files {
+            let name = path.to_string_lossy().into_owned();
+            if name.ends_with("dispatchers.json") || name.ends_with("-shm") {
+                continue;
+            }
             if let Ok(bytes) = fs::read(&path) {
+                hasher.update(name.as_bytes());
                 hasher.update(&bytes);
             }
         }
@@ -299,7 +322,7 @@ fn a_violating_file_is_refused_at_load_and_spawns_nothing() {
 fn a_call_prints_one_canonical_line_and_writes_nothing() {
     let fixture = Fixture::new("canonical");
     fixture.configure("ok");
-    let before = fixture.board_digest();
+    let before = fixture.state_digest();
     let mut lines = Vec::new();
     for json_flag in [true, false] {
         let mut args = vec![
@@ -337,9 +360,9 @@ fn a_call_prints_one_canonical_line_and_writes_nothing() {
         })
     );
     assert_eq!(
-        fixture.board_digest(),
+        fixture.state_digest(),
         before,
-        "plugin call wrote to the board"
+        "plugin call wrote to the board or the data root"
     );
 
     // The input must be one object, refused before the plugin is reached.
@@ -364,6 +387,38 @@ fn a_call_prints_one_canonical_line_and_writes_nothing() {
     assert!(output.status.success());
     let line: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(line["output"]["seen"], SECRET_VALUE);
+}
+
+/// PLUGIN-12: one row per plugin action, sorted by consumer then action, and
+/// delivery actions are not listed.
+#[test]
+fn the_listing_is_sorted_by_consumer_then_action() {
+    let fixture = Fixture::new("sorted");
+    let mut config = fixture.plugin_config("ok", &["plugin.read", "deliver"], 30_000);
+    let lookup = config["consumers"]["acme"]["actions"]["lookup"].clone();
+    config["consumers"]["acme"]["actions"]["alpha"] = lookup.clone();
+    let mut zeta = config["consumers"]["acme"].clone();
+    zeta["actions"] = json!({"lookup": lookup});
+    config["consumers"]["zeta"] = zeta;
+    fixture.write_config(&config);
+    let listed = fixture.ok_json(&["plugin", "list", "--json"]);
+    let order: Vec<(String, String)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["consumer"].as_str().unwrap().to_owned(),
+                row["action"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [("acme", "alpha"), ("acme", "lookup"), ("zeta", "lookup")]
+            .map(|(c, a)| (c.to_owned(), a.to_owned()))
+            .to_vec()
+    );
 }
 
 /// A4 (PLUGIN-07, PLUGIN-12, PLUGIN-15): each failed recheck refuses the call
