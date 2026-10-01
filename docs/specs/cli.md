@@ -11,8 +11,9 @@
   (choice `upstream`); its baseline is commit `7a1a555` on `kanban-geoyws-driver`.
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `DRAFT` for the 2026-10-02 `CLI-02` map delta until an independent readiness
-  review; `SPEC-READY` on 2026-10-01 for the `CLI-08` delta (independent reviewer against the
+- **Status:** `SPEC-READY` on 2026-10-02 for the `CLI-02` map delta (independent reviewer
+  `SpecReviewCli02Map` against the SDD §1 exit criteria at `ddab15b`: no findings);
+  `SPEC-READY` on 2026-10-01 for the `CLI-08` delta (independent reviewer against the
   SDD §1 exit criteria at `89d717e`: no findings), as on 2026-09-29 for `CLI-01`..`CLI-07`
   (independent reviewer applying the SDD §1 exit criteria:
   no findings. Specification readiness only — it authorises neither implementation, nor rollout,
@@ -455,3 +456,5 @@ is empty, `events --kind claim_released` holds one event by `worker`, and the ne
   row `t-159e55fb`). Because DEPLOY reads the same map, these boards now also record `@_bdt` and
   `@_bd` on `hax` like every other `geoyws` board (`docs/specs/deploy.md` DEPLOY-05). `A5` gains
   `medic` and `ord`. Status returns to `DRAFT` until an independent readiness review of the delta.
+- `2026-10-02` — stamped `SPEC-READY` for the `CLI-02` map delta (independent review of
+  `ddab15b` against the SDD §1 exit criteria: no findings). No requirement ID changed meaning.

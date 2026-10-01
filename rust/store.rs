@@ -602,8 +602,24 @@ pub(crate) fn estate_for_board(board: &str) -> Option<&'static str> {
     match board {
         "px" | "fmx" | "hx" | "hrx" | "ix" | "mx-root" | "prjx-root" | "rentx-root"
         | "auditx-root" | "ifca-docs" | "prjx" => Some("ifca"),
-        "kanban" | "omp" | "acies" | "dotfiles" | "geoyws" | "atmux" | "dash" | "gitea"
-        | "journal" | "orch" | "hax" => Some("geoyws"),
+        "kanban"
+        | "omp"
+        | "acies"
+        | "dotfiles"
+        | "geoyws"
+        | "atmux"
+        | "dash"
+        | "gitea"
+        | "journal"
+        | "orch"
+        | "hax"
+        | "medic"
+        | "ord"
+        | "hom"
+        | "vidgen"
+        | "superdriver"
+        | "approval-classifier"
+        | "dshoc" => Some("geoyws"),
         "memberx" => Some("unum"),
         name if name.starts_with("unum") => Some("unum"),
         _ => None,
@@ -17289,6 +17305,14 @@ mod tests {
             ("journal", "geoyws"),
             ("orch", "geoyws"),
             ("hax", "geoyws"),
+            // George's estate map, a-502383be (2026-09-20).
+            ("medic", "geoyws"),
+            ("ord", "geoyws"),
+            ("hom", "geoyws"),
+            ("vidgen", "geoyws"),
+            ("superdriver", "geoyws"),
+            ("approval-classifier", "geoyws"),
+            ("dshoc", "geoyws"),
             ("unum", "unum"),
             ("unum-ledger", "unum"),
             ("memberx", "unum"),
