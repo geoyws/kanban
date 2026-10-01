@@ -7,7 +7,8 @@ scripts/release-gate.sh
 ```
 
 That script IS the gate. Nothing else is, and no list here restates its
-steps: it runs
+steps: it first refuses a `tests/*.rs` target missing from its list, then
+runs
 `cargo fmt --all -- --check`,
 `cargo clippy --locked --all-targets -- -D warnings`,
 `cargo test --locked --lib`, the two ignored
@@ -17,12 +18,13 @@ target one at a time. Read the script for the order and the reasons; what
 follows is only what a reader of this matrix needs to know about the Rust
 half of it.
 
-**The integration targets are the eleven in `tests/`**, in the order the
+**The integration targets are the thirteen in `tests/`**, in the order the
 script runs them — cheapest first, `e2e` last:
 `claude_print_adapter_e2e`, `codex_queue_adapter_e2e`,
-`access_refusals_e2e`, `opencode_adapter_e2e`, `kimi_acp_adapter_e2e`,
-`cursor_worker_adapter_e2e`, `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
-`codex_app_server_adapter_e2e`, `authz_bypass_matrix_e2e`, and `e2e`. Each
+`access_refusals_e2e`, `secret_guard_e2e`, `opencode_adapter_e2e`,
+`kimi_acp_adapter_e2e`, `cursor_worker_adapter_e2e`,
+`zcode_notify_adapter_e2e`, `dispatcher_e2e`, `codex_app_server_adapter_e2e`,
+`authz_bypass_matrix_e2e`, `done_gate_e2e`, and `e2e`. Each
 invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 `std::process::Command`; those process-boundary assertions are
 compiled-process evidence. The gate as a whole is a
@@ -35,6 +37,9 @@ pairs), so as uid 0 every managed command in that target answers
 `denied-or-not-found`. The suite fails fast with that sentence instead of
 failing test by test, and it never skips: run it as a normal user or in the
 Linux gate container.
+`done_gate_e2e` needs a non-root user for one case,
+`a18_done_gate_verdict_list_hides_unreadable_evidence`: root reads a file
+whose mode denies it, so the unreadable-evidence path it proves cannot occur.
 
 **Serialization is a rule, not a preference.** Each target runs as its own
 `cargo test --locked --test TARGET -- --test-threads=1`, and no cargo

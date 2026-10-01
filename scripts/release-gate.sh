@@ -7,6 +7,8 @@
 #
 # The order is cheapest-failure-first:
 #
+#   0. Every `tests/*.rs` file is listed in `integration_targets`, and every
+#      listed name has its file -- a shell check, before anything compiles.
 #   1. `cargo fmt --all -- --check` -- no compilation at all.
 #   2. `cargo clippy --locked --all-targets -- -D warnings` -- one build of
 #      everything, including the test targets, with warnings fatal. A
@@ -72,6 +74,49 @@ run() {
     fi
 }
 
+# Cheapest target first, `e2e` last: it is the long one and the only one
+# that drives a browser.
+integration_targets=(
+    claude_print_adapter_e2e
+    codex_queue_adapter_e2e
+    access_refusals_e2e
+    secret_guard_e2e
+    opencode_adapter_e2e
+    kimi_acp_adapter_e2e
+    cursor_worker_adapter_e2e
+    zcode_notify_adapter_e2e
+    dispatcher_e2e
+    codex_app_server_adapter_e2e
+    authz_bypass_matrix_e2e
+    done_gate_e2e
+    e2e
+)
+
+# Before anything compiles: every `tests/*.rs` file is an integration target
+# cargo builds, so one missing from the list above is evidence the gate
+# silently never ran. Two did exactly that until t-78eeb3c9. A listed name
+# with no file is the converse mistake, refused the same way.
+gate_covers_every_target() {
+    local listed found missing=0
+    listed=" ${integration_targets[*]} "
+    for found in tests/*.rs; do
+        found="$(basename "$found" .rs)"
+        if [[ "$listed" != *" $found "* ]]; then
+            printf 'release-gate: tests/%s.rs is not in integration_targets\n' "$found" >&2
+            missing=1
+        fi
+    done
+    for found in "${integration_targets[@]}"; do
+        if [[ ! -f "tests/$found.rs" ]]; then
+            printf 'release-gate: integration_targets names %s, but tests/%s.rs does not exist\n' \
+                "$found" "$found" >&2
+            missing=1
+        fi
+    done
+    return "$missing"
+}
+run 'every tests/*.rs target is in the gate' gate_covers_every_target
+
 run 'cargo fmt' cargo fmt --all -- --check
 
 run 'cargo clippy' \
@@ -92,21 +137,7 @@ fi
 run 'kb skill wrapper tests' bash skills/kb/tests/kb-wrapper-tests.sh
 run 'migrate ACC body blocks' bash scripts/migrate-acc-body-blocks.test.sh
 
-# Cheapest target first, `e2e` last: it is the long one and the only one
-# that drives a browser.
-integration_targets=(
-    claude_print_adapter_e2e
-    codex_queue_adapter_e2e
-    access_refusals_e2e
-    opencode_adapter_e2e
-    kimi_acp_adapter_e2e
-    cursor_worker_adapter_e2e
-    zcode_notify_adapter_e2e
-    dispatcher_e2e
-    codex_app_server_adapter_e2e
-    authz_bypass_matrix_e2e
-    e2e
-)
+# The targets run in the order `integration_targets` lists them, above.
 for target in "${integration_targets[@]}"; do
     run "cargo test --test $target (serial)" \
         cargo test --locked --test "$target" -- --test-threads=1
