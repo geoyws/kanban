@@ -650,3 +650,32 @@ which deleted web routes; this slice builds no new web surface.
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
 | `CROSS-11` | MUST | process | `none` | no e2e coverage; A2 older-board migration/open |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
+
+## Requirements trace — docs/specs/plugin.md PLUGIN-01..PLUGIN-15
+
+One row per requirement, written with the specification on branch `wt/t-374806ea-plugin` at
+2026-10-01 (base `46964bc`). `Layer` uses the specification's vocabulary: `process` is a
+compiled-binary process-boundary exchange with no HTTP and no browser, `unit` an in-process
+`#[test]`. No test exists yet; the implementing row `t-f73a81ae` writes each one in the change
+that implements it, so every row says `no e2e coverage` (or `no unit coverage`) plainly.
+
+| Requirement | Strength | Layer | Test name | Note |
+| --- | --- | --- | --- | --- |
+| `PLUGIN-01` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-02` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-03` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-04` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A1). |
+| `PLUGIN-05` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A6). |
+| `PLUGIN-06` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
+| `PLUGIN-07` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+| `PLUGIN-08` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A3, A5). |
+| `PLUGIN-09` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
+| `PLUGIN-10` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
+| `PLUGIN-11` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
+| `PLUGIN-12` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+| `PLUGIN-13` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A7). |
+| `PLUGIN-14` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A1). |
+| `PLUGIN-15` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+
+15 requirements: 15 MUST, no SHOULD or MAY. No board or registry migration rides this slice;
+`dispatchers.json` gains version 2.
