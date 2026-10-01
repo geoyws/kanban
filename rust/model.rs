@@ -517,6 +517,24 @@ pub struct Claim {
     /// on every claim taken before `BOARD_V30` and on every claim that passed
     /// no `--model`, which an unrestricted task still accepts.
     pub model: Option<String>,
+    /// The task's claim attempt this lease belongs to (docs/specs/identity.md
+    /// IDENT-09): the task's counter after this claim or accepted handoff
+    /// raised it. A lease that predates board schema 38 reads 1.
+    #[serde(default)]
+    pub attempt: i64,
+    /// The delegated worker holding this lease, under managed enforcement
+    /// only (IDENT-08). Absent everywhere else, so no direct-mode output
+    /// shows one (IDENT-18).
+    #[serde(rename = "workerId", default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// The managed principal the lease was taken under (IDENT-08). Absent
+    /// under direct or prepared enforcement.
+    #[serde(
+        rename = "principalId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub principal_id: Option<String>,
 }
 
 /// One stored review verdict (DG-02, DG-11): the planner-written foreign-actor
@@ -592,6 +610,18 @@ pub struct ClaimSummary {
     pub heartbeat_at: i64,
     pub expires_at: i64,
     pub model: Option<String>,
+    /// The lease's attempt (IDENT-09), and its worker and principal under
+    /// managed enforcement only (IDENT-08, IDENT-18).
+    #[serde(default)]
+    pub attempt: i64,
+    #[serde(rename = "workerId", default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(
+        rename = "principalId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub principal_id: Option<String>,
 }
 
 impl From<&Claim> for ClaimSummary {
@@ -604,6 +634,9 @@ impl From<&Claim> for ClaimSummary {
             heartbeat_at: value.heartbeat_at,
             expires_at: value.expires_at,
             model: value.model.clone(),
+            attempt: value.attempt,
+            worker_id: value.worker_id.clone(),
+            principal_id: value.principal_id.clone(),
         }
     }
 }
@@ -643,6 +676,20 @@ pub struct Checkpoint {
     pub created_at: i64,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
+    /// The attempt of the lease this checkpoint was written under (IDENT-09).
+    /// Absent on a checkpoint written before board schema 38.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<i64>,
+    /// The worker and principal of that lease, under managed enforcement
+    /// only (IDENT-08).
+    #[serde(rename = "workerId", default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(
+        rename = "principalId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub principal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,6 +732,20 @@ pub struct Handoff {
     pub archived: bool,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
+    /// The attempt of the lease this handoff was created from (IDENT-09);
+    /// absent on a session handoff and on one created before board schema 38.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<i64>,
+    /// The worker and principal of that lease, under managed enforcement
+    /// only (IDENT-08).
+    #[serde(rename = "workerId", default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(
+        rename = "principalId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub principal_id: Option<String>,
 }
 
 /// One row of the durable audit trail. `lease_seized` and `task_removed`

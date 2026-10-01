@@ -25,7 +25,7 @@
 //! transition `access revoke` performs.
 
 //! Non-root only: the managed broker refuses root pairs by design
-//! (`routing::local_authority` mints no authority for euid 0, and
+//! (`routing::local_caller` mints no authority for euid 0, and
 //! `policy.rs` refuses root bootstrap/prove-rebind pairs), so as uid 0
 //! `bind_self` binds a principal the guard can never resolve and every
 //! managed command answers `denied-or-not-found`. `ManagedEstate::new`
@@ -332,7 +332,7 @@ fn id_output(args: &[&str]) -> String {
 }
 
 /// Fail fast as root instead of failing every test confusingly. The managed
-/// broker refuses root pairs by design (`routing::local_authority` mints no
+/// broker refuses root pairs by design (`routing::local_caller` mints no
 /// authority for euid 0; `policy.rs` refuses root bootstrap/prove-rebind
 /// pairs), so `bind_self` would bind a principal the guard can never resolve
 /// and every managed command would answer `denied-or-not-found`. This panics
@@ -342,7 +342,7 @@ fn require_non_root() {
     if self_uid() == 0 {
         panic!(
             "authz_bypass_matrix_e2e requires a non-root user: the managed broker refuses root pairs by design \
-             (routing::local_authority mints no authority for euid 0; policy.rs refuses root bootstrap/prove-rebind pairs), \
+             (routing::local_caller mints no authority for euid 0; policy.rs refuses root bootstrap/prove-rebind pairs), \
              so as uid 0 every managed command answers `denied-or-not-found`. \
              Re-run as a non-root user or in the Linux gate container."
         );

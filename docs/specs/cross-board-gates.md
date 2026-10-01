@@ -141,7 +141,7 @@ The trace of record is the matrix section for this slice; this table mirrors it.
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
 | `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
-| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: old-binary refusal against v38 needs a release-era binary in the gate |
+| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: old-binary refusal against v39 needs a release-era binary in the gate |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
 
 ## 9. Change log
@@ -151,4 +151,5 @@ The trace of record is the matrix section for this slice; this table mirrors it.
 - 2026-10-01 — George's decision `a-b63e7b50` (choice `scoped`) applied: an empty JSON array is `--clear-dependencies` and keeps caller-unwritable local gates (keep over refuse, the installed behaviour), and the waiting board's writer may remove a stored foreign edge without source read authority or any source signal. `CROSS-01`, `CROSS-05`, A2 and A3 updated; requirement IDs unchanged in meaning otherwise. Status DRAFT until an independent /quality spec re-stamp.
 - 2026-10-01 — Re-stamped SPEC-READY after independent /quality spec review of the `a-b63e7b50` delta at `871d158` (SpecReviewCrossClear): no findings. No CROSS code or end-to-end tests exist yet.
 - 2026-10-01 — Provenance: the reviewed delta `871d158` was published as `d668413` on `kanban-geoyws-driver` (rebased onto `96051e4` before first publication; the delta's added and removed lines are byte-identical).
-- 2026-10-01 — Row `t-e87d4704` implemented identity and authoring: board schema v38 (`tasks.incarnation`, `task_foreign_dependencies`, file `registration_token`), registry schema v15 (`boards.registration_token`), owner `init` as the only CROSS upgrade boundary, and `--depends-on-json` on `task add`/`task update`. §8 rows for `CROSS-01`, `02`, `05`, `06` and `11` now name their process tests (not yet run). Requirements unchanged.
+- 2026-10-01 — Row `t-e87d4704` implemented identity and authoring: board schema v39 (`tasks.incarnation`, `task_foreign_dependencies`, file `registration_token`), registry schema v16 (`boards.registration_token`), owner `init` as the only CROSS upgrade boundary, and `--depends-on-json` on `task add`/`task update`. §8 rows for `CROSS-01`, `02`, `05`, `06` and `11` now name their process tests (not yet run). Requirements unchanged.
+- 2026-10-02 — Integration row `t-e03f20e7`: the CROSS step was renumbered from board v38 / registry v15 to board v39 / registry v16, after the IDENTITY step (board v38 / registry v15), with no requirement change.

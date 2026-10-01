@@ -17,20 +17,22 @@ target one at a time. Read the script for the order and the reasons; what
 follows is only what a reader of this matrix needs to know about the Rust
 half of it.
 
-**The integration targets are the eleven in `tests/`**, in the order the
+**The integration targets are the thirteen in `tests/`**, in the order the
 script runs them — cheapest first, `e2e` last:
 `claude_print_adapter_e2e`, `codex_queue_adapter_e2e`,
 `access_refusals_e2e`, `opencode_adapter_e2e`, `kimi_acp_adapter_e2e`,
 `cursor_worker_adapter_e2e`, `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
-`codex_app_server_adapter_e2e`, `authz_bypass_matrix_e2e`, and `e2e`. Each
+`codex_app_server_adapter_e2e`, `authz_bypass_matrix_e2e`, `identity_e2e`,
+`worker_identity_e2e`, and `e2e`. Each
 invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 `std::process::Command`; those process-boundary assertions are
 compiled-process evidence. The gate as a whole is a
 unit/integration/process gate, not compiled-process E2E.
 
-**`authz_bypass_matrix_e2e` runs as non-root only.** The managed broker
-refuses root pairs by design (`rust/routing.rs` `local_authority` mints no
-authority for euid 0; `rust/policy.rs` refuses root bootstrap/prove-rebind
+**`authz_bypass_matrix_e2e` and `worker_identity_e2e` run as non-root only.**
+The managed broker refuses root pairs by design (`rust/routing.rs`
+`local_caller` mints no authority for euid 0; `rust/policy.rs` refuses root
+bootstrap/prove-rebind
 pairs), so as uid 0 every managed command in that target answers
 `denied-or-not-found`. The suite fails fast with that sentence instead of
 failing test by test, and it never skips: run it as a normal user or in the
@@ -648,7 +650,7 @@ which deleted web routes; this slice builds no new web surface.
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
 | `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
-| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: a pre-CROSS registered board stays at v37 for local work, owner `init` upgrades only the addressed board under the exclusive root and refuses a live holder; old-binary refusal against v38 needs a release-era binary in the gate |
+| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: a pre-CROSS registered board stays at v38 for local work, owner `init` upgrades only the addressed board under the exclusive root and refuses a live holder; old-binary refusal against v39 needs a release-era binary in the gate |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
 
 ## Requirements trace — docs/specs/plugin.md PLUGIN-01..PLUGIN-15
@@ -685,29 +687,30 @@ compiled-binary process-boundary exchange with no HTTP and no browser, `unit` an
 One row per requirement, written with the specification on branch `wt/t-026ece7c-identity` at
 2026-10-01 (base `60e5327`). `Layer` uses the specification's vocabulary: `process` is a
 compiled-binary process-boundary exchange with no HTTP and no browser; managed cases run under a
-non-root UID against a managed registry. No test exists yet; the implementing row `t-2aafd55c`
-writes each one in the change that implements it, so every row says `no e2e coverage` plainly.
+non-root UID against a managed registry. The implementing row `t-2aafd55c` writes each test in
+the change that implements it; a row with no test says `no e2e coverage` plainly, and a row
+covered in part says `partial` and names what is still owed.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `IDENT-01` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
-| `IDENT-02` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2). |
-| `IDENT-03` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A3). |
-| `IDENT-04` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
-| `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
-| `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
-| `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
-| `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
-| `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
-| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
-| `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
-| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7, A10). |
-| `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
-| `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
-| `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |
-| `IDENT-18` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+| `IDENT-01` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_identity_is_refused_outside_managed_enforcement` | covered: unregistered and prepared, worker verb and credential-bearing call, registry and board bytes unchanged. |
+| `IDENT-02` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_malformed_worker_label_is_refused_by_flag` | covered. |
+| `IDENT-03` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_retirement_event_names_the_parent_and_the_retirer` | covered: event kind, epoch +1, no credential or digest on the event; a refusal adds one denied audit row and keeps the epoch; the retirement event names principal, parent and retirer. |
+| `IDENT-04` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_child_task_root_must_sit_inside_the_parent_root`, `a_read_only_worker_cannot_register_a_writing_child` | covered. |
+| `IDENT-05` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `coordinator_only_commands_read_only_workers_and_retirement` | covered: other principal, malformed and retired credentials each answer `denied or not found`. |
+| `IDENT-06` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_task_root_bounds_the_workers_reads` | covered: the task root bounds task show, context, task list, events and search. |
+| `IDENT-07` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `only_the_principal_an_ancestor_or_the_worker_itself_retires_it` | covered. |
+| `IDENT-08` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `a_removed_tasks_handoff_outside_the_root_is_not_accepted` | covered. |
+| `IDENT-09` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`, `a_session_handoff_records_no_attempt`, `a_schema_37_board_migrates_with_leases_at_attempt_one`; `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and managed. |
+| `IDENT-10` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced` | covered: both directions of the worker/no-worker fence on checkpoint, heartbeat and release. |
+| `IDENT-11` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `an_mcp_server_with_a_credential_acts_as_the_worker`, `a_worker_may_not_run_watch` | covered. |
+| `IDENT-12` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement` | covered. |
+| `IDENT-13` | MUST | process | `tests/worker_identity_e2e.rs`: `leases_stay_per_task_across_workers_on_one_lane` | covered. |
+| `IDENT-14` | MUST | process | `tests/identity_e2e.rs`: `a_claim_request_id_replays_byte_identically_and_refuses_other_arguments`, `a_refused_request_stores_no_receipt_and_a_malformed_key_is_refused`, `a_checkpoint_request_id_replays_without_a_second_row`; `tests/worker_identity_e2e.rs`: `a_worker_claim_request_id_replays_byte_identically`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and under a worker credential. |
+| `IDENT-15` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_list_is_bounded_and_the_manifest_carries_the_worker_tools`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-16` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_list_is_bounded_and_the_manifest_carries_the_worker_tools`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-17` | MUST | process | `tests/identity_e2e.rs`: `a_schema_37_board_migrates_with_leases_at_attempt_one`; `tests/worker_identity_e2e.rs`: `a_schema_14_registry_migrates_to_15_and_serves_workers` | partial: the newer-schema refusal is proved on this binary (40 against 39), not on a baseline binary. |
+| `IDENT-18` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`; `tests/worker_identity_e2e.rs`: `worker_identity_is_refused_outside_managed_enforcement` | covered. |
 
 18 requirements: 18 MUST, no SHOULD or MAY. Registry schema 14 → 15 and board schema 37 → 38
 ride this slice (`IDENT-17`).

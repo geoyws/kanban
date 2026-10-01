@@ -79,7 +79,7 @@ new operation locks, so usable foreign sources must be on schemas they refuse ev
    exclusive upgrade; a refusal leaves the source unavailable until the owner retries. New registrations
    initialize under this explicit init boundary; adoption uses the root fd handed down by its parent and
    publishes with its own registry/board guard capability (ADR-056).
-   Refusing a pending CROSS *step* is not refusing the whole pre-CROSS board: registry v14 and board v37
+   Refusing a pending CROSS *step* is not refusing the whole pre-CROSS board: registry v15 and board v38
    remain usable for their existing local-only work until explicitly upgraded, with no foreign edge
    declaration/source/target allowed there. An already-current registry can create a new CROSS-aware board
    through ordinary init under the existing shared root/init lock; root exclusivity is reserved for a
@@ -100,7 +100,7 @@ new operation locks, so usable foreign sources must be on schemas they refuse ev
    that write's SQLite transaction before accepting the scratch-local capability; an open-time cached
    token-less flag is insufficient. A file whose token state cannot be read is unavailable, not token-less.
    This is a trigger-side SQL read, not a reentrant same-connection query in the scalar function (ADR-056).
-   Scratch candidate fd link count must equal one; hardlink alias of registered token-less v37 board outside
+   Scratch candidate fd link count must equal one; hardlink alias of registered token-less v38 board outside
    R refuses before inline migration. Registered board at CROSS version with **absent** file token or
    incomplete fences with a **matching** token is pending repair: owner init takes root exclusive, verifies
    registration path/inode and audit, and may bind the already minted registry token ONLY into an
@@ -150,7 +150,7 @@ Compiled-binary process tests compare registry/file token matches and mismatches
 retired/re-registered/corrupt sources under authorized and unauthorized callers, same-ID
 recreation/reconcile replacement, adoption token overwrite with item-token retention, legitimate versus
 mismatched restore, interrupted registry-mint/board-bind migration then retry, and source lookup leaving
-schema/WAL unchanged. Pause an old binary **after opening** a v37 source or v14 registry but before DML,
+schema/WAL unchanged. Pause an old binary **after opening** a v38 source or v15 registry but before DML,
 upgrade under root exclusivity, and prove schema-fence triggers refuse its later write; also cover a new
 direct token-bearing file opened under a misleading root and a disposable registered root that remains
 usable. No CROSS e2e evidence exists yet; §8 trace rows remain none until real Linux-gated tests run.
@@ -160,16 +160,16 @@ usable. No CROSS e2e evidence exists yet; §8 trace rows remain none until real 
    all-table trigger installation. This is a planned check, not executed CROSS coverage.
    Test a fresh and legacy token-less scratch board created/opened without a registry: full local operation
    still works after its inline board migration, CROSS JSON foreign input refuses, and no registration token
-   is minted; contrast a registered v37 board whose local operations work but whose foreign gates refuse
+   is minted; contrast a registered v38 board whose local operations work but whose foreign gates refuse
    until explicit owner init.
-   Add compiled-process hardlink alias of registered v37 board opened as scratch and assert refusal before
+   Add compiled-process hardlink alias of registered v38 board opened as scratch and assert refusal before
    schema change. Create a registered CROSS-version board with ABSENT token and show owner init binds
    existing registry token under root exclusive with all guards in one commit. Then copy a DIFFERENT
    token-bearing board file into the registered path, run owner init and assert it refuses without
    overwriting the present mismatched token or satisfying a target edge, even when the copied item ID/token
    and audit are otherwise valid.
    Verify one long shared-root holder blocks a pending owner upgrade honestly while a current-schema init
-   still registers a new board under shared root; verify local-only actions on v37/v14 remain usable without
+   still registers a new board under shared root; verify local-only actions on v38/v15 remain usable without
    declaring or satisfying foreign edges. Source/target CROSS use stays unavailable until both versions and
    tokens are current.
 

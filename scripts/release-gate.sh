@@ -97,6 +97,8 @@ integration_targets=(
     authz_bypass_matrix_e2e
     plugin_e2e
     cross_board_e2e
+    identity_e2e
+    worker_identity_e2e
     e2e
 )
 

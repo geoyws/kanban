@@ -23,7 +23,7 @@
 use crate::policy::{Capability, ScopeTuple, satisfies};
 use crate::routing::Enforcement;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The one refusal a denied access produces. Byte-identical whether the row is
@@ -160,6 +160,26 @@ pub struct AuthzContext {
     enforcement: Enforcement,
     authority: HashMap<ScopeTuple, Capability>,
     board_id: String,
+    /// The managed principal this context was minted for; `None` outside
+    /// managed enforcement (docs/specs/identity.md IDENT-08, IDENT-18).
+    principal_id: Option<String>,
+    /// The worker a worker call acts as; `None` for every other call. Boxed:
+    /// every store carries this context and almost none is a worker call.
+    worker: Option<Box<WorkerBinding>>,
+}
+
+/// What a store needs to know about the worker a call acts as: who it is,
+/// the lane actor its `--as` must equal, the task it is confined to, and —
+/// when it is confined — every task id inside that root on this board.
+#[derive(Debug, Clone)]
+pub struct WorkerBinding {
+    pub worker_id: String,
+    pub lane_actor: String,
+    pub task_root: Option<crate::worker::TaskRoot>,
+    /// The root and its descendants by `parent_id` on THIS board, read once
+    /// when the board is opened; empty when the root is on another board.
+    /// A confined worker whose scope was never read touches no task at all.
+    pub task_scope: Option<HashSet<String>>,
 }
 
 impl AuthzContext {
@@ -171,6 +191,8 @@ impl AuthzContext {
             enforcement: Enforcement::Direct,
             authority: HashMap::new(),
             board_id,
+            principal_id: None,
+            worker: None,
         }
     }
 
@@ -186,7 +208,77 @@ impl AuthzContext {
             enforcement,
             authority,
             board_id,
+            principal_id: None,
+            worker: None,
         }
+    }
+
+    /// Name the managed caller this context's authority was minted for, and
+    /// the worker it acts as, if any.
+    pub fn with_caller(
+        mut self,
+        principal_id: String,
+        worker: Option<crate::worker::ResolvedWorker>,
+    ) -> Self {
+        self.principal_id = Some(principal_id);
+        self.worker = worker.map(|worker| {
+            Box::new(WorkerBinding {
+                worker_id: worker.row.id,
+                lane_actor: worker.row.lane_actor,
+                task_root: worker.row.task_root,
+                task_scope: None,
+            })
+        });
+        self
+    }
+
+    /// Fix the task ids a root-confined worker may touch on this board
+    /// (docs/specs/identity.md IDENT-04, IDENT-06).
+    pub fn with_task_scope(mut self, scope: HashSet<String>) -> Self {
+        if let Some(worker) = self.worker.as_mut() {
+            worker.task_scope = Some(scope);
+        }
+        self
+    }
+
+    /// Whether this call may touch task `id` at all: always, except for a
+    /// worker with a task root, which reaches only that root's subtree on
+    /// that root's board (IDENT-06). Every task-bearing read and write asks
+    /// this alongside its tag check.
+    pub fn permits_task(&self, id: &str) -> bool {
+        match self.worker.as_deref() {
+            Some(WorkerBinding {
+                task_root: Some(_),
+                task_scope,
+                ..
+            }) => task_scope.as_ref().is_some_and(|scope| scope.contains(id)),
+            _ => true,
+        }
+    }
+
+    /// [`Self::permits_task`] as the one generic refusal, so a task root is
+    /// never an existence oracle.
+    pub fn check_task(&self, id: &str) -> Result<()> {
+        if self.permits_task(id) {
+            Ok(())
+        } else {
+            Err(DeniedOrNotFound.into())
+        }
+    }
+
+    /// The managed principal, under managed enforcement only.
+    pub fn principal_id(&self) -> Option<&str> {
+        self.principal_id.as_deref()
+    }
+
+    /// The worker this call acts as, for a worker call only.
+    pub fn worker(&self) -> Option<&WorkerBinding> {
+        self.worker.as_deref()
+    }
+
+    /// The worker id this call acts as, or `None`.
+    pub fn worker_id(&self) -> Option<&str> {
+        self.worker.as_ref().map(|worker| worker.worker_id.as_str())
     }
 
     /// The board UUID this context authorizes against.
@@ -202,6 +294,8 @@ impl AuthzContext {
         Self {
             enforcement: self.enforcement,
             authority: self.authority.clone(),
+            principal_id: self.principal_id.clone(),
+            worker: self.worker.clone(),
             board_id,
         }
     }

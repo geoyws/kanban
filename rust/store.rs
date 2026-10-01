@@ -950,6 +950,7 @@ fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContex
 fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str) -> Result<Task> {
     let tags = task_tags(connection, id)?;
     authz.check_read(&tags)?;
+    authz.check_task(id)?;
     authz.check_write(&tags, &tags)?;
     absent_as_denied(get_task(connection, id)?, "task", id, authz)
 }
@@ -1163,10 +1164,12 @@ fn task_linked_row_visible(
         return Ok(true);
     };
     if get_task(connection, task_id)?.is_some() {
-        return Ok(authz.permits_read(&task_tags(connection, task_id)?));
+        return Ok(
+            authz.permits_read(&task_tags(connection, task_id)?) && authz.permits_task(task_id)
+        );
     }
     match removed_task_tag_union(connection, task_id)? {
-        Some(tags) => Ok(authz.permits_read(&tags)),
+        Some(tags) => Ok(authz.permits_read(&tags) && authz.permits_task(task_id)),
         None => Ok(false),
     }
 }
@@ -1184,6 +1187,7 @@ fn require_task_authorized(
     authz: &AuthzContext,
 ) -> Result<Task> {
     authz.check_read(&task_tags(connection, id)?)?;
+    authz.check_task(id)?;
     absent_as_denied(get_task(connection, id)?, "task", id, authz)
 }
 
@@ -1621,6 +1625,9 @@ fn deployment_subject_tags_on(
         .flatten();
     match task_id.as_deref() {
         Some(task_id) => {
+            // A root-confined worker reaches no attempt about a task outside
+            // its root (IDENT-06), by the same generic refusal.
+            authz.check_task(task_id)?;
             if get_task(connection, task_id)?.is_some() {
                 task_tags(connection, task_id)
             } else {
@@ -2077,6 +2084,22 @@ fn subscription_row(row: &Row<'_>) -> rusqlite::Result<Subscription> {
     })
 }
 
+/// Raise a task's claim attempt counter by one and answer the new value
+/// (docs/specs/identity.md IDENT-09).
+///
+/// Called only inside the transaction that creates the lease, after every
+/// refusal has passed, so a refused claim never moves the counter and the
+/// counter never decreases: there is no other write to `tasks.attempt`.
+fn next_attempt(connection: &Connection, task_id: &str) -> Result<i64> {
+    connection
+        .query_row(
+            "UPDATE tasks SET attempt=attempt+1 WHERE id=? RETURNING attempt",
+            [task_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("task {task_id} has no row to count a claim attempt on"))
+}
+
 fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
     Ok(Claim {
         task_id: row.get("task_id")?,
@@ -2092,6 +2115,9 @@ fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
         head_sha: row.get("head_sha")?,
         root_head: row.get("root_head")?,
         model: row.get("model")?,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -2125,6 +2151,9 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
         dirty_summary: row.get("dirty_summary")?,
         root_head: row.get("root_head")?,
         created_at: row.get("created_at")?,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -2377,6 +2406,9 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         retired_by: row.get("retired_by")?,
         retire_note: row.get("retire_note")?,
         archived: row.get::<_, i64>("archived")? != 0,
+        attempt: row.get("attempt")?,
+        worker_id: row.get("worker_id")?,
+        principal_id: row.get("principal_id")?,
     })
 }
 
@@ -4176,7 +4208,7 @@ pub struct ClaimOptions {
 
 /// The outcome of settling a restore rescue source before copying it.
 pub(crate) enum PreparedRescueRead {
-    Online(Store),
+    Online(Box<Store>),
     PhysicalFailure(anyhow::Error),
 }
 
@@ -4689,6 +4721,162 @@ impl Store {
         Ok(())
     }
 
+    /// The stored receipt for one idempotent request, if any: the digest of
+    /// its normalized arguments and the exact bytes it answered with
+    /// (docs/specs/identity.md IDENT-14).
+    pub(crate) fn request_receipt(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        command: &str,
+        request_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT arguments_sha256,response FROM request_receipts \
+                 WHERE principal_id=? AND worker_id=? AND command=? AND request_id=?",
+                params![principal_id, worker_id, command, request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Record a request's receipt. Called only inside the write scope that
+    /// made the request's change, so the receipt lands with the write or not
+    /// at all.
+    pub(crate) fn record_request_receipt(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        command: &str,
+        request_id: &str,
+        arguments_sha256: &str,
+        response: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO request_receipts(principal_id,worker_id,command,request_id,arguments_sha256,response,created_at) \
+             VALUES(?,?,?,?,?,?,?)",
+            params![
+                principal_id,
+                worker_id,
+                command,
+                request_id,
+                arguments_sha256,
+                response,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Who a request receipt is keyed by (IDENT-14): the managed principal
+    /// and the worker, the empty string standing for none.
+    pub(crate) fn request_identity(&self) -> (String, String) {
+        (
+            self.authz.principal_id().unwrap_or_default().to_owned(),
+            self.authz.worker_id().unwrap_or_default().to_owned(),
+        )
+    }
+
+    /// IDENT-08: a worker's claim or handoff accept must name, in `--as`,
+    /// exactly the lane actor the worker was registered with.
+    fn require_worker_lane_actor(&self, actor: &str) -> Result<()> {
+        if let Some(worker) = self.authz.worker()
+            && worker.lane_actor != actor
+        {
+            bail!(
+                "worker {} acts as {}, not {actor}",
+                worker.worker_id,
+                worker.lane_actor
+            );
+        }
+        Ok(())
+    }
+
+    /// IDENT-10: a worker call may use only a lease its own worker holds, and
+    /// a call without a credential only a lease no worker holds. The refusal
+    /// names workers, never a lease token or a credential.
+    fn require_lease_worker(&self, claim: &Claim) -> Result<()> {
+        let caller = self.authz.worker_id();
+        if claim.worker_id.as_deref() == caller {
+            return Ok(());
+        }
+        bail!(
+            "lease belongs to {}, not {}",
+            claim.worker_id.as_deref().map_or_else(
+                || "no worker".to_owned(),
+                |holder| format!("worker {holder}")
+            ),
+            caller.unwrap_or("no worker")
+        );
+    }
+
+    /// `task_id` and its ancestors by `parent_id`, nearest first, or `None`
+    /// when the task is not on this board: what `worker register --task`
+    /// checks a task root against (IDENT-04).
+    pub(crate) fn task_lineage(&self, task_id: &str) -> Result<Option<Vec<String>>> {
+        let mut lineage = Vec::new();
+        let mut cursor = Some(task_id.to_owned());
+        // Bounded: a parent cycle cannot hold a caller here.
+        for _ in 0..10_000 {
+            let Some(id) = cursor else { break };
+            let parent: Option<Option<String>> = self
+                .connection
+                .query_row("SELECT parent_id FROM tasks WHERE id=?", [&id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match parent {
+                Some(parent) => {
+                    lineage.push(id);
+                    cursor = parent;
+                }
+                None if lineage.is_empty() => return Ok(None),
+                None => break,
+            }
+        }
+        Ok(Some(lineage))
+    }
+
+    /// IDENT-04, IDENT-06: `root` and every task below it by `parent_id` on
+    /// the board behind `connection`, read once per open; what a root-confined
+    /// worker's every task check is made against.
+    pub(crate) fn task_subtree_on(connection: &Connection, root: &str) -> Result<HashSet<String>> {
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE subtree(id) AS (\
+               SELECT id FROM tasks WHERE id=?1 \
+               UNION SELECT tasks.id FROM tasks JOIN subtree ON tasks.parent_id=subtree.id) \
+             SELECT id FROM subtree",
+        )?;
+        let ids = statement
+            .query_map([root], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(ids)
+    }
+
+    /// IDENT-10: a lease-bound worker call rechecks `write` against its
+    /// effective authority over the task's current tags, and its task root.
+    /// Every call that is not a worker call is left exactly as it was.
+    fn require_worker_task_write(&self, connection: &Connection, task_id: &str) -> Result<()> {
+        if self.authz.worker().is_none() {
+            return Ok(());
+        }
+        let tags = task_tags(connection, task_id)?;
+        self.authz.check_write(&tags, &tags)?;
+        self.authz.check_task(task_id)
+    }
+
+    /// Add the worker and principal to an event written under a worker call
+    /// (IDENT-08). Every other call's payload is left exactly as it was.
+    fn stamp_worker(&self, mut payload: Value) -> Value {
+        if let (Some(worker), Some(object)) = (self.authz.worker_id(), payload.as_object_mut()) {
+            object.insert("workerId".into(), json!(worker));
+            object.insert("principalId".into(), json!(self.authz.principal_id()));
+        }
+        payload
+    }
+
     /// Open a board file DIRECTLY: POSIX file permission is the only
     /// authorization, no policy row is consulted, and the guard no-ops. That
     /// is ADR-038 clause 9's direct open, stated as a constructor.
@@ -4917,7 +5105,10 @@ impl Store {
             Err(error) => return Ok(PreparedRescueRead::PhysicalFailure(error)),
         };
         whole_board_read_on(&authz, &connection)?;
-        Ok(PreparedRescueRead::Online(Self { connection, authz }))
+        Ok(PreparedRescueRead::Online(Box::new(Self {
+            connection,
+            authz,
+        })))
     }
 
     pub(crate) fn require_restore_write(path: &Path) -> Result<()> {
@@ -4954,6 +5145,10 @@ impl Store {
             if self
                 .authz
                 .permits_read(&cached_event_tags(&self.connection, &event, &mut cache)?)
+                && event
+                    .task_id
+                    .as_deref()
+                    .is_none_or(|task| self.authz.permits_task(task))
             {
                 out.push(event);
             }
@@ -6800,7 +6995,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -6832,7 +7029,9 @@ impl Store {
         let sql = format!(
             "SELECT t.*, c.agent_id AS claim_agent_id, c.session_id AS claim_session_id, \
              c.claimed_at AS claim_claimed_at, c.heartbeat_at AS claim_heartbeat_at, \
-             c.expires_at AS claim_expires_at, c.model AS claim_model \
+             c.expires_at AS claim_expires_at, c.model AS claim_model, \
+             c.attempt AS claim_attempt, c.worker_id AS claim_worker_id, \
+             c.principal_id AS claim_principal_id \
              FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?\
              {where_clause} ORDER BY t.priority,t.created_at,t.id"
         );
@@ -6852,6 +7051,9 @@ impl Store {
                             heartbeat_at: row.get("claim_heartbeat_at")?,
                             expires_at: row.get("claim_expires_at")?,
                             model: row.get("claim_model")?,
+                            attempt: row.get("claim_attempt")?,
+                            worker_id: row.get("claim_worker_id")?,
+                            principal_id: row.get("claim_principal_id")?,
                         })
                     })
                     .transpose()?;
@@ -6860,7 +7062,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
-        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
+        rows.retain(|(task, _)| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         apply_lapsed_leases(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         Ok(rows)
@@ -6952,7 +7156,9 @@ impl Store {
         self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -7016,7 +7222,8 @@ impl Store {
                 Some(known) => *known,
                 None => {
                     let tags = task_tags(&self.connection, &blocker.prerequisite_id)?;
-                    let permitted = self.authz.permits_read(&tags);
+                    let permitted = self.authz.permits_read(&tags)
+                        && self.authz.permits_task(&blocker.prerequisite_id);
                     readable.insert(blocker.prerequisite_id.clone(), permitted);
                     permitted
                 }
@@ -7052,6 +7259,7 @@ impl Store {
             if !self
                 .authz
                 .permits_read(&task_tags(&self.connection, &parent)?)
+                || !self.authz.permits_task(&parent)
             {
                 break;
             }
@@ -7160,6 +7368,7 @@ impl Store {
     pub fn list_verdicts(&self, task_id: &str) -> Result<Vec<Verdict>> {
         self.authz
             .check_read(&task_tags(&self.connection, task_id)?)?;
+        self.authz.check_task(task_id)?;
         require_active_task(&self.connection, task_id)?;
         if !has_verdicts_table(&self.connection)? {
             return Ok(Vec::new());
@@ -7740,6 +7949,9 @@ impl Store {
         if options.lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
+        // IDENT-08, before anything is read: a worker claims only as the lane
+        // actor it was registered with.
+        self.require_worker_lane_actor(&agent)?;
         // Before the write lock and before any row is chosen: a malformed
         // `--model` is refused by name rather than silently matching nothing
         // in an allow-list and reading as "this model may not claim it".
@@ -7760,6 +7972,7 @@ impl Store {
         let task = if let Some(id) = id {
             let tags = task_tags(&transaction, id)?;
             self.authz.check_write(&tags, &tags)?;
+            self.authz.check_task(id)?;
             let task = require_active_task_authorized(&transaction, id, &self.authz)?;
             if let Some(required_sprint) = sprint_filter.as_deref() {
                 let attached: Option<String> = transaction
@@ -7786,7 +7999,9 @@ impl Store {
             let mut selected = None;
             for candidate in candidates {
                 let tags = task_tags(&transaction, &candidate.id)?;
-                if self.authz.check_write(&tags, &tags).is_ok() {
+                if self.authz.check_write(&tags, &tags).is_ok()
+                    && self.authz.permits_task(&candidate.id)
+                {
                     selected = Some(candidate);
                     break;
                 }
@@ -7834,8 +8049,11 @@ impl Store {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
         let token = Uuid::new_v4().to_string();
+        let attempt = next_attempt(&transaction, &task.id)?;
+        // The lease names its worker and principal under managed enforcement
+        // (IDENT-08); both stay null everywhere else (IDENT-18).
         transaction.execute(
-            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 task.id,agent,options.session_id,token,now,now,now+options.lease_ms,
                 options.git.as_ref().map(|g| g.worktree.clone()),
@@ -7844,6 +8062,9 @@ impl Store {
                 options.git.as_ref().map(|g| g.head.clone()),
                 options.git.as_ref().and_then(|g| g.root_head.clone()),
                 options.model,
+                attempt,
+                self.authz.worker_id(),
+                self.authz.principal_id(),
             ],
         )?;
         transaction.execute(
@@ -7868,7 +8089,7 @@ impl Store {
                 if let Some(model) = &options.model {
                     payload["model"] = json!(model);
                 }
-                payload
+                self.stamp_worker(payload)
             },
             Some(&task.status),
             Some("in_progress"),
@@ -7907,7 +8128,9 @@ impl Store {
             eligible_claim_candidates(&self.connection, agent, options, sprint_filter.as_deref())?;
         attach_tags(&self.connection, candidates.iter_mut())?;
         attach_allowed_models(&self.connection, candidates.iter_mut())?;
-        candidates.retain(|candidate| self.authz.permits_read(&candidate.tags));
+        candidates.retain(|candidate| {
+            self.authz.permits_read(&candidate.tags) && self.authz.permits_task(&candidate.id)
+        });
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
         }
@@ -7942,6 +8165,8 @@ impl Store {
         }
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, id)?;
         // A live lease is never revoked by a gate, but renewing one asserts
         // the work is still going: a prerequisite introduced or reopened
         // underneath the holder stops the renewal here, and the holder's way
@@ -7973,7 +8198,7 @@ impl Store {
             Some(id),
             "claim_heartbeat",
             Some(&claim.agent_id),
-            json!({"expiresAt": now+lease_ms}),
+            self.stamp_worker(json!({"expiresAt": now+lease_ms})),
         )?;
         let result = active_claim(&transaction, id, now)?.context("claim disappeared")?;
         transaction.commit()?;
@@ -7990,6 +8215,8 @@ impl Store {
             require_active_task_authorized(&transaction, id, &self.authz)?;
         }
         let claim = require_lease(&transaction, id, token, now_ms())?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, id)?;
         transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         if !keep_status {
             transaction.execute(
@@ -8007,7 +8234,7 @@ impl Store {
             Some(id),
             "claim_released",
             Some(&claim.agent_id),
-            json!({}),
+            self.stamp_worker(json!({})),
             Some("in_progress"),
             Some(&current_status),
         )?;
@@ -8034,6 +8261,13 @@ impl Store {
         }
         reject_secret_shaped_text(body, "note body")?;
         let now = now_ms();
+        // IDENT-11: a worker notes only a task whose active lease it holds.
+        if self.authz.worker().is_some() {
+            let held = active_claim(&transaction, id, now)?
+                .ok_or_else(|| anyhow::Error::from(crate::authz::DeniedOrNotFound))?;
+            self.require_lease_worker(&held)?;
+            self.require_worker_task_write(&transaction, id)?;
+        }
         transaction.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
             params![
@@ -8049,7 +8283,7 @@ impl Store {
             Some(id),
             "note_added",
             Some(author),
-            json!({"kind":kind}),
+            self.stamp_worker(json!({"kind":kind})),
         )?;
         transaction.commit()?;
         // The receipt is the row this write just committed, re-read directly
@@ -8105,6 +8339,8 @@ impl Store {
         let prior_status = prior.status.clone();
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, &input.task_id)?;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -8136,9 +8372,12 @@ impl Store {
         for validation in &input.validations {
             reject_secret_shaped_text(validation, "checkpoint validation")?;
         }
+        // The checkpoint carries the attempt, worker and principal of the
+        // lease it was written under (IDENT-08, IDENT-09), read from that
+        // lease rather than from the caller.
         transaction.execute(
-            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
+            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,claim.attempt,claim.worker_id,claim.principal_id],
         )?;
         let seq = transaction.last_insert_rowid();
         // A `done` checkpoint closes the row exactly as a done-move does, so
@@ -8173,7 +8412,7 @@ impl Store {
             Some(&input.task_id),
             "checkpoint_added",
             Some(&input.author),
-            json!({"seq":seq,"state":input.state}),
+            self.stamp_worker(json!({"seq":seq,"state":input.state})),
             Some(prior_status.as_str()),
             Some(status),
         )?;
@@ -8969,7 +9208,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
     }
 
@@ -9803,6 +10044,8 @@ impl Store {
         let claim = match (&input.task_id, &input.lease_token) {
             (Some(task_id), Some(token)) => {
                 let claim = require_lease(&transaction, task_id, token, now)?;
+                self.require_lease_worker(&claim)?;
+                self.require_worker_task_write(&transaction, task_id)?;
                 if claim.agent_id != input.from_agent {
                     bail!(
                         "lease belongs to {}, not {}",
@@ -9812,7 +10055,15 @@ impl Store {
                 }
                 Some(claim)
             }
-            (None, None) => None,
+            (None, None) => {
+                // IDENT-11: a worker hands over only from a lease it holds.
+                if let Some(worker) = self.authz.worker_id() {
+                    bail!(
+                        "worker {worker} may hand over only a task whose lease it holds: pass the task id and --lease"
+                    );
+                }
+                None
+            }
             (Some(_), None) => bail!("handing over a task needs its lease: pass --lease"),
             (None, Some(_)) => {
                 bail!("a lease is held over a task, so --lease needs the task id it belongs to")
@@ -9843,11 +10094,22 @@ impl Store {
         // resumes from the durable record rather than the handoff's prose. A
         // session handoff has no task to checkpoint, and inventing one would
         // put a checkpoint on a row that was never worked.
+        // Both rows carry the attempt, worker and principal of the lease
+        // being handed over (IDENT-08, IDENT-09); a session handoff holds no
+        // lease and records none.
+        let (attempt, worker_id, principal_id) = match &claim {
+            Some(claim) => (
+                Some(claim.attempt),
+                claim.worker_id.clone(),
+                claim.principal_id.clone(),
+            ),
+            None => (None, None, None),
+        };
         let checkpoint_seq = match (&input.task_id, claim) {
             (Some(task_id), claim) => {
                 transaction.execute(
-                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?,?)",
-                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
+                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,attempt,worker_id,principal_id],
                 )?;
                 Some(transaction.last_insert_rowid())
             }
@@ -9855,8 +10117,8 @@ impl Store {
         };
         let id = format!("h-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
-            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,input.priority],
+            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session,priority,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?)",
+            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,input.priority,attempt,worker_id,principal_id],
         )?;
         // Releasing the lease and returning the task to the queue is the point
         // of a task handoff. A session handoff holds nothing and releases
@@ -9873,7 +10135,7 @@ impl Store {
             input.task_id.as_deref(),
             "handoff_created",
             Some(&input.from_agent),
-            json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)}),
+            self.stamp_worker(json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)})),
             prior_status.as_deref(),
             Some("todo"),
         )?;
@@ -9901,6 +10163,8 @@ impl Store {
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
+        // IDENT-08: the same --as rule and refusal as a worker's claim, first.
+        self.require_worker_lane_actor(&agent)?;
         if let Some(model) = &model {
             crate::model::validate_model_name(model)?;
         }
@@ -9966,7 +10230,7 @@ impl Store {
                 None,
                 "handoff_accepted",
                 Some(&agent),
-                json!({"handoffID":id,"session":true}),
+                self.stamp_worker(json!({"handoffID":id,"session":true})),
             )?;
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
@@ -9979,6 +10243,10 @@ impl Store {
         // leaving the handoff pending would rediscover it on every lane
         // resume. The event keeps the orphaned id, so it is emitted through
         // the removed-task snapshot fallback rather than as a session event.
+        // IDENT-08: a root-confined worker accepts nothing about a task
+        // outside its root — removed tasks included, which the branch below
+        // would otherwise acknowledge on tags alone.
+        self.authz.check_task(&task_id)?;
         let task = match get_task(&transaction, &task_id)? {
             Some(task) => task,
             None => {
@@ -9988,7 +10256,9 @@ impl Store {
                     Some(&task_id),
                     "handoff_accepted",
                     Some(&agent),
-                    json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                    self.stamp_worker(
+                        json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                    ),
                 )?;
                 let updated = transaction.query_row(
                     "SELECT * FROM handoffs WHERE id=?",
@@ -9999,6 +10269,8 @@ impl Store {
                 return Ok((updated, None));
             }
         };
+        // IDENT-08: after the target rule, write against E and the task root.
+        self.require_worker_task_write(&transaction, &task.id)?;
         // Once work has been blocked or settled, accepting an older brief is
         // acknowledgement rather than ownership transfer. There is no
         // claimable task to protect, and leaving the handoff pending forever
@@ -10011,7 +10283,9 @@ impl Store {
                 Some(&task.id),
                 "handoff_accepted",
                 Some(&agent),
-                json!({"handoffID":id,"acknowledged":true,"taskStatus":task.status}),
+                self.stamp_worker(
+                    json!({"handoffID":id,"acknowledged":true,"taskStatus":task.status}),
+                ),
             )?;
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
@@ -10067,7 +10341,8 @@ impl Store {
             );
         }
         let token = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
+        let attempt = next_attempt(&transaction, &task.id)?;
+        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
             task.id,agent,session,token,now,now,now+lease_ms,
             git.as_ref().map(|g| g.worktree.clone()),
             git.as_ref().map(|g| g.worktree_kind.to_owned()),
@@ -10075,6 +10350,9 @@ impl Store {
             git.as_ref().map(|g| g.head.clone()),
             git.as_ref().and_then(|g| g.root_head.clone()),
             model,
+            attempt,
+            self.authz.worker_id(),
+            self.authz.principal_id(),
         ])?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
@@ -10094,7 +10372,7 @@ impl Store {
                 if let Some(value) = &model {
                     payload["model"] = json!(value);
                 }
-                payload
+                self.stamp_worker(payload)
             },
             Some(&task.status),
             Some("in_progress"),
@@ -10487,7 +10765,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
-        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
+        rows.retain(|(task, _)| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         let mut out = Vec::new();
         for (task, heartbeat) in rows {
             let budget = task.stale_minutes.unwrap_or_default();
@@ -10594,6 +10874,7 @@ impl Store {
         let snapshot = ReadSnapshot::open(&self.connection)?;
         let tags = task_tags(&self.connection, task_id)?;
         self.authz.check_read(&tags)?;
+        self.authz.check_task(task_id)?;
         let sprint: Option<String> = self
             .connection
             .query_row(
@@ -11831,7 +12112,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -17542,13 +17825,24 @@ mod tests {
         let legacy = format!("geoyws/{}", "a".repeat(70));
         store
             .connection
-            .execute("UPDATE tags SET name=?1 WHERE name='geoyws/seed'", [&legacy])
+            .execute(
+                "UPDATE tags SET name=?1 WHERE name='geoyws/seed'",
+                [&legacy],
+            )
             .expect("seed an over-long legacy name");
         let renamed = store
             .rename_tag(&legacy, "geoyws/short", Some("geoyws"))
             .expect("an over-long OLD name renames to a usable NEW one");
-        assert_eq!((renamed.old.as_str(), renamed.new.as_str()), (legacy.as_str(), "geoyws/short"));
-        let names: Vec<String> = store.tags().unwrap().into_iter().map(|tag| tag.name).collect();
+        assert_eq!(
+            (renamed.old.as_str(), renamed.new.as_str()),
+            (legacy.as_str(), "geoyws/short")
+        );
+        let names: Vec<String> = store
+            .tags()
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.name)
+            .collect();
         assert_eq!(names, vec!["geoyws/short".to_owned()]);
     }
 

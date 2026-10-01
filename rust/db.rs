@@ -2641,6 +2641,123 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
 "#;
 
+/// Claim attempts, worker stamps and request receipts (docs/specs/identity.md
+/// IDENT-09, IDENT-14, IDENT-17).
+///
+/// `tasks.attempt` counts every successful claim and accepted handoff and
+/// never decreases; each lease, checkpoint and handoff records the attempt it
+/// belongs to. `worker_id` and `principal_id` name who held the lease under
+/// managed enforcement and stay null everywhere else, so every existing row
+/// keeps them null. A task that already has a lease starts at attempt 1, as
+/// does that lease; every other task starts at 0, so its next claim is 1.
+///
+/// `request_receipts` holds one row per accepted `--request-id`, keyed by who
+/// asked (principal and worker, the empty string standing for none) and by
+/// command, with the digest of the normalized arguments and the exact bytes
+/// of the answer, written in the same transaction as the write it describes.
+///
+/// The columns are added by [`apply_board_v38_columns`], one at a time and
+/// only where missing, rather than by ALTERs in this batch: a board rewound
+/// past v38 can carry some of them and not others, because an earlier step
+/// that rebuilds `task_claims` drops the lease columns while `tasks` keeps
+/// its counter. Each backfill runs only when its column was just added, so a
+/// rerun never resets a counter. The receipts table is `IF NOT EXISTS` for
+/// the same reason.
+const BOARD_V38: &str = r#"
+CREATE TABLE IF NOT EXISTS request_receipts (
+ principal_id TEXT NOT NULL,
+ worker_id TEXT NOT NULL,
+ command TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ arguments_sha256 TEXT NOT NULL,
+ response TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(principal_id,worker_id,command,request_id)
+) STRICT;
+"#;
+
+/// The v38 columns, each with the backfill that runs when it is added.
+const IDENTITY_COLUMNS_V38: [(&str, &str, &str, Option<&str>); 10] = [
+    (
+        "tasks",
+        "attempt",
+        "ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0)",
+        Some("UPDATE tasks SET attempt=1 WHERE id IN (SELECT task_id FROM task_claims)"),
+    ),
+    (
+        "task_claims",
+        "attempt",
+        "ALTER TABLE task_claims ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0)",
+        Some("UPDATE task_claims SET attempt=1"),
+    ),
+    (
+        "task_claims",
+        "worker_id",
+        "ALTER TABLE task_claims ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "task_claims",
+        "principal_id",
+        "ALTER TABLE task_claims ADD COLUMN principal_id TEXT",
+        None,
+    ),
+    (
+        "checkpoints",
+        "attempt",
+        "ALTER TABLE checkpoints ADD COLUMN attempt INTEGER",
+        None,
+    ),
+    (
+        "checkpoints",
+        "worker_id",
+        "ALTER TABLE checkpoints ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "checkpoints",
+        "principal_id",
+        "ALTER TABLE checkpoints ADD COLUMN principal_id TEXT",
+        None,
+    ),
+    (
+        "handoffs",
+        "attempt",
+        "ALTER TABLE handoffs ADD COLUMN attempt INTEGER",
+        None,
+    ),
+    (
+        "handoffs",
+        "worker_id",
+        "ALTER TABLE handoffs ADD COLUMN worker_id TEXT",
+        None,
+    ),
+    (
+        "handoffs",
+        "principal_id",
+        "ALTER TABLE handoffs ADD COLUMN principal_id TEXT",
+        None,
+    ),
+];
+
+/// Add every v38 column the board lacks, backfilling each one it adds.
+fn apply_board_v38_columns(connection: &Connection) -> Result<()> {
+    for (table, column, alter, backfill) in IDENTITY_COLUMNS_V38 {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        if present {
+            continue;
+        }
+        connection.execute_batch(alter)?;
+        if let Some(backfill) = backfill {
+            connection.execute_batch(backfill)?;
+        }
+    }
+    Ok(())
+}
 /// The CROSS identity step (`docs/specs/cross-board-gates.md` CROSS-02,
 /// ADR-057 §2): every task, story and epic row gets an immutable random
 /// item-creation incarnation, and the board gains its table of foreign
@@ -2654,9 +2771,9 @@ CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
 /// unregistered scratch board. Ordinary opens of a registered board stop
 /// before this step (ADR-056 §5); see [`ordinary_ceiling`].
 ///
-/// Re-run safe: the ALTER is skipped by `migrate`'s v38 guard when the
+/// Re-run safe: the ALTER is skipped by `migrate`'s v39 guard when the
 /// column already stands, and the rest is `IF NOT EXISTS` or idempotent.
-const BOARD_V38: &str = r#"
+const BOARD_V39: &str = r#"
 ALTER TABLE tasks ADD COLUMN incarnation TEXT;
 DROP TRIGGER IF EXISTS search_tasks_au;
 CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks
@@ -2685,7 +2802,7 @@ CREATE TRIGGER IF NOT EXISTS tasks_mint_incarnation AFTER INSERT ON tasks
  BEGIN UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE rowid=NEW.rowid; END;
 "#;
 
-/// Re-run safe body of the v38 step, for a board whose `incarnation` column
+/// Re-run safe body of the v39 step, for a board whose `incarnation` column
 /// already stands (a rewound board): everything but the ALTER. Not named
 /// `BOARD_V…`: the ladder test counts those declarations as versions.
 const BOARD_CROSS_REWIND: &str = r#"
@@ -3017,33 +3134,67 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
+/// Delegated workers (docs/specs/identity.md IDENT-02, IDENT-05, IDENT-17;
+/// ADR-059).
+///
+/// `workers` is a policy projection: `worker_registered` and `worker_retired`
+/// events carry every column, so replay rebuilds it and the policy state hash
+/// covers it. `worker_credentials` is deliberately NOT a projection: a policy
+/// event never holds a credential or its digest (IDENT-03), so the digest
+/// lives here, written in the registering transaction, outside replay. A
+/// worker id is minted by Kanban; `grants` is the worker's own grant list as
+/// `[{"capability","scope"}]`; `task_root` is `{"boardId","taskId"}` or null.
+/// Only `state` and `retired_at` ever change (IDENT-02).
+const REGISTRY_V15: &str = r#"
+CREATE TABLE workers (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ parent_worker_id TEXT,
+ run_id TEXT NOT NULL,
+ harness_agent_id TEXT,
+ lane_actor TEXT NOT NULL,
+ task_root TEXT CHECK(task_root IS NULL OR json_valid(task_root)),
+ grants TEXT NOT NULL CHECK(json_valid(grants) AND json_type(grants) = 'array'),
+ state TEXT NOT NULL CHECK(state IN ('active','retired')),
+ registered_at INTEGER NOT NULL,
+ registered_epoch INTEGER NOT NULL,
+ retired_at INTEGER
+) STRICT;
+CREATE INDEX idx_workers_principal ON workers(principal_id,registered_at DESC,id);
+CREATE INDEX idx_workers_parent ON workers(parent_worker_id);
+CREATE TABLE worker_credentials (
+ worker_id TEXT PRIMARY KEY NOT NULL,
+ credential_sha256 TEXT NOT NULL UNIQUE
+) STRICT;
+"#;
+
 /// The CROSS registry identity step (ADR-057 §1, §3): each registered board
 /// gets a random, immutable, non-reusable registration incarnation, minted
 /// once here for existing rows and at registration/adoption afterwards. A
 /// replaced or recreated board gets a new one even if its name, path or
 /// file-stem UUID repeats, so an old foreign pin can never resolve to it.
-const REGISTRY_V15: &str = r#"
+const REGISTRY_V16: &str = r#"
 ALTER TABLE boards ADD COLUMN registration_token TEXT;
 UPDATE boards SET registration_token=lower(hex(randomblob(16))) WHERE registration_token IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_registration_token ON boards(registration_token);
 "#;
 
-/// Re-run safe body of the v15 registry step, for a rewound registry whose
+/// Re-run safe body of the v16 registry step, for a rewound registry whose
 /// column already stands. Not named `REGISTRY_V…`, for the same reason.
 const REGISTRY_CROSS_REWIND: &str = r#"
 UPDATE boards SET registration_token=lower(hex(randomblob(16))) WHERE registration_token IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_registration_token ON boards(registration_token);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 38;
-pub const REGISTRY_SCHEMA_VERSION: usize = 15;
+pub const BOARD_SCHEMA_VERSION: usize = 39;
+pub const REGISTRY_SCHEMA_VERSION: usize = 16;
 /// The newest schema that is not CROSS-aware. An ordinary open of a
 /// registered board or of a registry never migrates past it: the CROSS step
 /// is the owner's, taken by `init` under the exclusive data-root lock
 /// (ADR-056 §5, ADR-057 §3). Below the CROSS step a board or registry stays
 /// fully usable for local-only work.
-pub const BOARD_PRE_CROSS_VERSION: usize = 37;
-pub const REGISTRY_PRE_CROSS_VERSION: usize = 14;
+pub const BOARD_PRE_CROSS_VERSION: usize = 38;
+pub const REGISTRY_PRE_CROSS_VERSION: usize = 15;
 /// The `board_meta` key holding the board's copy of its registry
 /// registration incarnation (ADR-057 §1).
 pub const REGISTRATION_TOKEN_META_KEY: &str = "registration_token";
@@ -3536,7 +3687,7 @@ fn bind_registration_token(connection: &Connection, token: &str) -> Result<()> {
 
 /// [`migrate`] up to `limit` steps only. `bind`, when given, is the board's
 /// registration incarnation: it is bound in the SAME transaction as the
-/// CROSS step (`BOARD_SCHEMA_VERSION` 38), so no CROSS-aware registered board
+/// CROSS step (`BOARD_SCHEMA_VERSION` 39), so no CROSS-aware registered board
 /// ever commits without its token (ADR-057 §3).
 fn migrate_through(
     connection: &mut Connection,
@@ -3584,19 +3735,24 @@ fn migrate_through(
         // The v35 ALTER, for the same reason and by the same guard.
         let board_v35_step = current + 1 == 35;
         let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
-        // The CROSS steps: board v38 and registry v15. Each ALTER is skipped
+        // The v38 identity columns are added one by one where missing, ahead
+        // of the step's own batch (see `BOARD_V38`).
+        if current + 1 == 38 {
+            apply_board_v38_columns(&transaction)?;
+        }
+        // The CROSS steps: board v39 and registry v16. Each ALTER is skipped
         // when its column already stands (a rewound file); the shape test is
-        // table-specific, so the other ladder's step of the same number never
-        // matches (a board has no `boards` table, a registry no `tasks`).
-        let board_v38_step = current + 1 == 38 && table_has_column(&transaction, "tasks", "id")?;
-        let v38_column = board_v38_step && table_has_column(&transaction, "tasks", "incarnation")?;
-        let registry_v15_step =
-            current + 1 == 15 && table_has_column(&transaction, "boards", "board_path")?;
-        let v15_column =
-            registry_v15_step && table_has_column(&transaction, "boards", "registration_token")?;
-        if v38_column {
+        // table-specific, so the other ladder's step never matches (a board
+        // has no `boards` table, a registry no `tasks`).
+        let board_v39_step = current + 1 == 39 && table_has_column(&transaction, "tasks", "id")?;
+        let v39_column = board_v39_step && table_has_column(&transaction, "tasks", "incarnation")?;
+        let registry_v16_step =
+            current + 1 == 16 && table_has_column(&transaction, "boards", "board_path")?;
+        let v16_column =
+            registry_v16_step && table_has_column(&transaction, "boards", "registration_token")?;
+        if v39_column {
             transaction.execute_batch(BOARD_CROSS_REWIND)?;
-        } else if v15_column {
+        } else if v16_column {
             transaction.execute_batch(REGISTRY_CROSS_REWIND)?;
         } else if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
             if v31_columns {
@@ -3611,7 +3767,7 @@ fn migrate_through(
                 )?;
             }
         }
-        if board_v38_step && let Some(token) = bind {
+        if board_v39_step && let Some(token) = bind {
             bind_registration_token(&transaction, token)?;
         }
         transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
@@ -3828,7 +3984,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37, BOARD_V38,
+    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37, BOARD_V38, BOARD_V39,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4400,6 +4556,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V13,
     REGISTRY_V14,
     REGISTRY_V15,
+    REGISTRY_V16,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -5095,11 +5252,8 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
-        assert_eq!(
-            schema_version(&connection).unwrap(),
-            REGISTRY_SCHEMA_VERSION
-        );
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..14]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         let boards: i64 = connection
             .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
@@ -5415,6 +5569,7 @@ mod tests {
             .expect("insert a pre-snooze row");
         migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
         assert_eq!(schema_version(&connection).unwrap(), 35);
+        assert_eq!(BOARD_SCHEMA_VERSION, 39);
         let trigger = |connection: &Connection, id: &str| -> Option<String> {
             connection
                 .query_row(

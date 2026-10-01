@@ -1538,11 +1538,11 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 37);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 37);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 37);
+    assert_eq!(doctor["registrySchemaVersion"], 16);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 16);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 39);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 39);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 39);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -6831,7 +6831,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        lines[0].contains("registry schema 14"),
+        lines[0].contains("registry schema 16"),
         "version output: {version}"
     );
     // The banner is one line now that the embedded operator UI is gone:
@@ -10902,6 +10902,8 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             ],
             "access audit" => vec!["access", "audit"],
             "access enforcement show" => vec!["access", "enforcement", "show"],
+            "worker show" => vec!["worker", "show", "w-00000000"],
+            "worker list" => vec!["worker", "list"],
             _ => return None,
         };
         Some(base.into_iter().map(str::to_owned).collect())
@@ -10931,11 +10933,26 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             .unwrap_or_else(|| panic!("{name} is labelled readOnly but this test cannot run it"));
         let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = fixture.run(&fixture.main, &borrowed);
-        assert!(
-            output.status.success(),
-            "{name}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if name.starts_with("worker ") {
+            // Worker identity exists only under managed enforcement
+            // (docs/specs/identity.md IDENT-01), and enforcement is read from
+            // the canonical root, which this `KANBAN_DATA_DIR` fixture never
+            // touches: so the read is the refusal, naming whichever unmanaged
+            // state the host's canonical root is in, and it too writes nothing.
+            assert!(!output.status.success(), "{name} ran outside managed");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("worker identity needs managed enforcement; this installation is "),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         assert_eq!(
             fs::read(&board).unwrap(),
             before,
@@ -18601,7 +18618,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["geoyws/infra", "geoyws/ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        37
+        38
     );
 }
 
@@ -19371,7 +19388,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        37
+        38
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -20739,7 +20756,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        37
+        38
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -28567,7 +28584,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
 }
 
@@ -28626,7 +28643,7 @@ fn registry_v10_migration_records_discarded_alias_names() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
     let (kind, actor, payload): (String, String, String) = registry
         .query_row(
@@ -42569,7 +42586,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 37, "the board did not migrate forward");
+    assert_eq!(migrated, 38, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -42601,7 +42618,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 37);
+    assert_eq!(again, 38);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any
@@ -43938,7 +43955,7 @@ fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
     assert_eq!(
-        schema, 37,
+        schema, 38,
         "a dev-tier attempt on hax moved the board schema"
     );
 }

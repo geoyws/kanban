@@ -232,9 +232,9 @@ fn edge_json(board_id: &str, id: &str) -> String {
 }
 
 /// Downgrade a freshly created estate to the pre-CROSS shape an old binary
-/// left behind: registry v14 without registration tokens, board v37 without
+/// left behind: registry v15 without registration tokens, board v38 without
 /// item incarnations, foreign-edge table, file token, mint trigger or the
-/// v38 guard on `search_tasks_au` (restored to its v37 body, so nothing still
+/// v39 guard on `search_tasks_au` (restored to its v38 body, so nothing still
 /// references the column SQLite is asked to drop).
 fn make_pre_cross(estate: &Estate, board_ids: &[&str]) {
     let registry = Connection::open(estate.data.join("registry.db")).unwrap();
@@ -242,7 +242,7 @@ fn make_pre_cross(estate: &Estate, board_ids: &[&str]) {
         .execute_batch(
             "DROP INDEX idx_boards_registration_token;
              ALTER TABLE boards DROP COLUMN registration_token;
-             PRAGMA user_version=14;",
+             PRAGMA user_version=15;",
         )
         .unwrap();
     for board_id in board_ids {
@@ -263,7 +263,7 @@ fn make_pre_cross(estate: &Estate, board_ids: &[&str]) {
                  DROP INDEX idx_task_foreign_dependencies_source;
                  DROP TABLE task_foreign_dependencies;
                  DELETE FROM board_meta WHERE key='registration_token';
-                 PRAGMA user_version=37;",
+                 PRAGMA user_version=38;",
             )
             .unwrap();
     }
@@ -275,9 +275,9 @@ fn a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file() {
     let board = estate.board("Alpha");
     estate.add_ok("Alpha", "t-1", &[]);
     let registry = readonly(&estate.data.join("registry.db"));
-    assert_eq!(user_version(&registry), 15);
+    assert_eq!(user_version(&registry), 16);
     let file = readonly(&estate.board_file(&board));
-    assert_eq!(user_version(&file), 38);
+    assert_eq!(user_version(&file), 39);
     let token = registry_token(&estate, &board).expect("the registry minted a token");
     assert_eq!(token.len(), 32);
     assert_eq!(board_token(&file).as_deref(), Some(token.as_str()));
@@ -605,7 +605,7 @@ fn a_scratch_db_refuses_json_and_keeps_local_scalars() {
         ],
     );
     let file = readonly(&scratch);
-    assert_eq!(user_version(&file), 38, "scratch takes the whole ladder");
+    assert_eq!(user_version(&file), 39, "scratch takes the whole ladder");
     assert_eq!(board_token(&file), None, "and binds no registration token");
 }
 
@@ -622,9 +622,9 @@ fn owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder() {
     estate.add_ok("Target", "t-wait", &["--depends-on", "t-local"]);
     assert_eq!(
         user_version(&readonly(&estate.data.join("registry.db"))),
-        14
+        15
     );
-    assert_eq!(user_version(&readonly(&estate.board_file(&target))), 37);
+    assert_eq!(user_version(&readonly(&estate.board_file(&target))), 38);
     let refusal = String::from_utf8_lossy(
         &estate
             .add(
@@ -651,7 +651,7 @@ fn owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder() {
         &["init", "--name", "Target", "--json"],
     );
     assert!(held.contains("another kanban process"), "{held}");
-    assert_eq!(user_version(&readonly(&estate.board_file(&target))), 37);
+    assert_eq!(user_version(&readonly(&estate.board_file(&target))), 38);
     drop(lock);
 
     // The owner's init upgrades the registry and the one addressed board.
@@ -661,14 +661,14 @@ fn owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder() {
     );
     assert_eq!(
         user_version(&readonly(&estate.data.join("registry.db"))),
-        15
+        16
     );
     let target_file = readonly(&estate.board_file(&target));
-    assert_eq!(user_version(&target_file), 38);
+    assert_eq!(user_version(&target_file), 39);
     assert_eq!(board_token(&target_file), registry_token(&estate, &target));
     assert_eq!(
         user_version(&readonly(&estate.board_file(&source))),
-        37,
+        38,
         "another board is never upgraded as a side effect"
     );
     assert_eq!(local_edges(&estate, &target, "t-wait"), ["t-local"]);
