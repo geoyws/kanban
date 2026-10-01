@@ -2,16 +2,22 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-08`, stable across wording
+- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-09`, stable across wording
   refinements; numbering is by creation, grouping is by topic. `CLI-06` was
   appended 2026-09-25 under board row `t-6148c0ba` (see the change log); its baseline
   is commit `869f5cb` on `wt/t-6148c0ba-idshape`. `CLI-07` was appended 2026-09-29
   under attention `a-9254741a` (see the change log). `CLI-08` was appended 2026-10-01
   under board row `t-a3c4d411`, admitted by George in atmux attention `a-79cae0a6`
   (choice `upstream`); its baseline is commit `7a1a555` on `kanban-geoyws-driver`.
+  `CLI-09` was appended 2026-10-02 under board row `t-94274f96`, from George's
+  2026-09-18 decision recorded on epic `e-2faa0cf9` (note seq 233); its baseline is
+  commit `96051e4` on `geoyws`.
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `SPEC-READY` on 2026-10-01 for the `CLI-08` delta (independent reviewer against the
+- **Status:** `SPEC-READY` on 2026-10-02 for the `CLI-09` delta (independent reviewer
+  `SpecReviewCli09` against the SDD §1 exit criteria at `8630f23`: two P3 consistency nits in
+  §2 and §5, fixed in the same change); `SPEC-READY` on 2026-10-01 for the `CLI-08` delta
+  (independent reviewer against the
   SDD §1 exit criteria at `89d717e`: no findings), as on 2026-09-29 for `CLI-01`..`CLI-07`
   (independent reviewer applying the SDD §1 exit criteria:
   no findings. Specification readiness only — it authorises neither implementation, nor rollout,
@@ -94,7 +100,8 @@ by ADR-015 and unchanged by this slice. Chip rendering is retired with the web v
 
 - `tag rename` and `tag remove` keep their existing contracts: renaming migrates any
   registered spelling, including a bare legacy tag, onto a namespaced one. This slice refuses
-  only new bare registrations.
+  only new bare registrations, and (`CLI-09`) a NEW name over 64 bytes on `tag add` or on the
+  NEW side of `tag rename`; the OLD side is looked up as stored.
 - Cross-estate registration is not refused: `tag add unum/queuer` on an IFCA board succeeds
   today and still succeeds — board row `t-fb600b26`'s own title reads "refuse a name whose
   prefix is not a registered estate", so any registered estate prefix is accepted. The map
@@ -171,6 +178,23 @@ Strength: `MUST` · Layer: `process` · Source: ADR-015; board rows `t-7f596f45`
 succeeds, returns the master-file row, and the tag attaches exactly as a registered tag
 does today (filter, list and rename remain ADR-015's). Data rules: one master-file row
 plus one `tag_added` event, unchanged.
+
+**CLI-09** — a tag name is at most 64 bytes, whole.
+Strength: `MUST` · Layer: `process` · Source: George, 2026-09-18, recorded on epic
+`e-2faa0cf9` (note seq 233); board row `t-94274f96`.
+Today `validate_tag_name` (`rust/store.rs:562` at the `CLI-09` baseline) checks the
+segment shape and the estate and bounds nothing, so a name of any length registers.
+After this requirement, a name whose UTF-8 length is over 64 bytes — every segment and
+every slash counted, measured as `sprint_id` is (`rust/model.rs:1057`) — is refused by
+`validate_tag_name` with
+`tag {name} is not a usable name: at most 64 bytes in all, every segment and slash counted, so a tag stays one readable handle`
+and writes nothing. The shape refusal is checked first, so a misshapen long name keeps
+the shape sentence. Because every registration and every rename passes that one
+validator, `kanban tag add {name}` and the NEW side of `kanban tag rename OLD NEW` are
+both refused; the OLD side of a rename is looked up as stored (`rust/store.rs:8004`-`8012`),
+so an over-long name already on a board can still be renamed shorter. A name of exactly
+64 bytes is accepted. No existing tag is grandfathered: the longest tag in the live
+ledger measured 25 bytes on 2026-10-02 (`geoyws/session-continuity`).
 
 ### Attachment
 
@@ -357,6 +381,19 @@ exists;
 is empty, `events --kind claim_released` holds one event by `worker`, and the newest
 `task_moved` carries `seizedFrom: null`.
 
+### A11 (`CLI-09`)
+
+*Given* a board,
+*when* `kanban tag add geoyws/{60 x a}` runs (`geoyws/` plus 60 letters: 67 bytes),
+*then* it exits non-zero with `tag geoyws/{60 x a} is not a usable name: at most 64 bytes in
+all, every segment and slash counted, so a tag stays one readable handle`, `tag list` is
+unchanged and no `tag_added` event exists;
+*and when* `kanban tag add geoyws/{57 x a}` runs (exactly 64 bytes),
+*then* it exits zero and the tag is listed;
+*and when* `kanban tag rename geoyws/{57 x a} geoyws/{60 x a}` runs,
+*then* it is refused with the same sentence and the 64-byte tag is still listed under its
+old name.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189` for
@@ -364,7 +401,8 @@ is empty, `events --kind claim_released` holds one event by `worker`, and the ne
   refusal set grows, by the two sentences `CLI-01` and `CLI-03` quote and the one
   sentence `CLI-06` quotes. `CLI-07` rewords the attach repair without adding a sentence.
   `CLI-08` removes one refusal case (the holder's own move) and adds no sentence, no flag
-  and no event kind: `claim_released` already exists (`rust/model.rs:120`).
+  and no event kind: `claim_released` already exists (`rust/model.rs:120`). `CLI-09` adds
+  the one length sentence it quotes, on `tag add` and the NEW side of `tag rename`.
   `--json` refusals keep the error-object shape (an object holding only `error`).
 - **Data invariants:** a refused registration writes nothing: no `tags` row, no `tag_added`
   event, no registry touch; a refused `task add` writes nothing: no row, no event.
@@ -421,6 +459,7 @@ is empty, `events --kind claim_released` holds one event by `worker`, and the ne
 | `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence, an empty listing and `board_initialized` as the only event; the same id as a `transact` `task_add` item rolls back with the same sentence; `t-1234abcd` accepted; the duplicate refused as before (`task t-1234abcd already exists`). The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. Reads of an opaque, SQL-seeded id stay proven by `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`. no e2e coverage |
 | `CLI-07` | MUST | process | `tag_attach_refusal_names_the_boards_estate_form` | `task add --tag assistant` on `prjx` refused with the exact `tag add ifca/assistant` repair and no row written; the named repair then registers and attaches; the unmapped board carries the estate list with the `<estate>/` placeholder and no single form. no e2e coverage |
 | `CLI-08` | MUST | process | `task_move_lets_the_lease_holder_move_its_own_row_and_still_refuses_a_bystander` | bystander refused with the exact sentence and nothing written; the holder's move to `review` succeeds without `--force`, deletes the claim, writes one holder `claim_released`, no `lease_seized`, `seizedFrom: null`; a holder's move to `in_progress` keeps the claim; holder `task remove` without `--force` still refused. no e2e coverage |
+| `CLI-09` | MUST | process | `tag_add_and_rename_refuse_a_name_over_64_bytes` | A11: 67-byte `tag add` refused with the exact sentence, nothing listed, no `tag_added`; 64 bytes accepted; `tag rename` to 67 bytes refused and the old name kept. Unit `a_tag_name_is_at_most_64_bytes` pins 64 accepted, 65 refused, and the shape refusal winning on a long misshapen name. no e2e coverage |
 
 ## 9. Change log
 
@@ -445,3 +484,10 @@ is empty, `events --kind claim_released` holds one event by `worker`, and the ne
   `DRAFT` until an independent readiness review of the delta.
 - `2026-10-01` — stamped `SPEC-READY` for `CLI-08` (independent review of `89d717e` against
   the SDD §1 exit criteria: no findings). No requirement ID changed meaning.
+- `2026-10-02` — `CLI-09` appended: a tag name is at most 64 bytes whole, refused by the one
+  validator on `tag add` and on the NEW side of `tag rename` (board row `t-94274f96`; George's
+  2026-09-18 decision on `e-2faa0cf9`, note seq 233). Status returns to `DRAFT` until an
+  independent readiness review of the delta.
+- `2026-10-02` — stamped `SPEC-READY` for `CLI-09` (independent review of `8630f23` against
+  the SDD §1 exit criteria; its two P3 nits, the §2 rename non-goal and the §5 refusal
+  inventory, fixed). No requirement ID changed meaning.
