@@ -79,7 +79,8 @@ run() {
 }
 
 # Cheapest target first, `e2e` last: it is the long one and the only one
-# that drives a browser. Every `tests/*.rs` file is listed here and nothing
+# that drives a browser. Every integration target Cargo discovers — each
+# `tests/NAME.rs` and each `tests/NAME/main.rs` — is listed here and nothing
 # else is; the check below holds the two in step.
 integration_targets=(
     claude_print_adapter_e2e
@@ -99,17 +100,24 @@ integration_targets=(
 
 listed=" ${integration_targets[*]} "
 target_drift=0
-for file in tests/*.rs; do
-    name="$(basename "$file" .rs)"
+for file in tests/*.rs tests/*/main.rs; do
+    # An unmatched pattern stays literal; only real files are targets.
+    [[ -f "$file" ]] || continue
+    if [[ "$file" == */main.rs ]]; then
+        name="$(basename "$(dirname "$file")")"
+    else
+        name="$(basename "$file" .rs)"
+    fi
     if [[ "$listed" != *" $name "* ]]; then
-        printf 'release-gate: tests/%s.rs is not in integration_targets, so the gate would never run it\n' \
-            "$name" >&2
+        printf 'release-gate: %s is not in integration_targets, so the gate would never run it\n' \
+            "$file" >&2
         target_drift=1
     fi
 done
 for target in "${integration_targets[@]}"; do
-    if [[ ! -f "tests/$target.rs" ]]; then
-        printf 'release-gate: integration target %s has no tests/%s.rs\n' "$target" "$target" >&2
+    if [[ ! -f "tests/$target.rs" && ! -f "tests/$target/main.rs" ]]; then
+        printf 'release-gate: integration target %s has no tests/%s.rs or tests/%s/main.rs\n' \
+            "$target" "$target" "$target" >&2
         target_drift=1
     fi
 done
