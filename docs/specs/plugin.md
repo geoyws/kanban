@@ -130,7 +130,7 @@ Strength: `MUST` · Layer: `process` · Source: `a-9056d954`; `rust/dispatch.rs:
 carry "kind": "plugin" ("kind" absent or "delivery" keeps today's meaning). A plugin action
 requires "revision" (1-128 ASCII characters, starting with a letter or digit, then letters,
 digits, dot, underscore or hyphen), "sha256" (exactly 64 lowercase hexadecimal characters) and
-"timeoutMs" (an integer from 1 to 300000 inclusive, matching rust/adapter_process.rs:237), and
+"timeoutMs" (an integer from 1 to 300000 inclusive, matching rust/adapter_process.rs:233-238), and
 may carry "secret" (the id of one entry in its
 consumer's "secrets" map). A delivery action takes its secret from the subscription row's
 secret reference (rust/dispatch.rs:553-562); a plugin call has no subscription, so the action
