@@ -897,7 +897,7 @@ fn a_managed_declaration_needs_source_row_read_and_refuses_without_confirming() 
         .into_owned();
     estate.ok_json(
         &source_work,
-        &["tag", "add", "secret", "--as", ACTOR, "--json"],
+        &["tag", "add", "geoyws/secret", "--as", ACTOR, "--json"],
     );
     estate.ok_json(
         &source_work,
@@ -908,7 +908,16 @@ fn a_managed_declaration_needs_source_row_read_and_refuses_without_confirming() 
     estate.ok_json(
         &source_work,
         &[
-            "task", "add", "hidden", "--id", "t-hidden", "--tag", "secret", "--as", ACTOR, "--json",
+            "task",
+            "add",
+            "hidden",
+            "--id",
+            "t-hidden",
+            "--tag",
+            "geoyws/secret",
+            "--as",
+            ACTOR,
+            "--json",
         ],
     );
     let owner = |board: &str| -> Vec<(&str, Vec<String>)> {
@@ -981,7 +990,7 @@ fn a_managed_declaration_needs_source_row_read_and_refuses_without_confirming() 
         "p-target-owner",
         &[(
             "read",
-            vec![format!("board:{source_id}"), "tag:secret".to_owned()],
+            vec![format!("board:{source_id}"), "tag:geoyws/secret".to_owned()],
         )],
     );
     estate.ok_json(&target_work, &strs(&declare("t-c", "t-hidden")));
