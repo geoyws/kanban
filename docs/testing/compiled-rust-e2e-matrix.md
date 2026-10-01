@@ -651,3 +651,90 @@ which deleted web routes; this slice builds no new web surface.
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
 | `CROSS-11` | MUST | process | `none` | no e2e coverage; A2 older-board migration/open |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
+
+## Requirements trace — docs/specs/plugin.md PLUGIN-01..PLUGIN-15
+
+One row per requirement, written with the specification on branch `wt/t-374806ea-plugin` at
+2026-10-01 (base `46964bc`). `Layer` uses the specification's vocabulary: `process` is a
+compiled-binary process-boundary exchange with no HTTP and no browser, `unit` an in-process
+`#[test]`. No test exists yet; the implementing row `t-f73a81ae` writes each one in the change
+that implements it, so every row says `no e2e coverage` (or `no unit coverage`) plainly.
+
+| Requirement | Strength | Layer | Test name | Note |
+| --- | --- | --- | --- | --- |
+| `PLUGIN-01` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-02` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-03` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
+| `PLUGIN-04` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A1). |
+| `PLUGIN-05` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A6). |
+| `PLUGIN-06` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
+| `PLUGIN-07` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+| `PLUGIN-08` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A3, A5). |
+| `PLUGIN-09` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
+| `PLUGIN-10` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
+| `PLUGIN-11` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
+| `PLUGIN-12` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+| `PLUGIN-13` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A7). |
+| `PLUGIN-14` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A1). |
+| `PLUGIN-15` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+
+15 requirements: 15 MUST, no SHOULD or MAY. No board or registry migration rides this slice;
+`dispatchers.json` gains version 2.
+
+## Requirements trace — docs/specs/identity.md IDENT-01..IDENT-18
+
+One row per requirement, written with the specification on branch `wt/t-026ece7c-identity` at
+2026-10-01 (base `60e5327`). `Layer` uses the specification's vocabulary: `process` is a
+compiled-binary process-boundary exchange with no HTTP and no browser; managed cases run under a
+non-root UID against a managed registry. No test exists yet; the implementing row `t-2aafd55c`
+writes each one in the change that implements it, so every row says `no e2e coverage` plainly.
+
+| Requirement | Strength | Layer | Test name | Note |
+| --- | --- | --- | --- | --- |
+| `IDENT-01` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+| `IDENT-02` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2). |
+| `IDENT-03` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A3). |
+| `IDENT-04` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
+| `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
+| `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
+| `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
+| `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
+| `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
+| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
+| `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
+| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7, A10). |
+| `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
+| `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
+| `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |
+| `IDENT-18` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
+
+18 requirements: 18 MUST, no SHOULD or MAY. Registry schema 14 → 15 and board schema 37 → 38
+ride this slice (`IDENT-17`).
+
+## Requirements trace — `docs/specs/batch.md` BA-01..BA-12
+
+The BA slice is `SPEC-READY` on 2026-09-29 and implemented by row `t-034b6a11` on branch
+`wt/t-034b6a11-batch`. `Layer` uses the specification's vocabulary: `process` is a
+compiled-binary process-boundary exchange in `tests/e2e.rs` or
+`tests/authz_bypass_matrix_e2e.rs`, or the `skills/kb` wrapper suite driving the real
+`kb-board` script. Every name was enumerated with `cargo test -- --list` (or, for the wrapper
+rows, read off `skills/kb/tests/kb-wrapper-tests.sh`). The slice has no browser surface.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `BA-01` | MUST | process | `kanban_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls` | twelve reads through one `kanban batch --items-file`; `schema --json` publishes `batch` as `readOnly: true`. One process is by construction: items run through `run_argv` in-process on one lent read-only board, with no spawn |
+| `BA-02` | MUST | process | `kanban_batch_over_the_bound_is_refused_naming_the_bound` | 33 refused naming 32 and 33; 32 runs |
+| `BA-03` | MUST | process | `kanban_batch_attempts_every_item_and_reports_each_independently` | an unknown id and an unknown argument fail their own items; the items after them answer; exit zero; `cli_batch_results` pins one `index` per item in order and an envelope of `results` only |
+| `BA-04` | MUST | process | `kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing` | `claim` and `transact` refused naming the index and `run writes through kanban transact`; an unknown name refused; an item naming `--project` or `--all-boards` refused (spec §6); row and events unchanged |
+| `BA-05` | MUST | process | `kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing` | `batch` and `transact` as `kanban batch` items; `a_transact_naming_batch_or_transact_is_refused_whole` covers both inside `transact`, and `a_batch_naming_a_writing_tool_is_refused_whole_and_runs_nothing` covers the MCP batch |
+| `BA-06` | MUST | process | `a_transact_carries_a_whole_claim_to_release_loop_and_its_read_sees_the_claim` | A4: `claim`, `context`, `checkpoint`, `note`, `release` in one `transact`; `context` carries index 0's `claimedAt`; a wrong lease at index 2 rolls back with no ledger event. `a_read_inside_a_transact_observes_the_earlier_writes` predates the slice |
+| `BA-07` | MUST | process | `test_board_transact_local_items_file_is_streamed` | `skills/kb` wrapper suite; `test_board_transact_items_ride_one_ssh_on_stdin` and `test_transact_items_file_at_the_boundary_needs_no_streaming` alongside. The transfer is command-agnostic, so `batch --items-file` takes the same path (spec delta 2026-10-01) |
+| `BA-08` | MUST | none | `none` | no e2e coverage. Blocked on `OB-14` (spec §7 OQ-1): no `mail` notice exists yet to place. |
+| `BA-09` | MUST | process | `every_kanban_batch_item_is_authorized_as_if_it_arrived_alone` | managed enforcement: a tag-denied row and a never-created row answer the same generic denial inside the batch; the visible row answers around them; exit zero; the same item alone is refused in the same words |
+| `BA-10` | MUST | process | `kanban_batch_items_keep_their_own_bands_and_the_batch_writes_nothing` | `sitrep list --all` over its band of 20 refuses naming `--limit` inside the batch, in the words it uses alone, while its siblings answer; events and the audit chain are unchanged |
+| `BA-11` | MUST | process | `kanban_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls` | each batched `result` equals the same call answered by its own `kanban` process, after only the fixture's declared volatile keys are dropped |
+| `BA-12` | MUST | process | `kanban_batch_and_mcp_batch_refuse_the_same_list_in_the_same_words` | eight bad lists, compared byte-for-byte after naming the batcher (`kanban batch`) and the writer (`kanban transact`); `tools/list` still offers `batch` once |
+
+12 requirements: 12 MUST; 11 proved at `process`, `BA-08` blocked on `OB-14`.

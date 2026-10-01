@@ -184,10 +184,12 @@ information. The mixed loop this enables is one `transact`: `claim`, `context`,
 **BA-07 — Deliver the items file across machines in kb-board.**
 Strength: `MUST` · Layer: `process` · Source: epic `e-cf7e5aaa` gap 2;
 `skills/kb/scripts/kb-board:216`-`skills/kb/scripts/kb-board:289`.
-`kb-board` transfers `--items-file` the way it transfers `--body-file`: the
-caller's file is base64-encoded, decoded into a private temp file on the board
-host, the flag rewritten to point at it, and the temp file removed whatever the
-exit status, so a refusal leaves nothing behind. Forwarding the flag literally
+`kb-board` transfers `--items-file` instead of forwarding it: the caller's file
+travels to the board host and the flag is rewritten to name what arrived there.
+As shipped, the file is streamed as ssh's standard input and the remote flag
+reads `--items-file /dev/stdin`, so there is no remote temp file to leave behind
+on any exit path. The transfer is the same for every command that takes the
+flag. Forwarding the flag literally
 repeats the defect the `--body-file` comment records (the remote reading a caller
 path that does not exist there). Without this, a `transact` from `@@mbp` must
 inline its JSON in argv under the 128 KiB ceiling.
@@ -402,27 +404,35 @@ replies... this way we can save on round trips.`"). This document files nothing.
 
 ## 8. Verification
 
-Planned only — no test below runs today. Each row is owed by `t-034b6a11` (draft
-until this slice is SPEC-READY) and lands in the matrix section
-`## Requirements trace — docs/specs/batch.md`. Where there is no browser evidence
-the Note says `no e2e coverage` plainly; every surface here is CLI, so every row
-does. Test names are proposed, not enumerated (no implementation exists to list).
+Every row lands in the matrix section `## Requirements trace — docs/specs/batch.md`
+(`docs/testing/compiled-rust-e2e-matrix.md`), which is the trace of record. Every surface
+here is CLI; there is no browser evidence.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `BA-01` | `MUST` | `process` | planned: `cli_batch_answers_reads_in_order_through_one_board_open` | no e2e coverage |
-| `BA-02` | `MUST` | `process` | planned: `cli_batch_over_the_bound_is_refused_naming_the_bound` | mirrors `tests/e2e.rs:13917`; no e2e coverage |
-| `BA-03` | `MUST` | `process` | planned: `cli_batch_attempts_every_item_and_reports_each_independently` | mixed ok/fail list; no e2e coverage |
-| `BA-04` | `MUST` | `process` | planned: `cli_batch_refuses_a_write_naming_the_fix_and_runs_nothing` | `claim` and `transact` as items; no e2e coverage |
-| `BA-05` | `MUST` | `process` | planned: `cli_batch_refuses_a_nested_batch_in_either_direction` | no e2e coverage |
-| `BA-06` | `MUST` | `process` | planned: `transact_read_item_observes_the_batch_uncommitted_writes` | probe (a2) promoted; no e2e coverage |
-| `BA-07` | `MUST` | `process` | planned: `kb_board_transfers_items_file_and_removes_the_remote_temp` | shell-level, over the real link; no e2e coverage |
-| `BA-08` | `MUST` | `process` | planned: `batch_envelope_carries_one_mail_notice_and_items_carry_none` | blocked on `OB-14`; no e2e coverage |
-| `BA-09` | `MUST` | `process` | planned: `every_batch_item_is_authorized_as_if_it_arrived_alone` | incl. non-oracle denial; no e2e coverage |
-| `BA-10` | `MUST` | `process` | planned: `batch_items_keep_their_own_bands_and_the_batch_writes_nothing` | ADR-037/021; no e2e coverage |
-| `BA-11` | `MUST` | `process` | planned: `cli_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls` | the `t-034b6a11` e2e; no e2e coverage |
-| `BA-12` | `MUST` | `process` | planned: `cli_batch_and_mcp_batch_refuse_the_same_list_in_the_same_words` | one parser; no e2e coverage |
+| `BA-01` | `MUST` | `process` | `kanban_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls` | `--items-file`; `schema --json` publishes `batch` read-only |
+| `BA-02` | `MUST` | `process` | `kanban_batch_over_the_bound_is_refused_naming_the_bound` | 33 refused, 32 runs |
+| `BA-03` | `MUST` | `process` | `kanban_batch_attempts_every_item_and_reports_each_independently` | mixed ok/fail list, exit zero |
+| `BA-04` | `MUST` | `process` | `kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing` | `claim` and `transact` as items |
+| `BA-05` | `MUST` | `process` | `kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing` | with `a_transact_naming_batch_or_transact_is_refused_whole` |
+| `BA-06` | `MUST` | `process` | `a_transact_carries_a_whole_claim_to_release_loop_and_its_read_sees_the_claim` | acceptance A4 |
+| `BA-07` | `MUST` | `process` | `test_board_transact_local_items_file_is_streamed` | `skills/kb` wrapper suite; command-agnostic |
+| `BA-08` | `MUST` | `process` | none | blocked on `OB-14`; no e2e coverage |
+| `BA-09` | `MUST` | `process` | `every_kanban_batch_item_is_authorized_as_if_it_arrived_alone` | `tests/authz_bypass_matrix_e2e.rs`; non-oracle denial |
+| `BA-10` | `MUST` | `process` | `kanban_batch_items_keep_their_own_bands_and_the_batch_writes_nothing` | ADR-037/021 |
+| `BA-11` | `MUST` | `process` | `kanban_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls` | twelve reads |
+| `BA-12` | `MUST` | `process` | `kanban_batch_and_mcp_batch_refuse_the_same_list_in_the_same_words` | one parser |
 
 ## 9. Change log
 
 - `2026-09-29` — created: `BA-01`..`BA-12`. New slice; no supersessions.
+- `2026-10-01` — delta with the implementation (`t-034b6a11`), no requirement added or
+  removed. `BA-07`: the mechanism sentence now describes what `kb-board` ships —
+  the items file streamed on ssh's standard input to `--items-file /dev/stdin`,
+  with no remote temp file — instead of the base64 temp-file route modelled on
+  `--body-file`. The obligation (transferred, never forwarded; nothing left
+  behind on any exit path) is unchanged. `BA-04` with `BA-12`: the write
+  refusal both batchers share now ends with the fix (`run writes through
+  transact` for MCP, `run writes through kanban transact` for the CLI), which
+  is the one wording change to the MCP `batch` tool. Its contract — what it
+  refuses and which items run — is unchanged. §8 now names the tests.

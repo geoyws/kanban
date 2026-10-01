@@ -6482,3 +6482,91 @@ fn import_requires_whole_board_write_and_names_no_denied_id() {
         serde_json::json!("a fresh import row"),
     );
 }
+
+/// docs/specs/batch.md BA-09 (acceptance A3): every `kanban batch` item is
+/// authorized as if it arrived alone. A caller who may read one row and not
+/// another gets the first and the generic denial for the second -- in the
+/// same words an id that was never created gets, so the batch is no oracle --
+/// and the batch itself still answers, exit zero, for the rows around it.
+#[test]
+fn every_kanban_batch_item_is_authorized_as_if_it_arrived_alone() {
+    let estate = ManagedEstate::new("batch-as-if-alone");
+    let work_a = estate.work_a.clone();
+    for tag in ["geoyws/visible", "geoyws/secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, tag) in [
+        ("t-visible", "geoyws/visible"),
+        ("t-secret", "geoyws/secret"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task",
+                "add",
+                "a batched row",
+                "--id",
+                id,
+                "--tag",
+                tag,
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+    }
+    estate.bind_self(
+        "p-batch",
+        &[
+            board_scope("read", &estate.id_a),
+            tag_scope("read", &estate.id_a, "geoyws/visible"),
+        ],
+    );
+    estate.enforce("managed");
+
+    let item = |id: &str| serde_json::json!({ "name": "task_show", "arguments": { "id": id } });
+    let list = serde_json::to_string(&[
+        item("t-visible"),
+        item("t-secret"),
+        item("t-never-created"),
+        item("t-visible"),
+    ])
+    .unwrap();
+    let output = estate.run(&work_a, &["batch", "--items", &list, "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "a batch with a denied item failed as a whole\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4, "{envelope}");
+
+    assert_eq!(results[0]["ok"], true, "{envelope}");
+    assert_eq!(results[0]["result"]["id"], "t-visible", "{envelope}");
+    assert_eq!(results[3]["result"], results[0]["result"], "{envelope}");
+
+    assert_eq!(
+        results[1]["ok"], false,
+        "a denied row was answered: {envelope}"
+    );
+    assert_eq!(results[2]["ok"], false, "{envelope}");
+    let denied = results[1]["error"].as_str().unwrap();
+    let unknown = results[2]["error"].as_str().unwrap();
+    assert!(denied.contains(DENIED), "not the generic denial: {denied}");
+    assert_eq!(
+        denied, unknown,
+        "a denied row and a never-created row answer differently, so the batch is an oracle"
+    );
+
+    // The same item alone is refused in the same words: "as if it arrived
+    // alone" is a property of the answer, not only of the verdict.
+    let alone = estate.run(&work_a, &["task", "show", "t-secret", "--json"]);
+    assert!(!alone.status.success(), "the denied row was answered alone");
+    assert!(
+        String::from_utf8_lossy(&alone.stderr).contains(denied),
+        "alone: {}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+}
