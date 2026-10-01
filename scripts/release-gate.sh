@@ -25,6 +25,12 @@
 #   5. Every integration target, one at a time, each with
 #      `-- --test-threads=1`, ending with `e2e`.
 #
+# Before step 1 the gate refuses to start if `tests/*.rs` and
+# `integration_targets` disagree: Cargo builds every file in `tests/` as a
+# target, so a file missing from the list is compiled by clippy but never
+# run, and every green gate silently omits it (kb kanban t-4fd18062: it
+# happened to `done_gate_e2e` and `secret_guard_e2e`).
+#
 # Why the integration targets are serialized rather than run as one
 # `cargo test --all-targets`: one target at a time, single-threaded inside
 # the target, `e2e` last.
@@ -72,6 +78,51 @@ run() {
     fi
 }
 
+# Cheapest target first, `e2e` last: it is the long one and the only one
+# that drives a browser. Every integration target Cargo discovers — each
+# `tests/NAME.rs` and each `tests/NAME/main.rs` — is listed here and nothing
+# else is; the check below holds the two in step.
+integration_targets=(
+    claude_print_adapter_e2e
+    codex_queue_adapter_e2e
+    access_refusals_e2e
+    opencode_adapter_e2e
+    kimi_acp_adapter_e2e
+    cursor_worker_adapter_e2e
+    zcode_notify_adapter_e2e
+    dispatcher_e2e
+    codex_app_server_adapter_e2e
+    secret_guard_e2e
+    done_gate_e2e
+    authz_bypass_matrix_e2e
+    e2e
+)
+
+listed=" ${integration_targets[*]} "
+target_drift=0
+for file in tests/*.rs tests/*/main.rs; do
+    # An unmatched pattern stays literal; only real files are targets.
+    [[ -f "$file" ]] || continue
+    if [[ "$file" == */main.rs ]]; then
+        name="$(basename "$(dirname "$file")")"
+    else
+        name="$(basename "$file" .rs)"
+    fi
+    if [[ "$listed" != *" $name "* ]]; then
+        printf 'release-gate: %s is not in integration_targets, so the gate would never run it\n' \
+            "$file" >&2
+        target_drift=1
+    fi
+done
+for target in "${integration_targets[@]}"; do
+    if [[ ! -f "tests/$target.rs" && ! -f "tests/$target/main.rs" ]]; then
+        printf 'release-gate: integration target %s has no tests/%s.rs or tests/%s/main.rs\n' \
+            "$target" "$target" "$target" >&2
+        target_drift=1
+    fi
+done
+((target_drift == 0)) || exit 1
+
 run 'cargo fmt' cargo fmt --all -- --check
 
 run 'cargo clippy' \
@@ -92,21 +143,7 @@ fi
 run 'kb skill wrapper tests' bash skills/kb/tests/kb-wrapper-tests.sh
 run 'migrate ACC body blocks' bash scripts/migrate-acc-body-blocks.test.sh
 
-# Cheapest target first, `e2e` last: it is the long one and the only one
-# that drives a browser.
-integration_targets=(
-    claude_print_adapter_e2e
-    codex_queue_adapter_e2e
-    access_refusals_e2e
-    opencode_adapter_e2e
-    kimi_acp_adapter_e2e
-    cursor_worker_adapter_e2e
-    zcode_notify_adapter_e2e
-    dispatcher_e2e
-    codex_app_server_adapter_e2e
-    authz_bypass_matrix_e2e
-    e2e
-)
+# The integration targets, in the order listed above.
 for target in "${integration_targets[@]}"; do
     run "cargo test --test $target (serial)" \
         cargo test --locked --test "$target" -- --test-threads=1
