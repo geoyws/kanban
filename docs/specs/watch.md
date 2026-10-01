@@ -513,3 +513,9 @@ Preserved-behaviour witnesses (not mapped 1:1 above, kept green by the same run)
   clarified to match A7: a family a pre-slice token never carried adopts the call's own set,
   while every newer token carries both sets. No existing requirement changed meaning. The live
   Ord side-by-side (A6) remains open on `t-fde5d91c` until Ord ships its stream.
+- `2026-10-01` — independent review of that delta (reviewer agent `ReviewWatch1`, commit
+  `3b8d77a`): PASS. Every MUST (WATCH-01..WATCH-13) is reachable from an acceptance example and
+  one §8 row, §5 interfaces are explicit, verification is planned with unrun e2e stated plainly,
+  and no material open question remains (the live Ord side-by-side is the authorised
+  implementation gate, not a spec question). Status stays `SPEC-READY`; it still authorises
+  neither rollout nor release.
