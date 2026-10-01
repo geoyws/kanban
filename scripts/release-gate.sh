@@ -95,6 +95,7 @@ integration_targets=(
     secret_guard_e2e
     done_gate_e2e
     authz_bypass_matrix_e2e
+    plugin_e2e
     e2e
 )
 

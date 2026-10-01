@@ -1036,8 +1036,10 @@ kanban-dispatcher --workspace /registered/root [--once] [--json]
 kanban-dispatcher --db /exact/board.db [--once] [--json]
 ```
 
-It resolves consumer/action capabilities from the operator-owned protocol-v1
-`$KANBAN_DATA_DIR/dispatchers.json`, never from a subscription row. The file
+It resolves consumer/action capabilities from the operator-owned
+`$KANBAN_DATA_DIR/dispatchers.json` (version 1, or version 2 when it also
+declares plugins), never from a subscription row. A subscription never
+delivers to a plugin action. The file
 maps strict consumer and action names to an allow-listed capability, one
 absolute executable and fixed arguments; an optional secret reference maps a
 named source environment variable to one safe adapter environment variable.
@@ -1058,6 +1060,38 @@ adapter cleanly, and a crash after adapter success but before acknowledgement
 is recovered after lease expiry. Delivery is therefore at-least-once, with
 immutable identity `(subscriptionID,eventID)` as the idempotency key rather
 than an exactly-once promise.
+
+## Plugins
+
+An operator can name a private plugin in the same `dispatchers.json`, and any
+lane can then call it synchronously (`docs/specs/plugin.md`, ADR-058):
+
+```bash
+kanban plugin call CONSUMER ACTION [--input-json JSON | --input-file PATH] [--json]
+kanban plugin list [--json]
+```
+
+A plugin action needs `"version": 2` and `"kind": "plugin"`, the capability
+`plugin.read` (declared by its consumer), two pins — `sha256`, the 64-character
+lowercase hash of its executable, and `revision`, the build identity the plugin
+must report — a `timeoutMs` from 1 to 300000, and optionally a `secret` naming
+one of its consumer's `secrets`. Version 1 files load unchanged; an older
+binary refuses version 2.
+
+Every call rereads the file and rechecks the consumer, the capability, the
+secret's source variable, the executable rules and the executable hash before
+it spawns anything, then runs the plugin under the adapter process rules. The
+plugin reads one request object on stdin,
+`{"protocolVersion":1,"target":{"consumerID":..,"actionID":..},"revision":..,"input":{..}}`,
+and writes one response, `{"protocolVersion":1,"revision":..,"output":{..}}`,
+each at most 1 MiB. A wrong revision, an invalid response, a non-zero exit or a
+timeout is refused and its output discarded. On success `plugin call` prints
+one canonical line (keys sorted, no whitespace, `schemaVersion` 1, consumer,
+action, revision, sha256, output) and writes nothing to any board. `plugin
+list` shows each plugin action and whether it is callable now, with the reason
+when it is not. Subscriptions never deliver to a plugin action, and `plugin
+call` never runs a delivery action. With no `dispatchers.json`, `plugin list`
+prints `[]` and every other command behaves exactly as before.
 
 ## Short names
 
