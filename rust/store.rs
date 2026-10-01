@@ -7042,7 +7042,15 @@ impl Store {
         if status == "done" && current.task_type == "task" && done_gate_on(&transaction)? {
             enforce_done_gate(&transaction, id, &actor, force, &current.status)?;
         }
-        let seized = require_free_lease(&transaction, id, &actor, force, "move")?;
+        // The lease guard stops a bystander from silently voiding someone
+        // else's claim; the holder moving its own row cannot do that, so it
+        // seizes nothing from itself (CLI-08). `task remove` keeps the guard.
+        let holder =
+            active_claim(&transaction, id, now_ms())?.filter(|claim| claim.agent_id == actor);
+        let seized = match holder {
+            Some(_) => None,
+            None => require_free_lease(&transaction, id, &actor, force, "move")?,
+        };
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let patch = patch
             .as_object()
@@ -7067,6 +7075,15 @@ impl Store {
         )?;
         if status != "in_progress" {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
+            if holder.is_some() {
+                event(
+                    &transaction,
+                    Some(id),
+                    "claim_released",
+                    Some(&actor),
+                    json!({}),
+                )?;
+            }
         }
         event_with_status(
             &transaction,

@@ -1215,7 +1215,10 @@ interpreted unambiguously is refused rather than guessed
 - **A live lease is not overridden silently.** `task move` and `task remove`
   refuse against a claimed task, naming the holder and its expiry. `--force`
   seizes the lease and writes a `lease_seized` event; a forced removal also
-  records how many notes and checkpoints it discarded.
+  records how many notes and checkpoints it discarded. The holder itself moves
+  its own row without `--force` (`--as` equal to the claim's agent): nothing is
+  seized, and a move off `in_progress` releases the claim with a
+  `claim_released` event (CLI-08). `task remove` still refuses the holder.
 - **`init` will not shadow an enclosing project.** Running it inside a
   registered tree points at `kanban workspace attach --to ROOT`, which is
   almost always what was meant. `--force` creates a genuinely separate nested

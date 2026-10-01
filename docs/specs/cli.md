@@ -11,8 +11,9 @@
   (choice `upstream`); its baseline is commit `7a1a555` on `kanban-geoyws-driver`.
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `DRAFT` on 2026-10-01 for the `CLI-08` delta (it was `SPEC-READY` on 2026-09-29 for
-  `CLI-01`..`CLI-07` after an independent reviewer applied the SDD §1 exit criteria:
+- **Status:** `SPEC-READY` on 2026-10-01 for the `CLI-08` delta (independent reviewer against the
+  SDD §1 exit criteria at `89d717e`: no findings), as on 2026-09-29 for `CLI-01`..`CLI-07`
+  (independent reviewer applying the SDD §1 exit criteria:
   no findings. Specification readiness only — it authorises neither implementation, nor rollout,
   nor release). Written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
   as ADR-047 §6 requires. George approved the slice, its implementation and its tests
@@ -442,3 +443,5 @@ is empty, `events --kind claim_released` holds one event by `worker`, and the ne
 - `2026-10-01` — `CLI-08` appended: a lease holder moves its own row without `--force`
   (board row `t-a3c4d411`; George atmux `a-79cae0a6`, choice `upstream`). Status returns to
   `DRAFT` until an independent readiness review of the delta.
+- `2026-10-01` — stamped `SPEC-READY` for `CLI-08` (independent review of `89d717e` against
+  the SDD §1 exit criteria: no findings). No requirement ID changed meaning.

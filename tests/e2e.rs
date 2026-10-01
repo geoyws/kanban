@@ -24373,6 +24373,110 @@ fn tag_attach_refusal_names_the_boards_estate_form() {
     );
 }
 
+/// CLI-08 — the lease holder moves its own row without `--force`; a bystander
+/// is still refused, and `task remove` keeps the guard for the holder too.
+#[test]
+fn task_move_lets_the_lease_holder_move_its_own_row_and_still_refuses_a_bystander() {
+    let fixture = Fixture::new("holder-move");
+    fixture.ok_json(&fixture.main, &["init", "--name", "HOLDER", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "held", "--id", "t-held", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-held", "--as", "worker", "--json"],
+    );
+    let events_of = |kind: &str| {
+        fixture
+            .ok_json(&fixture.main, &["events", "--kind", kind, "--json"])
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let show = || fixture.ok_json(&fixture.main, &["task", "show", "t-held", "--json"]);
+    let expires = show()["claim"]["expiresAt"].as_i64().unwrap();
+
+    // A bystander is refused exactly as before and writes nothing.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-held",
+            "todo",
+            "--as",
+            "bystander",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "a bystander voided a live lease");
+    assert_eq!(
+        refusal_object(&refused),
+        format!(
+            "task t-held is leased by worker until {expires} (session -); \
+             rerun with --force to move it anyway"
+        )
+    );
+    let after_refusal = show();
+    assert_eq!(after_refusal["status"], "in_progress");
+    assert_eq!(after_refusal["claim"]["agentID"], "worker");
+    assert!(events_of("lease_seized").is_empty());
+
+    // The holder's move to in_progress keeps its claim and releases nothing.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-held",
+            "in_progress",
+            "--as",
+            "worker",
+            "--json",
+        ],
+    );
+    assert_eq!(show()["claim"]["agentID"], "worker");
+    assert!(events_of("claim_released").is_empty());
+
+    // `task remove` keeps the guard, even for the holder.
+    let remove = fixture.run(
+        &fixture.main,
+        &["task", "remove", "t-held", "--as", "worker", "--json"],
+    );
+    assert!(
+        !remove.status.success(),
+        "the holder removed without --force"
+    );
+    assert!(
+        refusal_object(&remove).ends_with("rerun with --force to remove it anyway"),
+        "{}",
+        refusal_object(&remove)
+    );
+
+    // The holder moves its own row without --force: no seizure, one release.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "t-held", "review", "--as", "worker", "--json",
+        ],
+    );
+    let moved = show();
+    assert_eq!(moved["status"], "review");
+    assert!(
+        moved["claim"].is_null(),
+        "the holder's move left a claim: {moved}"
+    );
+    assert!(events_of("lease_seized").is_empty());
+    let released = events_of("claim_released");
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0]["actor"], "worker");
+    assert_eq!(released[0]["taskID"], "t-held");
+    let task_moved = events_of("task_moved");
+    assert_eq!(task_moved[0]["payload"]["status"], "review");
+    assert!(task_moved[0]["payload"]["seizedFrom"].is_null());
+}
+
 /// CLI-04 — a namespaced name registers exactly as before: it lists, and a
 /// row carries it.
 #[test]
