@@ -127,21 +127,21 @@ None about product scope: George’s accepted parent epic and `a-2980be50` settl
 
 ## 8. Verification
 
-The trace of record is the matrix section for this slice. Each row currently names `none` because the new compiled-process acceptance cases are not yet implemented; there is **no e2e coverage** for CROSS. The core implementation task must add real named process tests for A1–A5, enumerate them with `cargo test --locked --test e2e -- --list`, replace each `none` and run `scripts/release-gate.sh` inside the required Linux container before product completion. `/quality spec` reviews the planned examples and contract, not imaginary executed tests.
+The trace of record is the matrix section for this slice; this table mirrors it. Rows naming `none` have **no e2e coverage**. Row `t-e87d4704` added `tests/cross_board_e2e.rs` (in `scripts/release-gate.sh`), whose twelve names were enumerated with `cargo test --locked --test cross_board_e2e -- --list`; they are written and compiled but not yet run, because e2e runs once per deployment batch, so those rows still say `no e2e coverage` until that run inside the required Linux container. `/quality spec` reviews the planned examples and contract, not imaginary executed tests.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `CROSS-01` | MUST | process | `none` | no e2e coverage; A2 malformed/mixed/local-ID cases; A2 `[]`/`--clear-dependencies` parity keeping a hidden local gate (`a-b63e7b50`) |
-| `CROSS-02` | MUST | process | `none` | no e2e coverage; A2 pin/recreate/reopen cases |
+| `CROSS-01` | MUST | process | `a_json_entry_naming_this_board_is_the_legacy_local_edge`, `mixed_or_malformed_forms_refuse_before_any_write`, `a_scratch_db_refuses_json_and_keeps_local_scalars`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: managed-estate hidden local gate parity (`a-b63e7b50`) has no process case yet |
+| `CROSS-02` | MUST | process | `a_foreign_edge_pins_the_source_registration_and_item_incarnation`, `a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file`, `owner_init_never_overwrites_a_different_incarnation`, `a_reconcile_import_that_replaces_content_rotates_the_incarnation` | no e2e coverage (written, not yet run); partial: recreate/restore cases need gate evaluation (`t-a31b8d4f`) |
 | `CROSS-03` | MUST | process | `none` | no e2e coverage; A1 done/reopen/archive cases |
 | `CROSS-04` | MUST | process | `none` | no e2e coverage; A1/A5 lifecycle cases |
-| `CROSS-05` | MUST | process | `none` | no e2e coverage; A3 denied/absent parity; A3 foreign-edge removal without source read (`a-b63e7b50`) |
-| `CROSS-06` | MUST | process | `none` | no e2e coverage; A2/A3 no-partial-write cases |
+| `CROSS-05` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_managed_declaration_needs_source_row_read_and_refuses_without_confirming`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: masked read surfaces (`t-d8cc65c9`) |
+| `CROSS-06` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_refused_foreign_entry_leaves_an_update_completely_unwritten`, `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder` | no e2e coverage (written, not yet run); partial: gate-time evaluation and corrupt/token-mismatch sources (`t-a31b8d4f`) |
 | `CROSS-07` | MUST | process | `none` | no e2e coverage; A4 reciprocal/ancestry cycles |
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
 | `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
-| `CROSS-11` | MUST | process | `none` | no e2e coverage; A2 older-board migration/open |
+| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: old-binary refusal against v38 needs a release-era binary in the gate |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
 
 ## 9. Change log
@@ -151,3 +151,4 @@ The trace of record is the matrix section for this slice. Each row currently nam
 - 2026-10-01 — George's decision `a-b63e7b50` (choice `scoped`) applied: an empty JSON array is `--clear-dependencies` and keeps caller-unwritable local gates (keep over refuse, the installed behaviour), and the waiting board's writer may remove a stored foreign edge without source read authority or any source signal. `CROSS-01`, `CROSS-05`, A2 and A3 updated; requirement IDs unchanged in meaning otherwise. Status DRAFT until an independent /quality spec re-stamp.
 - 2026-10-01 — Re-stamped SPEC-READY after independent /quality spec review of the `a-b63e7b50` delta at `871d158` (SpecReviewCrossClear): no findings. No CROSS code or end-to-end tests exist yet.
 - 2026-10-01 — Provenance: the reviewed delta `871d158` was published as `d668413` on `kanban-geoyws-driver` (rebased onto `96051e4` before first publication; the delta's added and removed lines are byte-identical).
+- 2026-10-01 — Row `t-e87d4704` implemented identity and authoring: board schema v38 (`tasks.incarnation`, `task_foreign_dependencies`, file `registration_token`), registry schema v15 (`boards.registration_token`), owner `init` as the only CROSS upgrade boundary, and `--depends-on-json` on `task add`/`task update`. §8 rows for `CROSS-01`, `02`, `05`, `06` and `11` now name their process tests (not yet run). Requirements unchanged.

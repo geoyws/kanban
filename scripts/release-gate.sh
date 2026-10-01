@@ -96,6 +96,7 @@ integration_targets=(
     done_gate_e2e
     authz_bypass_matrix_e2e
     plugin_e2e
+    cross_board_e2e
     e2e
 )
 

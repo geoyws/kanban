@@ -3,7 +3,7 @@ use crate::registry::now_ms;
 use crate::store::{Store, event, live_claims, refuse_reused_task_id, whole_board_write_on};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -561,7 +561,40 @@ fn normalize_and_insert(
         } else {
             None
         };
+        // A reconcile that actually replaces a live row's content or type
+        // makes it a different item: it gets a fresh incarnation in this
+        // transaction, so a cross-board pin taken on the old content can never
+        // match the new (ADR-057 §2, `CROSS-02`). A true no-op, or a change of
+        // state such as status or assignee, keeps the token. `created_at` is
+        // not compared: an atmux source that omits it is stamped with the
+        // import time, so comparing it would rotate a true no-op and break a
+        // valid pin. A board below the CROSS step has no incarnation.
+        let replaces_identity = options.reconcile
+            && existing.contains(&input.id)
+            && crate::db::table_has_column(&transaction, "tasks", "incarnation")?
+            && transaction
+                .query_row(
+                    "SELECT type,title,body FROM tasks WHERE id=?",
+                    [&input.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .is_some_and(|(task_type, title, body)| {
+                    task_type != input.task_type || title != input.title || body != input.body
+                });
         transaction.execute("INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET type=excluded.type,parent_id=NULL,title=excluded.title,body=excluded.body,assignee=excluded.assignee,lane=excluded.lane,deliverable=excluded.deliverable,stale_minutes=excluded.stale_minutes,driver_only=excluded.driver_only,status=excluded.status,priority=excluded.priority,created_at=excluded.created_at,updated_at=excluded.updated_at,completed_at=excluded.completed_at,metadata=excluded.metadata",params![input.id,input.task_type,Option::<String>::None,input.title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,input.created_at,input.updated_at,completed,input.metadata.to_string()])?;
+        if replaces_identity {
+            transaction.execute(
+                "UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE id=?",
+                [&input.id],
+            )?;
+        }
         if options.reconcile && existing.contains(&input.id) {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [&input.id])?;
             transaction.execute("DELETE FROM task_dependencies WHERE task_id=?", [&input.id])?;

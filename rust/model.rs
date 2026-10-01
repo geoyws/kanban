@@ -457,6 +457,38 @@ pub struct GateBlocker {
     pub prerequisite_title: Option<String>,
     #[serde(rename = "prerequisiteStatus")]
     pub prerequisite_status: String,
+    /// The source board UUID of a cross-board prerequisite (`CROSS-09`).
+    /// Absent for a local prerequisite, so a local blocker reads exactly as
+    /// it always has.
+    #[serde(
+        rename = "prerequisiteBoardID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prerequisite_board_id: Option<String>,
+    /// Set only when a cross-board prerequisite cannot be read by this caller
+    /// or resolved at all. Always the literal `"unavailable"`, whatever the
+    /// cause — unknown, denied, retired, missing, corrupt, behind, foreign or
+    /// token-mismatched — so it never confirms which (`CROSS-05`,
+    /// `CROSS-06`). The status then reads `unavailable` too and the title is
+    /// `null`.
+    #[serde(
+        rename = "unavailable",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unavailable: Option<String>,
+}
+
+/// One entry of `--depends-on-json`: an exact board UUID and an opaque item
+/// ID, both strings, and nothing else (`CROSS-01`). The ID is never split on
+/// any delimiter; the board is named by UUID only, never by name or path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyRef {
+    #[serde(rename = "boardID")]
+    pub board_id: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -792,6 +824,9 @@ pub struct AddTask {
     pub status: String,
     pub priority: i64,
     pub dependencies: Vec<String>,
+    /// `--depends-on-json`: `None` when not given. Mutually exclusive with a
+    /// non-empty `dependencies` (the CLI refuses the mix before the store).
+    pub qualified_dependencies: Option<Vec<DependencyRef>>,
     pub metadata: Value,
     /// Who created the row. Compatibility callers may omit it; the CLI then
     /// supplies the explicit `system@cli` actor before the store writes.

@@ -2641,6 +2641,81 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE INDEX IF NOT EXISTS idx_verdicts_task_seq ON verdicts(task_id,seq);
 "#;
 
+/// The CROSS identity step (`docs/specs/cross-board-gates.md` CROSS-02,
+/// ADR-057 §2): every task, story and epic row gets an immutable random
+/// item-creation incarnation, and the board gains its table of foreign
+/// (board-qualified) prerequisites. A foreign edge pins the source board's
+/// UUID and registration incarnation plus the source item's ID and creation
+/// incarnation; it never stores a copied status, name or path.
+///
+/// The board's registration incarnation is not set here: it is the
+/// registry's token, bound into `board_meta` by the owner's `init` in the same
+/// transaction as this step (`migrate_through`'s binding), or never, for an
+/// unregistered scratch board. Ordinary opens of a registered board stop
+/// before this step (ADR-056 §5); see [`ordinary_ceiling`].
+///
+/// Re-run safe: the ALTER is skipped by `migrate`'s v38 guard when the
+/// column already stands, and the rest is `IF NOT EXISTS` or idempotent.
+const BOARD_V38: &str = r#"
+ALTER TABLE tasks ADD COLUMN incarnation TEXT;
+DROP TRIGGER IF EXISTS search_tasks_au;
+CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks
+ WHEN old.incarnation IS new.incarnation BEGIN
+ DELETE FROM search_documents WHERE task_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=new.id;
+END;
+UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE incarnation IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_incarnation ON tasks(incarnation);
+CREATE TABLE IF NOT EXISTS task_foreign_dependencies (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ source_board_id TEXT NOT NULL,
+ source_registration TEXT NOT NULL,
+ source_item_id TEXT NOT NULL,
+ source_item_incarnation TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(task_id,source_board_id,source_item_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_task_foreign_dependencies_source
+ ON task_foreign_dependencies(source_board_id,source_item_id);
+CREATE TRIGGER IF NOT EXISTS tasks_mint_incarnation AFTER INSERT ON tasks
+ WHEN NEW.incarnation IS NULL
+ BEGIN UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE rowid=NEW.rowid; END;
+"#;
+
+/// Re-run safe body of the v38 step, for a board whose `incarnation` column
+/// already stands (a rewound board): everything but the ALTER. Not named
+/// `BOARD_V…`: the ladder test counts those declarations as versions.
+const BOARD_CROSS_REWIND: &str = r#"
+DROP TRIGGER IF EXISTS search_tasks_au;
+CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks
+ WHEN old.incarnation IS new.incarnation BEGIN
+ DELETE FROM search_documents WHERE task_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=new.id;
+END;
+UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE incarnation IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_incarnation ON tasks(incarnation);
+CREATE TABLE IF NOT EXISTS task_foreign_dependencies (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ source_board_id TEXT NOT NULL,
+ source_registration TEXT NOT NULL,
+ source_item_id TEXT NOT NULL,
+ source_item_incarnation TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(task_id,source_board_id,source_item_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_task_foreign_dependencies_source
+ ON task_foreign_dependencies(source_board_id,source_item_id);
+CREATE TRIGGER IF NOT EXISTS tasks_mint_incarnation AFTER INSERT ON tasks
+ WHEN NEW.incarnation IS NULL
+ BEGIN UPDATE tasks SET incarnation=lower(hex(randomblob(16))) WHERE rowid=NEW.rowid; END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
@@ -2942,8 +3017,47 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 37;
-pub const REGISTRY_SCHEMA_VERSION: usize = 14;
+/// The CROSS registry identity step (ADR-057 §1, §3): each registered board
+/// gets a random, immutable, non-reusable registration incarnation, minted
+/// once here for existing rows and at registration/adoption afterwards. A
+/// replaced or recreated board gets a new one even if its name, path or
+/// file-stem UUID repeats, so an old foreign pin can never resolve to it.
+const REGISTRY_V15: &str = r#"
+ALTER TABLE boards ADD COLUMN registration_token TEXT;
+UPDATE boards SET registration_token=lower(hex(randomblob(16))) WHERE registration_token IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_registration_token ON boards(registration_token);
+"#;
+
+/// Re-run safe body of the v15 registry step, for a rewound registry whose
+/// column already stands. Not named `REGISTRY_V…`, for the same reason.
+const REGISTRY_CROSS_REWIND: &str = r#"
+UPDATE boards SET registration_token=lower(hex(randomblob(16))) WHERE registration_token IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_registration_token ON boards(registration_token);
+"#;
+
+pub const BOARD_SCHEMA_VERSION: usize = 38;
+pub const REGISTRY_SCHEMA_VERSION: usize = 15;
+/// The newest schema that is not CROSS-aware. An ordinary open of a
+/// registered board or of a registry never migrates past it: the CROSS step
+/// is the owner's, taken by `init` under the exclusive data-root lock
+/// (ADR-056 §5, ADR-057 §3). Below the CROSS step a board or registry stays
+/// fully usable for local-only work.
+pub const BOARD_PRE_CROSS_VERSION: usize = 37;
+pub const REGISTRY_PRE_CROSS_VERSION: usize = 14;
+/// The `board_meta` key holding the board's copy of its registry
+/// registration incarnation (ADR-057 §1).
+pub const REGISTRATION_TOKEN_META_KEY: &str = "registration_token";
+
+/// How far an ORDINARY open may migrate a file currently at `current`: up to
+/// the pre-CROSS version while the CROSS step is pending, and the whole
+/// ladder once the owner has taken it.
+pub fn ordinary_ceiling(current: usize, pre_cross: usize, len: usize) -> usize {
+    if current > pre_cross {
+        len
+    } else {
+        pre_cross.min(len)
+    }
+}
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -3381,6 +3495,56 @@ fn board_v35_result_shape_exists(connection: &Connection) -> Result<bool> {
 }
 
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
+    migrate_through(connection, migrations, migrations.len(), None)
+}
+
+pub(crate) fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Bind (or check) the board's copy of its registration incarnation inside
+/// the caller's transaction. An absent token is bound; a matching one is left
+/// alone; a present but DIFFERENT one is a different incarnation and is never
+/// overwritten (ADR-057 §3).
+fn bind_registration_token(connection: &Connection, token: &str) -> Result<()> {
+    let present: Option<String> = connection
+        .query_row(
+            "SELECT value FROM board_meta WHERE key=?",
+            [REGISTRATION_TOKEN_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match present {
+        Some(value) if value == token => Ok(()),
+        Some(_) => bail!(
+            "this board file carries a different registration than the registry holds for its path; it is another incarnation and is not rebound — re-register it under a fresh registration instead"
+        ),
+        None => {
+            connection.execute(
+                "INSERT INTO board_meta(key,value) VALUES(?,?)",
+                params![REGISTRATION_TOKEN_META_KEY, token],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// [`migrate`] up to `limit` steps only. `bind`, when given, is the board's
+/// registration incarnation: it is bound in the SAME transaction as the
+/// CROSS step (`BOARD_SCHEMA_VERSION` 38), so no CROSS-aware registered board
+/// ever commits without its token (ADR-057 §3).
+fn migrate_through(
+    connection: &mut Connection,
+    migrations: &[&str],
+    limit: usize,
+    bind: Option<&str>,
+) -> Result<()> {
+    let limit = limit.min(migrations.len());
     let mut current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > migrations.len() {
         bail!(
@@ -3388,7 +3552,7 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
             migrations.len()
         );
     }
-    while current < migrations.len() {
+    while current < limit {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         current = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if current > migrations.len() {
@@ -3397,7 +3561,7 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
                 migrations.len()
             );
         }
-        if current == migrations.len() {
+        if current >= limit {
             transaction.commit()?;
             return Ok(());
         }
@@ -3420,7 +3584,21 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
         // The v35 ALTER, for the same reason and by the same guard.
         let board_v35_step = current + 1 == 35;
         let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
-        if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
+        // The CROSS steps: board v38 and registry v15. Each ALTER is skipped
+        // when its column already stands (a rewound file); the shape test is
+        // table-specific, so the other ladder's step of the same number never
+        // matches (a board has no `boards` table, a registry no `tasks`).
+        let board_v38_step = current + 1 == 38 && table_has_column(&transaction, "tasks", "id")?;
+        let v38_column = board_v38_step && table_has_column(&transaction, "tasks", "incarnation")?;
+        let registry_v15_step =
+            current + 1 == 15 && table_has_column(&transaction, "boards", "board_path")?;
+        let v15_column =
+            registry_v15_step && table_has_column(&transaction, "boards", "registration_token")?;
+        if v38_column {
+            transaction.execute_batch(BOARD_CROSS_REWIND)?;
+        } else if v15_column {
+            transaction.execute_batch(REGISTRY_CROSS_REWIND)?;
+        } else if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
             if v31_columns {
                 transaction.execute_batch(
                     "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
@@ -3433,6 +3611,9 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
                 )?;
             }
         }
+        if board_v38_step && let Some(token) = bind {
+            bind_registration_token(&transaction, token)?;
+        }
         transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
         transaction.commit()?;
         current += 1;
@@ -3440,7 +3621,115 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The registry root `R` whose board `path` is: its realpath is
+/// `R/boards/<file>` and `R/registry.db` exists. Such a file is never scratch,
+/// token or no token, so an ordinary open never takes it through the CROSS
+/// step (ADR-056 §5, ADR-057 §3). The realpath decides, not the configured
+/// data root, so a symlink or a `/var` versus `/private/var` spelling cannot
+/// turn a registered board into scratch. `R` is returned canonical.
+pub(crate) fn registry_root_of(path: &Path) -> Result<Option<PathBuf>> {
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Ok(None);
+            };
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            match parent.canonicalize() {
+                Ok(parent) => parent.join(name),
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("resolve board directory {}", parent.display()));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("resolve board {}", path.display()));
+        }
+    };
+    let Some(boards) = resolved.parent() else {
+        return Ok(None);
+    };
+    if boards.file_name().is_none_or(|name| name != "boards") {
+        return Ok(None);
+    }
+    let Some(root) = boards.parent() else {
+        return Ok(None);
+    };
+    let registry = root.join("registry.db");
+    match fs::symlink_metadata(&registry) {
+        Ok(_) => Ok(Some(root.to_path_buf())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        // An apparent registry that cannot be inspected refuses rather than
+        // letting the board fall through to scratch (ADR-057 §3).
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect apparent registry {}", registry.display()))
+        }
+    }
+}
+
+/// Whether an ordinary open leaves a board at `version` where it stands, so a
+/// read may take the read-only path: the newest schema, or the pre-CROSS one
+/// at which a registered board waits for its owner's `init`.
+pub fn board_schema_is_settled(version: usize) -> bool {
+    version == BOARD_MIGRATIONS.len() || version == BOARD_PRE_CROSS_VERSION
+}
+
+/// The registry counterpart of [`board_schema_is_settled`].
+pub fn registry_schema_is_settled(version: usize) -> bool {
+    version == REGISTRY_MIGRATIONS.len() || version == REGISTRY_PRE_CROSS_VERSION
+}
+
+/// Open a board for ordinary use. A board inside a registry root stops short
+/// of the CROSS step until its owner runs `init` ([`open_board_owned`]); a
+/// scratch file outside every registry root takes the whole ladder and binds
+/// no registration token.
 pub fn open_board(path: &Path) -> Result<Connection> {
+    let limit = if registry_root_of(path)?.is_some() {
+        let current = stored_schema_version(path).unwrap_or(0);
+        ordinary_ceiling(current, BOARD_PRE_CROSS_VERSION, BOARD_MIGRATIONS.len())
+    } else {
+        BOARD_MIGRATIONS.len()
+    };
+    open_board_through(path, limit, None)
+}
+
+/// The owner's open of a registered board: the whole ladder, binding
+/// `registration_token` in the same transaction as the CROSS step, or
+/// checking it against the one already bound. A different token already in
+/// the file refuses and is never overwritten (ADR-057 §3).
+pub fn open_board_owned(path: &Path, registration_token: &str) -> Result<Connection> {
+    let connection = open_board_through(path, BOARD_MIGRATIONS.len(), Some(registration_token))?;
+    // A board already past the CROSS step skipped the binding transaction;
+    // repair an absent token or refuse a different one now.
+    {
+        let transaction = connection.unchecked_transaction()?;
+        bind_registration_token(&transaction, registration_token)?;
+        transaction.commit()?;
+    }
+    Ok(connection)
+}
+
+/// The board's own copy of its registration incarnation, if bound.
+pub fn board_registration_token(connection: &Connection) -> Result<Option<String>> {
+    if !table_has_column(connection, "board_meta", "key")? {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT value FROM board_meta WHERE key=?",
+            [REGISTRATION_TOKEN_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn open_board_through(path: &Path, limit: usize, bind: Option<&str>) -> Result<Connection> {
     let mut connection = open(path)?;
     // Foreign keys are off across the upgrade, and on for everything after.
     //
@@ -3457,7 +3746,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     // the connection does any work.
     let before: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     connection.pragma_update(None, "foreign_keys", false)?;
-    let outcome = migrate(&mut connection, BOARD_MIGRATIONS);
+    let outcome = migrate_through(&mut connection, BOARD_MIGRATIONS, limit, bind);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
     let after: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -3481,7 +3770,17 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 /// Turn a private online-backup target into a normal current board without
 /// reopening its path. Adoption uses this so migration, validation, hashing,
 /// and publication all remain tied to the one destination inode it created.
-pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
+///
+/// The staged copy is a NEW incarnation (ADR-057 §3): whatever registration
+/// token it carried from its old home is dropped, and `registration_token` —
+/// minted by the adopting registry — is bound in the CROSS step's own
+/// transaction. `None` is a pre-CROSS registry, which cannot mint one; the
+/// copy then stops at the pre-CROSS schema like every registered board there.
+/// Returns the schema version the board was left at.
+pub fn finalize_adopted_board(
+    connection: &mut Connection,
+    registration_token: Option<&str>,
+) -> Result<usize> {
     connection.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
     )?;
@@ -3490,15 +3789,38 @@ pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
     // an adoption run by root into a directory it does not own must not leave
     // them root's.
     mirror_connection_directory_owner(connection)?;
+    if table_has_column(connection, "board_meta", "key")? {
+        connection.execute(
+            "DELETE FROM board_meta WHERE key=?",
+            [REGISTRATION_TOKEN_META_KEY],
+        )?;
+    }
+    let current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let limit = match registration_token {
+        Some(_) => BOARD_MIGRATIONS.len(),
+        None => ordinary_ceiling(current, BOARD_PRE_CROSS_VERSION, BOARD_MIGRATIONS.len()),
+    };
     connection.pragma_update(None, "foreign_keys", false)?;
-    let outcome = migrate(connection, BOARD_MIGRATIONS);
+    let outcome = migrate_through(connection, BOARD_MIGRATIONS, limit, registration_token);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
+    // A copy already past the CROSS step skipped the binding transaction.
+    if let Some(token) = registration_token {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        bind_registration_token(&transaction, token)?;
+        transaction.commit()?;
+    }
     crate::audit::initialize_board_chain(connection)?;
     // Adoption is always a write, and the copied board may predate the
     // search schema entirely; embed whatever migration and chain-init left.
     crate::search::embed_missing(connection)?;
-    Ok(())
+    schema_version(connection)
+}
+
+/// Whether this registry connection carries the CROSS registration column,
+/// and so can mint and hold registration incarnations.
+pub fn registry_holds_registration_tokens(connection: &Connection) -> Result<bool> {
+    table_has_column(connection, "boards", "registration_token")
 }
 
 const BOARD_MIGRATIONS: &[&str] = &[
@@ -3506,7 +3828,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
     BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32, BOARD_V33,
-    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37,
+    BOARD_V34, BOARD_V35, BOARD_V36, BOARD_V37, BOARD_V38,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -3647,7 +3969,7 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     // `-shm` if it was not there, and a refused inspection leaves the same
     // root-owned sidecar an accepted one would.
     mirror_database_directory_owner(path)?;
-    if version != BOARD_MIGRATIONS.len() {
+    if !board_schema_is_settled(version) {
         bail!(
             "board schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
             BOARD_MIGRATIONS.len()
@@ -3691,7 +4013,7 @@ pub fn stored_schema_version(path: &Path) -> Option<usize> {
 /// Whether this registry file can be opened by [`open_registry_readonly`] as
 /// it stands. See [`stored_schema_version`].
 pub fn registry_schema_is_current(path: &Path) -> bool {
-    stored_schema_version(path) == Some(REGISTRY_MIGRATIONS.len())
+    stored_schema_version(path).is_some_and(registry_schema_is_settled)
 }
 
 /// Whether this file is there and refuses a write from this process.
@@ -3927,7 +4249,38 @@ fn ensure_registry_v12_rules(connection: &Connection) -> Result<()> {
 
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
+    let current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // A fresh registry is no legacy file and no old binary holds it, so it is
+    // born CROSS-aware; only an existing pre-CROSS registry waits for `init`.
+    let limit = if current == 0 {
+        REGISTRY_MIGRATIONS.len()
+    } else {
+        ordinary_ceiling(
+            current,
+            REGISTRY_PRE_CROSS_VERSION,
+            REGISTRY_MIGRATIONS.len(),
+        )
+    };
+    migrate_through(&mut connection, REGISTRY_MIGRATIONS, limit, None)?;
+    open_registry_tail(path, connection)
+}
+
+/// The owner's open of a registry: the whole ladder, CROSS step included.
+/// Only `init`'s upgrade boundary calls it, under the exclusive data-root
+/// lock (ADR-056 §5).
+pub fn open_registry_owned(path: &Path) -> Result<Connection> {
+    let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
+    open_registry_tail(path, connection)
+}
+
+/// Whether a registry or board file at `version` has the CROSS step still to
+/// take — read-only detection for `init`, before it takes any root lock.
+pub fn cross_step_pending(version: Option<usize>, pre_cross: usize) -> bool {
+    version.is_some_and(|version| version <= pre_cross)
+}
+
+fn open_registry_tail(path: &Path, mut connection: Connection) -> Result<Connection> {
     {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_registry_v12_rules(&transaction)?;
@@ -4046,6 +4399,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V12,
     REGISTRY_V13,
     REGISTRY_V14,
+    REGISTRY_V15,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -4059,7 +4413,7 @@ pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
     let version = schema_version(&connection)?;
     // Before the refusal, for the reason given in `open_board_readonly`.
     mirror_database_directory_owner(path)?;
-    if version != REGISTRY_MIGRATIONS.len() {
+    if !registry_schema_is_settled(version) {
         bail!(
             "registry schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
             REGISTRY_MIGRATIONS.len()
@@ -4742,7 +5096,10 @@ mod tests {
             .unwrap();
 
         migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
 
         let boards: i64 = connection
             .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
@@ -5058,7 +5415,6 @@ mod tests {
             .expect("insert a pre-snooze row");
         migrate(&mut connection, &BOARD_MIGRATIONS[..35]).expect("migrate through v35");
         assert_eq!(schema_version(&connection).unwrap(), 35);
-        assert_eq!(BOARD_SCHEMA_VERSION, 37);
         let trigger = |connection: &Connection, id: &str| -> Option<String> {
             connection
                 .query_row(

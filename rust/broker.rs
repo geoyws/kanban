@@ -1194,6 +1194,7 @@ mod tests {
             let mut store = Store::open(&board_path).expect("open board directly");
             store
                 .add_task(AddTask {
+                    qualified_dependencies: None,
                     id: None,
                     task_type: "task".to_owned(),
                     parent_id: None,

@@ -626,26 +626,29 @@ One row per requirement. The docs-only specification became SPEC-READY on 2026-1
 after independent /quality spec review of revision 3B85, against published Kanban commit `b7867f6`. George approved this slice under
 `e-c0852fe7` in `a-2980be50`; its accepted parent is `e-df626704`.
 `process` means compiled Rust binaries across real process boundaries.
-Every `none` is truthful: **no e2e coverage** exists for CROSS.
+Rows naming `none` are truthful: **no e2e coverage** exists for them.
 Acceptance examples A1–A5 in the specification define planned process evidence.
-Implementation must replace `none` with names enumerated via
-`cargo test --locked --test e2e -- --list` and run the Linux release gate.
+Row `t-e87d4704` (identity and authoring) added `tests/cross_board_e2e.rs`; its
+names below were enumerated with `cargo test --locked --test cross_board_e2e -- --list`
+and the target is in `scripts/release-gate.sh`. They are written and compiled but
+**not yet run**: e2e runs once per deployment batch, so each such row still says
+`no e2e coverage` until that run. Partial rows name what is still missing.
 The parent epic’s historical web clause predates George’s accepted ADR-053,
 which deleted web routes; this slice builds no new web surface.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `CROSS-01` | MUST | process | `none` | no e2e coverage; A2 malformed/mixed/local-ID cases; A2 `[]`/`--clear-dependencies` parity keeping a hidden local gate (`a-b63e7b50`) |
-| `CROSS-02` | MUST | process | `none` | no e2e coverage; A2 pin/recreate/reopen cases |
+| `CROSS-01` | MUST | process | `a_json_entry_naming_this_board_is_the_legacy_local_edge`, `mixed_or_malformed_forms_refuse_before_any_write`, `a_scratch_db_refuses_json_and_keeps_local_scalars`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: `[]`/`--clear-dependencies` parity keeping a hidden local gate under managed enforcement (`a-b63e7b50`) has no process case yet; unit `cross::tests::json_set_is_exact_typed_and_alias_free` holds the exact shape, UUID spelling and duplicate-key refusals |
+| `CROSS-02` | MUST | process | `a_foreign_edge_pins_the_source_registration_and_item_incarnation`, `a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file`, `owner_init_never_overwrites_a_different_incarnation`, `a_reconcile_import_that_replaces_content_rotates_the_incarnation` | no e2e coverage (written, not yet run); partial: an import `--reconcile` that replaces content or type rotates the item incarnation, while a state-only one keeps it; source delete/same-ID recreate and legitimate-restore cases need gate evaluation (`t-a31b8d4f`) |
 | `CROSS-03` | MUST | process | `none` | no e2e coverage; A1 done/reopen/archive cases |
 | `CROSS-04` | MUST | process | `none` | no e2e coverage; A1/A5 lifecycle cases |
-| `CROSS-05` | MUST | process | `none` | no e2e coverage; A3 denied/absent parity; A3 foreign-edge removal without source read (`a-b63e7b50`) |
-| `CROSS-06` | MUST | process | `none` | no e2e coverage; A2/A3 no-partial-write cases |
+| `CROSS-05` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_managed_declaration_needs_source_row_read_and_refuses_without_confirming`, `clearing_a_pin_needs_no_source_and_carries_only_identities` | no e2e coverage (written, not yet run); partial: unknown, missing, foreign-registry, retired, board-denied and tag-denied sources share one sentence and write nothing (the managed case needs the gate's non-root user); masked read surfaces are `t-d8cc65c9` |
+| `CROSS-06` | MUST | process | `every_unusable_source_gives_one_refusal_and_writes_nothing`, `a_refused_foreign_entry_leaves_an_update_completely_unwritten`, `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder` | no e2e coverage (written, not yet run); partial: a refused add or update writes no row, edge, field or event, and a pre-CROSS source is unavailable until its own owner upgrades; gate-time evaluation and corrupt/token-mismatch sources belong to `t-a31b8d4f` |
 | `CROSS-07` | MUST | process | `none` | no e2e coverage; A4 reciprocal/ancestry cycles |
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
 | `CROSS-09` | MUST | process | `none` | no e2e coverage; A3/A5 CLI/MCP parity |
 | `CROSS-10` | MUST | process | `none` | no e2e coverage; A5 qualified watch/event identity |
-| `CROSS-11` | MUST | process | `none` | no e2e coverage; A2 older-board migration/open |
+| `CROSS-11` | MUST | process | `owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder`, `a_scratch_db_refuses_json_and_keeps_local_scalars` | no e2e coverage (written, not yet run); partial: a pre-CROSS registered board stays at v37 for local work, owner `init` upgrades only the addressed board under the exclusive root and refuses a live holder; old-binary refusal against v38 needs a release-era binary in the gate |
 | `CROSS-12` | MUST | process | `none` | no e2e coverage; A5 read scope/source immutability |
 
 ## Requirements trace — docs/specs/plugin.md PLUGIN-01..PLUGIN-15

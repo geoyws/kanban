@@ -15,6 +15,7 @@ mod codex_app_server_messages;
 mod codex_app_server_state;
 mod codex_queue_adapter;
 mod context;
+mod cross;
 mod cursor_worker_adapter;
 mod db;
 mod dispatch;
@@ -128,7 +129,7 @@ Usage:
   kanban restore --from DIRECTORY --force [--as ACTOR] [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled]
-             [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
+             [--priority P0|P1|P2|0-9] [--depends-on ID ... | --depends-on-json JSON] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only] [--sprint sp-…] [--allowed-model NAME ...]
   kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--allowed-model NAME] [--all]
@@ -151,7 +152,8 @@ Usage:
   kanban task remove ID --as ACTOR [--force]
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
              [--priority P0|P1|P2|0-9] [--parent ID | --clear-parent]
-             [--tag NAME ... | --clear-tags] [--depends-on ID ... | --clear-dependencies]
+             [--tag NAME ... | --clear-tags]
+             [--depends-on ID ... | --depends-on-json JSON | --clear-dependencies]
              [--assignee AGENT | --unassign] [--lane LANE | --clear-lane]
              [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
              [--driver-only | --no-driver-only] [--sprint sp-… | --clear-sprint]
@@ -1073,6 +1075,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "status",
             "priority",
             "depends-on",
+            "depends-on-json",
             "assignee",
             "lane",
             "deliverable",
@@ -1150,6 +1153,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "priority",
             "depends-on",
             "clear-dependencies",
+            "depends-on-json",
             "sprint",
             "clear-sprint",
             "allowed-model",
@@ -6124,10 +6128,21 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         true => None,
         false => direct_db(&args),
     };
+    // `init` on a registry or board whose CROSS step is still pending is the
+    // owner's upgrade boundary (ADR-056 §5): detected read-only here, before
+    // any lock, and taken only under the root EXCLUSIVELY. Every other init
+    // keeps the shared lock.
+    let cross_upgrade = command == "init"
+        && match args.one("name") {
+            Some(name) => Registry::init_cross_pending(name)?,
+            None => false,
+        };
     let _data_root = if lock::touches_data_root(addressed_board.as_deref()) {
         Some(
             if command == "restore" || (command == "workspace" && sub == Some("adopt")) {
                 lock::exclusive()?
+            } else if cross_upgrade {
+                lock::exclusive_for_cross_upgrade()?
             } else {
                 lock::shared()?
             },
@@ -6162,13 +6177,23 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             Some(args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?))
         };
         let _initialization = lock::initialization()?;
-        let mut registry = Registry::open()?;
+        let mut registry = if cross_upgrade {
+            Registry::open_owned()?
+        } else {
+            Registry::open()?
+        };
         let record = registry.register(
             workspace.as_deref(),
             args.require("name")?,
             args.has("force"),
             args.one("as").unwrap_or("system@cli"),
         )?;
+        // The addressed board takes its CROSS step (or the repair of an
+        // absent token) only here, bound to the registry's token in the same
+        // transaction; a different token already in the file refuses.
+        if cross_upgrade && let Some(token) = registry.registration_token(&record.board_path)? {
+            drop(db::open_board_owned(Path::new(&record.board_path), &token)?);
+        }
         let mut store = Store::open_as_caller(Path::new(&record.board_path))?;
         store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
@@ -7059,8 +7084,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
+        if args.has("depends-on-json") && args.has("depends-on") {
+            bail!("--depends-on-json and --depends-on are mutually exclusive");
+        }
         let task = store.add_task_in_sprint(
             crate::model::AddTask {
+                qualified_dependencies: args
+                    .one("depends-on-json")
+                    .map(crate::cross::parse_dependency_json)
+                    .transpose()?,
                 tags: args.many("tag"),
                 allowed_models: args.many("allowed-model"),
                 id: option_string(&args, "id"),
@@ -7211,6 +7243,8 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             ("deliverable", "clear-deliverable"),
             ("parent", "clear-parent"),
             ("depends-on", "clear-dependencies"),
+            ("depends-on-json", "depends-on"),
+            ("depends-on-json", "clear-dependencies"),
             ("tag", "clear-tags"),
             ("sprint", "clear-sprint"),
             ("allowed-model", "clear-allowed-models"),
@@ -7280,6 +7314,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             } else {
                 None
             },
+            qualified_dependencies: args
+                .one("depends-on-json")
+                .map(crate::cross::parse_dependency_json)
+                .transpose()?,
             sprint: if let Some(value) = args.one("sprint") {
                 Some(Some(value.to_owned()))
             } else if args.has("clear-sprint") {

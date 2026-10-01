@@ -194,6 +194,18 @@ impl AuthzContext {
         &self.board_id
     }
 
+    /// The SAME caller's authority, aimed at another board: same enforcement
+    /// state, same authority map, a different board UUID. A cross-board
+    /// source read is checked with this, so the target board's context can
+    /// never stand in for read authority on the source (ADR-057 §4).
+    pub fn for_board(&self, board_id: String) -> Self {
+        Self {
+            enforcement: self.enforcement,
+            authority: self.authority.clone(),
+            board_id,
+        }
+    }
+
     /// Whether the guard is live at all — that is, whether the estate is
     /// [`Enforcement::Managed`].
     ///
