@@ -233,7 +233,9 @@ fn edge_json(board_id: &str, id: &str) -> String {
 
 /// Downgrade a freshly created estate to the pre-CROSS shape an old binary
 /// left behind: registry v14 without registration tokens, board v37 without
-/// item incarnations, foreign-edge table or file token.
+/// item incarnations, foreign-edge table, file token, mint trigger or the
+/// v38 guard on `search_tasks_au` (restored to its v37 body, so nothing still
+/// references the column SQLite is asked to drop).
 fn make_pre_cross(estate: &Estate, board_ids: &[&str]) {
     let registry = Connection::open(estate.data.join("registry.db")).unwrap();
     registry
@@ -247,7 +249,16 @@ fn make_pre_cross(estate: &Estate, board_ids: &[&str]) {
         let board = Connection::open(estate.board_file(board_id)).unwrap();
         board
             .execute_batch(
-                "DROP INDEX idx_tasks_incarnation;
+                "DROP TRIGGER tasks_mint_incarnation;
+                 DROP TRIGGER search_tasks_au;
+                 CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks BEGIN
+                  DELETE FROM search_documents WHERE task_id=old.id;
+                  INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+                  SELECT * FROM search_source_rows WHERE task_id=new.id;
+                  INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+                  SELECT * FROM search_deployment_event_rows WHERE task_id=new.id;
+                 END;
+                 DROP INDEX idx_tasks_incarnation;
                  ALTER TABLE tasks DROP COLUMN incarnation;
                  DROP INDEX idx_task_foreign_dependencies_source;
                  DROP TABLE task_foreign_dependencies;
@@ -720,4 +731,257 @@ fn owner_init_never_overwrites_a_different_incarnation() {
         "the present token is never rewritten"
     );
     assert_eq!(registry_token(&estate, &target), Some(registered));
+}
+
+/// A managed estate in the canonical root (`XDG_DATA_HOME/kanban`), the only
+/// root a managed caller's authority is minted from, addressed by working
+/// directory alone — the route managed enforcement does not refuse.
+struct Managed {
+    root: PathBuf,
+    xdg: PathBuf,
+}
+
+impl Managed {
+    fn new(label: &str) -> Self {
+        let uid = Command::new("id").arg("-u").output().unwrap();
+        assert_ne!(
+            String::from_utf8_lossy(&uid.stdout).trim(),
+            "0",
+            "managed enforcement mints no authority for root by design; run as a non-root user \
+             or in the Linux gate container"
+        );
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "kanban-cross-managed-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        let xdg = root.join("xdg");
+        fs::create_dir_all(&xdg).unwrap();
+        Self { root, xdg }
+    }
+
+    fn work(&self, name: &str) -> PathBuf {
+        let work = self.root.join("work").join(name);
+        fs::create_dir_all(&work).unwrap();
+        work
+    }
+
+    fn run(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_kanban"))
+            .current_dir(cwd)
+            .args(args)
+            .env("XDG_DATA_HOME", &self.xdg)
+            .env_remove("KANBAN_DATA_DIR")
+            .env_remove("KANBAN_DB")
+            .env_remove("KANBAN_PROJECT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    }
+
+    fn ok_json(&self, cwd: &Path, args: &[&str]) -> Value {
+        let output = self.run(cwd, args);
+        assert!(
+            output.status.success(),
+            "command should have succeeded: {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn refused(&self, cwd: &Path, args: &[&str]) -> String {
+        let output = self.run(cwd, args);
+        assert!(!output.status.success(), "{args:?} must be refused");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn registry(&self) -> Connection {
+        Connection::open(self.xdg.join("kanban").join("registry.db")).unwrap()
+    }
+
+    /// Bind this process's own identity to `principal` (once), then grant it
+    /// each `(capability, atoms)` scope.
+    fn grant(&self, principal: &str, scopes: &[(&str, Vec<String>)]) {
+        let username = Command::new("id").arg("-un").output().unwrap();
+        let uid = Command::new("id").arg("-u").output().unwrap();
+        let registry = self.registry();
+        registry
+            .execute(
+                "INSERT OR IGNORE INTO principals(id,username,uid,enabled,bound_at_epoch,bound_by_event_id) \
+                 VALUES(?1,?2,?3,1,0,'pe-00000000')",
+                rusqlite::params![
+                    principal,
+                    String::from_utf8_lossy(&username.stdout).trim(),
+                    String::from_utf8_lossy(&uid.stdout).trim().parse::<u32>().unwrap()
+                ],
+            )
+            .unwrap();
+        for (index, (capability, atoms)) in scopes.iter().enumerate() {
+            registry
+                .execute(
+                    "INSERT INTO grants(id,principal_id,capability,scope,state,origin,\
+                     granted_at_epoch,granted_by_event_id) \
+                     VALUES(?1,?2,?3,?4,'active','grant',0,'pe-00000000')",
+                    rusqlite::params![
+                        format!(
+                            "g-{principal}-{index}-{}",
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos()
+                        ),
+                        principal,
+                        capability,
+                        serde_json::to_string(atoms).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    fn pins(&self, board_path: &str, task: &str) -> Vec<String> {
+        let board = readonly(Path::new(board_path));
+        let mut statement = board
+            .prepare(
+                "SELECT source_item_id FROM task_foreign_dependencies WHERE task_id=? \
+                 ORDER BY source_item_id",
+            )
+            .unwrap();
+        statement
+            .query_map([task], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+}
+
+impl Drop for Managed {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn a_managed_declaration_needs_source_row_read_and_refuses_without_confirming() {
+    let estate = Managed::new("authority");
+    let source_work = estate.work("Source");
+    let target_work = estate.work("Target");
+    // Built while the estate is still direct, as a real estate reaches managed.
+    let source = estate.ok_json(&source_work, &["init", "--name", "Source", "--json"]);
+    let target = estate.ok_json(&target_work, &["init", "--name", "Target", "--json"]);
+    let source_path = source["boardPath"].as_str().unwrap().to_owned();
+    let target_path = target["boardPath"].as_str().unwrap().to_owned();
+    let source_id = Path::new(&source_path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let target_id = Path::new(&target_path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    estate.ok_json(
+        &source_work,
+        &["tag", "add", "secret", "--as", ACTOR, "--json"],
+    );
+    estate.ok_json(
+        &source_work,
+        &[
+            "task", "add", "open", "--id", "t-open", "--as", ACTOR, "--json",
+        ],
+    );
+    estate.ok_json(
+        &source_work,
+        &[
+            "task", "add", "hidden", "--id", "t-hidden", "--tag", "secret", "--as", ACTOR, "--json",
+        ],
+    );
+    let owner = |board: &str| -> Vec<(&str, Vec<String>)> {
+        vec![
+            ("read", vec![format!("board:{board}")]),
+            ("write", vec![format!("board:{board}")]),
+            ("read", vec![format!("board:{board}"), "*".to_owned()]),
+            ("write", vec![format!("board:{board}"), "*".to_owned()]),
+        ]
+    };
+    estate.grant("p-target-owner", &owner(&target_id));
+    estate
+        .registry()
+        .execute(
+            "UPDATE enforcement_state SET state='managed' WHERE id=1",
+            [],
+        )
+        .unwrap();
+    let declare = |task: &str, item: &str| -> Vec<String> {
+        vec![
+            "task".into(),
+            "add".into(),
+            task.into(),
+            "--id".into(),
+            task.into(),
+            "--as".into(),
+            ACTOR.into(),
+            "--depends-on-json".into(),
+            edge_json(&source_id, item),
+            "--json".into(),
+        ]
+    };
+
+    // No authority on the source board at all: the one sentence, nothing
+    // written — exactly what an unknown board UUID answers.
+    let denied = estate.refused(&target_work, &strs(&declare("t-a", "t-open")));
+    assert_eq!(
+        denied,
+        format!("prerequisite boardID {source_id} id t-open {UNAVAILABLE}")
+    );
+    let unknown = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    let mut probe = declare("t-a", "t-open");
+    probe[8] = edge_json(unknown, "t-open");
+    assert_eq!(
+        estate.refused(&target_work, &strs(&probe)),
+        format!("prerequisite boardID {unknown} id t-open {UNAVAILABLE}"),
+        "denied and unknown differ only in the caller's own input"
+    );
+    assert!(estate.pins(&target_path, "t-a").is_empty());
+
+    // Board read without the tag: the untagged row pins, the tagged one is
+    // as unavailable as a row that does not exist.
+    estate.grant(
+        "p-target-owner",
+        &[("read", vec![format!("board:{source_id}")])],
+    );
+    estate.ok_json(&target_work, &strs(&declare("t-b", "t-open")));
+    assert_eq!(estate.pins(&target_path, "t-b"), ["t-open"]);
+    assert_eq!(
+        estate.refused(&target_work, &strs(&declare("t-c", "t-hidden"))),
+        format!("prerequisite boardID {source_id} id t-hidden {UNAVAILABLE}")
+    );
+    assert_eq!(
+        estate.refused(&target_work, &strs(&declare("t-c", "t-absent"))),
+        format!("prerequisite boardID {source_id} id t-absent {UNAVAILABLE}")
+    );
+
+    // Granting the tag reveals the tagged row.
+    estate.grant(
+        "p-target-owner",
+        &[(
+            "read",
+            vec![format!("board:{source_id}"), "tag:secret".to_owned()],
+        )],
+    );
+    estate.ok_json(&target_work, &strs(&declare("t-c", "t-hidden")));
+    assert_eq!(estate.pins(&target_path, "t-c"), ["t-hidden"]);
+}
+
+fn strs(owned: &[String]) -> Vec<&str> {
+    owned.iter().map(String::as_str).collect()
 }
