@@ -282,7 +282,9 @@ handoff accept, under IDENT-08; worker register, worker show, worker list
 and worker retire, for itself and its descendants. Every other command, including task add, task
 move, task update, task remove, transact, sitrep, attention, subscription, deploy and every access
 command, is refused with "worker <id> may not run <command>: it is coordinator-only" before any
-other check, and writes nothing.`
+other check, and writes nothing. A worker's session handoff (handoff create with no task) holds
+no lease, and is refused with "worker <id> may hand over only a task whose lease it holds: pass
+the task id and --lease", writing nothing.`
 
 **IDENT-12** — A worker without write holds no lease.
 Strength: `MUST` · Layer: `process` · Source: `e-3a942ae9` ("Read-only workers get identity and
@@ -545,24 +547,24 @@ row covered in part says `partial` and names what is still owed.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `IDENT-01` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1). |
-| `IDENT-02` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2). |
-| `IDENT-03` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A3). |
-| `IDENT-04` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
-| `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
-| `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
-| `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
-| `IDENT-09` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`, `a_session_handoff_records_no_attempt`, `a_schema_37_board_migrates_with_leases_at_attempt_one` | partial: direct mode only. Managed-mode A4 owed by `t-2aafd55c` Part B. |
-| `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
-| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
-| `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
-| `IDENT-14` | MUST | process | `tests/identity_e2e.rs`: `a_claim_request_id_replays_byte_identically_and_refuses_other_arguments`, `a_refused_request_stores_no_receipt_and_a_malformed_key_is_refused`, `a_checkpoint_request_id_replays_without_a_second_row` | partial: direct mode, receipts keyed with no principal and no worker. A7 under `k1` and A10 owed by `t-2aafd55c` Part B. |
-| `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
-| `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
-| `IDENT-17` | MUST | process | `tests/identity_e2e.rs`: `a_schema_37_board_migrates_with_leases_at_attempt_one` | partial: board 37 → 38 only, and the newer-schema refusal is proved on this binary (39 against 38), not on a baseline binary. Registry 14 → 15 owed by `t-2aafd55c` Part B. |
-| `IDENT-18` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one` | partial: no `workerId` or `principalId` on direct claim, checkpoint and handoff output. The A1 worker-verb refusals owed by `t-2aafd55c` Part B. |
+| `IDENT-01` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_identity_is_refused_outside_managed_enforcement` | covered: unregistered and prepared, worker verb and credential-bearing call, registry and board bytes unchanged. |
+| `IDENT-02` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_malformed_worker_label_is_refused_by_flag` | covered. |
+| `IDENT-03` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_child_worker_only_narrows_and_a_revocation_lands_next_call` | covered: event kind, epoch +1, no credential or digest on the event; a refusal adds one denied audit row and keeps the epoch. |
+| `IDENT-04` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_child_task_root_must_sit_inside_the_parent_root` | covered. |
+| `IDENT-05` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `coordinator_only_commands_read_only_workers_and_retirement` | covered: other principal, malformed and retired credentials each answer `denied or not found`. |
+| `IDENT-06` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call` | covered. |
+| `IDENT-07` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `only_the_principal_an_ancestor_or_the_worker_itself_retires_it` | covered. |
+| `IDENT-08` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered. |
+| `IDENT-09` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`, `a_session_handoff_records_no_attempt`, `a_schema_37_board_migrates_with_leases_at_attempt_one`; `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and managed. |
+| `IDENT-10` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced` | covered: both directions of the worker/no-worker fence on checkpoint, heartbeat and release. |
+| `IDENT-11` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-12` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement` | covered. |
+| `IDENT-13` | MUST | process | `tests/worker_identity_e2e.rs`: `leases_stay_per_task_across_workers_on_one_lane` | covered. |
+| `IDENT-14` | MUST | process | `tests/identity_e2e.rs`: `a_claim_request_id_replays_byte_identically_and_refuses_other_arguments`, `a_refused_request_stores_no_receipt_and_a_malformed_key_is_refused`, `a_checkpoint_request_id_replays_without_a_second_row`; `tests/worker_identity_e2e.rs`: `a_worker_claim_request_id_replays_byte_identically`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and under a worker credential. |
+| `IDENT-15` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_list_is_bounded_and_the_manifest_carries_the_worker_tools`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-16` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_list_is_bounded_and_the_manifest_carries_the_worker_tools`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-17` | MUST | process | `tests/identity_e2e.rs`: `a_schema_37_board_migrates_with_leases_at_attempt_one`; `tests/worker_identity_e2e.rs`: `a_schema_14_registry_migrates_to_15_and_serves_workers` | partial: the newer-schema refusal is proved on this binary (39 against 38), not on a baseline binary. |
+| `IDENT-18` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`; `tests/worker_identity_e2e.rs`: `worker_identity_is_refused_outside_managed_enforcement` | covered. |
 
 ## 9. Change log
 
@@ -577,3 +579,8 @@ row covered in part says `partial` and names what is still owed.
   exercises it with a handoff-create replay. IDENT-10 names its check (`check_write` against E
   over the task's current tags). §1 lists ADR-029. IDENT-13 quotes and cites the already-claimed
   sentence.
+- `2026-10-02` — implementing row `t-2aafd55c` Part B. Requirement delta, IDENT-11: the refusal
+  sentence for a worker's session handoff, which the closed list ("handoff create, from a lease it
+  holds") excluded without naming; exercised in
+  `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`. §8 trace rows filled from
+  `tests/worker_identity_e2e.rs`; IDENT-17 stays partial (baseline-binary refusal not run).

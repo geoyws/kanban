@@ -202,6 +202,8 @@ pub fn kind_advances_epoch(kind: &str) -> bool {
             | "breakglass_principal_rebound"
             | "breakglass_registry_admin"
             | "breakglass_sso_mapped"
+            | "worker_registered"
+            | "worker_retired"
     )
 }
 
@@ -361,6 +363,12 @@ pub struct PolicyEffect {
     pub unmapped_mappings: Vec<MappingRetirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enforcement: Option<String>,
+    /// Workers a `worker_registered` event creates, with every column
+    /// (docs/specs/identity.md IDENT-03). Never a credential or its digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<crate::worker::WorkerRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_workers: Vec<crate::worker::WorkerRetirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,7 +615,7 @@ pub fn matched_grant_ids(
 // Store helpers.
 // ---------------------------------------------------------------------------
 
-fn journal_next_seq(connection: &Connection, table: &str) -> Result<i64> {
+pub(crate) fn journal_next_seq(connection: &Connection, table: &str) -> Result<i64> {
     let last: i64 = connection.query_row(
         &format!("SELECT COALESCE(MAX(seq),0) FROM {table}"),
         [],
@@ -616,11 +624,11 @@ fn journal_next_seq(connection: &Connection, table: &str) -> Result<i64> {
     Ok(last + 1)
 }
 
-fn policy_event_id(seq: i64) -> String {
+pub(crate) fn policy_event_id(seq: i64) -> String {
     format!("pe-{seq:08}")
 }
 
-fn enforcement_state_on(connection: &Connection) -> Result<String> {
+pub(crate) fn enforcement_state_on(connection: &Connection) -> Result<String> {
     connection
         .query_row(
             "SELECT state FROM enforcement_state WHERE id=1",
@@ -630,7 +638,7 @@ fn enforcement_state_on(connection: &Connection) -> Result<String> {
         .map_err(Into::into)
 }
 
-fn policy_epoch_on(connection: &Connection) -> Result<i64> {
+pub(crate) fn policy_epoch_on(connection: &Connection) -> Result<i64> {
     connection
         .query_row(
             "SELECT COALESCE(MAX(epoch),0) FROM policy_epochs",
@@ -797,12 +805,20 @@ pub fn compute_state_hash(connection: &Connection) -> Result<String> {
             serde_json::to_string(&mapping).expect("mapping serializes")
         ));
     }
+    // Workers join the hash only when there are any, so a registry with no
+    // worker hashes exactly as it did before schema 15.
+    for worker in crate::worker::all_workers_on(connection)? {
+        parts.push(format!(
+            "worker={}",
+            serde_json::to_string(&worker).expect("worker serializes")
+        ));
+    }
     Ok(audit::bytes_sha256(parts.join("\n").as_bytes()))
 }
 
 /// The live `(epoch, resulting_state_hash)`, or the empty epoch-0 state when no
 /// policy event has committed yet.
-fn live_policy_state_on(connection: &Connection) -> Result<(i64, String)> {
+pub(crate) fn live_policy_state_on(connection: &Connection) -> Result<(i64, String)> {
     let payload: Option<String> = connection
         .query_row(
             "SELECT payload FROM policy_epochs ORDER BY seq DESC LIMIT 1",
@@ -821,7 +837,10 @@ fn live_policy_state_on(connection: &Connection) -> Result<(i64, String)> {
 }
 
 /// Append an access-audit row, chained into ADR-029's registry hash chain.
-fn append_access_audit(connection: &Connection, payload: &AccessAuditPayload) -> Result<()> {
+pub(crate) fn append_access_audit(
+    connection: &Connection,
+    payload: &AccessAuditPayload,
+) -> Result<()> {
     let json = serde_json::to_string(payload)?;
     let (seq, prev_hash, event_hash) = audit::next_chained(
         connection,
@@ -848,7 +867,7 @@ fn append_access_audit(connection: &Connection, payload: &AccessAuditPayload) ->
 }
 
 /// Append a policy event, chained, returning `(seq, event_hash)`.
-fn append_policy_event(
+pub(crate) fn append_policy_event(
     connection: &Connection,
     kind: &str,
     occurred_at: i64,
@@ -883,7 +902,10 @@ fn append_policy_event(
 }
 
 /// Append a policy epoch row, chained.
-fn append_policy_epoch(connection: &Connection, payload: &PolicyEpochPayload) -> Result<()> {
+pub(crate) fn append_policy_epoch(
+    connection: &Connection,
+    payload: &PolicyEpochPayload,
+) -> Result<()> {
     let json = serde_json::to_string(payload)?;
     let (seq, prev_hash, event_hash) = audit::next_chained(
         connection,
@@ -910,7 +932,7 @@ fn append_policy_epoch(connection: &Connection, payload: &PolicyEpochPayload) ->
 }
 
 /// Apply one event's projection effect to the materialized tables.
-fn apply_effect(connection: &Connection, effect: &PolicyEffect) -> Result<()> {
+pub(crate) fn apply_effect(connection: &Connection, effect: &PolicyEffect) -> Result<()> {
     for principal in &effect.principals {
         connection.execute(
             "INSERT INTO principals(id,username,uid,enabled,bound_at_epoch,bound_by_event_id,\
@@ -1002,6 +1024,15 @@ fn apply_effect(connection: &Connection, effect: &PolicyEffect) -> Result<()> {
     if let Some(state) = &effect.enforcement {
         connection.execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])?;
     }
+    for worker in &effect.workers {
+        crate::worker::insert_worker_on(connection, worker)?;
+    }
+    for retirement in &effect.retired_workers {
+        connection.execute(
+            "UPDATE workers SET state='retired',retired_at=? WHERE id=?",
+            params![retirement.retired_at, retirement.id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1016,7 +1047,7 @@ fn principal_with_on(connection: &Connection, row: &PrincipalRow) -> Result<Prin
 }
 
 /// The authority map for an enabled principal, from its active grants.
-fn principal_authority_on(
+pub(crate) fn principal_authority_on(
     connection: &Connection,
     principal_id: &str,
 ) -> Result<HashMap<ScopeTuple, Capability>> {
@@ -1102,7 +1133,7 @@ fn check_pair_collision(
 }
 
 /// Append a denied access-audit row and return the generic denial error.
-fn deny(
+pub(crate) fn deny(
     connection: &Connection,
     actor: &PolicyActor,
     operation: &str,
@@ -1159,7 +1190,11 @@ fn deny(
 
 /// Require the live epoch and state hash to equal the caller's minted context
 /// (clause 8). A mismatch is a stale context and is refused generically.
-fn require_context(connection: &Connection, actor: &PolicyActor, operation: &str) -> Result<()> {
+pub(crate) fn require_context(
+    connection: &Connection,
+    actor: &PolicyActor,
+    operation: &str,
+) -> Result<()> {
     let (epoch, state_hash) = live_policy_state_on(connection)?;
     if epoch != actor.epoch || state_hash != actor.state_hash {
         return Err(deny(
@@ -1246,7 +1281,7 @@ fn require_grantor_holds(
 }
 
 /// Build the allowed access-audit payload for a policy mutation.
-fn allowed_audit(
+pub(crate) fn allowed_audit(
     actor: &PolicyActor,
     operation: &str,
     epoch: i64,
@@ -3786,6 +3821,7 @@ fn replay_policy_on(connection: &Connection) -> Result<()> {
     let mut principals: HashMap<String, PrincipalRow> = HashMap::new();
     let mut grants: HashMap<String, Grant> = HashMap::new();
     let mut mappings: HashMap<String, SsoMapping> = HashMap::new();
+    let mut workers: HashMap<String, crate::worker::WorkerRow> = HashMap::new();
     let mut enforcement = "direct".to_owned();
     let mut prior_epoch = 0;
 
@@ -3827,6 +3863,15 @@ fn replay_policy_on(connection: &Connection) -> Result<()> {
         if let Some(state) = &event.effect.enforcement {
             enforcement = state.clone();
         }
+        for worker in &event.effect.workers {
+            workers.insert(worker.id.clone(), worker.clone());
+        }
+        for retirement in &event.effect.retired_workers {
+            if let Some(worker) = workers.get_mut(&retirement.id) {
+                worker.state = crate::worker::WorkerState::Retired;
+                worker.retired_at = Some(retirement.retired_at);
+            }
+        }
     }
 
     let mut live_principals: Vec<PrincipalRow> = all_principal_rows_on(connection)?;
@@ -3855,6 +3900,12 @@ fn replay_policy_on(connection: &Connection) -> Result<()> {
 
     if enforcement_state_on(connection)? != enforcement {
         bail!("replayed enforcement state does not match the materialized projection");
+    }
+
+    let mut replayed_workers: Vec<crate::worker::WorkerRow> = workers.into_values().collect();
+    replayed_workers.sort_by(|a, b| a.id.cmp(&b.id));
+    if crate::worker::all_workers_on(connection)? != replayed_workers {
+        bail!("replayed workers do not match the materialized projection");
     }
 
     // Verify the state hash against every epoch row.

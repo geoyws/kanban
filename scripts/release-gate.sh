@@ -106,6 +106,7 @@ integration_targets=(
     codex_app_server_adapter_e2e
     authz_bypass_matrix_e2e
     identity_e2e
+    worker_identity_e2e
     e2e
 )
 for target in "${integration_targets[@]}"; do

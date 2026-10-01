@@ -33,6 +33,7 @@ mod routing;
 mod search;
 mod store;
 mod watch;
+mod worker;
 mod zcode_notify_adapter;
 
 use crate::context::{render_context, render_todo};
@@ -297,6 +298,11 @@ Usage:
              --confirm prepared [--json]
   kanban access enforcement activate --expected-epoch EPOCH --prepare-receipt RECEIPT
              --as ACTOR --reason TEXT --confirm no-direct-fallback [--json]
+  kanban worker register --run RUN --lane-actor ACTOR [--harness-agent ID] [--task TASK]
+             --grant CAPABILITY=ATOM[,ATOM...] [--grant ...] [--json]
+  kanban worker show WORKER [--json]
+  kanban worker list [--limit N] [--state active|retired|all] [--json]
+  kanban worker retire WORKER [--json]
   kanban transact (--items JSON_ARRAY | --items-file PATH) [--json]
   kanban schema [--json]
   kanban mcp
@@ -453,13 +459,15 @@ pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
 /// everywhere else they appear — which is nowhere today, and that split is
 /// the reason this stays per-operation like the rest of [`LIST_VALUED`].
 pub(crate) const VERDICT_ADD_REPEATABLE: [&str; 2] = ["sha", "evidence"];
+/// A worker's own grant list, one `--grant` per pair (IDENT-04).
+pub(crate) const WORKER_REGISTER_REPEATABLE: [&str; 1] = ["grant"];
 struct ListValued {
     command: &'static str,
     sub: Option<&'static str>,
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 11] = [
+const LIST_VALUED: [ListValued; 12] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -514,6 +522,11 @@ const LIST_VALUED: [ListValued; 11] = [
         command: "task",
         sub: Some("verdict add"),
         flags: &VERDICT_ADD_REPEATABLE,
+    },
+    ListValued {
+        command: "worker",
+        sub: Some("register"),
+        flags: &WORKER_REGISTER_REPEATABLE,
     },
 ];
 
@@ -858,6 +871,31 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         Some("enforcement activate"),
         &["db", "project", "workspace"],
         "activates enforcement in the policy registry, never a board",
+    ),
+    // Worker records live in the policy registry (IDENT-02), never a board.
+    (
+        "worker",
+        Some("register"),
+        &["db", "project", "workspace"],
+        "registers a worker in the policy registry, never a board",
+    ),
+    (
+        "worker",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads a worker from the policy registry, never a board",
+    ),
+    (
+        "worker",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "lists workers from the policy registry, never a board",
+    ),
+    (
+        "worker",
+        Some("retire"),
+        &["db", "project", "workspace"],
+        "retires a worker in the policy registry, never a board",
     ),
 ];
 
@@ -1658,6 +1696,16 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         false,
     ),
+    (
+        "worker",
+        Some("register"),
+        &["run", "lane-actor", "harness-agent", "task", "grant"],
+        &[],
+        false,
+    ),
+    ("worker", Some("show"), &[], &["worker"], true),
+    ("worker", Some("list"), &["limit", "state"], &[], true),
+    ("worker", Some("retire"), &[], &["worker"], false),
 ];
 
 /// Whether an enum-valued argument is a flag or a positional.
@@ -1927,7 +1975,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 14] = [
+const SUBCOMMAND_GROUPS: [&str; 15] = [
     "task",
     "story",
     "handoff",
@@ -1942,6 +1990,7 @@ const SUBCOMMAND_GROUPS: [&str; 14] = [
     "subscription",
     "access",
     "sprint",
+    "worker",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -2636,7 +2685,8 @@ fn begin_request(store: &Store, args: &Args, command: &'static str) -> Result<Re
     if owns_scope {
         store.begin_batch()?;
     }
-    let stored = match store.request_receipt("", "", command, key) {
+    let (principal, worker) = store.request_identity();
+    let stored = match store.request_receipt(&principal, &worker, command, key) {
         Ok(stored) => stored,
         Err(error) => {
             if owns_scope {
@@ -2674,9 +2724,10 @@ fn finish_request(
         return emit(&outcome?);
     };
     let landed = outcome.and_then(|text| {
+        let (principal, worker) = store.request_identity();
         store.record_request_receipt(
-            "",
-            "",
+            &principal,
+            &worker,
             pending.command,
             &pending.key,
             &pending.digest,
@@ -6025,6 +6076,9 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     // something to discard on the way to a confident answer.
     reject_ignored_selectors(&args, command, spec_sub.as_deref())?;
 
+    // IDENT-01 and IDENT-11, before anything is opened or written.
+    require_worker_may_run(command, spec_sub.as_deref())?;
+
     if command == "version" {
         emit(&version_string())?;
         return Ok(());
@@ -6868,6 +6922,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     // opens one. It is also the only surface that mints a policy actor.
     if command == "access" {
         return run_access(&args, spec_sub.as_deref());
+    }
+    // Worker records are registry rows too (IDENT-02), never a board's.
+    if command == "worker" {
+        return run_worker(&args, spec_sub.as_deref(), rest);
     }
 
     // Before the single open site, because a batch opens the board itself and
@@ -7904,6 +7962,186 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         return Ok(());
     }
     bail!("unknown command; run kanban --help")
+}
+
+/// IDENT-01 and IDENT-11: worker identity exists only under managed
+/// enforcement, and a worker runs a closed list of operations. Called before
+/// any board, registry write or lock, so a refusal writes nothing.
+fn require_worker_may_run(command: &str, sub: Option<&str>) -> Result<()> {
+    let credential = env::var_os(worker::CREDENTIAL_ENV);
+    if command != "worker" && credential.is_none() {
+        return Ok(());
+    }
+    let state = routing::enforcement_label()?;
+    if state != "managed" {
+        bail!("worker identity needs managed enforcement; this installation is {state}");
+    }
+    if credential.is_none() {
+        return Ok(());
+    }
+    // IDENT-05: every way a credential fails to name a live worker of this
+    // caller's principal is the one generic answer.
+    let worker_id = routing::local_caller()
+        .ok()
+        .and_then(|caller| caller.worker)
+        .map(|worker| worker.row.id)
+        .ok_or_else(|| anyhow::anyhow!("denied or not found"))?;
+    let lease_bound = matches!(
+        (command, sub),
+        ("claim" | "heartbeat" | "release" | "checkpoint" | "note", _)
+            | ("handoff", Some("create" | "accept"))
+    );
+    // The read side is exactly the commands whose generated MCP tool reads
+    // only, every `access` command excepted; `batch` is that read-only
+    // envelope, and `mcp` serves each call through this same gate.
+    let read_only = command != "access"
+        && (matches!(command, "version" | "help" | "batch" | "mcp")
+            || COMMANDS
+                .iter()
+                .any(|row| row.0 == command && row.1 == sub && row.4));
+    if command == "worker" || lease_bound || read_only {
+        return Ok(());
+    }
+    let name = sub.map_or_else(|| command.to_owned(), |sub| format!("{command} {sub}"));
+    bail!("worker {worker_id} may not run {name}: it is coordinator-only")
+}
+
+/// `worker register|show|list|retire` (IDENT-02 .. IDENT-07, IDENT-15).
+fn run_worker(args: &Args, sub: Option<&str>, rest: &[String]) -> Result<()> {
+    let json = args.has("json");
+    let presented = env::var(worker::CREDENTIAL_ENV).ok();
+    let mut registry = Registry::open()?;
+    let actor = local_actor(&registry, None, None)?;
+    let denied = || anyhow::anyhow!("denied or not found");
+    let principal_id = actor.principal_id.clone().ok_or_else(denied)?;
+    let caller = match presented.as_deref() {
+        Some(credential) => Some(
+            registry
+                .resolve_worker(&principal_id, credential)?
+                .ok_or_else(denied)?,
+        ),
+        None => None,
+    };
+    match sub {
+        Some("register") => {
+            let run_id = args.require("run")?;
+            worker::validate_label("run", run_id)?;
+            let harness_agent_id = args.one("harness-agent");
+            if let Some(value) = harness_agent_id {
+                worker::validate_label("harness-agent", value)?;
+            }
+            let lane_actor = args.require("lane-actor")?;
+            worker::validate_lane_actor(lane_actor)?;
+            let grants = args
+                .many("grant")
+                .iter()
+                .map(|value| worker::WorkerGrant::parse(value))
+                .collect::<Result<Vec<_>>>()?;
+            if grants.is_empty() {
+                bail!("worker register needs at least one --grant CAPABILITY=ATOM[,ATOM...]");
+            }
+            let task_root = match args.one("task") {
+                None => worker::TaskRootChoice::Inherit,
+                Some(task) => worker_task_root(&registry, &grants, caller.as_ref(), task)?,
+            };
+            let registration = registry.register_worker(
+                &actor,
+                presented.as_deref(),
+                worker::RegisterWorker {
+                    run_id: run_id.to_owned(),
+                    harness_agent_id: harness_agent_id.map(str::to_owned),
+                    lane_actor: lane_actor.to_owned(),
+                    grants,
+                    task_root,
+                },
+            )?;
+            print(&registration, json)
+        }
+        Some("show") => {
+            let id = rest.first().context("worker id is required")?;
+            print(
+                &registry.visible_worker(&principal_id, caller.as_ref(), id)?,
+                json,
+            )
+        }
+        Some("list") => {
+            let limit = match args.one("limit") {
+                None => worker::LIST_DEFAULT,
+                Some(raw) => raw
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| (1..=worker::LIST_CEILING).contains(n))
+                    .with_context(|| {
+                        format!(
+                            "--limit must be between 1 and {}, got {raw}",
+                            worker::LIST_CEILING
+                        )
+                    })?,
+            };
+            let filter = worker::StateFilter::parse(args.one("state").unwrap_or("all"))?;
+            let (workers, truncated) =
+                registry.visible_workers(&principal_id, caller.as_ref(), filter, limit)?;
+            print(&json!({"workers": workers, "truncated": truncated}), json)
+        }
+        Some("retire") => {
+            let id = rest.first().context("worker id is required")?;
+            print(
+                &registry.retire_worker(&actor, presented.as_deref(), id)?,
+                json,
+            )
+        }
+        _ => bail!("worker needs a subcommand: register, show, list or retire"),
+    }
+}
+
+/// Resolve `worker register --task TASK` (IDENT-04): the task must be on a
+/// board one of the requested grants covers, and — when the registrant is a
+/// worker with a task root — that root or one of its descendants.
+fn worker_task_root(
+    registry: &Registry,
+    grants: &[worker::WorkerGrant],
+    registrant: Option<&worker::ResolvedWorker>,
+    task: &str,
+) -> Result<worker::TaskRootChoice> {
+    let boards: HashSet<String> = grants
+        .iter()
+        .filter_map(|grant| match ScopeTuple::from_atoms(&grant.scope).ok()? {
+            ScopeTuple::Board { board_id }
+            | ScopeTuple::BoardTag { board_id, .. }
+            | ScopeTuple::BoardWildcard { board_id } => Some(board_id),
+            ScopeTuple::Registry => None,
+        })
+        .collect();
+    for project in registry.projects()? {
+        let Some(board_id) = board_id_from_path(&project.board_path) else {
+            continue;
+        };
+        if !boards.contains(&board_id) {
+            continue;
+        }
+        let Ok(store) = Store::open_readonly_as_caller(Path::new(&project.board_path)) else {
+            continue;
+        };
+        let Some(lineage) = store.task_lineage(task)? else {
+            continue;
+        };
+        if let Some(parent) = registrant
+            && let Some(root) = &parent.row.task_root
+            && (root.board_id != board_id || !lineage.contains(&root.task_id))
+        {
+            return Ok(worker::TaskRootChoice::Refused(format!(
+                "task {task} is outside worker {}'s task root {}",
+                parent.row.id, root.task_id
+            )));
+        }
+        return Ok(worker::TaskRootChoice::Named(worker::TaskRoot {
+            board_id,
+            task_id: task.to_owned(),
+        }));
+    }
+    Ok(worker::TaskRootChoice::Refused(
+        "denied or not found".to_owned(),
+    ))
 }
 
 /// Mint the policy actor for the local trusted caller. The broker's

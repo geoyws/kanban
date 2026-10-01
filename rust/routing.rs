@@ -247,16 +247,27 @@ pub fn board_authz(path: &Path) -> Result<AuthzContext> {
     // Under `managed` a failure to establish authority is not an error to
     // report, it is an absence of authority: an empty map denies every row
     // through the one generic refusal, so an unbound UID, a diverged passwd
-    // pair and an unreadable policy table are indistinguishable from outside.
-    // Fail-closed, and not an oracle.
-    Ok(AuthzContext::new(
-        enforcement,
-        local_authority().unwrap_or_default(),
-        board_id,
-    ))
+    // pair, an unreadable policy table and a credential that resolves to no
+    // live worker are indistinguishable from outside. Fail-closed, and not an
+    // oracle.
+    Ok(match local_caller() {
+        Ok(caller) => AuthzContext::new(enforcement, caller.authority, board_id)
+            .with_caller(caller.principal_id, caller.worker),
+        Err(_) => AuthzContext::new(enforcement, HashMap::new(), board_id),
+    })
 }
 
-/// The authority this process holds, minted from its own kernel identity.
+/// What a managed caller is: its principal, its authority, and — for a
+/// worker call — the worker it acts as.
+pub struct LocalCaller {
+    pub principal_id: String,
+    pub authority: HashMap<ScopeTuple, Capability>,
+    pub worker: Option<crate::worker::ResolvedWorker>,
+}
+
+/// The caller this process is, minted from its own kernel identity and, when
+/// `KANBAN_WORKER_CREDENTIAL` is set, from the worker that credential names
+/// (docs/specs/identity.md IDENT-05, IDENT-06).
 ///
 /// The broker's `SO_PEERCRED` hop is a separate slice, and in its place this
 /// applies exactly the evidence chain `local_actor` already applies to the
@@ -267,10 +278,16 @@ pub fn board_authz(path: &Path) -> Result<AuthzContext> {
 /// `--actor-header`, or a subscription's `actor` column can produce none of
 /// this and none of them is read here.
 ///
+/// A worker call's authority is the worker's effective authority, narrowed
+/// from that principal's live grants down the worker's ancestry, recomputed
+/// here on every open so a revocation or a retirement lands on the next call.
+/// A credential that resolves to no live worker of this principal is an
+/// error, which the board open turns into no authority at all.
+///
 /// Root gets nothing: clause 6 says root is not a policy principal, so a
 /// root-owned board open under managed enforcement holds no board authority
 /// and has to go through break-glass rather than through this.
-fn local_authority() -> Result<HashMap<ScopeTuple, Capability>> {
+pub fn local_caller() -> Result<LocalCaller> {
     let uid = unsafe { libc::geteuid() };
     if uid == 0 {
         bail!("root is not a policy principal");
@@ -287,7 +304,37 @@ fn local_authority() -> Result<HashMap<ScopeTuple, Capability>> {
     let principal = registry
         .resolve_principal(&username, uid)?
         .context("uid resolves to no enabled principal")?;
-    registry.principal_authority(&principal.row.id)
+    let principal_id = principal.row.id;
+    let Some(credential) = std::env::var_os(crate::worker::CREDENTIAL_ENV) else {
+        return Ok(LocalCaller {
+            authority: registry.principal_authority(&principal_id)?,
+            principal_id,
+            worker: None,
+        });
+    };
+    let worker = registry
+        .resolve_worker(&principal_id, &credential.to_string_lossy())?
+        .context("the worker credential resolves to no live worker")?;
+    Ok(LocalCaller {
+        authority: worker.authority.clone(),
+        principal_id,
+        worker: Some(worker),
+    })
+}
+
+/// The installation's enforcement state as IDENT-01's refusal names it:
+/// `unregistered` when the canonical registry is absent, else the state the
+/// enforcement gate reads.
+pub fn enforcement_label() -> Result<&'static str> {
+    let root = canonical_data_root()?;
+    if !root.join("registry.db").exists() {
+        return Ok("unregistered");
+    }
+    Ok(match enforcement_state_at(&root)? {
+        Enforcement::Direct => "direct",
+        Enforcement::Prepared => "prepared",
+        Enforcement::Managed => "managed",
+    })
 }
 
 #[cfg(test)]

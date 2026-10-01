@@ -2677,7 +2677,7 @@ CREATE TABLE IF NOT EXISTS request_receipts (
 "#;
 
 /// The v38 columns, each with the backfill that runs when it is added.
-const BOARD_V38_COLUMNS: [(&str, &str, &str, Option<&str>); 10] = [
+const IDENTITY_COLUMNS_V38: [(&str, &str, &str, Option<&str>); 10] = [
     (
         "tasks",
         "attempt",
@@ -2742,7 +2742,7 @@ const BOARD_V38_COLUMNS: [(&str, &str, &str, Option<&str>); 10] = [
 
 /// Add every v38 column the board lacks, backfilling each one it adds.
 fn apply_board_v38_columns(connection: &Connection) -> Result<()> {
-    for (table, column, alter, backfill) in BOARD_V38_COLUMNS {
+    for (table, column, alter, backfill) in IDENTITY_COLUMNS_V38 {
         let present: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
             params![table, column],
@@ -3060,8 +3060,42 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
+/// Delegated workers (docs/specs/identity.md IDENT-02, IDENT-05, IDENT-17;
+/// ADR-059).
+///
+/// `workers` is a policy projection: `worker_registered` and `worker_retired`
+/// events carry every column, so replay rebuilds it and the policy state hash
+/// covers it. `worker_credentials` is deliberately NOT a projection: a policy
+/// event never holds a credential or its digest (IDENT-03), so the digest
+/// lives here, written in the registering transaction, outside replay. A
+/// worker id is minted by Kanban; `grants` is the worker's own grant list as
+/// `[{"capability","scope"}]`; `task_root` is `{"boardId","taskId"}` or null.
+/// Only `state` and `retired_at` ever change (IDENT-02).
+const REGISTRY_V15: &str = r#"
+CREATE TABLE workers (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ parent_worker_id TEXT,
+ run_id TEXT NOT NULL,
+ harness_agent_id TEXT,
+ lane_actor TEXT NOT NULL,
+ task_root TEXT CHECK(task_root IS NULL OR json_valid(task_root)),
+ grants TEXT NOT NULL CHECK(json_valid(grants) AND json_type(grants) = 'array'),
+ state TEXT NOT NULL CHECK(state IN ('active','retired')),
+ registered_at INTEGER NOT NULL,
+ registered_epoch INTEGER NOT NULL,
+ retired_at INTEGER
+) STRICT;
+CREATE INDEX idx_workers_principal ON workers(principal_id,registered_at DESC,id);
+CREATE INDEX idx_workers_parent ON workers(parent_worker_id);
+CREATE TABLE worker_credentials (
+ worker_id TEXT PRIMARY KEY NOT NULL,
+ credential_sha256 TEXT NOT NULL UNIQUE
+) STRICT;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 38;
-pub const REGISTRY_SCHEMA_VERSION: usize = 14;
+pub const REGISTRY_SCHEMA_VERSION: usize = 15;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -4169,6 +4203,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V12,
     REGISTRY_V13,
     REGISTRY_V14,
+    REGISTRY_V15,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -4864,7 +4899,7 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..14]).unwrap();
         assert_eq!(schema_version(&connection).unwrap(), 14);
 
         let boards: i64 = connection

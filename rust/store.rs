@@ -4014,7 +4014,7 @@ pub struct ClaimOptions {
 
 /// The outcome of settling a restore rescue source before copying it.
 pub(crate) enum PreparedRescueRead {
-    Online(Store),
+    Online(Box<Store>),
     PhysicalFailure(anyhow::Error),
 }
 
@@ -4568,6 +4568,130 @@ impl Store {
         Ok(())
     }
 
+    /// Who a request receipt is keyed by (IDENT-14): the managed principal
+    /// and the worker, the empty string standing for none.
+    pub(crate) fn request_identity(&self) -> (String, String) {
+        (
+            self.authz.principal_id().unwrap_or_default().to_owned(),
+            self.authz.worker_id().unwrap_or_default().to_owned(),
+        )
+    }
+
+    /// IDENT-08: a worker's claim or handoff accept must name, in `--as`,
+    /// exactly the lane actor the worker was registered with.
+    fn require_worker_lane_actor(&self, actor: &str) -> Result<()> {
+        if let Some(worker) = self.authz.worker()
+            && worker.lane_actor != actor
+        {
+            bail!(
+                "worker {} acts as {}, not {actor}",
+                worker.worker_id,
+                worker.lane_actor
+            );
+        }
+        Ok(())
+    }
+
+    /// IDENT-10: a worker call may use only a lease its own worker holds, and
+    /// a call without a credential only a lease no worker holds. The refusal
+    /// names workers, never a lease token or a credential.
+    fn require_lease_worker(&self, claim: &Claim) -> Result<()> {
+        let caller = self.authz.worker_id();
+        if claim.worker_id.as_deref() == caller {
+            return Ok(());
+        }
+        bail!(
+            "lease belongs to {}, not {}",
+            claim.worker_id.as_deref().map_or_else(
+                || "no worker".to_owned(),
+                |holder| format!("worker {holder}")
+            ),
+            caller.unwrap_or("no worker")
+        );
+    }
+
+    /// IDENT-04, IDENT-06: a worker with a task root reaches only that task
+    /// and its descendants by `parent_id`, on that board. Anything else is the
+    /// generic refusal, so the root is not an existence oracle.
+    fn require_in_task_root(&self, connection: &Connection, task_id: &str) -> Result<()> {
+        let Some(root) = self
+            .authz
+            .worker()
+            .and_then(|worker| worker.task_root.as_ref())
+        else {
+            return Ok(());
+        };
+        if root.board_id != self.authz.board_id() {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        let mut cursor = Some(task_id.to_owned());
+        // Bounded walk up the parent links: a parent cycle cannot hold a
+        // caller here.
+        for _ in 0..10_000 {
+            let Some(id) = cursor else { break };
+            if id == root.task_id {
+                return Ok(());
+            }
+            cursor = connection
+                .query_row("SELECT parent_id FROM tasks WHERE id=?", [&id], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten();
+        }
+        Err(crate::authz::DeniedOrNotFound.into())
+    }
+
+    /// `task_id` and its ancestors by `parent_id`, nearest first, or `None`
+    /// when the task is not on this board: what `worker register --task`
+    /// checks a task root against (IDENT-04).
+    pub(crate) fn task_lineage(&self, task_id: &str) -> Result<Option<Vec<String>>> {
+        let mut lineage = Vec::new();
+        let mut cursor = Some(task_id.to_owned());
+        // Bounded, as `require_in_task_root` is: a parent cycle cannot hold a
+        // caller here.
+        for _ in 0..10_000 {
+            let Some(id) = cursor else { break };
+            let parent: Option<Option<String>> = self
+                .connection
+                .query_row("SELECT parent_id FROM tasks WHERE id=?", [&id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match parent {
+                Some(parent) => {
+                    lineage.push(id);
+                    cursor = parent;
+                }
+                None if lineage.is_empty() => return Ok(None),
+                None => break,
+            }
+        }
+        Ok(Some(lineage))
+    }
+
+    /// IDENT-10: a lease-bound worker call rechecks `write` against its
+    /// effective authority over the task's current tags, and its task root.
+    /// Every call that is not a worker call is left exactly as it was.
+    fn require_worker_task_write(&self, connection: &Connection, task_id: &str) -> Result<()> {
+        if self.authz.worker().is_none() {
+            return Ok(());
+        }
+        let tags = task_tags(connection, task_id)?;
+        self.authz.check_write(&tags, &tags)?;
+        self.require_in_task_root(connection, task_id)
+    }
+
+    /// Add the worker and principal to an event written under a worker call
+    /// (IDENT-08). Every other call's payload is left exactly as it was.
+    fn stamp_worker(&self, mut payload: Value) -> Value {
+        if let (Some(worker), Some(object)) = (self.authz.worker_id(), payload.as_object_mut()) {
+            object.insert("workerId".into(), json!(worker));
+            object.insert("principalId".into(), json!(self.authz.principal_id()));
+        }
+        payload
+    }
+
     /// Open a board file DIRECTLY: POSIX file permission is the only
     /// authorization, no policy row is consulted, and the guard no-ops. That
     /// is ADR-038 clause 9's direct open, stated as a constructor.
@@ -4796,7 +4920,10 @@ impl Store {
             Err(error) => return Ok(PreparedRescueRead::PhysicalFailure(error)),
         };
         whole_board_read_on(&authz, &connection)?;
-        Ok(PreparedRescueRead::Online(Self { connection, authz }))
+        Ok(PreparedRescueRead::Online(Box::new(Self {
+            connection,
+            authz,
+        })))
     }
 
     pub(crate) fn require_restore_write(path: &Path) -> Result<()> {
@@ -7530,6 +7657,9 @@ impl Store {
         if options.lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
+        // IDENT-08, before anything is read: a worker claims only as the lane
+        // actor it was registered with.
+        self.require_worker_lane_actor(&agent)?;
         // Before the write lock and before any row is chosen: a malformed
         // `--model` is refused by name rather than silently matching nothing
         // in an allow-list and reading as "this model may not claim it".
@@ -7550,6 +7680,7 @@ impl Store {
         let task = if let Some(id) = id {
             let tags = task_tags(&transaction, id)?;
             self.authz.check_write(&tags, &tags)?;
+            self.require_in_task_root(&transaction, id)?;
             let task = require_active_task_authorized(&transaction, id, &self.authz)?;
             if let Some(required_sprint) = sprint_filter.as_deref() {
                 let attached: Option<String> = transaction
@@ -7576,7 +7707,11 @@ impl Store {
             let mut selected = None;
             for candidate in candidates {
                 let tags = task_tags(&transaction, &candidate.id)?;
-                if self.authz.check_write(&tags, &tags).is_ok() {
+                if self.authz.check_write(&tags, &tags).is_ok()
+                    && self
+                        .require_in_task_root(&transaction, &candidate.id)
+                        .is_ok()
+                {
                     selected = Some(candidate);
                     break;
                 }
@@ -7625,8 +7760,10 @@ impl Store {
         }
         let token = Uuid::new_v4().to_string();
         let attempt = next_attempt(&transaction, &task.id)?;
+        // The lease names its worker and principal under managed enforcement
+        // (IDENT-08); both stay null everywhere else (IDENT-18).
         transaction.execute(
-            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 task.id,agent,options.session_id,token,now,now,now+options.lease_ms,
                 options.git.as_ref().map(|g| g.worktree.clone()),
@@ -7636,6 +7773,8 @@ impl Store {
                 options.git.as_ref().and_then(|g| g.root_head.clone()),
                 options.model,
                 attempt,
+                self.authz.worker_id(),
+                self.authz.principal_id(),
             ],
         )?;
         transaction.execute(
@@ -7660,7 +7799,7 @@ impl Store {
                 if let Some(model) = &options.model {
                     payload["model"] = json!(model);
                 }
-                payload
+                self.stamp_worker(payload)
             },
             Some(&task.status),
             Some("in_progress"),
@@ -7734,6 +7873,8 @@ impl Store {
         }
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, id)?;
         // A live lease is never revoked by a gate, but renewing one asserts
         // the work is still going: a prerequisite introduced or reopened
         // underneath the holder stops the renewal here, and the holder's way
@@ -7765,7 +7906,7 @@ impl Store {
             Some(id),
             "claim_heartbeat",
             Some(&claim.agent_id),
-            json!({"expiresAt": now+lease_ms}),
+            self.stamp_worker(json!({"expiresAt": now+lease_ms})),
         )?;
         let result = active_claim(&transaction, id, now)?.context("claim disappeared")?;
         transaction.commit()?;
@@ -7782,6 +7923,8 @@ impl Store {
             require_active_task_authorized(&transaction, id, &self.authz)?;
         }
         let claim = require_lease(&transaction, id, token, now_ms())?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, id)?;
         transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         if !keep_status {
             transaction.execute(
@@ -7799,7 +7942,7 @@ impl Store {
             Some(id),
             "claim_released",
             Some(&claim.agent_id),
-            json!({}),
+            self.stamp_worker(json!({})),
             Some("in_progress"),
             Some(&current_status),
         )?;
@@ -7826,6 +7969,13 @@ impl Store {
         }
         reject_secret_shaped_text(body, "note body")?;
         let now = now_ms();
+        // IDENT-11: a worker notes only a task whose active lease it holds.
+        if self.authz.worker().is_some() {
+            let held = active_claim(&transaction, id, now)?
+                .ok_or_else(|| anyhow::Error::from(crate::authz::DeniedOrNotFound))?;
+            self.require_lease_worker(&held)?;
+            self.require_worker_task_write(&transaction, id)?;
+        }
         transaction.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
             params![
@@ -7841,7 +7991,7 @@ impl Store {
             Some(id),
             "note_added",
             Some(author),
-            json!({"kind":kind}),
+            self.stamp_worker(json!({"kind":kind})),
         )?;
         transaction.commit()?;
         // The receipt is the row this write just committed, re-read directly
@@ -7897,6 +8047,8 @@ impl Store {
         let prior_status = prior.status.clone();
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
+        self.require_lease_worker(&claim)?;
+        self.require_worker_task_write(&transaction, &input.task_id)?;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -7968,7 +8120,7 @@ impl Store {
             Some(&input.task_id),
             "checkpoint_added",
             Some(&input.author),
-            json!({"seq":seq,"state":input.state}),
+            self.stamp_worker(json!({"seq":seq,"state":input.state})),
             Some(prior_status.as_str()),
             Some(status),
         )?;
@@ -9598,6 +9750,8 @@ impl Store {
         let claim = match (&input.task_id, &input.lease_token) {
             (Some(task_id), Some(token)) => {
                 let claim = require_lease(&transaction, task_id, token, now)?;
+                self.require_lease_worker(&claim)?;
+                self.require_worker_task_write(&transaction, task_id)?;
                 if claim.agent_id != input.from_agent {
                     bail!(
                         "lease belongs to {}, not {}",
@@ -9607,7 +9761,15 @@ impl Store {
                 }
                 Some(claim)
             }
-            (None, None) => None,
+            (None, None) => {
+                // IDENT-11: a worker hands over only from a lease it holds.
+                if let Some(worker) = self.authz.worker_id() {
+                    bail!(
+                        "worker {worker} may hand over only a task whose lease it holds: pass the task id and --lease"
+                    );
+                }
+                None
+            }
             (Some(_), None) => bail!("handing over a task needs its lease: pass --lease"),
             (None, Some(_)) => {
                 bail!("a lease is held over a task, so --lease needs the task id it belongs to")
@@ -9679,7 +9841,7 @@ impl Store {
             input.task_id.as_deref(),
             "handoff_created",
             Some(&input.from_agent),
-            json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)}),
+            self.stamp_worker(json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)})),
             prior_status.as_deref(),
             Some("todo"),
         )?;
@@ -9707,6 +9869,8 @@ impl Store {
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
+        // IDENT-08: the same --as rule and refusal as a worker's claim, first.
+        self.require_worker_lane_actor(&agent)?;
         if let Some(model) = &model {
             crate::model::validate_model_name(model)?;
         }
@@ -9772,7 +9936,7 @@ impl Store {
                 None,
                 "handoff_accepted",
                 Some(&agent),
-                json!({"handoffID":id,"session":true}),
+                self.stamp_worker(json!({"handoffID":id,"session":true})),
             )?;
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
@@ -9794,7 +9958,9 @@ impl Store {
                     Some(&task_id),
                     "handoff_accepted",
                     Some(&agent),
-                    json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                    self.stamp_worker(
+                        json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                    ),
                 )?;
                 let updated = transaction.query_row(
                     "SELECT * FROM handoffs WHERE id=?",
@@ -9805,6 +9971,8 @@ impl Store {
                 return Ok((updated, None));
             }
         };
+        // IDENT-08: after the target rule, write against E and the task root.
+        self.require_worker_task_write(&transaction, &task.id)?;
         // Once work has been blocked or settled, accepting an older brief is
         // acknowledgement rather than ownership transfer. There is no
         // claimable task to protect, and leaving the handoff pending forever
@@ -9817,7 +9985,9 @@ impl Store {
                 Some(&task.id),
                 "handoff_accepted",
                 Some(&agent),
-                json!({"handoffID":id,"acknowledged":true,"taskStatus":task.status}),
+                self.stamp_worker(
+                    json!({"handoffID":id,"acknowledged":true,"taskStatus":task.status}),
+                ),
             )?;
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
@@ -9874,7 +10044,7 @@ impl Store {
         }
         let token = Uuid::new_v4().to_string();
         let attempt = next_attempt(&transaction, &task.id)?;
-        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
+        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
             task.id,agent,session,token,now,now,now+lease_ms,
             git.as_ref().map(|g| g.worktree.clone()),
             git.as_ref().map(|g| g.worktree_kind.to_owned()),
@@ -9883,6 +10053,8 @@ impl Store {
             git.as_ref().and_then(|g| g.root_head.clone()),
             model,
             attempt,
+            self.authz.worker_id(),
+            self.authz.principal_id(),
         ])?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
@@ -9902,7 +10074,7 @@ impl Store {
                 if let Some(value) = &model {
                     payload["model"] = json!(value);
                 }
-                payload
+                self.stamp_worker(payload)
             },
             Some(&task.status),
             Some("in_progress"),

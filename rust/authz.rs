@@ -160,6 +160,21 @@ pub struct AuthzContext {
     enforcement: Enforcement,
     authority: HashMap<ScopeTuple, Capability>,
     board_id: String,
+    /// The managed principal this context was minted for; `None` outside
+    /// managed enforcement (docs/specs/identity.md IDENT-08, IDENT-18).
+    principal_id: Option<String>,
+    /// The worker a worker call acts as; `None` for every other call. Boxed:
+    /// every store carries this context and almost none is a worker call.
+    worker: Option<Box<WorkerBinding>>,
+}
+
+/// What a store needs to know about the worker a call acts as: who it is,
+/// the lane actor its `--as` must equal, and the task it is confined to.
+#[derive(Debug, Clone)]
+pub struct WorkerBinding {
+    pub worker_id: String,
+    pub lane_actor: String,
+    pub task_root: Option<crate::worker::TaskRoot>,
 }
 
 impl AuthzContext {
@@ -171,6 +186,8 @@ impl AuthzContext {
             enforcement: Enforcement::Direct,
             authority: HashMap::new(),
             board_id,
+            principal_id: None,
+            worker: None,
         }
     }
 
@@ -186,7 +203,42 @@ impl AuthzContext {
             enforcement,
             authority,
             board_id,
+            principal_id: None,
+            worker: None,
         }
+    }
+
+    /// Name the managed caller this context's authority was minted for, and
+    /// the worker it acts as, if any.
+    pub fn with_caller(
+        mut self,
+        principal_id: String,
+        worker: Option<crate::worker::ResolvedWorker>,
+    ) -> Self {
+        self.principal_id = Some(principal_id);
+        self.worker = worker.map(|worker| {
+            Box::new(WorkerBinding {
+                worker_id: worker.row.id,
+                lane_actor: worker.row.lane_actor,
+                task_root: worker.row.task_root,
+            })
+        });
+        self
+    }
+
+    /// The managed principal, under managed enforcement only.
+    pub fn principal_id(&self) -> Option<&str> {
+        self.principal_id.as_deref()
+    }
+
+    /// The worker this call acts as, for a worker call only.
+    pub fn worker(&self) -> Option<&WorkerBinding> {
+        self.worker.as_deref()
+    }
+
+    /// The worker id this call acts as, or `None`.
+    pub fn worker_id(&self) -> Option<&str> {
+        self.worker.as_ref().map(|worker| worker.worker_id.as_str())
     }
 
     /// The board UUID this context authorizes against.
