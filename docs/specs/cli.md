@@ -16,8 +16,9 @@
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-10-02 for the `CLI-09` delta (independent reviewer
   `SpecReviewCli09` against the SDD §1 exit criteria at `8630f23`: two P3 consistency nits in
-  §2 and §5, fixed in the same change); `SPEC-READY` on 2026-10-01 for the `CLI-08` delta
-  (independent reviewer against the
+  §2 and §5, fixed in the same change); `SPEC-READY` on 2026-10-02 for the `CLI-02` map delta
+  (independent reviewer `SpecReviewCli02Map` against the SDD §1 exit criteria at `ddab15b`: no
+  findings); `SPEC-READY` on 2026-10-01 for the `CLI-08` delta (independent reviewer against the
   SDD §1 exit criteria at `89d717e`: no findings), as on 2026-09-29 for `CLI-01`..`CLI-07`
   (independent reviewer applying the SDD §1 exit criteria:
   no findings. Specification readiness only — it authorises neither implementation, nor rollout,
@@ -152,10 +153,12 @@ Permissions: registration stays open to any writer, exactly as today.
 
 **CLI-02** — the board-to-estate map is compiled in beside `ESTATES`.
 Strength: `MUST` · Layer: `unit` · Source: board rows `t-7f596f45`, `t-fb600b26` (decision
-recorded, not re-decided here).
+recorded, not re-decided here); George's board-to-estate map `a-502383be` (2026-09-20), added
+by `t-159e55fb`.
 `estate_for_board` maps `px`, `fmx`, `hx`, `hrx`, `ix`, `mx-root`, `prjx-root`, `rentx-root`,
 `auditx-root`, `ifca-docs` and `prjx` to `ifca`; `kanban`, `omp`, `acies`, `dotfiles`,
-`geoyws`, `atmux`, `dash`, `gitea`, `journal`, `orch` and `hax` to `geoyws`; any name
+`geoyws`, `atmux`, `dash`, `gitea`, `journal`, `orch`, `hax`, `medic`, `ord`, `hom`,
+`vidgen`, `superdriver`, `approval-classifier` and `dshoc` to `geoyws`; any name
 starting with `unum`, and `memberx`, to `unum`; every other name to no estate. Adding a
 fourth estate, or moving a board, is a deliberate edit to this map — never a side effect of
 a mistyped tag. There is no second board list: `rust/store.rs:409` stays the one estate
@@ -310,7 +313,8 @@ active board` on the rule), and none carries `not namespaced`.
 *Given* the compiled binary,
 *when* the map is asked for `prjx`, `ix`, `kanban`, `hax`, `memberx`, `unum-ledger` and
 `scratch`,
-*then* it answers `ifca`, `ifca`, `geoyws`, `geoyws`, `unum`, `unum` and no estate.
+*then* it answers `ifca`, `ifca`, `geoyws`, `geoyws`, `unum`, `unum` and no estate; and for
+`medic` and `ord` it answers `geoyws`.
 
 ### A6 (`CLI-01`)
 
@@ -491,3 +495,11 @@ old name.
 - `2026-10-02` — stamped `SPEC-READY` for `CLI-09` (independent review of `8630f23` against
   the SDD §1 exit criteria; its two P3 nits, the §2 rename non-goal and the §5 refusal
   inventory, fixed). No requirement ID changed meaning.
+- `2026-10-02` — `CLI-02` map delta: `medic`, `ord`, `hom`, `vidgen`, `superdriver`,
+  `approval-classifier` and `dshoc` map to `geoyws`, as George's board-to-estate map
+  `a-502383be` (2026-09-20) already decided; the compiled map had never carried them (board
+  row `t-159e55fb`). Because DEPLOY reads the same map, these boards now also record `@_bdt` and
+  `@_bd` on `hax` like every other `geoyws` board (`docs/specs/deploy.md` DEPLOY-05). `A5` gains
+  `medic` and `ord`. Status returns to `DRAFT` until an independent readiness review of the delta.
+- `2026-10-02` — stamped `SPEC-READY` for the `CLI-02` map delta (independent review of
+  `ddab15b` against the SDD §1 exit criteria: no findings). No requirement ID changed meaning.
