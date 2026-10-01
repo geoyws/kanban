@@ -2360,6 +2360,7 @@ mod tests {
             seed.add_tag("visible", None, Some("seed")).expect("tag");
             seed.add_tag("secret", None, Some("seed")).expect("tag");
             seed.add_task(crate::model::AddTask {
+                qualified_dependencies: None,
                 id: Some("t-visible".to_owned()),
                 task_type: "task".to_owned(),
                 parent_id: None,
@@ -2380,6 +2381,7 @@ mod tests {
             })
             .expect("seed visible");
             seed.add_task(crate::model::AddTask {
+                qualified_dependencies: None,
                 id: Some("t-secret".to_owned()),
                 task_type: "task".to_owned(),
                 parent_id: None,

@@ -691,6 +691,13 @@ fn board_archived(connection: &Connection, board_path: &str) -> Result<Option<bo
         .map_err(Into::into)
 }
 
+/// A fresh board registration incarnation (ADR-057 §1): random, in the same
+/// 32-hex shape the registry migration backfills, never derived from a name,
+/// path or file-stem UUID.
+fn mint_registration_token() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
 fn active_named(
     connection: &Connection,
     name: &str,
@@ -1840,6 +1847,79 @@ impl Registry {
         })
     }
 
+    /// The owner's open (ADR-056 §5): the whole registry ladder, CROSS step
+    /// included. Only `init` calls it, and only while it holds the data root
+    /// EXCLUSIVELY after [`Registry::init_cross_pending`] said a step waits.
+    pub fn open_owned() -> Result<Self> {
+        let root = data_root()?;
+        own_private_dir(&root)?;
+        reconcile_pending_adoption(&root)?;
+        let connection = crate::db::open_registry_owned(&root.join("registry.db"))?;
+        Ok(Self {
+            connection,
+            root,
+            adoption_boards: None,
+        })
+    }
+
+    /// Read-only, before any root lock: whether `init --name NAME` on this
+    /// data root has a CROSS step to take — the registry is pre-CROSS, or the
+    /// active board of that name is pre-CROSS or carries no registration
+    /// token yet (ADR-056 §5, ADR-057 §3). A missing registry or board has
+    /// nothing pending: both are born CROSS-aware. A board token that DIFFERS
+    /// from the registry's also answers pending, so that `init` reaches the
+    /// owned open and refuses it there, under the exclusive lock.
+    pub fn init_cross_pending(name: &str) -> Result<bool> {
+        let root = data_root()?;
+        let registry_path = root.join("registry.db");
+        if fs::symlink_metadata(&registry_path).is_err() {
+            return Ok(false);
+        }
+        let registry_version = crate::db::stored_schema_version(&registry_path);
+        if crate::db::cross_step_pending(registry_version, crate::db::REGISTRY_PRE_CROSS_VERSION) {
+            return Ok(true);
+        }
+        let registry = Self::open_readonly_at(&root)?;
+        let Some((board_path, registry_token)) = registry
+            .connection
+            .query_row(
+                "SELECT board_path,registration_token FROM boards WHERE name=? AND archived=0 LIMIT 1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let board_path = PathBuf::from(board_path);
+        if fs::symlink_metadata(&board_path).is_err() {
+            return Ok(false);
+        }
+        let board_version = crate::db::stored_schema_version(&board_path);
+        if crate::db::cross_step_pending(board_version, crate::db::BOARD_PRE_CROSS_VERSION) {
+            return Ok(true);
+        }
+        let board = crate::db::open_board_readonly(&board_path)?;
+        Ok(crate::db::board_registration_token(&board)? != registry_token)
+    }
+
+    /// The registration incarnation the registry holds for `board_path`, or
+    /// `None` on a pre-CROSS registry or a row not yet given one.
+    pub fn registration_token(&self, board_path: &str) -> Result<Option<String>> {
+        if !crate::db::registry_holds_registration_tokens(&self.connection)? {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT registration_token FROM boards WHERE board_path=?",
+                [board_path],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub(crate) fn open_for_adoption() -> Result<Self> {
         let root = data_root()?;
         let (root_dir, boards) = secure_registry_dirs(&root, true)?;
@@ -2178,10 +2258,18 @@ impl Registry {
         if active_named(&transaction, name, None)? {
             bail!("a Kanban board is already named {name}");
         }
+        let registration_token = crate::db::registry_holds_registration_tokens(&transaction)?
+            .then(mint_registration_token);
         transaction.execute(
             "INSERT INTO boards(board_path,name,created_at,last_used_at) VALUES(?,?,?,?)",
             params![board_path.to_string_lossy(), name, now, now],
         )?;
+        if let Some(token) = &registration_token {
+            transaction.execute(
+                "UPDATE boards SET registration_token=? WHERE board_path=?",
+                params![token, board_path.to_string_lossy()],
+            )?;
+        }
         if let Some(root_path) = root_path {
             transaction.execute(
                 "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
@@ -2202,6 +2290,12 @@ impl Registry {
             now,
         )?;
         transaction.commit()?;
+        // A board registered in a CROSS-aware registry is born CROSS-aware,
+        // its incarnation bound in the same step that creates its schema
+        // (ADR-057 §3); an ordinary open of it later never would.
+        if let Some(token) = &registration_token {
+            drop(crate::db::open_board_owned(&board_path, token)?);
+        }
         self.project_for_board_path(&board_path.to_string_lossy())
     }
 
@@ -2331,13 +2425,21 @@ impl Registry {
             let backup = rusqlite::backup::Backup::new(snapshot, &mut destination)?;
             backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
             drop(backup);
-            finalize_adopted_board(&mut destination)?;
-            validate_board_snapshot(
-                &destination,
-                "adopted board",
-                name,
-                crate::db::BOARD_SCHEMA_VERSION,
-            )?;
+            let registration_token = crate::db::registry_holds_registration_tokens(&transaction)?
+                .then(mint_registration_token);
+            let adopted_version =
+                finalize_adopted_board(&mut destination, registration_token.as_deref())?;
+            // With a token the copy must reach the newest schema; without one
+            // (a pre-CROSS registry) it stops at pre-CROSS unless the source
+            // was already past it.
+            let expected_schema = if registration_token.is_none()
+                && adopted_version != crate::db::BOARD_SCHEMA_VERSION
+            {
+                crate::db::BOARD_PRE_CROSS_VERSION
+            } else {
+                crate::db::BOARD_SCHEMA_VERSION
+            };
+            validate_board_snapshot(&destination, "adopted board", name, expected_schema)?;
             checkpoint(&destination)?;
             adopted_file
                 .sync_all()
@@ -2386,6 +2488,12 @@ impl Registry {
                 "INSERT INTO boards(board_path,name,created_at,last_used_at) VALUES(?,?,?,?)",
                 params![board_path.to_string_lossy(), name, now, now],
             )?;
+            if let Some(token) = &registration_token {
+                transaction.execute(
+                    "UPDATE boards SET registration_token=? WHERE board_path=?",
+                    params![token, board_path.to_string_lossy()],
+                )?;
+            }
             if let Some(root_path) = &root_path {
                 transaction.execute(
                     "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
@@ -4719,6 +4827,7 @@ mod tests {
     fn add_source_task(store: &mut Store, id: &str) {
         store
             .add_task(AddTask {
+                qualified_dependencies: None,
                 id: Some(id.to_owned()),
                 task_type: "task".to_owned(),
                 parent_id: None,

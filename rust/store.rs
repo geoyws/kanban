@@ -2737,6 +2737,8 @@ fn blocking_gates(
                 prerequisite_id: row.get(1)?,
                 prerequisite_title: row.get(2)?,
                 prerequisite_status: row.get(3)?,
+                prerequisite_board_id: None,
+                unavailable: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3931,6 +3933,123 @@ fn require_no_gate_deadlock(connection: &Connection, id: &str) -> Result<()> {
     )
 }
 
+/// Split a `--depends-on-json` set on the board behind `connection`: entries
+/// naming this board's own registered UUID become legacy local IDs, with
+/// every local visibility, deletion and gate rule unchanged; the rest are
+/// foreign references (`CROSS-01`). A scratch board refuses the whole set; a
+/// registered board that has not taken its CROSS step refuses only if a
+/// foreign entry is present.
+fn split_qualified_dependencies(
+    connection: &Connection,
+    set: Vec<DependencyRef>,
+) -> Result<(Vec<String>, Vec<DependencyRef>, crate::cross::TargetBoard)> {
+    let target = crate::cross::target_board(connection)?;
+    let (own, foreign): (Vec<_>, Vec<_>) = set
+        .into_iter()
+        .partition(|reference| reference.board_id == target.board_id);
+    if !foreign.is_empty() {
+        crate::cross::require_cross_aware(&target)?;
+    }
+    Ok((
+        own.into_iter().map(|reference| reference.id).collect(),
+        foreign,
+        target,
+    ))
+}
+
+/// What one replacement of a row's foreign edges did, as qualified
+/// identities only — never a source title or status (`CROSS-05`).
+#[derive(Default)]
+struct ForeignEdgeChange {
+    added: Vec<DependencyRef>,
+    removed: Vec<DependencyRef>,
+}
+
+/// Replace the foreign edges stored on `task_id` with `wanted`.
+///
+/// Removal is a write on the waiting row and nothing else: it reads no source
+/// and succeeds whatever state the source is in (`CROSS-05`, George
+/// `a-b63e7b50`). An entry already pinned keeps its pin untouched — a pin is
+/// never re-resolved, so it can never rebind to a recreated row
+/// (`CROSS-02`). Only a NEW entry is resolved, read-only, against its
+/// source, and pinned to that source's registration and item incarnation; any
+/// failure is the one non-confirming refusal and the caller's transaction is
+/// dropped with nothing written. A board below the CROSS step has no foreign
+/// edges to replace.
+fn replace_foreign_dependencies(
+    transaction: &Connection,
+    authz: &AuthzContext,
+    target: Option<&crate::cross::TargetBoard>,
+    task_id: &str,
+    wanted: &[DependencyRef],
+) -> Result<ForeignEdgeChange> {
+    if !crate::db::table_has_column(transaction, "task_foreign_dependencies", "task_id")? {
+        return Ok(ForeignEdgeChange::default());
+    }
+    let existing: Vec<DependencyRef> = {
+        let mut statement = transaction.prepare(
+            "SELECT source_board_id,source_item_id FROM task_foreign_dependencies \
+             WHERE task_id=? ORDER BY source_board_id,source_item_id",
+        )?;
+        statement
+            .query_map([task_id], |row| {
+                Ok(DependencyRef {
+                    board_id: row.get(0)?,
+                    id: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut change = ForeignEdgeChange::default();
+    for reference in &existing {
+        if !wanted.contains(reference) {
+            transaction.execute(
+                "DELETE FROM task_foreign_dependencies \
+                 WHERE task_id=? AND source_board_id=? AND source_item_id=?",
+                params![task_id, reference.board_id, reference.id],
+            )?;
+            change.removed.push(reference.clone());
+        }
+    }
+    for reference in wanted {
+        if existing.contains(reference) {
+            continue;
+        }
+        let target = target.context("a foreign prerequisite needs a registered target board")?;
+        let Some(source) = crate::cross::resolve_source(&target.root, authz, reference) else {
+            bail!(
+                "prerequisite boardID {} id {} {}",
+                reference.board_id,
+                reference.id,
+                crate::cross::UNAVAILABLE_SENTENCE
+            );
+        };
+        transaction.execute(
+            "INSERT INTO task_foreign_dependencies(task_id,source_board_id,source_registration,\
+             source_item_id,source_item_incarnation,created_at) VALUES(?,?,?,?,?,?)",
+            params![
+                task_id,
+                source.board_id,
+                source.registration,
+                source.item_id,
+                source.incarnation,
+                now_ms()
+            ],
+        )?;
+        change.added.push(reference.clone());
+    }
+    Ok(change)
+}
+
+/// The qualified identities of a set, for an audited event payload.
+fn qualified_identities(set: &[DependencyRef]) -> Value {
+    json!(
+        set.iter()
+            .map(|reference| json!({ "boardID": reference.board_id, "id": reference.id }))
+            .collect::<Vec<_>>()
+    )
+}
+
 #[derive(Default)]
 pub struct UpdateTask {
     pub parent_id: Option<Option<String>>,
@@ -3943,6 +4062,10 @@ pub struct UpdateTask {
     pub driver_only: Option<bool>,
     pub priority: Option<i64>,
     pub dependencies: Option<Vec<String>>,
+    /// `--depends-on-json`: `Some(set)` replaces the row's dependencies with
+    /// `set`, exactly as `dependencies` does, plus its foreign edges. The CLI
+    /// never sets both.
+    pub qualified_dependencies: Option<Vec<DependencyRef>>,
     /// `None` leaves tags alone; `Some(list)` replaces them wholesale.
     pub tags: Option<Vec<String>>,
     /// `None` leaves the model allow-list alone; `Some(list)` replaces it
@@ -4668,7 +4791,7 @@ impl Store {
     /// permission and hide the reason a read wanted to write at all.
     pub(crate) fn open_for_read_as_caller(path: &Path) -> Result<Self> {
         let stored = crate::db::stored_schema_version(path);
-        if stored == Some(crate::db::BOARD_SCHEMA_VERSION) {
+        if stored.is_some_and(crate::db::board_schema_is_settled) {
             return Self::open_readonly_as_caller(path);
         }
         if let Some(version) = stored
@@ -6434,7 +6557,18 @@ impl Store {
             "INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![id,input.task_type,input.parent_id,title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,now,now,if input.status == "done" { Some(now) } else { None },input.metadata.to_string()],
         )?;
-        for dependency in input.dependencies {
+        let (local_dependencies, foreign_dependencies, target) = match input.qualified_dependencies
+        {
+            Some(set) => {
+                if !input.dependencies.is_empty() {
+                    bail!("--depends-on-json cannot be combined with --depends-on");
+                }
+                let (local, foreign, target) = split_qualified_dependencies(&transaction, set)?;
+                (local, foreign, Some(target))
+            }
+            None => (input.dependencies, Vec::new(), None),
+        };
+        for dependency in local_dependencies {
             // A dependency names its prerequisite: same gate as the parent.
             authorize_task_attach(&transaction, &self.authz, &dependency)?;
             if dependency == id {
@@ -6448,6 +6582,17 @@ impl Store {
                 params![id, dependency],
             )?;
         }
+        let foreign_change = if foreign_dependencies.is_empty() {
+            ForeignEdgeChange::default()
+        } else {
+            replace_foreign_dependencies(
+                &transaction,
+                &self.authz,
+                target.as_ref(),
+                &id,
+                &foreign_dependencies,
+            )?
+        };
         require_no_gate_deadlock(&transaction, &id)?;
         // A row may be created straight into work — an import, a task moved in
         // one step — and the gate applies to that exactly as it applies to the
@@ -6471,7 +6616,13 @@ impl Store {
             Some(&id),
             "task_added",
             input.actor.as_deref(),
-            json!({ "type": input.task_type, "status": input.status }),
+            {
+                let mut payload = json!({ "type": input.task_type, "status": input.status });
+                if !foreign_change.added.is_empty() {
+                    payload["foreignDependencies"] = qualified_identities(&foreign_change.added);
+                }
+                payload
+            },
             None,
             Some(&input.status),
         )?;
@@ -7262,8 +7413,26 @@ impl Store {
             "UPDATE tasks SET parent_id=?,title=?,body=?,assignee=?,lane=?,deliverable=?,stale_minutes=?,driver_only=?,priority=?,updated_at=? WHERE id=?",
             params![parent,nonempty(&title,"title")?,body,assignee,lane,deliverable,stale,driver as i64,priority,now_ms(),id],
         )?;
-        let dependencies_replaced = input.dependencies.is_some();
-        if let Some(deps) = input.dependencies {
+        let (dependency_replacement, foreign_replacement, target) = match (
+            input.dependencies,
+            input.qualified_dependencies,
+        ) {
+            (Some(_), Some(_)) => {
+                bail!(
+                    "--depends-on-json cannot be combined with --depends-on or --clear-dependencies"
+                )
+            }
+            (None, Some(set)) => {
+                let (local, foreign, target) = split_qualified_dependencies(&transaction, set)?;
+                (Some(local), Some(foreign), Some(target))
+            }
+            // A local replacement or clear is the same set operation, so
+            // it replaces the row's foreign edges too: with none.
+            (Some(local), None) => (Some(local), Some(Vec::new()), None),
+            (None, None) => (None, None, None),
+        };
+        let dependencies_replaced = dependency_replacement.is_some();
+        if let Some(deps) = dependency_replacement {
             let mut unique = Vec::new();
             for dependency in deps {
                 if !unique.contains(&dependency) {
@@ -7357,6 +7526,16 @@ impl Store {
                 )?;
             }
         }
+        let foreign_change = match &foreign_replacement {
+            Some(wanted) => replace_foreign_dependencies(
+                &transaction,
+                &self.authz,
+                target.as_ref(),
+                id,
+                wanted,
+            )?,
+            None => ForeignEdgeChange::default(),
+        };
         // Either change can build a gate nothing can satisfy: a new
         // prerequisite, or a new parent whose gates this row now inherits.
         // Validated once, after both are written, so it sees the shape the
@@ -7390,6 +7569,10 @@ impl Store {
             ("priority", priority != previous_priority),
             ("parentID", parent != previous_parent),
             ("allowedModels", models_moved),
+            (
+                "foreignDependencies",
+                !foreign_change.added.is_empty() || !foreign_change.removed.is_empty(),
+            ),
         ] {
             if moved {
                 changed.push(field);
@@ -7398,6 +7581,14 @@ impl Store {
         let mut payload = json!({ "changed": changed });
         if body != previous_body {
             payload["previousBody"] = json!(previous_body);
+        }
+        // Qualified identities only: a removal reads no source, and neither
+        // half carries a source title or status (`CROSS-05`, `CROSS-10`).
+        if !foreign_change.added.is_empty() {
+            payload["foreignDependenciesAdded"] = qualified_identities(&foreign_change.added);
+        }
+        if !foreign_change.removed.is_empty() {
+            payload["foreignDependenciesRemoved"] = qualified_identities(&foreign_change.removed);
         }
         event(
             &transaction,
@@ -12257,6 +12448,7 @@ mod tests {
 
     fn task_input(id: &str, title: &str, tags: Vec<String>, dependencies: Vec<String>) -> AddTask {
         AddTask {
+            qualified_dependencies: None,
             id: Some(id.to_owned()),
             task_type: "task".to_owned(),
             parent_id: None,
@@ -12319,6 +12511,7 @@ mod tests {
     /// would build it.
     fn gate_row(id: &str, task_type: &str, parent: Option<&str>) -> AddTask {
         AddTask {
+            qualified_dependencies: None,
             id: Some(id.to_owned()),
             task_type: task_type.to_owned(),
             parent_id: parent.map(str::to_owned),
@@ -16450,6 +16643,7 @@ mod tests {
         store.add_tag("alpha", None, Some("test")).unwrap();
         store
             .add_task(AddTask {
+                qualified_dependencies: None,
                 id: Some("t-semantic".into()),
                 task_type: "task".into(),
                 parent_id: None,
@@ -16489,6 +16683,7 @@ mod tests {
         let mut store = test_store("semantic-move");
         store
             .add_task(AddTask {
+                qualified_dependencies: None,
                 id: Some("t-move".into()),
                 task_type: "task".into(),
                 parent_id: None,
@@ -16578,6 +16773,7 @@ mod tests {
         let mut store = test_store("events-since-removed");
         store
             .add_task(AddTask {
+                qualified_dependencies: None,
                 id: Some("t-removed".into()),
                 task_type: "task".into(),
                 parent_id: None,
@@ -16916,6 +17112,7 @@ mod tests {
         let mut store = test_store("incremental-embed");
         store
             .add_task(AddTask {
+                qualified_dependencies: None,
                 id: Some("t-embed".into()),
                 task_type: "task".into(),
                 parent_id: None,

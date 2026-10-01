@@ -92,6 +92,27 @@ pub fn exclusive() -> Result<DataRootLock> {
     }
 }
 
+/// Take the data root exclusively for `init`'s CROSS upgrade (ADR-056 §5).
+///
+/// Refuses at once while any other kanban process holds the root: the
+/// upgrade installs a schema old binaries must never write past, so it drains
+/// them rather than waiting on, or racing, a long-lived holder.
+pub fn exclusive_for_cross_upgrade() -> Result<DataRootLock> {
+    let (path, file) = open_lock_file(".lock")?;
+    match file.try_lock() {
+        Ok(()) => Ok(DataRootLock { _file: file }),
+        Err(TryLockError::WouldBlock) => bail!(
+            "this board's cross-board upgrade is pending and needs {} to itself, but another \
+             kanban process is using it; stop every kanban process on this data root and run \
+             the same init again. Until then the board keeps working for local-only use",
+            path.parent().unwrap_or(&path).display()
+        ),
+        Err(TryLockError::Error(error)) => {
+            Err(anyhow::Error::new(error).context(format!("lock {}", path.display())))
+        }
+    }
+}
+
 /// Take the data root shared, for a caller that reads and writes through
 /// SQLite. Excludes nothing but a restore.
 pub fn shared() -> Result<DataRootLock> {
