@@ -17231,6 +17231,28 @@ mod tests {
         assert!(error.contains("one concept"), "{error}");
     }
 
+    /// CLI-09: the OLD side of `tag rename` is looked up as stored, so a tag
+    /// registered over the bound before it existed can still be renamed
+    /// shorter. The CLI can no longer create one, so it is seeded in SQL.
+    #[test]
+    fn an_over_long_legacy_tag_can_still_be_renamed_shorter() {
+        let mut store = test_store("tag-rename-legacy-long");
+        store
+            .add_tag("geoyws/seed", None, Some("geoyws"))
+            .expect("seed tag");
+        let legacy = format!("geoyws/{}", "a".repeat(70));
+        store
+            .connection
+            .execute("UPDATE tags SET name=?1 WHERE name='geoyws/seed'", [&legacy])
+            .expect("seed an over-long legacy name");
+        let renamed = store
+            .rename_tag(&legacy, "geoyws/short", Some("geoyws"))
+            .expect("an over-long OLD name renames to a usable NEW one");
+        assert_eq!((renamed.old.as_str(), renamed.new.as_str()), (legacy.as_str(), "geoyws/short"));
+        let names: Vec<String> = store.tags().unwrap().into_iter().map(|tag| tag.name).collect();
+        assert_eq!(names, vec!["geoyws/short".to_owned()]);
+    }
+
     #[test]
     fn a_tag_name_has_exactly_one_spelling() {
         for good in ["infra", "queuer", "askie", "px-crm", "v2", "a"] {
