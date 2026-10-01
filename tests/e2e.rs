@@ -15293,9 +15293,9 @@ fn a_transact_naming_batch_or_transact_is_refused_whole() {
     assert!(itself.contains("transact item 1"), "{itself}");
     assert!(itself.contains("may not carry a batch"), "{itself}");
 
-    // The read-only batch needs no code of its own: it has no COMMANDS row,
-    // so it resolves to no operation, exactly as `batch`'s own validation
-    // refuses a nested batch.
+    // The read-only batch is refused by name too: its COMMANDS row publishes
+    // `kanban batch` as a read, which would otherwise admit it as an item
+    // (docs/specs/batch.md BA-05).
     let read_batch = transact_refusal(
         &fixture,
         &fixture.main,
@@ -15306,7 +15306,7 @@ fn a_transact_naming_batch_or_transact_is_refused_whole() {
     );
     assert!(read_batch.contains("transact item 1"), "{read_batch}");
     assert!(
-        read_batch.contains("no such operation batch"),
+        read_batch.contains("names batch, and a batch may not carry a batch"),
         "{read_batch}"
     );
 
@@ -15526,6 +15526,569 @@ fn the_schema_lists_transact_as_a_writing_operation() {
             (json!("items-file"), json!("value")),
         ]
     );
+}
+
+/// One `kanban batch`, answered as its `results` (docs/specs/batch.md BA-03).
+///
+/// A batch whose items failed is still a batch that answered, so the exit
+/// status is zero whatever the items said, and the envelope carries nothing
+/// but `results`.
+fn cli_batch_results(fixture: &Fixture, cwd: &Path, items: &[Value]) -> Vec<Value> {
+    let list = serde_json::to_string(items).unwrap();
+    let output = fixture.run(cwd, &["batch", "--items", &list, "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "kanban batch exited non-zero\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("kanban batch stdout is not JSON: {error}\n{stdout}"));
+    let keys = envelope.as_object().unwrap().keys().collect::<Vec<_>>();
+    assert_eq!(keys, ["results"], "the envelope grew a field: {envelope}");
+    let results = envelope["results"].as_array().unwrap().clone();
+    let indices = results
+        .iter()
+        .map(|entry| entry["index"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indices,
+        (0..items.len())
+            .map(|index| json!(index))
+            .collect::<Vec<_>>(),
+        "results are not one per item, in order: {envelope}"
+    );
+    results
+}
+
+/// The refusal of a `kanban batch` rejected before any of it ran.
+fn cli_batch_refusal(fixture: &Fixture, cwd: &Path, items: &[Value]) -> String {
+    let list = serde_json::to_string(items).unwrap();
+    let output = fixture.run(cwd, &["batch", "--items", &list, "--json"]);
+    assert!(
+        !output.status.success(),
+        "a kanban batch that must be refused was answered: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let answered: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "a refused kanban batch printed no JSON error: {error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let text = answered["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refusal names itself: {answered}"))
+        .to_owned();
+    assert!(text.ends_with("nothing in it ran"), "{text}");
+    text
+}
+
+/// A started MCP session on `cwd`, past `initialize`.
+fn mcp_session(fixture: &Fixture, cwd: &Path) -> Session {
+    let mut session = Session::start(Path::new(env!("CARGO_BIN_EXE_kanban")), cwd, &fixture.data);
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    session
+}
+
+/// BA-01, BA-03, BA-11: the benchmark's read loop, plus one more read to make
+/// twelve, through ONE `kanban batch --items-file`, answers read for read what
+/// the same twelve calls answer one process each.
+#[test]
+fn kanban_batch_of_twelve_reads_is_byte_identical_to_twelve_single_calls() {
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/testing/bench/fixture-v2.json");
+    let bench: Value = serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let reads = bench["reads"].as_array().unwrap().clone();
+    assert_eq!(reads.len(), 12, "the v2 fixture is no longer twelve reads");
+
+    let fixture = Fixture::new("cli-batch-identity");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CLIBATCHID", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "geoyws/driver", "--as", "geoyws", "--json"],
+    );
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let id = format!("t-ident{index}");
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("identity fixture task {index}"),
+                "--id",
+                &id,
+                "--tag",
+                "geoyws/driver",
+                "--lane",
+                "driver",
+                "--json",
+            ],
+        );
+        task_ids.push(id);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &["attention", "raise", "open row", "--as", "geoyws", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "identity fixture sitrep",
+            "--as",
+            "geoyws",
+            "--lane",
+            "driver",
+            "--json",
+        ],
+    );
+
+    // The fixture's reads as a lane on this board asks them. `claim
+    // --candidates` is the one the batch refuses (its row covers every
+    // `claim`, and plain `claim` writes), so `tag_list` stands in as the
+    // twelfth. No item names `project`: the batch addresses one board and an
+    // item may not name another (docs/specs/batch.md §6), so the board is the
+    // working directory's for the batch and for every single call alike.
+    let mut planned = Vec::new();
+    let mut next_task = 0;
+    for read in &reads {
+        if read["tool"] == "claim" {
+            continue;
+        }
+        let mut arguments = read["args"].as_object().unwrap().clone();
+        if arguments.contains_key("id") {
+            arguments.insert("id".into(), json!(task_ids[next_task % task_ids.len()]));
+            next_task += 1;
+        }
+        let drop_keys = read["normalize_drop_keys"]
+            .as_array()
+            .map(|keys| {
+                keys.iter()
+                    .map(|key| key.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        planned.push((
+            read["id"].as_str().unwrap().to_owned(),
+            read["tool"].as_str().unwrap().to_owned(),
+            Value::Object(arguments),
+            drop_keys,
+        ));
+    }
+    planned.push((
+        "tag_list".to_owned(),
+        "tag_list".to_owned(),
+        json!({}),
+        Vec::new(),
+    ));
+    assert_eq!(planned.len(), 12);
+
+    // Every read alone first, each its own `kanban` process: MCP `tools/call`
+    // runs the binary once per call with the argument list the batch builds.
+    let mut session = mcp_session(&fixture, &fixture.main);
+    let mut alone = Vec::new();
+    for (index, (id, tool, arguments, _)) in planned.iter().enumerate() {
+        let answered = session.ask(json!({
+            "jsonrpc": "2.0", "id": 100 + index as i64, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }));
+        assert_eq!(
+            answered["result"]["isError"],
+            false,
+            "{id} did not answer on its own: {}",
+            tool_text(&answered["result"])
+        );
+        alone.push(tool_text(&answered["result"]));
+    }
+    session.finish();
+
+    // The same twelve through one process, the list delivered as a file: the
+    // form a lane uses once a list outgrows one argv string (BA-01).
+    let items = planned
+        .iter()
+        .map(|(_, tool, arguments, _)| json!({ "name": tool, "arguments": arguments }))
+        .collect::<Vec<_>>();
+    let list_path = fixture.main.join("cli-batch-items.json");
+    fs::write(&list_path, serde_json::to_string(&items).unwrap()).unwrap();
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "batch",
+            "--items-file",
+            list_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "kanban batch --items-file failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let batched = envelope["results"].as_array().unwrap();
+    assert_eq!(batched.len(), 12, "{envelope}");
+
+    for (index, (entry, ((id, .., drop_keys), outside))) in batched
+        .iter()
+        .zip(planned.iter().zip(alone.iter()))
+        .enumerate()
+    {
+        assert_eq!(entry["index"], index, "{id} out of order: {entry}");
+        assert_eq!(entry["ok"], true, "{id} failed inside the batch: {entry}");
+        let inside = entry["result"].to_string();
+        assert_eq!(
+            normalized_body(&format!("{id} inside kanban batch"), &inside, drop_keys),
+            normalized_body(&format!("{id} on its own"), outside, drop_keys),
+            "{id} differed between kanban batch and the same call alone"
+        );
+        for key in drop_keys {
+            assert!(
+                volatile_key_present(&inside, key),
+                "{id} declares {key} volatile but the batched answer has no such key"
+            );
+        }
+    }
+
+    // Published as a read-only operation, which is what makes adapters and the
+    // manifest carry it.
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operation = schema["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["name"] == "batch")
+        .unwrap_or_else(|| panic!("the manifest does not publish batch: {schema}"));
+    assert_eq!(operation["readOnly"], true, "{operation}");
+}
+
+/// BA-03: every item is attempted and answers for itself; one refusal hides
+/// no other answer and is not a batch failure.
+#[test]
+fn kanban_batch_attempts_every_item_and_reports_each_independently() {
+    let fixture = Fixture::new("cli-batch-partial");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CLIBATCHPART", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "answers", "--id", "t-answers", "--json"],
+    );
+    let results = cli_batch_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "task_show", "arguments": { "id": "t-answers" } }),
+            json!({ "name": "context", "arguments": { "id": "t-absent" } }),
+            json!({ "name": "task_show", "arguments": { "id": "t-answers", "bogus": "1" } }),
+            json!({ "name": "task_show", "arguments": { "id": "t-answers" } }),
+        ],
+    );
+    assert_eq!(results[0]["ok"], true, "{results:?}");
+    assert_eq!(results[0]["result"]["title"], "answers");
+    assert_eq!(results[1]["ok"], false, "an unknown task id answered");
+    assert!(
+        results[1].get("result").is_none(),
+        "a failure carried a result"
+    );
+    let failed = results[1]["error"].as_str().unwrap();
+    assert!(failed.contains("t-absent"), "{failed}");
+    // An argument the command does not take is that item's refusal, in the
+    // words the MCP layer uses for it, not a batch refusal.
+    assert_eq!(results[2]["ok"], false);
+    assert!(
+        results[2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("task_show has no argument bogus"),
+        "{results:?}"
+    );
+    assert_eq!(results[3]["ok"], true, "a read after a failure was skipped");
+    assert_eq!(results[3]["result"], results[0]["result"]);
+}
+
+/// BA-02: the MCP batch's bound, not a second number. 33 is refused whole,
+/// naming both numbers; 32 runs.
+#[test]
+fn kanban_batch_over_the_bound_is_refused_naming_the_bound() {
+    let fixture = Fixture::new("cli-batch-bound");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "CLIBATCHBOUND", "--json"],
+    );
+    let reads = |count: usize| vec![json!({ "name": "tag_list", "arguments": {} }); count];
+
+    let refusal = cli_batch_refusal(&fixture, &fixture.main, &reads(33));
+    assert!(refusal.contains("at most 32"), "{refusal}");
+    assert!(refusal.contains("given 33"), "{refusal}");
+
+    let results = cli_batch_results(&fixture, &fixture.main, &reads(32));
+    assert_eq!(results.len(), 32);
+    assert!(
+        results.iter().all(|entry| entry["ok"] == true),
+        "a batch at the bound did not run: {results:?}"
+    );
+}
+
+/// BA-04, BA-05: a write, a nested batcher or an unknown name refuses the
+/// whole list before anything runs, naming the index; a write names the fix.
+#[test]
+fn kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing() {
+    let fixture = Fixture::new("cli-batch-refusals");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "CLIBATCHREFUSE", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "already here", "--id", "t-1", "--json"],
+    );
+    let tasks_before = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let read = json!({ "name": "task_show", "arguments": { "id": "t-1" } });
+
+    // Plain `claim`: its row covers every `claim`, and plain `claim` writes a
+    // lease. The read before it would have answered had the batch validated
+    // item by item as it ran.
+    let claim = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            read.clone(),
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+        ],
+    );
+    assert_eq!(
+        claim,
+        "kanban batch call 1 names claim, which writes, and a batch carries read-only tools \
+         only: run writes through kanban transact; nothing in it ran"
+    );
+
+    // `transact` is a batcher and a writer: refused, with the same fix.
+    let transact = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            read.clone(),
+            json!({ "name": "transact", "arguments": { "items": "[]" } }),
+        ],
+    );
+    assert!(
+        transact.starts_with("kanban batch call 1 names transact, which writes"),
+        "{transact}"
+    );
+    assert!(
+        transact.contains("run writes through kanban transact"),
+        "{transact}"
+    );
+
+    // A batch may not carry a batch, although `batch` now has a row.
+    let nested = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            read.clone(),
+            json!({ "name": "batch", "arguments": { "items": "[]" } }),
+        ],
+    );
+    assert_eq!(
+        nested,
+        "kanban batch call 1 names no such tool batch; nothing in it ran"
+    );
+
+    let unknown = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[read.clone(), json!({ "name": "frobnicate" })],
+    );
+    assert_eq!(
+        unknown,
+        "kanban batch call 1 names no such tool frobnicate; nothing in it ran"
+    );
+
+    // An item naming a second board: the selector belongs to the batch.
+    let selector = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[json!({ "name": "task_show", "arguments": { "id": "t-1", "project": "ELSEWHERE" } })],
+    );
+    assert!(
+        selector.starts_with("kanban batch call 0 names --project"),
+        "{selector}"
+    );
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]),
+        tasks_before,
+        "a refused batch changed the row it named"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a refused batch wrote to the ledger"
+    );
+}
+
+/// BA-06 (acceptance A4): a lane's claim-to-release loop is one `transact`,
+/// and its `context` read sees the claim the batch has not committed yet; a
+/// wrong lease part way rolls the whole loop back.
+#[test]
+fn a_transact_carries_a_whole_claim_to_release_loop_and_its_read_sees_the_claim() {
+    let fixture = Fixture::new("transact-loop");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXLOOP", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-loop", "--json"],
+    );
+    let lease = || json!({ "$ref": { "item": 0, "path": "/leaseToken" } });
+    let loop_items = |checkpoint_lease: Value| {
+        vec![
+            json!({ "name": "claim", "arguments": { "id": "t-loop", "as": "agent-a" } }),
+            json!({ "name": "context", "arguments": { "id": "t-loop" } }),
+            checkpoint_item("t-loop", checkpoint_lease, "agent-a"),
+            json!({ "name": "note", "arguments": { "id": "t-loop", "text": "loop note", "as": "agent-a" } }),
+            json!({ "name": "release", "arguments": { "id": "t-loop", "lease": lease() } }),
+        ]
+    };
+
+    // A wrong lease at index 2: nothing lands, later items are skipped.
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let failed = transact_results(&fixture, &fixture.main, &loop_items(json!("not-the-lease")));
+    assert_eq!(failed["failedIndex"], 2, "{failed}");
+    assert_eq!(failed["rolledBack"], true, "{failed}");
+    assert_eq!(failed["results"][3]["skipped"], true, "{failed}");
+    assert_eq!(failed["results"][4]["skipped"], true, "{failed}");
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-loop", "--json"]);
+    assert_eq!(task["claim"], Value::Null, "{task}");
+    assert_eq!(task["notes"], json!([]), "{task}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a rolled-back loop wrote to the ledger"
+    );
+
+    // The right lease: every item lands, and the read at index 1 carries the
+    // claim index 0 wrote before anything committed.
+    let landed = transact_results(&fixture, &fixture.main, &loop_items(lease()));
+    assert_eq!(landed["ok"], true, "{landed}");
+    let claim = &landed["results"][0]["result"];
+    let seen = &landed["results"][1]["result"]["claim"];
+    assert_eq!(seen["agentID"], "agent-a", "{landed}");
+    assert_eq!(seen["claimedAt"], claim["claimedAt"], "{landed}");
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-loop", "--json"]);
+    assert_eq!(
+        task["claim"],
+        Value::Null,
+        "the loop's release did not land: {task}"
+    );
+    assert_eq!(task["notes"][0]["body"], "loop note", "{task}");
+}
+
+/// BA-10: each item keeps its own bands, and a read batch writes nothing.
+#[test]
+fn kanban_batch_items_keep_their_own_bands_and_the_batch_writes_nothing() {
+    let fixture = Fixture::new("cli-batch-bands");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CLIBATCHBAND", "--json"]);
+    // One more sitrep than `sitrep list --all` answers without `--limit`.
+    // `--all`, because posting archives a lane's older sitreps and the
+    // current view alone never grows past the band.
+    for index in 0..21 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "sitrep",
+                "post",
+                &format!("band sitrep {index}"),
+                "--as",
+                "geoyws",
+                "--lane",
+                "driver",
+                "--json",
+            ],
+        );
+    }
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "500", "--json"]);
+    let audit_before = board_audit(&fixture);
+
+    let results = cli_batch_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "sitrep_list", "arguments": { "all": true } }),
+            json!({ "name": "sitrep_list", "arguments": { "all": true, "limit": "21" } }),
+            json!({ "name": "tag_list", "arguments": {} }),
+        ],
+    );
+    // The listing over its default band refuses naming `--limit`, inside a
+    // batch exactly as alone, rather than passing a first page off as whole.
+    assert_eq!(results[0]["ok"], false, "{results:?}");
+    let refused = results[0]["error"].as_str().unwrap();
+    assert!(refused.contains("--limit"), "{refused}");
+    let alone = fixture.run(&fixture.main, &["sitrep", "list", "--all", "--json"]);
+    assert!(!alone.status.success());
+    assert!(
+        String::from_utf8_lossy(&alone.stderr).contains(refused),
+        "the batched refusal differs from the same call alone: {refused}"
+    );
+    // Its siblings answer.
+    assert_eq!(results[1]["ok"], true, "{results:?}");
+    assert_eq!(results[1]["result"].as_array().unwrap().len(), 21);
+    assert_eq!(results[2]["ok"], true, "{results:?}");
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "500", "--json"]),
+        events_before,
+        "a read batch appended to the ledger"
+    );
+    assert_eq!(
+        board_audit(&fixture),
+        audit_before,
+        "a read batch moved the audit chain"
+    );
+}
+
+/// BA-12: one pre-flight, so the CLI batch and the MCP batch refuse the same
+/// list in the same words, differing only in naming the batcher and where a
+/// write goes; and `tools/list` still offers `batch` exactly once.
+#[test]
+fn kanban_batch_and_mcp_batch_refuse_the_same_list_in_the_same_words() {
+    let fixture = Fixture::new("cli-batch-one-parser");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CLIBATCHONE", "--json"]);
+    let mut session = mcp_session(&fixture, &fixture.main);
+
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let offered = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["name"] == "batch")
+        .count();
+    assert_eq!(offered, 1, "tools/list offers batch {offered} times");
+
+    let lists = [
+        vec![json!({ "name": "task_add", "arguments": { "title": "x" } })],
+        vec![json!({ "name": "transact", "arguments": {} })],
+        vec![json!({ "name": "tag_list" }), json!({ "name": "batch" })],
+        vec![json!({ "name": "watch" })],
+        vec![json!({ "arguments": {} })],
+        vec![json!({ "name": "tag_list", "extra": 1 })],
+        vec![json!("tag_list")],
+        vec![json!({ "name": "tag_list" }); 33],
+    ];
+    for (id, list) in lists.iter().enumerate() {
+        let mcp = batch_refusal(&mut session, 10 + id as i64, list.clone());
+        let cli = cli_batch_refusal(&fixture, &fixture.main, list);
+        let expected = format!("kanban {mcp}").replace(
+            "run writes through transact;",
+            "run writes through kanban transact;",
+        );
+        assert_eq!(cli, expected, "list {id} is refused in different words");
+    }
+    session.finish();
 }
 
 #[test]

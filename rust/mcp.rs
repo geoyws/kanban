@@ -250,6 +250,9 @@ fn tools() -> Vec<Value> {
         // from that row it would advertise `--items` as a string an agent has
         // to serialize by hand, and `--items-file` as a path this layer owns.
         .filter(|(command, sub, ..)| tool_name(command, *sub) != TRANSACT)
+        // `batch` likewise: its row publishes `kanban batch` (docs/specs/batch.md
+        // BA-01), and its tool stays the hand-written `batch_tool` below.
+        .filter(|(command, sub, ..)| tool_name(command, *sub) != BATCH)
         .map(|(command, sub, flags, positionals, read_only)| {
             let mut properties = serde_json::Map::new();
             let mut required = Vec::new();
@@ -402,13 +405,14 @@ pub(crate) fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>
 /// the refusal text is the most useful thing an agent can be given, and this
 /// CLI's refusals name the fix. A transport-level error would hide it.
 fn call(path: &Path, name: &str, arguments: &Value) -> Value {
-    // `batch` is the one tool that names no command, so the one that cannot be
-    // answered by running the binary. Dispatched here rather than in
-    // `respond` so a batched entry and a standalone call are the same function
-    // call and cannot drift apart: byte-identical results are the property the
-    // benchmark's equivalence check rests on. A batch inside a batch is
-    // impossible — `batch` has no `COMMANDS` row, and validation refuses any
-    // name that has none.
+    // `batch` is answered in this process rather than by running the binary
+    // once for the whole list, so each entry can run the standalone `call`.
+    // Dispatched here rather than in `respond` so a batched entry and a
+    // standalone call are the same function call and cannot drift apart:
+    // byte-identical results are the property the benchmark's equivalence
+    // check rests on. A batch inside a batch is impossible —
+    // `listed_read_only` answers `None` for `batch`, and validation refuses
+    // any name it answers `None` for.
     if name == BATCH {
         return batch(path, arguments);
     }
@@ -466,9 +470,15 @@ const BATCH: &str = "batch";
 /// writes: `None` when no listed tool has that name.
 ///
 /// Filtered on the same two tables `tools` reads, so what is advertised and
-/// what a batch accepts cannot answer differently. `batch` itself has no row,
-/// so it answers `None` and a batch cannot nest.
+/// what a batch accepts cannot answer differently. `batch` answers `None`
+/// although it has a row, so a batch cannot nest.
 fn listed_read_only(name: &str) -> Option<bool> {
+    // `batch` has a `COMMANDS` row so `schema --json` publishes `kanban
+    // batch`, but it is still not an operation either batcher may carry: a
+    // batch may not carry a batch (ADR-041 §1, docs/specs/batch.md BA-05).
+    if name == BATCH {
+        return None;
+    }
     COMMANDS
         .iter()
         .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
@@ -562,48 +572,10 @@ fn batch(path: &Path, arguments: &Value) -> Value {
         }
         None => return error_result(&format!("{BATCH} needs a calls array")),
     };
-    if calls.len() > BATCH_LIMIT {
-        return error_result(&format!(
-            "{BATCH} takes at most {BATCH_LIMIT} calls and was given {}; nothing in it ran",
-            calls.len()
-        ));
-    }
-    let mut planned = Vec::with_capacity(calls.len());
-    for (index, entry) in calls.iter().enumerate() {
-        let Value::Object(fields) = entry else {
-            return error_result(&format!(
-                "{BATCH} call {index} must be an object, not {entry}; nothing in it ran"
-            ));
-        };
-        if let Some(unknown) = fields
-            .keys()
-            .find(|key| !matches!(key.as_str(), "name" | "arguments"))
-        {
-            return error_result(&format!(
-                "{BATCH} call {index} has no field {unknown}; nothing in it ran"
-            ));
-        }
-        let Some(name) = fields.get("name").and_then(Value::as_str) else {
-            return error_result(&format!(
-                "{BATCH} call {index} needs a name; nothing in it ran"
-            ));
-        };
-        match listed_read_only(name) {
-            Some(true) => {}
-            Some(false) => {
-                return error_result(&format!(
-                    "{BATCH} call {index} names {name}, which writes; a batch carries read-only \
-                     tools only, so nothing in it ran"
-                ));
-            }
-            None => {
-                return error_result(&format!(
-                    "{BATCH} call {index} names no such tool {name}; nothing in it ran"
-                ));
-            }
-        }
-        planned.push((name, fields.get("arguments").unwrap_or(&Value::Null)));
-    }
+    let planned = match plan_batch(BATCH, TRANSACT, calls) {
+        Ok(planned) => planned,
+        Err(message) => return error_result(&message),
+    };
     let results = planned
         .into_iter()
         .map(|(name, arguments)| {
@@ -621,6 +593,64 @@ fn batch(path: &Path, arguments: &Value) -> Value {
         "content": [{ "type": "text", "text": json!({ "results": results }).to_string() }],
         "isError": false,
     })
+}
+
+/// Check a read-only batch's whole call list before any of it runs, and answer
+/// with the calls to run in order.
+///
+/// The one pre-flight both read batchers use — the MCP `batch` tool here and
+/// `kanban batch` on the command line — so the two refuse the same list in the
+/// same words and accept the same names (docs/specs/batch.md BA-12). The
+/// names are the only thing that differs: `label` is what the refusal calls
+/// the batcher, and `writer` is where it sends a write (BA-04).
+pub(crate) fn plan_batch<'a>(
+    label: &str,
+    writer: &str,
+    calls: &'a [Value],
+) -> std::result::Result<Vec<(&'a str, &'a Value)>, String> {
+    if calls.len() > BATCH_LIMIT {
+        return Err(format!(
+            "{label} takes at most {BATCH_LIMIT} calls and was given {}; nothing in it ran",
+            calls.len()
+        ));
+    }
+    let mut planned = Vec::with_capacity(calls.len());
+    for (index, entry) in calls.iter().enumerate() {
+        let Value::Object(fields) = entry else {
+            return Err(format!(
+                "{label} call {index} must be an object, not {entry}; nothing in it ran"
+            ));
+        };
+        if let Some(unknown) = fields
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "arguments"))
+        {
+            return Err(format!(
+                "{label} call {index} has no field {unknown}; nothing in it ran"
+            ));
+        }
+        let Some(name) = fields.get("name").and_then(Value::as_str) else {
+            return Err(format!(
+                "{label} call {index} needs a name; nothing in it ran"
+            ));
+        };
+        match listed_read_only(name) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(format!(
+                    "{label} call {index} names {name}, which writes, and a batch carries \
+                     read-only tools only: run writes through {writer}; nothing in it ran"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "{label} call {index} names no such tool {name}; nothing in it ran"
+                ));
+            }
+        }
+        planned.push((name, fields.get("arguments").unwrap_or(&Value::Null)));
+    }
+    Ok(planned)
 }
 
 /// The one writing tool whose input is a list of calls rather than flags.
@@ -1142,7 +1172,10 @@ exit {code}
         // would have an agent send an argument the binary then rejects, and
         // the agent would read the refusal as its own mistake.
         for (command, sub, ..) in COMMANDS {
-            if crate::LONG_RUNNING.contains(command) {
+            // The `batch` row is the CLI twin; the tool of that name is the
+            // hand-written MCP batch, which takes no selector of its own
+            // because each call it carries resolves its board itself.
+            if crate::LONG_RUNNING.contains(command) || tool_name(command, *sub) == BATCH {
                 continue;
             }
             let ignored = crate::ignored_selectors(command, *sub).0;
@@ -1220,14 +1253,26 @@ exit {code}
         let total = names.len();
         names.dedup();
         assert_eq!(total, names.len(), "two operations share a tool name");
-        // The listed set is every callable operation plus exactly one name
-        // that is not an operation. Spelled out rather than relaxed: a second
-        // hand-written tool must be added here to be legal, and `batch` must
-        // not collide with a command, or `tools/call batch` would answer for
-        // an operation instead.
+        // The listed set is every callable operation and nothing else. One
+        // operation shares its name with a hand-written tool: `batch`, whose
+        // row publishes the CLI twin `kanban batch` (docs/specs/batch.md
+        // BA-01). Spelled out rather than relaxed: `tools/call batch` must
+        // answer for the hand-written MCP batch, so the row must stay out of
+        // the generated list and the listed `batch` must be the one that
+        // takes `calls`.
+        let batch_rows = COMMANDS
+            .iter()
+            .filter(|(c, s, ..)| tool_name(c, *s) == BATCH)
+            .map(|(c, s, flags, positionals, read_only)| (*c, *s, *flags, *positionals, *read_only))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batch_rows,
+            [("batch", None, &["items", "items-file"][..], &[][..], true)],
+            "an operation other than the CLI batch is named {BATCH}"
+        );
         assert!(
-            !names.contains(&BATCH.to_owned()),
-            "an operation is named {BATCH} and the batch tool would shadow it"
+            tool(BATCH)["inputSchema"]["properties"]["calls"].is_object(),
+            "the listed {BATCH} is not the hand-written MCP batch"
         );
         let generated = COMMANDS
             .iter()
@@ -1238,15 +1283,10 @@ exit {code}
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut expected = generated;
-        expected.insert(BATCH.to_owned());
-        assert_eq!(
-            listed, expected,
-            "tools/list is not the operations plus {BATCH}"
-        );
+        assert_eq!(listed, generated, "tools/list is not the operations");
         assert_eq!(listed.len(), tools().len(), "tools/list repeats a name");
-        // And the name that is not an operation resolves to no operation, which
-        // is what stops a batch from carrying a batch.
+        // And `batch` resolves to no item operation, although it has a row,
+        // which is what stops a batch from carrying a batch.
         assert_eq!(listed_read_only(BATCH), None);
         assert_eq!(listed_read_only("task_list"), Some(true));
         assert_eq!(listed_read_only("task_add"), Some(false));

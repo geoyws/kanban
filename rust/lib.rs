@@ -293,6 +293,7 @@ Usage:
              --confirm prepared [--json]
   kanban access enforcement activate --expected-epoch EPOCH --prepare-receipt RECEIPT
              --as ACTOR --reason TEXT --confirm no-direct-fallback [--json]
+  kanban batch (--items JSON_ARRAY | --items-file PATH) [--json]
   kanban transact (--items JSON_ARRAY | --items-file PATH) [--json]
   kanban schema [--json]
   kanban mcp
@@ -1257,6 +1258,11 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     // `mcp::listed_read_only` answers `Some(false)`, which is what makes the
     // read-only `batch` refuse `transact` as an entry with no new code.
     ("transact", None, &["items", "items-file"], &[], false),
+    // docs/specs/batch.md BA-01: the read-only twin, published so `schema
+    // --json` and the manifest carry it. It is still no batcher's item:
+    // `mcp::listed_read_only` answers `None` for it and `transactable`
+    // refuses it by name (BA-05).
+    ("batch", None, &["items", "items-file"], &[], true),
     ("schema", None, &[], &[], true),
     ("mcp", None, &[], &[], false),
     ("tag", Some("add"), &["as", "description"], &["name"], false),
@@ -5379,14 +5385,15 @@ impl OwedRuleTagRenames {
     }
 }
 
-/// The items of a `transact`, from `--items` or from a file.
+/// The items of a `transact` or a `batch`, from `--items` or from a file.
 ///
 /// The pair is modelled on `--body`/`--body-file`, refusing both at once
 /// included, and it exists for a measured reason: with `--items` the list
 /// travels as a single argv string, and one argv string is capped at 128 KiB
 /// on Linux (`MAX_ARG_STRLEN`), so a full batch carrying checkpoint bodies
-/// would die as `E2BIG` before the binary saw it (ADR-041 §8).
-fn transact_items(args: &Args) -> Result<Vec<Value>> {
+/// would die as `E2BIG` before the binary saw it (ADR-041 §8). `command` is
+/// the batcher reading them, named in every refusal.
+fn batch_items(args: &Args, command: &str) -> Result<Vec<Value>> {
     let text = match (args.one("items"), args.one("items-file")) {
         (Some(_), Some(_)) => bail!(
             "--items and --items-file both give the item list; pass one, because picking \
@@ -5394,19 +5401,22 @@ fn transact_items(args: &Args) -> Result<Vec<Value>> {
         ),
         (Some(text), None) => text.to_owned(),
         (None, Some(path)) => {
-            fs::read_to_string(path).with_context(|| format!("read transact items from {path}"))?
+            fs::read_to_string(path).with_context(|| format!("read {command} items from {path}"))?
         }
         (None, None) => bail!(
-            "transact needs its item list: --items JSON_ARRAY, or --items-file PATH for a list \
+            "{command} needs its item list: --items JSON_ARRAY, or --items-file PATH for a list \
              too long for one argv string"
         ),
     };
-    let parsed: Value = serde_json::from_str(&text).context(
-        "transact items must be a JSON array of {\"name\": TOOL, \"arguments\": {…}} objects",
-    )?;
+    let parsed: Value = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{command} items must be a JSON array of {{\"name\": TOOL, \"arguments\": {{…}}}} \
+             objects"
+        )
+    })?;
     match parsed {
         Value::Array(items) => Ok(items),
-        other => bail!("transact items must be a JSON array, not {other}; nothing in it ran"),
+        other => bail!("{command} items must be a JSON array, not {other}; nothing in it ran"),
     }
 }
 
@@ -5432,12 +5442,12 @@ const NOT_TRANSACTABLE: [(&str, Option<&str>); 3] = [
 /// Read off the same two tables `tools/list` and the CLI parser read, so what
 /// the surface offers and what a batch accepts cannot answer differently.
 ///
-/// ADR-041 §1: a batch may not carry a batch, in either direction. Only
-/// `transact` needs saying here — the read-only `batch` has no `COMMANDS`
-/// row, so it already resolves to no operation below, exactly as it does for
-/// `batch`'s own validation (`rust/mcp.rs:451`).
+/// ADR-041 §1: a batch may not carry a batch, in either direction. Both
+/// batchers are refused by name: `transact` because its row would otherwise
+/// admit it, and the read-only `batch` because its row publishes `kanban
+/// batch` as a read (docs/specs/batch.md BA-05).
 fn transactable(name: &str) -> Result<()> {
-    if name == "transact" {
+    if name == "transact" || name == "batch" {
         bail!("names {name}, and a batch may not carry a batch");
     }
     let Some((command, sub, ..)) = COMMANDS
@@ -5701,6 +5711,17 @@ fn run_transact_item(
     let arguments = resolve_refs(arguments, results)?;
     let argv = mcp::arguments_for(name, &arguments)?;
     let _stamp = store::BatchStamp::set(batch_id, index);
+    run_captured(name, argv)
+}
+
+/// Run one batched item through the whole dispatch, collecting what it would
+/// have printed instead of printing it.
+///
+/// The one place both batchers run an item, so a `kanban batch` read and a
+/// `transact` item go through the same parse, refusals, authorization and
+/// store method as the same command alone (ADR-041 §2; docs/specs/batch.md
+/// BA-09, BA-11).
+fn run_captured(name: &str, argv: Vec<String>) -> Result<Value> {
     CAPTURED.with_borrow_mut(|slot| *slot = Some(String::new()));
     let outcome = run_argv(argv);
     let captured = CAPTURED.with_borrow_mut(Option::take).unwrap_or_default();
@@ -5743,7 +5764,7 @@ fn refuse_transact(batch_id: &str, refusal: TransactRefusal) -> Result<()> {
 /// concept means an agent that has learned to build a batched read cannot
 /// reuse the item it just built (ADR-041 §1).
 fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
-    let items = transact_items(args)?;
+    let items = batch_items(args, "transact")?;
     // Minted once, before the outer scope opens, in a lease token's format and
     // by the same mint (ADR-041 §7). A rolled-back batch appends nothing, so a
     // `batchId` in the ledger always means a batch that landed whole.
@@ -5819,6 +5840,64 @@ fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
             "transact rolled back: item {index} failed, so nothing in the batch landed"
         )),
     }
+}
+
+/// `kanban batch`: up to [`mcp::BATCH_LIMIT`] read-only operations answered by
+/// one process with one board open (docs/specs/batch.md).
+///
+/// The command-line twin of the MCP `batch` tool, and a shortcut rather than
+/// a capability: it can do nothing a sequence of separate calls could not.
+///
+/// - **One pre-flight.** The list is checked by [`mcp::plan_batch`], the
+///   function the MCP tool checks its list with, so the two refuse the same
+///   list in the same words and accept the same names (BA-02, BA-04, BA-05,
+///   BA-12). A refused list runs nothing.
+/// - **One board open.** The board opens read-only once and is lent to every
+///   item, so the whole list costs one process instead of a spawn per item
+///   (BA-01). A read-only connection carries `PRAGMA query_only`, so a batch
+///   writes nothing and an item that tried to would fail loudly (BA-10).
+/// - **Every item as if alone.** Each item runs through [`run_captured`], the
+///   same dispatch, refusals and authorization as the command on its own, so
+///   its `result` is byte-identical to that command's answer (BA-09, BA-11).
+/// - **Independent answers.** A failing item is that item's `error` beside
+///   every other item's `result`, and the batch still exits zero: a batch
+///   that gave up on the first refusal would hide the rest (BA-03).
+fn run_batch(args: &Args) -> Result<()> {
+    let items = batch_items(args, "batch")?;
+    let planned =
+        mcp::plan_batch("kanban batch", "kanban transact", &items).map_err(anyhow::Error::msg)?;
+    // A batch addresses one board -- the one `kanban batch` itself resolved --
+    // and every item reads it. An item naming another would have its selector
+    // silently discarded, the wrong-board defect ADR-007 exists to prevent
+    // (docs/specs/batch.md §6, the rule `plan_transact` applies to transact).
+    for (index, (_, arguments)) in planned.iter().enumerate() {
+        if let Some(named) = BOARD_SELECTORS
+            .iter()
+            .find(|flag| item_passes(arguments, flag))
+        {
+            bail!(
+                "kanban batch call {index} names --{named}, and a batch addresses one board: \
+                 pass the selector to `kanban batch` itself; nothing in it ran"
+            );
+        }
+    }
+
+    let store = Store::open_for_read_as_caller(&store_path_readonly(args)?)?;
+    LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+    let results = planned
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            match mcp::arguments_for(name, arguments).and_then(|argv| run_captured(name, argv)) {
+                Ok(result) => json!({ "index": index, "ok": true, "result": result }),
+                Err(error) => json!({ "index": index, "ok": false, "error": format!("{error:#}") }),
+            }
+        })
+        .collect::<Vec<_>>();
+    // Taken back before printing, so nothing after this batch in the same
+    // process can reach its board.
+    drop(LENT_BOARD.with_borrow_mut(Option::take));
+    print(&json!({ "results": results }), true)
 }
 
 fn run() -> Result<()> {
@@ -6735,6 +6814,11 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     // lends it to every item (ADR-041 §3.4), and after the data-root lock,
     // because the batch holds that lock for the whole list rather than once
     // per item.
+    // The read-only twin, dispatched here for the same reason: it opens the
+    // board once itself and lends it to every item (docs/specs/batch.md BA-01).
+    if command == "batch" {
+        return run_batch(&args);
+    }
     if command == "transact" {
         return run_transact(&args, creation);
     }
@@ -8508,7 +8592,7 @@ mod tests {
     #[test]
     fn a_transact_takes_its_items_from_one_place_or_refuses() {
         assert_eq!(
-            transact_items(&args(&["--items", "[]"])).unwrap(),
+            batch_items(&args(&["--items", "[]"]), "transact").unwrap(),
             Vec::<Value>::new()
         );
 
@@ -8518,7 +8602,8 @@ mod tests {
             now_ms()
         ));
         fs::write(&path, r#"[{"name":"stale"}]"#).unwrap();
-        let from_file = transact_items(&args(&["--items-file", path.to_str().unwrap()])).unwrap();
+        let from_file =
+            batch_items(&args(&["--items-file", path.to_str().unwrap()]), "transact").unwrap();
         assert_eq!(from_file, vec![json!({ "name": "stale" })]);
         fs::remove_file(&path).unwrap();
 
@@ -8541,7 +8626,10 @@ mod tests {
                 "not {\"name\":\"stale\"}",
             ),
         ] {
-            let error = format!("{:#}", transact_items(&args(&arguments)).expect_err(label));
+            let error = format!(
+                "{:#}",
+                batch_items(&args(&arguments), "transact").expect_err(label)
+            );
             assert!(error.contains(expected), "{label}: {error}");
         }
     }
@@ -8554,10 +8642,11 @@ mod tests {
             transactable(name).unwrap_or_else(|error| panic!("{name}: {error:#}"));
         }
         for (name, expected) in [
-            // Its own name: the one nesting refusal that needs stating.
+            // Its own name: a batch may not carry a batch.
             ("transact", "may not carry a batch"),
-            // The read-only batch has no row, so it resolves to nothing.
-            ("batch", "names no such operation batch"),
+            // The read-only batch, by name too: its row publishes `kanban
+            // batch` as a read, which would otherwise admit it (BA-05).
+            ("batch", "may not carry a batch"),
             ("frobnicate", "names no such operation frobnicate"),
             // Withheld from `tools/list`, and withheld here for the same
             // reason: an unbounded follow inside a write scope is not an item.
