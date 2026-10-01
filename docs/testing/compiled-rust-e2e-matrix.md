@@ -697,13 +697,13 @@ writes each one in the change that implements it, so every row says `no e2e cove
 | `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
 | `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
 | `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
+| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
 | `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
 | `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
-| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
 | `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
 | `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
-| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7). |
+| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7, A10). |
 | `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
 | `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
 | `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |

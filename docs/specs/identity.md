@@ -9,7 +9,12 @@
   Every "today" claim below cites `<path>:<line>` in that worktree. At the baseline no worker,
   run, delegation, attempt or request-receipt concept exists in `rust/`; `tasks.parent_id`
   (`rust/db.rs:16-19`) is work breakdown, not authority.
-- **Status:** `DRAFT` — gate requested 2026-10-01.
+- **Status:** `SPEC-READY` on 2026-10-01 (independent reviewer agent `ReviewIdentitySpec1` at
+  commit `5d2f1a7`, applying the SDD §1 exit criteria: eighteen MUST requirements, each testable,
+  single-layer and sourced, reached by an acceptance example and one §8 row identical to the
+  matrix; both material owner choices taken on `a-75f7280c` and `a-ed2bbd7d`; cited lines
+  spot-checked in this worktree. Its six wording findings are applied as recorded in §9.
+  Specification readiness only — it authorises neither implementation, nor rollout, nor release.)
 - **Owner (product scope):** George. He alone resolves scope and the open questions in §7.
 - **Decider (wording of this document):** slice row `t-026ece7c` under epic `e-c0852fe7`,
   admitted on owner verdict `a-eaa4d835` (resolved by geoyws 2026-09-30: "IDENTITY slice approved
@@ -44,6 +49,9 @@
   - `docs/adr/ADR-010-adapters-generated-from-the-command-surface.md` and
     `docs/adr/ADR-011-in-binary-mcp-server-and-in-place-reload.md` — CLI, schema manifest and MCP
     tools come from one command table.
+  - `docs/adr/ADR-029-audit-journals-are-hash-chained-and-externally-anchored.md` — policy events
+    and access-audit rows, denied attempts included, are hash-chained journals; IDENT-03 adds
+    entries to them and no new journal.
   - Shipped surface at the baseline:
     - Direct identity is free text: `--as`, `--lane`, `--session` are trimmed and checked
       non-empty only (`rust/store.rs:18-24`, `:125-127`); the lane grammar is
@@ -148,8 +156,7 @@ Strength: `MUST` · Layer: `process` · Source: `a-75f7280c`.
 `When the canonical registry is absent or its enforcement state is direct or prepared, every
 worker verb, and every other command run with KANBAN_WORKER_CREDENTIAL set, is refused with
 "worker identity needs managed enforcement; this installation is <state>", where <state> is
-direct, prepared or "unregistered", and writes nothing. A refused worker call is never retried as
-a plain call.`
+direct, prepared or "unregistered", and writes nothing.`
 
 **IDENT-02** — A worker record carries a minted id and immutable labels.
 Strength: `MUST` · Layer: `process` · Source: `t-2aafd55c` ("immutable worker/run/parent
@@ -228,7 +235,7 @@ abandoned lease does today (rust/store.rs:3451-3475). Retiring a retired worker 
 
 ### Leases
 
-**IDENT-08** — A worker's claim is bound to the worker and stamped.
+**IDENT-08** — A worker's claim or handoff accept is bound to the worker and stamped.
 Strength: `MUST` · Layer: `process` · Source: `t-2aafd55c`; `e-3a942ae9` ("atomically claim exact
 ready task with registered worker binding").
 `A worker call to claim (by id or --next) requires --as to equal the worker's laneActor exactly,
@@ -239,6 +246,11 @@ today's columns, and the claim receipt shows workerId and attempt (IDENT-09). Ev
 handoff and task event written under a worker-bound lease records the same workerId and
 principalId. A claim made without a credential under managed enforcement records principalId and a
 null workerId; under direct or prepared enforcement both are null.`
+`A worker call to handoff accept applies the same --as rule and the same refusal first, then the
+baseline's target rule unchanged (rust/store.rs:9658-9669, refusal "handoff <id> targets
+<target>, not <as>"), then check_write against E and the task root on the handoff's task. The
+lease it creates records the accepting worker's workerId and principalId, exactly as a worker's
+claim does.`
 
 **IDENT-09** — Each task counts its claim attempts.
 Strength: `MUST` · Layer: `process` · Source: `t-2aafd55c` ("task attempt/generation").
@@ -254,7 +266,8 @@ Strength: `MUST` · Layer: `process` · Source: `t-2aafd55c` ("exact-token fenci
 `heartbeat, release, checkpoint, note and handoff create made as a worker call first apply
 require_lease and its existing refusals unchanged (rust/store.rs:3266-3291), then require the
 lease's workerId to equal the caller's worker id, else "lease belongs to worker <holder>, not
-<caller>", then apply IDENT-06 to the task. A lease taken without a credential cannot be used by a
+<caller>", then apply check_write against E (IDENT-06) over the task's current tags, together with
+the task root. A lease taken without a credential cannot be used by a
 worker call, and a worker-bound lease cannot be used by a call without a credential; each is
 refused with that sentence, naming "no worker" for the side without one. No refusal names a lease
 token or a credential.`
@@ -265,7 +278,7 @@ Strength: `MUST` · Layer: `process` · Source: `a-ed2bbd7d` ("explicit policy m
 `A worker call may run only: a command whose generated MCP tool carries readOnlyHint true
 (rust/mcp.rs:316), each row it reads checked against E; claim; heartbeat; release; checkpoint;
 note, only on a task whose active lease the worker holds; handoff create, from a lease it holds;
-handoff accept, of a handoff addressed to its laneActor; worker register, worker show, worker list
+handoff accept, under IDENT-08; worker register, worker show, worker list
 and worker retire, for itself and its descendants. Every other command, including task add, task
 move, task update, task remove, transact, sitrep, attention, subscription, deploy and every access
 command, is refused with "worker <id> may not run <command>: it is coordinator-only" before any
@@ -284,7 +297,9 @@ group coordinator must not serialize its sibling task workers").
 `Two workers with the same laneActor, or with the same parent, each claiming a different ready task
 at the same time, both succeed and hold distinct leases with distinct workerIds. Two workers
 claiming the same task at the same time produce exactly one lease; the other is refused with the
-existing already-claimed sentence. Holding a lease never blocks a claim on another task.`
+existing already-claimed sentence, which begins "task <id> is already claimed by <holder> until
+<expiry> (epoch ms)" (rust/store.rs:7516-7524). Holding a lease never blocks a claim on another
+task.`
 
 ### Requests
 
@@ -350,7 +365,7 @@ The managed examples run as a non-root UID with the principal `alice` holding `w
 `board:B` (`B` the test board's id), as `tests/authz_bypass_matrix_e2e.rs` sets up; `C` names the
 coordinator, a process with no credential.
 
-### A1 (IDENT-01, IDENT-18)
+### A1 (IDENT-01, IDENT-09, IDENT-18)
 
 *Given* a fresh data root with no registry, and separately a registry in state `prepared`,
 *when* the caller runs `worker list --json`, then `task list` with `KANBAN_WORKER_CREDENTIAL` set to
@@ -388,7 +403,7 @@ then `checkpoint T --lease L ...` without a credential, then the same with `k1`,
 returns a lease with `workerId` w1 and `attempt` 1, the third is refused with `lease belongs to
 worker w1, not no worker`, and the fourth writes a checkpoint stamped with w1, alice and attempt 1.
 
-### A5 (IDENT-07, IDENT-11, IDENT-12)
+### A5 (IDENT-05, IDENT-07, IDENT-11, IDENT-12)
 
 *Given* `w1` holding T's lease, and `w2` from A3 (grant `read` only),
 *when* a `k1` call runs `task move T done --as @:t/b/driver`, a `k2` call claims a ready task, C
@@ -423,13 +438,25 @@ and calls `worker_list`,
 refused with `--limit must be between 1 and 500, got 501`, and the manifest lists the four worker
 tools with `readOnlyHint` true only on `worker_show` and `worker_list`.
 
-### A9 (IDENT-17)
+### A9 (IDENT-09, IDENT-17)
 
 *Given* a board at schema 37 with one leased task and one unleased task, and a registry at 14,
 *when* this slice's binary opens them, then a baseline binary opens them,
 *then* the leased task shows attempt 1 and the unleased task's next claim gets attempt 1, the old
 lease's holder can still heartbeat it without a credential, and the baseline binary is refused
 with `database version 38 is newer than supported version 37`.
+
+### A10 (IDENT-08, IDENT-11, IDENT-14)
+
+*Given* `w1` holding T's lease `L` (attempt 1), and a worker `w5` registered by C with
+`--lane-actor @:t/b/driver-2 --grant write=board:B` (credential `k5`),
+*when* a `k1` call runs `handoff create T --lease L --as @:t/b/driver --to @:t/b/driver-2
+--summary s --intent i --request-id hand-00000000001 --json` twice, then a `k5` call runs
+`handoff accept H --as @:t/b/driver` and then `handoff accept H --as @:t/b/driver-2 --json`,
+where `H` is the created handoff,
+*then* the two creates print byte-identical output and the board holds one handoff, the first
+accept is refused with `worker w5 acts as @:t/b/driver-2, not @:t/b/driver`, and the second
+returns a lease on T with `workerId` w5 and `attempt` 2.
 
 ## 5. Contracts and data
 
@@ -494,7 +521,9 @@ with `database version 38 is newer than supported version 37`.
   credential's entropy, one-time display and digest-only storage (IDENT-05); V16.2.1 applies to
   the chained policy events (IDENT-03).
 - **Operability:** `worker list` and `worker show` are the coordinator's view of who it delegated
-  to; every lease, checkpoint and handoff names its worker and attempt.
+  to; every lease, checkpoint and handoff names its worker and attempt. Guidance, not a
+  requirement: a lane that receives the IDENT-01 refusal should stop and report it rather than
+  retry the call without its credential, which would run with the principal's full authority.
 - **Performance:** no budget. Observation: each worker call reads the registry once more to walk
   the worker's ancestry, which is bounded by the delegation depth.
 
@@ -523,13 +552,13 @@ table is its draft and the two land identical. No test exists yet: the implement
 | `IDENT-05` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A2, A5). |
 | `IDENT-06` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A3). |
 | `IDENT-07` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
-| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
+| `IDENT-08` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4, A10). |
 | `IDENT-09` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A1, A4, A9). |
 | `IDENT-10` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A4). |
-| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
+| `IDENT-11` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5, A10). |
 | `IDENT-12` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A5). |
 | `IDENT-13` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A6). |
-| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7). |
+| `IDENT-14` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A7, A10). |
 | `IDENT-15` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
 | `IDENT-16` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A8). |
 | `IDENT-17` | MUST | process | `none` | no e2e coverage. Owed by `t-2aafd55c` (A9). |
@@ -540,3 +569,11 @@ table is its draft and the two land identical. No test exists yet: the implement
 - `2026-10-01` — slice created at `IDENT-01` .. `IDENT-18` under row `t-026ece7c`, after owner
   verdicts `a-eaa4d835` (slice admitted for `t-2aafd55c` only), `a-75f7280c` (managed-only
   delegation) and `a-ed2bbd7d` (broker registry grants). No supersessions yet.
+- `2026-10-01` — independent `/quality spec` review (`ReviewIdentitySpec1`, commit `5d2f1a7`):
+  SPEC-READY with six wording findings, applied without changing any requirement's meaning.
+  IDENT-01 loses its unenforceable no-retry sentence, which moves to §6 operability as guidance.
+  Acceptance headings A1, A5 and A9 name every requirement they prove. IDENT-08 states the
+  handoff-accept rule (same `--as` rule, then the baseline target rule) and new example A10
+  exercises it with a handoff-create replay. IDENT-10 names its check (`check_write` against E
+  over the task's current tags). §1 lists ADR-029. IDENT-13 quotes and cites the already-claimed
+  sentence.
