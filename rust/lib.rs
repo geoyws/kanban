@@ -26,6 +26,7 @@ mod lock;
 mod mcp;
 mod model;
 mod opencode_adapter;
+mod plugin;
 #[allow(dead_code)]
 mod policy;
 mod registry;
@@ -93,6 +94,8 @@ Usage:
   kanban subscription list [--status active|paused] [--consumer NAME] [--all] [--json]
   kanban subscription show ID [--json]
   kanban subscription pause|resume ID --as ACTOR [--json]
+  kanban plugin call CONSUMER ACTION [--input-json JSON | --input-file PATH] [--json]
+  kanban plugin list [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
   kanban deploy start --repo REPO --commit FULL_SHA --tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p --environment NAME
@@ -695,6 +698,18 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         &["db", "project", "workspace"],
         "resolves a board per tool call, not once for the server",
     ),
+    (
+        "plugin",
+        Some("call"),
+        &["db", "project", "workspace"],
+        "calls an operator-configured plugin, not a board",
+    ),
+    (
+        "plugin",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "lists the operator's configured plugins, not a board",
+    ),
     // Rules refused these before this table existed, from two inline loops in
     // the dispatcher. Refusing there and declaring nothing here left the rest
     // of the surface reading the wrong answer: `schema --json` published
@@ -1027,6 +1042,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("subscription", Some("show"), &[], &["id"], true),
     ("subscription", Some("pause"), &["as"], &["id"], false),
     ("subscription", Some("resume"), &["as"], &["id"], false),
+    (
+        "plugin",
+        Some("call"),
+        &["input-json", "input-file"],
+        &["consumer", "action"],
+        true,
+    ),
+    ("plugin", Some("list"), &[], &[], true),
     ("restore", None, &["from", "force", "as"], &[], false),
     (
         "task",
@@ -1920,7 +1943,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 14] = [
+const SUBCOMMAND_GROUPS: [&str; 15] = [
     "task",
     "story",
     "handoff",
@@ -1935,6 +1958,7 @@ const SUBCOMMAND_GROUPS: [&str; 14] = [
     "subscription",
     "access",
     "sprint",
+    "plugin",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -5735,6 +5759,21 @@ fn refuse_transact(batch_id: &str, refusal: TransactRefusal) -> Result<()> {
     Err(anyhow::anyhow!(refusal.message))
 }
 
+/// `kanban plugin call|list` (docs/specs/plugin.md). `call` prints the one
+/// canonical line with or without `--json` (PLUGIN-11).
+fn run_plugin(args: &Args, sub: Option<&str>, rest: &[String]) -> Result<()> {
+    match sub {
+        Some("call") => {
+            let consumer = rest.first().context("consumer is required")?;
+            let action = rest.get(1).context("action is required")?;
+            let input = plugin::parse_input(args.one("input-json"), args.one("input-file"))?;
+            emit(&plugin::call(consumer, action, input)?)
+        }
+        Some("list") => print(&plugin::list()?, args.has("json")),
+        _ => bail!("unknown command; run kanban --help"),
+    }
+}
+
 /// `kanban transact`: one ordered list of operations, all of which land or
 /// none of which do.
 ///
@@ -5922,6 +5961,13 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             args.reject_conflicting_board_selectors()?;
         }
         None => bail!("unknown command; run kanban --help"),
+    }
+
+    // Calls or lists operator-configured plugins (docs/specs/plugin.md). It
+    // reads `dispatchers.json`, opens no board, takes no lock and writes
+    // nothing, so it returns before any of that machinery (PLUGIN-06).
+    if command == "plugin" {
+        return run_plugin(&args, spec_sub.as_deref(), rest);
     }
 
     require_sane_clock()?;
@@ -6771,6 +6817,19 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                     .to_owned(),
             ),
         };
+        // A subscription delivers to a delivery action, never to a plugin
+        // (PLUGIN-05). Only a file that loads can name a plugin; an absent or
+        // unreadable one leaves this command exactly as it was, and the
+        // dispatcher refuses the same case again when it resolves.
+        let consumer = args.require("consumer")?;
+        let action = args.require("action")?;
+        if let Ok(Some(config)) = dispatch::DispatcherConfigLoader::load_optional()
+            && config.action_is_plugin(consumer, action) == Some(true)
+        {
+            bail!(
+                "action {consumer}/{action} is a plugin; subscriptions deliver only to delivery actions"
+            );
+        }
         return print(
             &store.add_subscription(AddSubscription {
                 id: option_string(&args, "id"),

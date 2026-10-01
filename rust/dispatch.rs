@@ -23,7 +23,15 @@ const EXEC_MODE_ANY_EXEC: u32 = 0o111;
 const IDENTIFIER_MAX: usize = 64;
 const SECRET_REF_MAX: usize = 128;
 const ENV_NAME_MAX: usize = 128;
-const SUPPORTED_VERSION: i64 = 1;
+/// Version 1 is the delivery-only shape; version 2 admits plugin actions
+/// (docs/specs/plugin.md PLUGIN-01). An older binary refuses version 2.
+const SUPPORTED_VERSIONS: [i64; 2] = [1, 2];
+/// The one capability a plugin action may name (PLUGIN-02).
+const PLUGIN_CAPABILITY: &str = "plugin.read";
+const PLUGIN_KIND: &str = "plugin";
+const DELIVERY_KIND: &str = "delivery";
+const REVISION_MAX: usize = 128;
+const PLUGIN_TIMEOUT_MAX_MS: i64 = 300_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +54,31 @@ struct ActionConfig {
     capability: String,
     executable: String,
     args: Vec<String>,
+    /// Absent or `delivery`: a subscription target. `plugin`: a synchronous
+    /// plugin action (version 2 only).
+    kind: Option<String>,
+    revision: Option<String>,
+    sha256: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: Option<i64>,
+    secret: Option<String>,
+}
+
+impl ActionConfig {
+    fn is_plugin(&self) -> bool {
+        self.kind.as_deref() == Some(PLUGIN_KIND)
+    }
+
+    /// The version 2 fields, in the order a refusal names the first present.
+    fn plugin_fields(&self) -> [(&'static str, bool); 5] {
+        [
+            ("kind", self.kind.is_some()),
+            ("revision", self.revision.is_some()),
+            ("sha256", self.sha256.is_some()),
+            ("timeoutMs", self.timeout_ms.is_some()),
+            ("secret", self.secret.is_some()),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -364,6 +397,117 @@ fn validate_secret_config(secret: &SecretConfig, secret_id: &str) -> Result<()> 
     Ok(())
 }
 
+/// A strict revision label: exactly the bytes given, no trimming (PLUGIN-01).
+fn valid_revision(value: &str) -> bool {
+    (1..=REVISION_MAX).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The version 2 rules for one action (PLUGIN-01, PLUGIN-02). Each refusal
+/// names the consumer, the action and the field.
+fn validate_action_kind(
+    version: i64,
+    consumer_id: &str,
+    action_id: &str,
+    action: &ActionConfig,
+    consumer: &ConsumerConfig,
+) -> Result<()> {
+    let fields = action.plugin_fields();
+    if version == 1 {
+        if let Some((name, _)) = fields.iter().find(|(_, present)| *present) {
+            bail!(
+                "action {consumer_id}/{action_id}: field {name} needs dispatcher config version 2"
+            );
+        }
+        return Ok(());
+    }
+    match action.kind.as_deref() {
+        None | Some(DELIVERY_KIND) => {
+            if let Some((name, _)) = fields[1..].iter().find(|(_, present)| *present) {
+                bail!(
+                    "action {consumer_id}/{action_id}: field {name} is allowed only on a plugin action"
+                );
+            }
+            Ok(())
+        }
+        Some(PLUGIN_KIND) => {
+            if action.capability != PLUGIN_CAPABILITY {
+                bail!(
+                    "plugin action {consumer_id}/{action_id} must use capability {PLUGIN_CAPABILITY}"
+                );
+            }
+            let required = |name: &str| {
+                anyhow::anyhow!(
+                    "action {consumer_id}/{action_id}: field {name} is required on a plugin action"
+                )
+            };
+            let revision = action
+                .revision
+                .as_deref()
+                .ok_or_else(|| required("revision"))?;
+            if !valid_revision(revision) {
+                bail!(
+                    "action {consumer_id}/{action_id}: field revision must be 1-{REVISION_MAX} ASCII characters, start with a letter or digit, and contain only letters, digits, dot, underscore, or hyphen"
+                );
+            }
+            let sha256 = action.sha256.as_deref().ok_or_else(|| required("sha256"))?;
+            if !is_lower_hex_64(sha256) {
+                bail!(
+                    "action {consumer_id}/{action_id}: field sha256 must be exactly 64 lowercase hexadecimal characters"
+                );
+            }
+            let timeout_ms = action.timeout_ms.ok_or_else(|| required("timeoutMs"))?;
+            if !(1..=PLUGIN_TIMEOUT_MAX_MS).contains(&timeout_ms) {
+                bail!(
+                    "action {consumer_id}/{action_id}: field timeoutMs must be between 1 and {PLUGIN_TIMEOUT_MAX_MS}, got {timeout_ms}"
+                );
+            }
+            if let Some(secret) = action.secret.as_deref()
+                && !consumer.secrets.contains_key(secret)
+            {
+                bail!(
+                    "action {consumer_id}/{action_id}: field secret names no secret of consumer {consumer_id}"
+                );
+            }
+            Ok(())
+        }
+        Some(other) => bail!(
+            "action {consumer_id}/{action_id}: field kind must be {PLUGIN_KIND} or {DELIVERY_KIND}, got {other}"
+        ),
+    }
+}
+
+/// SHA-256 of a file's bytes, streamed, as 64 lowercase hex characters.
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("read executable {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut chunk)
+            .with_context(|| format!("read executable {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&chunk[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn verify_executable(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect executable {}", path.display()))?;
@@ -493,7 +637,7 @@ impl DispatcherConfigLoader {
         ensure_private_root(&root)?;
         let path = root.join(CONFIG_FILE);
         let config = read_verified_config(&path)?;
-        if config.version != SUPPORTED_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&config.version) {
             bail!("unsupported dispatcher config version {}", config.version);
         }
         if config.consumers.is_empty() {
@@ -508,6 +652,7 @@ impl DispatcherConfigLoader {
             for (action_id, action) in &consumer.actions {
                 exact_identifier(action_id, "action id", IDENTIFIER_MAX)?;
                 validate_action_config(action, action_id)?;
+                validate_action_kind(config.version, consumer_id, action_id, action, consumer)?;
             }
             for (secret_id, secret) in &consumer.secrets {
                 exact_identifier(secret_id, "secret reference", SECRET_REF_MAX)?;
@@ -518,6 +663,46 @@ impl DispatcherConfigLoader {
             consumers: config.consumers,
         })
     }
+
+    /// The configuration, or `None` when there is none to read: the data root
+    /// or `dispatchers.json` does not exist. Absence is the only state read as
+    /// "no plugins" (PLUGIN-04); a present file that fails any check is still
+    /// refused by [`Self::load`] (PLUGIN-03).
+    pub(crate) fn load_optional() -> Result<Option<DispatcherConfig>> {
+        let root = config_root()?;
+        for path in [root.clone(), root.join(CONFIG_FILE)] {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                _ => {}
+            }
+        }
+        Self::load().map(Some)
+    }
+}
+
+/// One plugin action, checked and ready to run (PLUGIN-07).
+#[derive(Debug)]
+pub(crate) struct ResolvedPlugin {
+    pub(crate) consumer_id: String,
+    pub(crate) action_id: String,
+    pub(crate) executable: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) secret: Option<ResolvedSecret>,
+    pub(crate) revision: String,
+    pub(crate) sha256: String,
+    pub(crate) timeout_ms: i64,
+}
+
+/// What `plugin list` shows of one plugin action before any check (PLUGIN-12):
+/// never its args, its secret reference or anything read from the environment.
+#[derive(Debug)]
+pub(crate) struct PluginEntry {
+    pub(crate) consumer_id: String,
+    pub(crate) action_id: String,
+    pub(crate) capability: String,
+    pub(crate) revision: String,
+    pub(crate) sha256: String,
+    pub(crate) executable: String,
 }
 
 impl DispatcherConfig {
@@ -527,6 +712,105 @@ impl DispatcherConfig {
             bail!("unknown consumer {consumer_id}");
         }
         Ok(())
+    }
+
+    /// Whether `consumer`/`action` names a plugin action; `None` when the file
+    /// declares no such action.
+    pub(crate) fn action_is_plugin(&self, consumer_id: &str, action_id: &str) -> Option<bool> {
+        self.consumers
+            .get(consumer_id)?
+            .actions
+            .get(action_id)
+            .map(ActionConfig::is_plugin)
+    }
+
+    /// Every plugin action, sorted by consumer then action.
+    pub(crate) fn plugin_entries(&self) -> Vec<PluginEntry> {
+        self.consumers
+            .iter()
+            .flat_map(|(consumer_id, consumer)| {
+                consumer
+                    .actions
+                    .iter()
+                    .filter(|(_, action)| action.is_plugin())
+                    .map(move |(action_id, action)| PluginEntry {
+                        consumer_id: consumer_id.clone(),
+                        action_id: action_id.clone(),
+                        capability: action.capability.clone(),
+                        revision: action.revision.clone().unwrap_or_default(),
+                        sha256: action.sha256.clone().unwrap_or_default(),
+                        executable: action.executable.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Resolve and recheck one plugin action, in the order PLUGIN-07 names,
+    /// without spawning anything. The first failure is the one sentence the
+    /// caller sees.
+    pub(crate) fn resolve_plugin(
+        &self,
+        consumer_id: &str,
+        action_id: &str,
+    ) -> Result<ResolvedPlugin> {
+        let not_configured =
+            || anyhow::anyhow!("no plugin {consumer_id}/{action_id} is configured");
+        let consumer = self.consumers.get(consumer_id).ok_or_else(not_configured)?;
+        let action = consumer.actions.get(action_id).ok_or_else(not_configured)?;
+        if !action.is_plugin() {
+            bail!("action {consumer_id}/{action_id} is not a plugin action");
+        }
+        let unavailable = |reason: String| {
+            anyhow::anyhow!("plugin {consumer_id}/{action_id} is unavailable: {reason}")
+        };
+        if !consumer
+            .capabilities
+            .iter()
+            .any(|value| value == &action.capability)
+        {
+            return Err(unavailable(format!(
+                "consumer {consumer_id} does not declare capability {}",
+                action.capability
+            )));
+        }
+        let secret = match action.secret.as_deref() {
+            Some(secret_ref) => {
+                let secret = consumer.secrets.get(secret_ref).ok_or_else(|| {
+                    unavailable(format!(
+                        "unknown secret {secret_ref} for consumer {consumer_id}"
+                    ))
+                })?;
+                let Some(value) = env::var_os(&secret.source_env) else {
+                    return Err(unavailable(format!(
+                        "missing source env for secret {secret_ref}"
+                    )));
+                };
+                Some(ResolvedSecret {
+                    target_env: secret.target_env.clone(),
+                    secret_value: value,
+                })
+            }
+            None => None,
+        };
+        let executable = PathBuf::from(action.executable.trim());
+        verify_executable(&executable).map_err(|error| unavailable(format!("{error:#}")))?;
+        let pinned = action.sha256.clone().unwrap_or_default();
+        let found = file_sha256(&executable).map_err(|error| unavailable(format!("{error:#}")))?;
+        if found != pinned {
+            return Err(unavailable(format!(
+                "executable sha256 {found} does not match pinned {pinned}"
+            )));
+        }
+        Ok(ResolvedPlugin {
+            consumer_id: consumer_id.to_owned(),
+            action_id: action_id.to_owned(),
+            executable,
+            args: action.args.clone(),
+            secret,
+            revision: action.revision.clone().unwrap_or_default(),
+            sha256: pinned,
+            timeout_ms: action.timeout_ms.unwrap_or_default(),
+        })
     }
 
     pub(crate) fn resolve(&self, subscription: &Subscription) -> Result<ResolvedDispatch> {
@@ -540,6 +824,15 @@ impl DispatcherConfig {
             .actions
             .get(&action_id)
             .with_context(|| format!("unknown action {action_id} for consumer {consumer_id}"))?;
+        // A plugin answers a question; a delivery is a notification. The two
+        // never cross (PLUGIN-05), rechecked here because the file is reread
+        // for every candidate and an action may have become a plugin since
+        // the subscription was added.
+        if action.is_plugin() {
+            bail!(
+                "action {consumer_id}/{action_id} is a plugin; subscriptions deliver only to delivery actions"
+            );
+        }
         let capability = exact_identifier(&action.capability, "capability", IDENTIFIER_MAX)?;
         if !consumer
             .capabilities

@@ -656,26 +656,26 @@ which deleted web routes; this slice builds no new web surface.
 One row per requirement, written with the specification on branch `wt/t-374806ea-plugin` at
 2026-10-01 (base `46964bc`). `Layer` uses the specification's vocabulary: `process` is a
 compiled-binary process-boundary exchange with no HTTP and no browser, `unit` an in-process
-`#[test]`. No test exists yet; the implementing row `t-f73a81ae` writes each one in the change
-that implements it, so every row says `no e2e coverage` (or `no unit coverage`) plainly.
+`#[test]`. Row `t-f73a81ae` wrote each test with the implementation: `process` tests in
+`tests/plugin_e2e.rs` (in the release gate's serial list), `unit` tests in `rust/plugin.rs`.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `PLUGIN-01` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
-| `PLUGIN-02` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
-| `PLUGIN-03` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A2). |
-| `PLUGIN-04` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A1). |
-| `PLUGIN-05` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A6). |
-| `PLUGIN-06` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
-| `PLUGIN-07` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
-| `PLUGIN-08` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A3, A5). |
-| `PLUGIN-09` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
-| `PLUGIN-10` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A5). |
-| `PLUGIN-11` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A3). |
-| `PLUGIN-12` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
-| `PLUGIN-13` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A7). |
-| `PLUGIN-14` | MUST | unit | `none` | no unit coverage. Owed by `t-f73a81ae` (A1). |
-| `PLUGIN-15` | MUST | process | `none` | no e2e coverage. Owed by `t-f73a81ae` (A4). |
+| `PLUGIN-01` | MUST | process | `plugin_e2e::a_violating_file_is_refused_at_load_and_spawns_nothing` | A2. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-02` | MUST | process | `plugin_e2e::a_violating_file_is_refused_at_load_and_spawns_nothing` | A2. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-03` | MUST | process | `plugin_e2e::a_violating_file_is_refused_at_load_and_spawns_nothing` | A2. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-04` | MUST | process | `plugin_e2e::a_host_without_plugins_lists_none_and_refuses_a_call` | A1. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-05` | MUST | process | `plugin_e2e::plugin_actions_and_subscription_delivery_never_cross` | A6. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-06` | MUST | process | `plugin_e2e::a_call_prints_one_canonical_line_and_writes_nothing` | A3. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-07` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-08` | MUST | unit | `plugin::tests::every_broken_rule_is_refused_by_name` | Also `the_request_carries_exactly_the_v1_envelope`. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-09` | MUST | process | `plugin_e2e::a_misbehaving_plugin_is_refused_and_its_output_discarded` | A5. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-10` | MUST | process | `plugin_e2e::a_misbehaving_plugin_is_refused_and_its_output_discarded` | A5. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-11` | MUST | process | `plugin_e2e::a_call_prints_one_canonical_line_and_writes_nothing` | A3; numbers also by unit `the_envelope_is_canonical_at_every_depth`. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-12` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-13` | MUST | process | `plugin_e2e::both_verbs_are_read_only_mcp_tools_with_cli_answers` | A7. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-14` | MUST | unit | `plugin::tests::the_public_tree_carries_no_plugin_and_no_private_dependency` | A1's tree half. Passed in a Linux container dev run 2026-10-01. |
+| `PLUGIN-15` | MUST | process | `plugin_e2e::every_call_rechecks_pin_grant_and_secret_before_it_spawns` | A4. Passed in a Linux container dev run 2026-10-01. |
 
 15 requirements: 15 MUST, no SHOULD or MAY. No board or registry migration rides this slice;
 `dispatchers.json` gains version 2.
