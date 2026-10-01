@@ -11003,7 +11003,15 @@ fn the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it() {
     assert_eq!(flag_kind("task"), "value");
     assert_eq!(flag_kind("rule"), "value");
     assert_eq!(flag_kind("registry"), "boolean");
-    for name in ["kind", "relation", "prior-status", "current-status", "tag"] {
+    for name in [
+        "kind",
+        "relation",
+        "prior-status",
+        "current-status",
+        "tag",
+        "lane",
+        "note-kind",
+    ] {
         assert_eq!(flag_kind(name), "list", "{name} is not repeatable");
     }
 
@@ -12410,6 +12418,459 @@ fn watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats() {
     assert_eq!(moved["payload"]["actor"], "geoyws");
     assert_eq!(moved["payload"]["priorStatus"], "todo");
     assert_eq!(moved["payload"]["currentStatus"], "in_progress");
+    assert!(watcher.finish().is_empty());
+}
+
+fn watch_board_head(fixture: &Fixture, project: &str) -> i64 {
+    let path = board_path_for_project(fixture, &fixture.main, project);
+    Connection::open(path)
+        .unwrap()
+        .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn watch_seq(envelope: &Value) -> i64 {
+    decode_watch_cursor(envelope["cursor"].as_str().unwrap())["seq"]
+        .as_i64()
+        .unwrap()
+}
+
+/// WATCH-01..04 and WATCH-12 (A1, A2, A3): `--lane` steers by the subject
+/// row's lane, binds to the cursor, is echoed in scope, and is refused on
+/// registry scope.
+#[test]
+fn watch_lane_steers_by_subject_lane_binds_the_cursor_and_echoes_the_set() {
+    let fixture = Fixture::new("watch-lane");
+    fixture.ok_json(&fixture.main, &["init", "--name", "WATCH-LANE", "--json"]);
+    for (id, lane) in [("t-two", "driver-2"), ("t-three", "driver-3")] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task", "add", id, "--id", id, "--lane", lane, "--as", "geoyws", "--json",
+            ],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &["note", id, "one note", "--as", "geoyws", "--json"],
+        );
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "laneless", "--id", "t-none", "--as", "geoyws", "--json",
+        ],
+    );
+
+    let steered = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--lane", "driver-9", "--lane", "driver-2", "--lane", "driver-2", "--cursor",
+            "0", "--limit", "100", "--json",
+        ],
+    );
+    assert!(
+        steered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&steered.stderr)
+    );
+    let rows = ndjson_values(&steered);
+    let kinds = rows
+        .iter()
+        .map(|row| row["payload"]["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["task_added", "note_added"], "{rows:?}");
+    for row in &rows {
+        assert_eq!(row["payload"]["taskID"], "t-two");
+        assert_eq!(row["payload"]["lane"], "driver-2");
+        // A2: the empty half of the set is visible, not silent.
+        assert_eq!(row["scope"]["lanes"], json!(["driver-2", "driver-9"]));
+    }
+    let cursor = rows.last().unwrap()["cursor"].as_str().unwrap().to_owned();
+    assert_eq!(
+        decode_watch_cursor(&cursor)["lanes"],
+        json!(["driver-2", "driver-9"])
+    );
+
+    // The same normalized set resumes; any other set is refused before a
+    // row is read, with nothing on stdout but the refusal.
+    let resumed = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--lane", "driver-2", "--lane", "driver-9", "--cursor", &cursor, "--json",
+        ],
+    );
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(ndjson_values(&resumed).is_empty());
+    let other = fixture.run(
+        &fixture.main,
+        &["watch", "--lane", "driver-3", "--cursor", &cursor, "--json"],
+    );
+    let error = refusal_object(&other);
+    assert!(error.contains("different watch stream"), "{error}");
+    assert!(error.contains("--lane"), "{error}");
+    let unsteered = fixture.run(&fixture.main, &["watch", "--cursor", &cursor, "--json"]);
+    assert!(refusal_object(&unsteered).contains("different watch stream"));
+
+    // A3: registry scope refuses each steering flag by name.
+    for (flag, value) in [("--lane", "driver-2"), ("--note-kind", "blocker")] {
+        let refused = fixture.run(
+            &fixture.main,
+            &[
+                "watch",
+                "--registry",
+                flag,
+                value,
+                "--cursor",
+                "0",
+                "--json",
+            ],
+        );
+        let error = refusal_object(&refused);
+        assert!(error.contains(flag), "{flag}: {error}");
+    }
+    let zero = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--lane", "driver-2", "--follow", "--limit", "0", "--json",
+        ],
+    );
+    assert!(refusal_object(&zero).contains("at least 1"));
+
+    // WATCH-12: the limit bounds the filtered set, not the raw scan.
+    let limited = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--lane", "driver-3", "--cursor", "0", "--limit", "1", "--json",
+        ],
+    );
+    let limited = ndjson_values(&limited);
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0]["payload"]["taskID"], "t-three");
+}
+
+/// WATCH-05 and WATCH-13 (A4): `--note-kind` steers notes, `steer` is a
+/// note kind that round-trips with its author, and an unknown kind is
+/// refused naming every accepted kind without writing anything.
+#[test]
+fn watch_note_kind_steers_notes_and_a_steer_note_round_trips_with_its_actor() {
+    let fixture = Fixture::new("watch-note-kind");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-NOTE-KIND", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "noted", "--id", "t-noted", "--lane", "driver", "--as", "geoyws",
+            "--json",
+        ],
+    );
+    for kind in ["blocker", "progress"] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note", "t-noted", kind, "--kind", kind, "--as", "geoyws", "--json",
+            ],
+        );
+    }
+    let planner = "@:geoyws/kanban/planner";
+    let steer = fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-noted",
+            "look at t-noted now",
+            "--kind",
+            "steer",
+            "--as",
+            planner,
+            "--json",
+        ],
+    );
+    assert_eq!(steer["kind"], "steer");
+
+    let replay = |kinds: &[&str]| {
+        let mut args = vec!["watch", "--task", "t-noted"];
+        for kind in kinds {
+            args.extend(["--note-kind", kind]);
+        }
+        args.extend(["--cursor", "0", "--limit", "100", "--json"]);
+        let output = fixture.run(&fixture.main, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ndjson_values(&output)
+    };
+    let blocker = replay(&["blocker"]);
+    assert_eq!(blocker.len(), 1, "{blocker:?}");
+    assert_eq!(blocker[0]["payload"]["kind"], "note_added");
+    assert_eq!(blocker[0]["payload"]["payload"]["kind"], "blocker");
+    assert_eq!(blocker[0]["scope"]["noteKinds"], json!(["blocker"]));
+
+    let steered = replay(&["steer"]);
+    assert_eq!(steered.len(), 1, "{steered:?}");
+    assert_eq!(steered[0]["payload"]["payload"]["kind"], "steer");
+    assert_eq!(steered[0]["payload"]["actor"], planner);
+    assert_eq!(steered[0]["payload"]["lane"], "driver");
+
+    // ORed within the family; the task_added event never passes.
+    let both = replay(&["steer", "blocker"]);
+    let note_kinds = both
+        .iter()
+        .map(|row| row["payload"]["payload"]["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(note_kinds, ["blocker", "steer"]);
+
+    let before = watch_board_head(&fixture, "WATCH-NOTE-KIND");
+    let unknown = fixture.run(
+        &fixture.main,
+        &["watch", "--note-kind", "urgent", "--cursor", "0", "--json"],
+    );
+    let error = refusal_object(&unknown);
+    for kind in [
+        "plan", "progress", "blocker", "decision", "evidence", "done", "steer",
+    ] {
+        assert!(error.contains(kind), "{kind} missing from {error}");
+    }
+    let bad_note = fixture.run(
+        &fixture.main,
+        &[
+            "note", "t-noted", "x", "--kind", "urgent", "--as", "geoyws", "--json",
+        ],
+    );
+    assert!(refusal_object(&bad_note).contains("steer"));
+    assert_eq!(watch_board_head(&fixture, "WATCH-NOTE-KIND"), before);
+}
+
+/// WATCH-06, WATCH-09, WATCH-10 (A5): board envelopes carry the subject
+/// row's lane, type, priority and level beside the unchanged v1 keys;
+/// registry, taskless and removed-subject envelopes carry explicit nulls;
+/// no lease token leaks.
+#[test]
+fn watch_envelopes_carry_subject_lane_type_and_priority_with_explicit_nulls() {
+    let fixture = Fixture::new("watch-envelope-fields");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-ENVELOPE", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "P1 task",
+            "--id",
+            "t-p1",
+            "--lane",
+            "driver-2",
+            "--priority",
+            "4",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-p1",
+            "--as",
+            "@:geoyws/kanban/driver-2",
+            "--json",
+        ],
+    );
+    let lease = claim["leaseToken"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-p1",
+            "decided",
+            "--kind",
+            "decision",
+            "--as",
+            "@:geoyws/kanban/driver-2",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Gone", "--id", "t-gone", "--lane", "driver-2", "--as", "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-gone", "--as", "geoyws", "--json"],
+    );
+
+    let board = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "100", "--json"],
+    );
+    assert!(board.status.success());
+    let stdout = String::from_utf8_lossy(&board.stdout).into_owned();
+    assert!(
+        !stdout.contains(&lease),
+        "a lease token reached a watch envelope"
+    );
+    assert!(!stdout.contains("leaseToken"));
+    let rows = ndjson_values(&board);
+    let decision = rows
+        .iter()
+        .find(|row| row["payload"]["kind"] == "note_added")
+        .expect("decision note event");
+    let payload = &decision["payload"];
+    assert_eq!(payload["lane"], "driver-2");
+    assert_eq!(payload["type"], "task");
+    assert_eq!(payload["priority"], 4);
+    assert_eq!(payload["priorityLevel"], "P1");
+    assert_eq!(payload["actor"], "@:geoyws/kanban/driver-2");
+    for key in [
+        "board",
+        "eventID",
+        "timestamp",
+        "subject",
+        "relations",
+        "priorStatus",
+        "currentStatus",
+        "tags",
+        "metadata",
+    ] {
+        assert!(payload.get(key).is_some(), "v1 key {key} vanished");
+    }
+    assert_eq!(payload["subject"], json!({"type":"task","id":"t-p1"}));
+
+    // A removed subject has no row to read: explicit nulls, never absent.
+    let gone = rows
+        .iter()
+        .filter(|row| row["payload"]["taskID"] == "t-gone")
+        .collect::<Vec<_>>();
+    assert!(!gone.is_empty());
+    for row in gone {
+        for key in ["lane", "type", "priority", "priorityLevel"] {
+            assert_eq!(row["payload"].get(key), Some(&Value::Null), "{key}: {row}");
+        }
+    }
+
+    let registry = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--registry",
+            "--cursor",
+            "0",
+            "--limit",
+            "100",
+            "--json",
+        ],
+    );
+    assert!(
+        registry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registry.stderr)
+    );
+    let registry_rows = ndjson_values(&registry);
+    assert!(
+        !registry_rows.is_empty(),
+        "the registry trail emitted nothing"
+    );
+    for row in &registry_rows {
+        for key in ["lane", "type", "priority", "priorityLevel"] {
+            assert_eq!(row["payload"].get(key), Some(&Value::Null), "{key}: {row}");
+        }
+    }
+}
+
+/// WATCH-08 and WATCH-11 (A7): a cursor minted before WATCH resumes under
+/// a lane predicate, and a follow over an unmatched tail advances the
+/// cursor once to the tail instead of re-reading it.
+#[test]
+fn watch_lane_follow_advances_over_an_unmatched_tail_and_resumes_a_pre_watch_cursor() {
+    let fixture = Fixture::new("watch-lane-follow");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-LANE-FOLLOW", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "other lane",
+            "--id",
+            "t-other",
+            "--lane",
+            "driver-3",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let plain = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "100", "--json"],
+    );
+    let plain = ndjson_values(&plain);
+    let mut old = decode_watch_cursor(plain.last().unwrap()["cursor"].as_str().unwrap());
+    let object = old.as_object_mut().unwrap();
+    assert!(object.remove("lanes").is_some(), "new cursors carry lanes");
+    assert!(object.remove("noteKinds").is_some());
+    let old = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&old).unwrap());
+
+    for index in 0..50 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note",
+                "t-other",
+                &format!("unmatched {index}"),
+                "--as",
+                "geoyws",
+                "--json",
+            ],
+        );
+    }
+    let head = watch_board_head(&fixture, "WATCH-LANE-FOLLOW");
+
+    let watcher = WatchSession::start(
+        &fixture,
+        &fixture.main,
+        &fixture.data,
+        &[
+            "--lane", "driver-2", "--cursor", &old, "--follow", "--limit", "64", "--json",
+        ],
+    );
+    let first = watcher.next_stdout_json(Duration::from_secs(10));
+    assert_eq!(first["type"], "heartbeat", "{first}");
+    assert_eq!(first["payload"]["state"], "advanced");
+    assert_eq!(
+        watch_seq(&first),
+        head,
+        "the advance stopped short of the tail"
+    );
+    assert_eq!(
+        decode_watch_cursor(first["cursor"].as_str().unwrap())["lanes"],
+        json!(["driver-2"])
+    );
+    for _ in 0..3 {
+        let next = watcher.next_stdout_json(Duration::from_secs(10));
+        assert_eq!(
+            next["payload"]["state"], "idle",
+            "the stream re-looped: {next}"
+        );
+        assert_eq!(watch_seq(&next), head);
+    }
     assert!(watcher.finish().is_empty());
 }
 

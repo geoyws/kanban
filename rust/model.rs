@@ -360,8 +360,10 @@ pub struct Sitrep {
 }
 
 pub const TASK_TYPES: [&str; 3] = ["epic", "story", "task"];
-pub const NOTE_KINDS: [&str; 6] = [
-    "plan", "progress", "blocker", "decision", "evidence", "done",
+/// `steer` is a planner's urgent pointer to a lane, distinct from progress
+/// (WATCH-13); watch consumers select it with `--note-kind steer`.
+pub const NOTE_KINDS: [&str; 7] = [
+    "plan", "progress", "blocker", "decision", "evidence", "done", "steer",
 ];
 pub const HANDOFF_REASONS: [&str; 4] =
     ["token_pressure", "provider_limit", "session_end", "manual"];

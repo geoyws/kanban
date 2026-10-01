@@ -85,6 +85,7 @@ Usage:
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
              [--relation parent:ID|ancestor:ID|depends-on:ID ...] [--prior-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...]
              [--current-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...] [--tag NAME ...]
+             [--lane LANE ...] [--note-kind plan|progress|blocker|decision|evidence|done|steer ...]
              [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
   kanban subscription add --consumer NAME --action NAME --timeout-ms N
              --max-retries N --rate-per-minute N --max-concurrency N --as ACTOR
@@ -172,7 +173,7 @@ Usage:
              [--limit N] [--model NAME] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
-  kanban note ID TEXT --as AGENT [--kind plan|progress|blocker|decision|evidence|done]
+  kanban note ID TEXT --as AGENT [--kind plan|progress|blocker|decision|evidence|done|steer]
   kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT
              --next-action TEXT [--session ID] [--model NAME] [--state continue|blocked|done]
              [--blocker TEXT ...] [--validation TEXT ...]
@@ -415,8 +416,14 @@ pub(crate) const REPEATABLE: [&str; 6] = [
 
 /// Watch-only list-valued filters. Other commands retain their historical
 /// single-valued `--kind` behavior.
-pub(crate) const WATCH_REPEATABLE: [&str; 4] =
-    ["kind", "relation", "prior-status", "current-status"];
+pub(crate) const WATCH_REPEATABLE: [&str; 6] = [
+    "kind",
+    "relation",
+    "prior-status",
+    "current-status",
+    "lane",
+    "note-kind",
+];
 
 pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
     ["kind", "relation", "prior-status", "current-status"];
@@ -1506,6 +1513,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "prior-status",
             "current-status",
             "tag",
+            "lane",
+            "note-kind",
             "cursor",
             "follow",
             "all",
@@ -1892,6 +1901,13 @@ pub(crate) const ENUM_ARGUMENTS: &[EnumArgument] = &[
         slot: ArgSlot::Flag,
         name: "current-status",
         values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "note-kind",
+        values: &NOTE_KINDS,
     },
     EnumArgument {
         command: "access",
