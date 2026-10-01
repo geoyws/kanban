@@ -294,7 +294,13 @@ fn a_json_entry_naming_this_board_is_the_legacy_local_edge() {
     let estate = Estate::new("own");
     let board = estate.board("Alpha");
     let id = "weird/id:with\"quotes";
-    estate.add_ok("Alpha", id, &[]);
+    // `task add --id` now accepts only the kind's id shape (CLI-06), so the
+    // legacy opaque id an older board can still carry is seeded in SQL.
+    estate.add_ok("Alpha", "t-legacy", &[]);
+    Connection::open(estate.board_file(&board))
+        .unwrap()
+        .execute("UPDATE tasks SET id=?1 WHERE id='t-legacy'", [id])
+        .unwrap();
     estate.add_ok(
         "Alpha",
         "t-wait",

@@ -7223,7 +7223,9 @@ impl Store {
                     .remove(id)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|prerequisite| readable.contains(prerequisite))
+                    .filter(|prerequisite| {
+                        readable.contains(prerequisite) && self.authz.permits_task(prerequisite)
+                    })
                     .collect()
             })
             .collect())
