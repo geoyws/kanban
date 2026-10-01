@@ -1,15 +1,18 @@
-# Specification: `tag add` registers only namespaced tags, refused with the board's estate (slice CLI); `task add --id` accepts only the kind's id shape
+# Specification: `tag add` registers only namespaced tags, refused with the board's estate (slice CLI); `task add --id` accepts only the kind's id shape; a lease holder moves its own row
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-07`, stable across wording
+- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-08`, stable across wording
   refinements; numbering is by creation, grouping is by topic. `CLI-06` was
   appended 2026-09-25 under board row `t-6148c0ba` (see the change log); its baseline
   is commit `869f5cb` on `wt/t-6148c0ba-idshape`. `CLI-07` was appended 2026-09-29
-  under attention `a-9254741a` (see the change log).
+  under attention `a-9254741a` (see the change log). `CLI-08` was appended 2026-10-01
+  under board row `t-a3c4d411`, admitted by George in atmux attention `a-79cae0a6`
+  (choice `upstream`); its baseline is commit `7a1a555` on `kanban-geoyws-driver`.
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
-- **Status:** `SPEC-READY` on 2026-09-29 (independent reviewer applying the SDD §1 exit criteria:
+- **Status:** `DRAFT` on 2026-10-01 for the `CLI-08` delta (it was `SPEC-READY` on 2026-09-29 for
+  `CLI-01`..`CLI-07` after an independent reviewer applied the SDD §1 exit criteria:
   no findings. Specification readiness only — it authorises neither implementation, nor rollout,
   nor release). Written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
   as ADR-047 §6 requires. George approved the slice, its implementation and its tests
@@ -31,6 +34,11 @@
     the attach refusal too. The attach refusal on prjx reads 'register it first with tag
     add ifca/assistant'. One sentence wording change plus a test; one refusal, one working
     repair." This answers `OQ-1` and admits `CLI-07`.
+  - George, 2026-10-01, atmux attention `a-79cae0a6` (choice `upstream`, "Fix kanban: the
+    holder may move its own row"), restated in its duplicate `a-942d600c`: kanban board row
+    `t-a3c4d411` is promoted and shipped, and atmux's External Kanban CLI adapter, which
+    claims in one process and moves the row in a later one, stops passing `--force`. This
+    admits `CLI-08`.
   - Board rows `t-7f596f45` and `t-fb600b26` — the requirement source. The estate map below is
     recorded from that contract, not re-decided here: estates `ifca`, `unum`, `geoyws`; IFCA
     boards `px`, `fmx`, `hx`, `hrx`, `ix`, `mx-root`, `prjx-root`, `rentx-root`, `auditx-root`,
@@ -72,7 +80,9 @@ carries the kind's own id shape, so ids stay safe as unquoted shell and URL toke
 **In scope.** The `tag add` registration command and its refusal; the compile-time
 board-to-estate map it reads; the unchanged `--tag` filter refusals it is held against;
 and, since `CLI-06`, the `task add --id` shape refusal with the one id check it reads;
-and, since `CLI-07`, the attach refusals' estate-form repair, built from the same map.
+and, since `CLI-07`, the attach refusals' estate-form repair, built from the same map;
+and, since `CLI-08`, the live-lease refusal on `task move`, which no longer reaches the
+lease holder itself.
 
 **Boundaries.** The `--tag` filter paths (`task list`, `attention list`, rule task-tag
 validation) are touched only as the behaviour that must not move (`CLI-05`) — they are owned
@@ -90,6 +100,13 @@ by ADR-015 and unchanged by this slice. Chip rendering is retired with the web v
   suggests; it does not confine.
 - No registry row, no board migration, no event kind. The map is compiled in beside
   `rust/store.rs:409` until a registry row supersedes it.
+- `CLI-08` does not touch `task remove`: a holder removing its own row is still refused
+  without `--force`, and still records `lease_seized` with it. Board row `t-a3c4d411`
+  and George's `a-79cae0a6` name the move only.
+- `CLI-08` does not change how a holder is recognised: the claim row's `agent_id` must
+  equal the move's `--as` exactly, the comparison `move_task` already makes for
+  completion gates (`rust/store.rs:7029-7032` at the `CLI-08` baseline). Two harness
+  labels for one lane are two actors here, as everywhere else in the ledger.
 
 ## 3. Requirements
 
@@ -206,6 +223,27 @@ keep reading back — reads never check the shape, and the atmux import writes b
 direct SQL and is not validated. A well-formed explicit id (`t-<8 hex>`) is
 accepted unchanged, and a duplicate is still refused by the primary key as before.
 
+### Lease holders
+
+**CLI-08** — the lease holder moves its own row without `--force`.
+Strength: `MUST` · Layer: `process` · Source: board row `t-a3c4d411`, admitted by George
+in atmux `a-79cae0a6` (choice `upstream`); ADR-008.
+Today `require_free_lease` (`rust/store.rs:3451-3477` at the `CLI-08` baseline) refuses a
+`task move` on any live lease unless `--force`, including when the claim's `agent_id` is
+the move's own `--as`, and with `--force` it records a `lease_seized` event against the
+holder itself. After this requirement, when the live claim's `agent_id` equals the
+move's `--as`, `kanban task move ID STATUS --as HOLDER` without `--force` succeeds; it
+writes no `lease_seized` event, and the `task_moved` event's `seizedFrom` is `null`. A
+move to any status but `in_progress` deletes the claim, exactly as every move does today,
+and in this holder case also writes one `claim_released` event whose actor is the holder,
+so the event history says how the lease ended. A move to `in_progress` keeps the claim and
+writes no `claim_released`. A holder's `--force` takes the same path: it seizes nothing
+from itself. Every other actor is refused exactly as today, with
+`task {id} is leased by {holder} until {expiresAt} (session {session}); rerun with --force to move it anyway`,
+and writes nothing; with `--force` it seizes the lease and records `lease_seized` as
+today. The story-projection refusal, the completion gates and the done gate
+(`docs/specs/done-gate.md`) run before the lease check and apply to the holder unchanged.
+
 ## 4. Acceptance examples
 
 ### A1 (`CLI-01`)
@@ -301,12 +339,31 @@ and *when* `kanban tag add ifca/assistant` then runs on `prjx`,
 *then* it exits zero, and the retried `task add --tag ifca/assistant` carries the tag
 on the new row.
 
+### A10 (`CLI-08`)
+
+*Given* a board with task `t-held` claimed `--as worker`,
+*when* `kanban task move t-held todo --as bystander` runs,
+*then* it exits non-zero with `task t-held is leased by worker until` … `rerun with --force
+to move it anyway`, the row stays `in_progress` under `worker`'s claim and no
+`lease_seized` event exists;
+*and when* `kanban task move t-held in_progress --as worker` runs without `--force`,
+*then* it exits zero, the claim is still held by `worker`, and no `claim_released` event
+exists;
+*and when* `kanban task remove t-held --as worker` runs without `--force`,
+*then* it is still refused with `rerun with --force to remove it anyway`;
+*and when* `kanban task move t-held review --as worker` runs without `--force`,
+*then* it exits zero, the row is `review` with no claim, `events --kind lease_seized`
+is empty, `events --kind claim_released` holds one event by `worker`, and the newest
+`task_moved` carries `seizedFrom: null`.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189` for
   `tag add`; `task add` already carries `[--id ID]` at `rust/lib.rs:129`): only the
   refusal set grows, by the two sentences `CLI-01` and `CLI-03` quote and the one
   sentence `CLI-06` quotes. `CLI-07` rewords the attach repair without adding a sentence.
+  `CLI-08` removes one refusal case (the holder's own move) and adds no sentence, no flag
+  and no event kind: `claim_released` already exists (`rust/model.rs:120`).
   `--json` refusals keep the error-object shape (an object holding only `error`).
 - **Data invariants:** a refused registration writes nothing: no `tags` row, no `tag_added`
   event, no registry touch; a refused `task add` writes nothing: no row, no event.
@@ -321,7 +378,9 @@ on the new row.
   filter, rename, remove) behaves exactly as at the baseline. Since `CLI-06`, an older
   caller passing `task add --id` outside the kind's shape (a bare `rm`, `b-1`, a wrong-kind
   prefix such as a `t-` epic, uppercase, whitespace or shell metacharacters) is refused
-  where it used to succeed; rows already filed under such ids are untouched.
+  where it used to succeed; rows already filed under such ids are untouched. Since
+  `CLI-08`, a holder's `task move` that used to be refused succeeds; a caller that passed
+  `--force` to work around it keeps working, now without the self-`lease_seized` event.
 - **Ownership:** each board owns its master file (ADR-015); the map is product vocabulary
   owned by George, compiled in beside `rust/store.rs:409`.
 
@@ -335,7 +394,10 @@ on the new row.
 - **Security:** the refusal is fail-closed per ADR-008 (non-zero exit, nothing written);
   no authorization posture changes — any writer may still register, exactly as today.
   `CLI-06` keeps whitespace, control characters and shell metacharacters out of new row
-  ids; the refusal is fail-closed per ADR-008.
+  ids; the refusal is fail-closed per ADR-008. `CLI-08` narrows the lease refusal only for
+  the actor the claim row already names: the guard exists so a bystander cannot silently
+  delete another holder's claim, and the holder moving its own row cannot do that.
+  Authorization (tag-scoped write checks) and every gate run before the lease check, unchanged.
 - **Operability:** the sentence is the repair: it names the exact command form to run.
 - **Performance:** an observation, not a budget: the check is two string scans against a
   match table; no measurement is owed and none is claimed.
@@ -357,6 +419,7 @@ on the new row.
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
 | `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence, an empty listing and `board_initialized` as the only event; the same id as a `transact` `task_add` item rolls back with the same sentence; `t-1234abcd` accepted; the duplicate refused as before (`task t-1234abcd already exists`). The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. Reads of an opaque, SQL-seeded id stay proven by `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`. no e2e coverage |
 | `CLI-07` | MUST | process | `tag_attach_refusal_names_the_boards_estate_form` | `task add --tag assistant` on `prjx` refused with the exact `tag add ifca/assistant` repair and no row written; the named repair then registers and attaches; the unmapped board carries the estate list with the `<estate>/` placeholder and no single form. no e2e coverage |
+| `CLI-08` | MUST | process | `task_move_lets_the_lease_holder_move_its_own_row_and_still_refuses_a_bystander` | bystander refused with the exact sentence and nothing written; the holder's move to `review` succeeds without `--force`, deletes the claim, writes one holder `claim_released`, no `lease_seized`, `seizedFrom: null`; a holder's move to `in_progress` keeps the claim; holder `task remove` without `--force` still refused. no e2e coverage |
 
 ## 9. Change log
 
@@ -376,3 +439,6 @@ on the new row.
   `OQ-1` answered. Status stays `DRAFT`: no independent readiness gate has been run.
 - `2026-09-29` — stamped `SPEC-READY` (independent review against the SDD §1 exit criteria:
   no findings). No requirement ID changed meaning.
+- `2026-10-01` — `CLI-08` appended: a lease holder moves its own row without `--force`
+  (board row `t-a3c4d411`; George atmux `a-79cae0a6`, choice `upstream`). Status returns to
+  `DRAFT` until an independent readiness review of the delta.
