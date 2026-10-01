@@ -638,11 +638,11 @@ which deleted web routes; this slice builds no new web surface.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `CROSS-01` | MUST | process | `none` | no e2e coverage; A2 malformed/mixed/local-ID cases |
+| `CROSS-01` | MUST | process | `none` | no e2e coverage; A2 malformed/mixed/local-ID cases; A2 `[]`/`--clear-dependencies` parity keeping a hidden local gate (`a-b63e7b50`) |
 | `CROSS-02` | MUST | process | `none` | no e2e coverage; A2 pin/recreate/reopen cases |
 | `CROSS-03` | MUST | process | `none` | no e2e coverage; A1 done/reopen/archive cases |
 | `CROSS-04` | MUST | process | `none` | no e2e coverage; A1/A5 lifecycle cases |
-| `CROSS-05` | MUST | process | `none` | no e2e coverage; A3 denied/absent parity |
+| `CROSS-05` | MUST | process | `none` | no e2e coverage; A3 denied/absent parity; A3 foreign-edge removal without source read (`a-b63e7b50`) |
 | `CROSS-06` | MUST | process | `none` | no e2e coverage; A2/A3 no-partial-write cases |
 | `CROSS-07` | MUST | process | `none` | no e2e coverage; A4 reciprocal/ancestry cycles |
 | `CROSS-08` | MUST | process | `none` | no e2e coverage; A4 synchronized process races |
