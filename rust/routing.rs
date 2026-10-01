@@ -22,7 +22,7 @@ use crate::model::board_id_from_path;
 use crate::policy::{Capability, ScopeTuple};
 use crate::registry::{Registry, canonical_data_root};
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -250,11 +250,26 @@ pub fn board_authz(path: &Path) -> Result<AuthzContext> {
     // pair, an unreadable policy table and a credential that resolves to no
     // live worker are indistinguishable from outside. Fail-closed, and not an
     // oracle.
-    Ok(match local_caller() {
+    let context = match local_caller() {
         Ok(caller) => AuthzContext::new(enforcement, caller.authority, board_id)
             .with_caller(caller.principal_id, caller.worker),
-        Err(_) => AuthzContext::new(enforcement, HashMap::new(), board_id),
-    })
+        Err(_) => return Ok(AuthzContext::new(enforcement, HashMap::new(), board_id)),
+    };
+    // A worker with a task root touches only that root's subtree, and only on
+    // the root's own board (IDENT-04, IDENT-06): read the subtree once, here,
+    // so every surface of this open checks the same set. A board that cannot
+    // be read for it confines the worker to nothing, never to everything.
+    let Some(root) = context.worker().and_then(|worker| worker.task_root.clone()) else {
+        return Ok(context);
+    };
+    let scope = if root.board_id == context.board_id() {
+        crate::db::open_board_readonly(path)
+            .and_then(|connection| crate::store::Store::task_subtree_on(&connection, &root.task_id))
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+    Ok(context.with_task_scope(scope))
 }
 
 /// What a managed caller is: its principal, its authority, and — for a

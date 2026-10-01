@@ -180,7 +180,8 @@ Strength: `MUST` · Layer: `process` · Source: ADR-038 clause 4 (events are tru
 "worker_registered" and "worker_retired") and advance the policy epoch by one, through the same
 epoch check every policy mutation uses, so a context minted before the event is refused at commit.
 The event names the worker id, the principal id, the parent worker id and, for registration, the
-full grant set and task root; it never holds a credential or its digest. A refused registration
+full grant set and task root, or, for retirement, the retiring worker id (null when the principal
+retired it without a credential); it never holds a credential or its digest. A refused registration
 appends one denied-attempt audit row, as other denied policy mutations do, and does not advance
 the epoch.`
 
@@ -549,15 +550,15 @@ row covered in part says `partial` and names what is still owed.
 | --- | --- | --- | --- | --- |
 | `IDENT-01` | MUST | process | `tests/worker_identity_e2e.rs`: `worker_identity_is_refused_outside_managed_enforcement` | covered: unregistered and prepared, worker verb and credential-bearing call, registry and board bytes unchanged. |
 | `IDENT-02` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_malformed_worker_label_is_refused_by_flag` | covered. |
-| `IDENT-03` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_child_worker_only_narrows_and_a_revocation_lands_next_call` | covered: event kind, epoch +1, no credential or digest on the event; a refusal adds one denied audit row and keeps the epoch. |
-| `IDENT-04` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_child_task_root_must_sit_inside_the_parent_root` | covered. |
+| `IDENT-03` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_retirement_event_names_the_parent_and_the_retirer` | covered: event kind, epoch +1, no credential or digest on the event; a refusal adds one denied audit row and keeps the epoch; the retirement event names principal, parent and retirer. |
+| `IDENT-04` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_child_task_root_must_sit_inside_the_parent_root`, `a_read_only_worker_cannot_register_a_writing_child` | covered. |
 | `IDENT-05` | MUST | process | `tests/worker_identity_e2e.rs`: `registration_mints_a_worker_and_binds_its_credential_to_the_principal`, `coordinator_only_commands_read_only_workers_and_retirement` | covered: other principal, malformed and retired credentials each answer `denied or not found`. |
-| `IDENT-06` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call` | covered. |
+| `IDENT-06` | MUST | process | `tests/worker_identity_e2e.rs`: `a_child_worker_only_narrows_and_a_revocation_lands_next_call`, `a_task_root_bounds_the_workers_reads` | covered: the task root bounds task show, context, task list, events and search. |
 | `IDENT-07` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `only_the_principal_an_ancestor_or_the_worker_itself_retires_it` | covered. |
-| `IDENT-08` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered. |
+| `IDENT-08` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `a_removed_tasks_handoff_outside_the_root_is_not_accepted` | covered. |
 | `IDENT-09` | MUST | process | `tests/identity_e2e.rs`: `a_direct_claim_reports_its_attempt_and_no_worker`, `checkpoints_and_handoffs_record_the_lease_attempt_and_accept_counts_one`, `a_session_handoff_records_no_attempt`, `a_schema_37_board_migrates_with_leases_at_attempt_one`; `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and managed. |
 | `IDENT-10` | MUST | process | `tests/worker_identity_e2e.rs`: `a_worker_lease_is_bound_stamped_and_fenced` | covered: both directions of the worker/no-worker fence on checkpoint, heartbeat and release. |
-| `IDENT-11` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `an_mcp_server_with_a_credential_acts_as_the_worker` | covered. |
+| `IDENT-11` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor`, `an_mcp_server_with_a_credential_acts_as_the_worker`, `a_worker_may_not_run_watch` | covered. |
 | `IDENT-12` | MUST | process | `tests/worker_identity_e2e.rs`: `coordinator_only_commands_read_only_workers_and_retirement` | covered. |
 | `IDENT-13` | MUST | process | `tests/worker_identity_e2e.rs`: `leases_stay_per_task_across_workers_on_one_lane` | covered. |
 | `IDENT-14` | MUST | process | `tests/identity_e2e.rs`: `a_claim_request_id_replays_byte_identically_and_refuses_other_arguments`, `a_refused_request_stores_no_receipt_and_a_malformed_key_is_refused`, `a_checkpoint_request_id_replays_without_a_second_row`; `tests/worker_identity_e2e.rs`: `a_worker_claim_request_id_replays_byte_identically`, `a_worker_handoff_replays_and_its_accept_is_bound_to_the_lane_actor` | covered: direct and under a worker credential. |

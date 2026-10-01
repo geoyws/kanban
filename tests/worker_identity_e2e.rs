@@ -1104,3 +1104,221 @@ fn mcp(estate: &Estate, credential: Option<&str>, requests: &[Value]) -> Vec<Val
     );
     replies
 }
+
+/// A worker confined to `root` (and its credential): `root` is a story with
+/// one child; `outside` is a sibling task.
+fn rooted(estate: &Estate, grant: &str) -> (String, String, String, String) {
+    let root = estate.ok_json(
+        None,
+        &[
+            "task",
+            "add",
+            "zebra root",
+            "--type",
+            "story",
+            "--as",
+            ACTOR,
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let inside = estate.ok_json(
+        None,
+        &[
+            "task",
+            "add",
+            "zebra inside",
+            "--parent",
+            &root,
+            "--as",
+            ACTOR,
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let outside = estate.add_task("zebra outside");
+    let output = estate.register(None, ACTOR, &["--grant", grant, "--task", &root]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    (
+        root,
+        inside,
+        outside,
+        receipt["credential"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// IDENT-06: a task root bounds what the worker reads, not only what it
+/// writes. Outside the root a single-row read is the generic refusal, and a
+/// list, the event log and search carry nothing about the outside task.
+#[test]
+fn a_task_root_bounds_the_workers_reads() {
+    let estate = Estate::managed("rootreads");
+    let grant = format!("read=board:{}", estate.board_id);
+    let (root, inside, outside, k) = rooted(&estate, &grant);
+
+    estate.refused(Some(&k), &["task", "show", &outside, "--json"], DENIED);
+    estate.refused(Some(&k), &["context", &outside], DENIED);
+    estate.ok(Some(&k), &["task", "show", &inside, "--json"]);
+    estate.ok(Some(&k), &["context", &inside]);
+
+    let list = stdout(&estate.ok(Some(&k), &["task", "list", "--json"]));
+    assert!(list.contains(&root) && list.contains(&inside), "{list}");
+    assert!(
+        !list.contains(&outside),
+        "task list leaked {outside}: {list}"
+    );
+
+    let events = stdout(&estate.ok(Some(&k), &["events", "--json"]));
+    assert!(events.contains(&inside), "{events}");
+    assert!(
+        !events.contains(&outside),
+        "events leaked {outside}: {events}"
+    );
+
+    let hits = stdout(&estate.ok(Some(&k), &["search", "zebra", "--json"]));
+    assert!(hits.contains(&inside), "{hits}");
+    assert!(!hits.contains(&outside), "search leaked {outside}: {hits}");
+
+    // The coordinator, unconfined, still sees the outside task.
+    let all = stdout(&estate.ok(None, &["task", "list", "--json"]));
+    assert!(all.contains(&outside), "{all}");
+}
+
+/// IDENT-08: accepting a handoff whose task was removed is still bound by
+/// the task root; the handoff stays pending.
+#[test]
+fn a_removed_tasks_handoff_outside_the_root_is_not_accepted() {
+    let estate = Estate::managed("rootaccept");
+    let grant = format!("write=board:{}", estate.board_id);
+    let (_root, _inside, outside, k) = rooted(&estate, &grant);
+    let claim = estate.ok_json(None, &["claim", &outside, "--as", ACTOR, "--json"]);
+    let lease = claim["leaseToken"].as_str().unwrap().to_owned();
+    let handoff = estate.ok_json(
+        None,
+        &[
+            "handoff",
+            "create",
+            &outside,
+            "--lease",
+            &lease,
+            "--as",
+            ACTOR,
+            "--to",
+            ACTOR,
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--repo",
+            "/r",
+            "--branch",
+            "b",
+            "--head",
+            "abc1234",
+            "--dirty",
+            "clean",
+            "--json",
+        ],
+    );
+    let id = handoff["id"].as_str().unwrap().to_owned();
+    estate.ok(
+        None,
+        &["task", "remove", &outside, "--as", ACTOR, "--force"],
+    );
+
+    estate.refused(Some(&k), &["handoff", "accept", &id, "--as", ACTOR], DENIED);
+    let status: String = estate
+        .board()
+        .query_row("SELECT status FROM handoffs WHERE id=?", [&id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "pending");
+}
+
+/// IDENT-04: a read-only worker cannot mint a child that writes.
+#[test]
+fn a_read_only_worker_cannot_register_a_writing_child() {
+    let estate = Estate::managed("readchild");
+    let b = estate.board_id.clone();
+    let (_w1, k1) = estate.worker(ACTOR);
+    let reader: Value = serde_json::from_slice(
+        &estate
+            .register(Some(&k1), ACTOR, &["--grant", &format!("read=board:{b}")])
+            .stdout,
+    )
+    .unwrap();
+    let k2 = reader["credential"].as_str().unwrap().to_owned();
+    let epoch = estate.epoch();
+    let output = estate.register(Some(&k2), ACTOR, &["--grant", &format!("write=board:{b}")]);
+    assert!(
+        !output.status.success(),
+        "a read-only worker minted a writer"
+    );
+    assert!(stderr(&output).contains(DENIED), "{}", stderr(&output));
+    assert_eq!(estate.epoch(), epoch, "a refusal advanced the epoch");
+}
+
+/// IDENT-03, IDENT-07: the `worker_retired` event names the worker's parent
+/// and the worker that retired it.
+#[test]
+fn a_retirement_event_names_the_parent_and_the_retirer() {
+    let estate = Estate::managed("retireevent");
+    let b = estate.board_id.clone();
+    let (w1, k1) = estate.worker(ACTOR);
+    let child: Value = serde_json::from_slice(
+        &estate
+            .register(Some(&k1), ACTOR, &["--grant", &format!("read=board:{b}")])
+            .stdout,
+    )
+    .unwrap();
+    let w2 = child["workerId"].as_str().unwrap().to_owned();
+    estate.ok(Some(&k1), &["worker", "retire", &w2]);
+    let payload: Value = serde_json::from_str(
+        &estate
+            .registry()
+            .query_row(
+                "SELECT payload FROM policy_events WHERE kind='worker_retired' \
+                 ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let text = payload.to_string();
+    assert!(
+        text.contains(&format!("\"parentWorkerId\":\"{w1}\"")),
+        "{payload}"
+    );
+    assert!(
+        text.contains(&format!("\"retiredByWorkerId\":\"{w1}\"")),
+        "{payload}"
+    );
+    assert!(
+        text.contains(&format!("\"principalId\":\"{ALICE}\"")),
+        "{payload}"
+    );
+}
+
+/// IDENT-11: `watch` is long-running and has no generated MCP tool, so it is
+/// not on a worker's read list.
+#[test]
+fn a_worker_may_not_run_watch() {
+    let estate = Estate::managed("watch");
+    let (w1, k1) = estate.worker(ACTOR);
+    let output = estate.run(Some(&k1), &["watch", "--json"]);
+    assert!(!output.status.success(), "a worker ran watch");
+    assert!(
+        stderr(&output).contains(&format!("worker {w1} may not run watch")),
+        "{}",
+        stderr(&output)
+    );
+}

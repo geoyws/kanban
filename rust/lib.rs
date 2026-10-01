@@ -7992,13 +7992,16 @@ fn require_worker_may_run(command: &str, sub: Option<&str>) -> Result<()> {
             | ("handoff", Some("create" | "accept"))
     );
     // The read side is exactly the commands whose generated MCP tool reads
-    // only, every `access` command excepted; `batch` is that read-only
-    // envelope, and `mcp` serves each call through this same gate.
+    // only, every `access` command excepted. A long-running command has no
+    // generated tool, so `watch` is not on it; `mcp` is admitted because it
+    // serves each call through this same gate (IDENT-16), and `batch` is the
+    // read-only envelope.
     let read_only = command != "access"
         && (matches!(command, "version" | "help" | "batch" | "mcp")
-            || COMMANDS
-                .iter()
-                .any(|row| row.0 == command && row.1 == sub && row.4));
+            || (!LONG_RUNNING.contains(&command)
+                && COMMANDS
+                    .iter()
+                    .any(|row| row.0 == command && row.1 == sub && row.4)));
     if command == "worker" || lease_bound || read_only {
         return Ok(());
     }

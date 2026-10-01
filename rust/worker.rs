@@ -131,10 +131,16 @@ pub struct WorkerRow {
     pub retired_at: Option<i64>,
 }
 
+/// One `worker_retired` effect. It names the worker, its principal and its
+/// parent (IDENT-03), and which worker retired it — none when the principal
+/// did, without a credential. Replay reads only `id` and `retired_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRetirement {
     pub id: String,
+    pub principal_id: String,
+    pub parent_worker_id: Option<String>,
+    pub retired_by_worker_id: Option<String>,
     pub retired_at: i64,
 }
 
@@ -615,10 +621,12 @@ impl Registry {
             let target = worker_on(&tx, worker_id)?
                 .filter(|row| row.principal_id == principal_id)
                 .ok_or_else(|| policy::deny(&tx, actor, OPERATION, "worker", "not_found", epoch))?;
+            let mut retired_by = None;
             if let Some(credential) = presented {
                 let caller = resolve_on(&tx, &principal_id, credential)?.ok_or_else(|| {
                     policy::deny(&tx, actor, OPERATION, "worker", "unresolved", epoch)
                 })?;
+                retired_by = Some(caller.row.id.clone());
                 let mut lineage = vec![target.id.clone()];
                 let mut cursor = target.parent_worker_id.clone();
                 while let Some(id) = cursor {
@@ -649,6 +657,9 @@ impl Registry {
             let effect = PolicyEffect {
                 retired_workers: vec![WorkerRetirement {
                     id: target.id.clone(),
+                    principal_id: principal_id.clone(),
+                    parent_worker_id: target.parent_worker_id.clone(),
+                    retired_by_worker_id: retired_by,
                     retired_at: occurred_at,
                 }],
                 ..Default::default()

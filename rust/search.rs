@@ -762,6 +762,15 @@ pub fn search(
             if !authz.permits_read(&document_row_tags(connection, &document, &mut tag_cache)?) {
                 continue;
             }
+            // A root-confined worker finds nothing about a task outside its
+            // root (IDENT-06): the document's own task, or its event's.
+            let task = (document.source_kind == "task")
+                .then_some(document.source_id.as_str())
+                .or(document.task_id.as_deref())
+                .or(document.event_task_id.as_deref());
+            if task.is_some_and(|task| !authz.permits_task(task)) {
+                continue;
+            }
             permitted.insert(document.seq);
         }
         candidates.push(document);

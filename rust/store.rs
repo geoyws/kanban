@@ -922,6 +922,7 @@ fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContex
 fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str) -> Result<Task> {
     let tags = task_tags(connection, id)?;
     authz.check_read(&tags)?;
+    authz.check_task(id)?;
     authz.check_write(&tags, &tags)?;
     absent_as_denied(get_task(connection, id)?, "task", id, authz)
 }
@@ -1135,10 +1136,12 @@ fn task_linked_row_visible(
         return Ok(true);
     };
     if get_task(connection, task_id)?.is_some() {
-        return Ok(authz.permits_read(&task_tags(connection, task_id)?));
+        return Ok(
+            authz.permits_read(&task_tags(connection, task_id)?) && authz.permits_task(task_id)
+        );
     }
     match removed_task_tag_union(connection, task_id)? {
-        Some(tags) => Ok(authz.permits_read(&tags)),
+        Some(tags) => Ok(authz.permits_read(&tags) && authz.permits_task(task_id)),
         None => Ok(false),
     }
 }
@@ -1156,6 +1159,7 @@ fn require_task_authorized(
     authz: &AuthzContext,
 ) -> Result<Task> {
     authz.check_read(&task_tags(connection, id)?)?;
+    authz.check_task(id)?;
     absent_as_denied(get_task(connection, id)?, "task", id, authz)
 }
 
@@ -1593,6 +1597,9 @@ fn deployment_subject_tags_on(
         .flatten();
     match task_id.as_deref() {
         Some(task_id) => {
+            // A root-confined worker reaches no attempt about a task outside
+            // its root (IDENT-06), by the same generic refusal.
+            authz.check_task(task_id)?;
             if get_task(connection, task_id)?.is_some() {
                 task_tags(connection, task_id)
             } else {
@@ -4610,46 +4617,13 @@ impl Store {
         );
     }
 
-    /// IDENT-04, IDENT-06: a worker with a task root reaches only that task
-    /// and its descendants by `parent_id`, on that board. Anything else is the
-    /// generic refusal, so the root is not an existence oracle.
-    fn require_in_task_root(&self, connection: &Connection, task_id: &str) -> Result<()> {
-        let Some(root) = self
-            .authz
-            .worker()
-            .and_then(|worker| worker.task_root.as_ref())
-        else {
-            return Ok(());
-        };
-        if root.board_id != self.authz.board_id() {
-            return Err(crate::authz::DeniedOrNotFound.into());
-        }
-        let mut cursor = Some(task_id.to_owned());
-        // Bounded walk up the parent links: a parent cycle cannot hold a
-        // caller here.
-        for _ in 0..10_000 {
-            let Some(id) = cursor else { break };
-            if id == root.task_id {
-                return Ok(());
-            }
-            cursor = connection
-                .query_row("SELECT parent_id FROM tasks WHERE id=?", [&id], |row| {
-                    row.get::<_, Option<String>>(0)
-                })
-                .optional()?
-                .flatten();
-        }
-        Err(crate::authz::DeniedOrNotFound.into())
-    }
-
     /// `task_id` and its ancestors by `parent_id`, nearest first, or `None`
     /// when the task is not on this board: what `worker register --task`
     /// checks a task root against (IDENT-04).
     pub(crate) fn task_lineage(&self, task_id: &str) -> Result<Option<Vec<String>>> {
         let mut lineage = Vec::new();
         let mut cursor = Some(task_id.to_owned());
-        // Bounded, as `require_in_task_root` is: a parent cycle cannot hold a
-        // caller here.
+        // Bounded: a parent cycle cannot hold a caller here.
         for _ in 0..10_000 {
             let Some(id) = cursor else { break };
             let parent: Option<Option<String>> = self
@@ -4670,6 +4644,22 @@ impl Store {
         Ok(Some(lineage))
     }
 
+    /// IDENT-04, IDENT-06: `root` and every task below it by `parent_id` on
+    /// the board behind `connection`, read once per open; what a root-confined
+    /// worker's every task check is made against.
+    pub(crate) fn task_subtree_on(connection: &Connection, root: &str) -> Result<HashSet<String>> {
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE subtree(id) AS (\
+               SELECT id FROM tasks WHERE id=?1 \
+               UNION SELECT tasks.id FROM tasks JOIN subtree ON tasks.parent_id=subtree.id) \
+             SELECT id FROM subtree",
+        )?;
+        let ids = statement
+            .query_map([root], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(ids)
+    }
+
     /// IDENT-10: a lease-bound worker call rechecks `write` against its
     /// effective authority over the task's current tags, and its task root.
     /// Every call that is not a worker call is left exactly as it was.
@@ -4679,7 +4669,7 @@ impl Store {
         }
         let tags = task_tags(connection, task_id)?;
         self.authz.check_write(&tags, &tags)?;
-        self.require_in_task_root(connection, task_id)
+        self.authz.check_task(task_id)
     }
 
     /// Add the worker and principal to an event written under a worker call
@@ -4960,6 +4950,10 @@ impl Store {
             if self
                 .authz
                 .permits_read(&cached_event_tags(&self.connection, &event, &mut cache)?)
+                && event
+                    .task_id
+                    .as_deref()
+                    .is_none_or(|task| self.authz.permits_task(task))
             {
                 out.push(event);
             }
@@ -6752,7 +6746,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -6817,7 +6813,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
-        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
+        rows.retain(|(task, _)| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         apply_lapsed_leases(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         Ok(rows)
@@ -6909,7 +6907,9 @@ impl Store {
         self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -6973,7 +6973,8 @@ impl Store {
                 Some(known) => *known,
                 None => {
                     let tags = task_tags(&self.connection, &blocker.prerequisite_id)?;
-                    let permitted = self.authz.permits_read(&tags);
+                    let permitted = self.authz.permits_read(&tags)
+                        && self.authz.permits_task(&blocker.prerequisite_id);
                     readable.insert(blocker.prerequisite_id.clone(), permitted);
                     permitted
                 }
@@ -7009,6 +7010,7 @@ impl Store {
             if !self
                 .authz
                 .permits_read(&task_tags(&self.connection, &parent)?)
+                || !self.authz.permits_task(&parent)
             {
                 break;
             }
@@ -7117,6 +7119,7 @@ impl Store {
     pub fn list_verdicts(&self, task_id: &str) -> Result<Vec<Verdict>> {
         self.authz
             .check_read(&task_tags(&self.connection, task_id)?)?;
+        self.authz.check_task(task_id)?;
         require_active_task(&self.connection, task_id)?;
         if !has_verdicts_table(&self.connection)? {
             return Ok(Vec::new());
@@ -7680,7 +7683,7 @@ impl Store {
         let task = if let Some(id) = id {
             let tags = task_tags(&transaction, id)?;
             self.authz.check_write(&tags, &tags)?;
-            self.require_in_task_root(&transaction, id)?;
+            self.authz.check_task(id)?;
             let task = require_active_task_authorized(&transaction, id, &self.authz)?;
             if let Some(required_sprint) = sprint_filter.as_deref() {
                 let attached: Option<String> = transaction
@@ -7708,9 +7711,7 @@ impl Store {
             for candidate in candidates {
                 let tags = task_tags(&transaction, &candidate.id)?;
                 if self.authz.check_write(&tags, &tags).is_ok()
-                    && self
-                        .require_in_task_root(&transaction, &candidate.id)
-                        .is_ok()
+                    && self.authz.permits_task(&candidate.id)
                 {
                     selected = Some(candidate);
                     break;
@@ -7838,7 +7839,9 @@ impl Store {
             eligible_claim_candidates(&self.connection, agent, options, sprint_filter.as_deref())?;
         attach_tags(&self.connection, candidates.iter_mut())?;
         attach_allowed_models(&self.connection, candidates.iter_mut())?;
-        candidates.retain(|candidate| self.authz.permits_read(&candidate.tags));
+        candidates.retain(|candidate| {
+            self.authz.permits_read(&candidate.tags) && self.authz.permits_task(&candidate.id)
+        });
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
         }
@@ -8916,7 +8919,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
     }
 
@@ -9949,6 +9954,10 @@ impl Store {
         // leaving the handoff pending would rediscover it on every lane
         // resume. The event keeps the orphaned id, so it is emitted through
         // the removed-task snapshot fallback rather than as a session event.
+        // IDENT-08: a root-confined worker accepts nothing about a task
+        // outside its root — removed tasks included, which the branch below
+        // would otherwise acknowledge on tags alone.
+        self.authz.check_task(&task_id)?;
         let task = match get_task(&transaction, &task_id)? {
             Some(task) => task,
             None => {
@@ -10467,7 +10476,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
-        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
+        rows.retain(|(task, _)| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         let mut out = Vec::new();
         for (task, heartbeat) in rows {
             let budget = task.stale_minutes.unwrap_or_default();
@@ -10574,6 +10585,7 @@ impl Store {
         let snapshot = ReadSnapshot::open(&self.connection)?;
         let tags = task_tags(&self.connection, task_id)?;
         self.authz.check_read(&tags)?;
+        self.authz.check_task(task_id)?;
         let sprint: Option<String> = self
             .connection
             .query_row(
@@ -11811,7 +11823,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
-        rows.retain(|task| self.authz.permits_read(&task.tags));
+        rows.retain(|task| {
+            self.authz.permits_read(&task.tags) && self.authz.permits_task(&task.id)
+        });
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
