@@ -15920,6 +15920,20 @@ fn kanban_batch_refuses_writes_and_nested_batches_and_runs_nothing() {
         selector.starts_with("kanban batch call 0 names --project"),
         "{selector}"
     );
+    // `--all-boards` too: a batched search would otherwise answer about every
+    // registered board, outside the one the batch addresses.
+    let all_boards = cli_batch_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            read.clone(),
+            json!({ "name": "search", "arguments": { "query": "row", "all-boards": true } }),
+        ],
+    );
+    assert!(
+        all_boards.starts_with("kanban batch call 1 names --all-boards"),
+        "{all_boards}"
+    );
 
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]),

@@ -5868,11 +5868,14 @@ fn run_batch(args: &Args) -> Result<()> {
         mcp::plan_batch("kanban batch", "kanban transact", &items).map_err(anyhow::Error::msg)?;
     // A batch addresses one board -- the one `kanban batch` itself resolved --
     // and every item reads it. An item naming another would have its selector
-    // silently discarded, the wrong-board defect ADR-007 exists to prevent
-    // (docs/specs/batch.md §6, the rule `plan_transact` applies to transact).
+    // silently discarded, the wrong-board defect ADR-007 exists to prevent,
+    // and `--all-boards` would answer about boards outside the batch
+    // (docs/specs/batch.md §6: the rule `plan_transact` applies to transact,
+    // `--all-boards` included).
     for (index, (_, arguments)) in planned.iter().enumerate() {
         if let Some(named) = BOARD_SELECTORS
             .iter()
+            .chain(std::iter::once(&"all-boards"))
             .find(|flag| item_passes(arguments, flag))
         {
             bail!(
