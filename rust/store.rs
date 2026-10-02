@@ -10207,19 +10207,19 @@ impl Store {
         };
         // LINKED-13: a revoked binding's leases end only via `release`, never
         // by handoff onward. The holder is the lease, not the presenter.
-        if let (Some(task_id), Some(claim)) = (&input.task_id, &claim) {
-            if let Some(reason) = crate::linked::holder_handoff_barred(
+        if let (Some(task_id), Some(claim)) = (&input.task_id, &claim)
+            && let Some(reason) = crate::linked::holder_handoff_barred(
                 &transaction,
                 task_id,
                 &claim.agent_id,
                 claim.session_id.as_deref(),
-            )? {
-                bail!(
-                    "task {task_id} is held under a revoked selected-scope binding ({reason}); a \
-                     revoked lease ends only via `release {task_id} --lease TOKEN`, never by \
-                     handoff onward"
-                );
-            }
+            )?
+        {
+            bail!(
+                "task {task_id} is held under a revoked selected-scope binding ({reason}); a \
+                 revoked lease ends only via `release {task_id} --lease TOKEN`, never by \
+                 handoff onward"
+            );
         }
         // A handoff has no `blocked` state; its `--blocker` list is where it
         // says what stops the work, so that list is the half the owner gate

@@ -139,8 +139,13 @@ impl Estate {
     }
 
     fn add(&self, board: &str, id: &str, extra: &[&str]) {
+        self.add_titled(board, id, id, extra);
+    }
+
+    /// `task add TITLE --id ID`: the title is one argv entry, whatever it holds.
+    fn add_titled(&self, board: &str, id: &str, title: &str, extra: &[&str]) {
         let work = self.workspace(board);
-        let mut args = vec!["task", "add", id, "--id", id, "--as", OP, "--json"];
+        let mut args = vec!["task", "add", title, "--id", id, "--as", OP, "--json"];
         args.extend_from_slice(extra);
         let output = self.run(&work, &args);
         assert!(
@@ -190,6 +195,19 @@ fn pairing_shape(shown: &Value) -> (String, Vec<(String, String, String)>) {
         .collect::<Vec<_>>();
     endpoints.sort();
     (pairing["pairingID"].as_str().unwrap().to_owned(), endpoints)
+}
+
+/// The incarnation a pairing receipt pins for the endpoint on `board_id`:
+/// endpoints are stored in `(boardID, id)` order, so either board may be A.
+fn incarnation_on(receipt: &Value, board_id: &str) -> String {
+    ["boardA", "boardB"]
+        .iter()
+        .map(|side| &receipt[*side])
+        .find(|endpoint| endpoint["boardID"] == board_id)
+        .unwrap_or_else(|| panic!("no endpoint on board {board_id}: {receipt}"))["incarnation"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 /// A1 — Pair two disposable boards; both directions read identical after a
@@ -287,7 +305,7 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let unum = estate.board("unum");
     let acies = estate.board("acies");
     estate.add("unum", "t-u1", &[]);
-    estate.add("acies", "t-a1", &["classified-alpha-title"]);
+    estate.add_titled("acies", "t-a1", "classified-alpha-title", &[]);
     let added = estate.ok_json(
         &estate.root,
         &[
@@ -307,7 +325,7 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
         ],
     );
     let pairing_id = added["pairingID"].as_str().unwrap().to_owned();
-    let pinned = added["boardB"]["incarnation"].as_str().unwrap().to_owned();
+    let pinned = incarnation_on(&added, &acies);
 
     // A display name is not identity: refused naming the (boardID, id) shape.
     let shape = estate.refused(
@@ -464,10 +482,22 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
         "the retired endpoint reads retired: {retired}"
     );
 
-    // Recreating an item under the retired ID does not retarget the pairing:
-    // the new row reads recreated, and re-pairing while the old row lives is
-    // refused as a conflicting duplicate.
-    estate.add("acies", "t-a1", &[]);
+    // Recreating an item under the retired ID does not retarget the pairing.
+    // The board now refuses to reuse a removed id, so the recreation is
+    // planted the way history left it (as `tests/e2e.rs` plants its reused
+    // id): a raw insert under the removed id, which the board mints a fresh
+    // incarnation for. The new row reads recreated, and re-pairing while the
+    // old row lives is refused as a conflicting duplicate.
+    let planted = Connection::open(estate.board_file(&acies)).unwrap();
+    planted
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DELETE FROM search_documents WHERE task_id='t-a1';
+             INSERT INTO tasks(id,type,title,status,created_at,updated_at)
+               VALUES('t-a1','task','replacement-title','todo',1,1);",
+        )
+        .unwrap();
+    drop(planted);
     let recreated = estate.ok_json(
         &estate.root,
         &["link", "show", "--board", &unum, "--id", "t-u1", "--json"],
@@ -477,9 +507,32 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
         .iter()
         .find(|(board, _, _)| board == &acies)
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         acies_end.2, pinned,
+        "the pin never moves onto the recreated row"
+    );
+    let replacement: String = readonly(&estate.board_file(&acies))
+        .query_row("SELECT incarnation FROM tasks WHERE id='t-a1'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_ne!(
+        replacement, pinned,
         "the recreated item carries a new incarnation"
+    );
+    let states: Vec<&str> = recreated[0]["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|endpoint| endpoint["state"].as_str().unwrap())
+        .collect();
+    assert!(
+        states.contains(&"recreated"),
+        "the reused ID reads recreated, never as its replacement: {recreated}"
+    );
+    assert!(
+        !recreated.to_string().contains("replacement-title"),
+        "no replacement content is projected: {recreated}"
     );
     let conflict = estate.refused(
         &estate.root,
@@ -549,8 +602,9 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
         "the re-pair is a new stored row"
     );
     assert_eq!(
-        repaired["boardB"]["incarnation"].as_str().unwrap(),
-        acies_end.2
+        incarnation_on(&repaired, &acies),
+        replacement,
+        "the explicit re-pair pins the recreated incarnation"
     );
 }
 
@@ -562,9 +616,13 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     let unum = estate.board("unum");
     estate.board("acies");
     let work = estate.workspace("unum");
-    estate.add("unum", "t-in", &[]);
+    // A task contains nothing, so `t-in` sits in a story beside an unselected
+    // story-mate: selecting a task selects neither its parent nor its
+    // parent's other children (LINKED-10).
+    estate.add("unum", "s-par", &["--type", "story"]);
+    estate.add("unum", "t-in", &["--parent", "s-par"]);
     estate.add("unum", "t-out", &[]);
-    estate.add("unum", "t-child", &["--parent", "t-in"]);
+    estate.add("unum", "t-mate", &["--parent", "s-par"]);
     // The neighbour carries a depends-on edge whose gate is satisfied, so the
     // scope refusal — not a readiness gate — is what fires on it (LINKED-10:
     // a relation never implies membership).
@@ -618,7 +676,7 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     );
 
     // Candidates offer the selected task and none of the others — not the
-    // sibling, not the unselected child, not the depends-on neighbour.
+    // sibling, not the unselected story-mate, not the depends-on neighbour.
     let candidates = estate.ok_json(
         &work,
         &[
@@ -655,7 +713,7 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
             "--json",
         ],
     );
-    let lease = claimed["claim"]["leaseToken"].as_str().unwrap().to_owned();
+    let lease = claimed["leaseToken"].as_str().unwrap().to_owned();
     let payload: Value = readonly(&estate.board_file(&unum))
         .query_row(
             "SELECT payload FROM events WHERE kind='task_claimed' ORDER BY seq DESC LIMIT 1",
@@ -669,10 +727,10 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     assert_eq!(payload["scopeSet"], Value::from("joint-3"));
     assert_eq!(payload["scopeRevision"], Value::from(3));
 
-    // Every other path refuses with the same sentence: the sibling, the child
-    // and the neighbour even while the selected task is held.
+    // Every other path refuses with the same sentence: the sibling, the
+    // story-mate and the neighbour even while the selected task is held.
     let mut same_sentence = Vec::new();
-    for task in ["t-out", "t-child", "t-nbr"] {
+    for task in ["t-out", "t-mate", "t-nbr"] {
         same_sentence.push(estate.refused(
             &work,
             &[
@@ -731,7 +789,7 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     // A lease-taking handoff for the sibling: take it as an unbound lane,
     // offer it over, and watch the bound worker's accept stay pending.
     let held = estate.ok_json(&work, &["claim", "t-out", "--as", "op2", "--json"]);
-    let op_lease = held["claim"]["leaseToken"].as_str().unwrap().to_owned();
+    let op_lease = held["leaseToken"].as_str().unwrap().to_owned();
     let handoff = estate.ok_json(
         &work,
         &[
@@ -748,6 +806,14 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
             "cover",
             "--next-action",
             "claim",
+            "--repo",
+            "/r",
+            "--branch",
+            "b",
+            "--head",
+            "abc1234",
+            "--dirty",
+            "clean",
             "--json",
         ],
     );
@@ -779,6 +845,9 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
         .to_owned();
     assert_eq!(status, "pending", "an out-of-set accept grants no lease");
     // Both resumption entry points refuse onto the sibling with the same words.
+    // The pending handoff leaves `t-out` assigned to op2; `--allow-reassign`
+    // lifts that existing gate (CLAIM-07) so the scope gate is the one that
+    // answers, with the same words as every other path.
     same_sentence.push(estate.refused(
         &work,
         &[
@@ -790,6 +859,7 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
             LANE,
             "--session",
             SESSION,
+            "--allow-reassign",
             "--json",
         ],
     ));
@@ -819,7 +889,7 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
         .map(|refusal| {
             refusal
                 .replace("t-out", "T")
-                .replace("t-child", "T")
+                .replace("t-mate", "T")
                 .replace("t-nbr", "T")
         })
         .collect::<Vec<_>>();
@@ -904,7 +974,7 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
             "--json",
         ],
     );
-    let lease = claimed["claim"]["leaseToken"].as_str().unwrap().to_owned();
+    let lease = claimed["leaseToken"].as_str().unwrap().to_owned();
     estate.ok_json(
         &estate.root,
         &[
@@ -964,6 +1034,14 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
             "pass",
             "--next-action",
             "pass",
+            "--repo",
+            "/r",
+            "--branch",
+            "b",
+            "--head",
+            "abc1234",
+            "--dirty",
+            "clean",
             "--json",
         ],
     );

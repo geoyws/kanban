@@ -329,8 +329,8 @@ fn fresh_repo(parent: &Path, name: &str) -> PathBuf {
 
 fn commit_file(dir: &Path, name: &str, content: &str, message: &str) -> String {
     fs::write(dir.join(name), content).unwrap();
-    git(&dir, &["add", name]);
-    git(&dir, &["commit", "-qm", message]);
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-qm", message]);
     git(dir, &["rev-parse", "HEAD"])
 }
 

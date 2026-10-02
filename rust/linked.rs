@@ -408,18 +408,31 @@ fn companion_receipt(row: &CompanionRow, retired: bool) -> serde_json::Value {
     })
 }
 
+/// Two endpoints named by `(boardID, id)` on both ends, as `link add`,
+/// `link remove`, and `contrib close` address one pairing (LINKED-02).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EndpointPair<'a> {
+    pub a_board: &'a str,
+    pub a_id: &'a str,
+    pub b_board: &'a str,
+    pub b_id: &'a str,
+}
+
 /// Pair two endpoints by `(boardID, id)` on both ends: audited, idempotent,
 /// symmetric (LINKED-01..LINKED-04, LINKED-06).
 pub(crate) fn add_companion(
     connection: &Connection,
     root: &Path,
-    a_board: &str,
-    a_id: &str,
-    b_board: &str,
-    b_id: &str,
+    pair: EndpointPair,
     actor: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let EndpointPair {
+        a_board,
+        a_id,
+        b_board,
+        b_id,
+    } = pair;
     let first = require_endpoint_shape(a_board, a_id, "first")?;
     let second = require_endpoint_shape(b_board, b_id, "second")?;
     if first == second {
@@ -494,10 +507,10 @@ pub(crate) fn add_companion(
             &one.item_id,
             &two.board_id,
             &two.item_id,
-        )? {
-            if winner.incarnation_a == one.incarnation && winner.incarnation_b == two.incarnation {
-                return Ok(companion_receipt(&winner, false));
-            }
+        )? && winner.incarnation_a == one.incarnation
+            && winner.incarnation_b == two.incarnation
+        {
+            return Ok(companion_receipt(&winner, false));
         }
         return Err(error.into());
     }
@@ -530,14 +543,17 @@ pub(crate) fn add_companion(
 pub(crate) fn remove_companion(
     connection: &Connection,
     root: &Path,
-    a_board: &str,
-    a_id: &str,
-    b_board: &str,
-    b_id: &str,
+    pair: EndpointPair,
     actor: &str,
     reason: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let EndpointPair {
+        a_board,
+        a_id,
+        b_board,
+        b_id,
+    } = pair;
     let first = require_endpoint_shape(a_board, a_id, "first")?;
     let second = require_endpoint_shape(b_board, b_id, "second")?;
     if first == second {
@@ -690,7 +706,7 @@ fn retired_or_refused(
             .map_err(|_| refusal())?;
         return Ok("retired".to_owned());
     };
-    let scoped = confine_to_task_root(&caller, &registered.path, &reference.board_id)
+    let scoped = confine_to_task_root(caller, &registered.path, &reference.board_id)
         .map_err(|_| refusal())?;
     scoped.check_read(&[]).map_err(|_| refusal())?;
     scoped.check_task(&reference.id).map_err(|_| refusal())?;
@@ -777,19 +793,29 @@ fn set_head(connection: &Connection, set_id: &str) -> Result<Option<(bool, SetHe
     )))
 }
 
+/// One audited revision as `linked_set_revisions` stores it (LINKED-12).
+#[derive(Debug, Clone, Copy)]
+struct Revision<'a> {
+    set_id: &'a str,
+    revision: i64,
+    kind: &'a str,
+    author: &'a str,
+    reason: &'a str,
+    members: &'a [SetMember],
+}
+
 /// Append one audited revision, chained into the registry hash chain the same
 /// way the policy journals chain it, so `audit verify` covers every revision
 /// (LINKED-12).
-fn append_revision(
-    connection: &Connection,
-    set_id: &str,
-    revision: i64,
-    kind: &str,
-    author: &str,
-    reason: &str,
-    members: &[SetMember],
-    now: i64,
-) -> Result<()> {
+fn append_revision(connection: &Connection, entry: Revision, now: i64) -> Result<()> {
+    let Revision {
+        set_id,
+        revision,
+        kind,
+        author,
+        reason,
+        members,
+    } = entry;
     debug_assert!(REVISION_KINDS.contains(&kind));
     let members_json = serde_json::to_string(members)?;
     let payload = json!({
@@ -872,12 +898,14 @@ pub(crate) fn create_set(
     let members: Vec<SetMember> = Vec::new();
     append_revision(
         connection,
-        &set_id,
-        1,
-        "create",
-        &actor,
-        reason.trim(),
-        &members,
+        Revision {
+            set_id: &set_id,
+            revision: 1,
+            kind: "create",
+            author: &actor,
+            reason: reason.trim(),
+            members: &members,
+        },
         now,
     )?;
     Ok(set_receipt(&set_id, 1, "create", &members))
@@ -904,7 +932,7 @@ fn require_membership_authority(
         let Some(registered) = crate::cross::registered_board(root, &member.board_id)? else {
             bail!("member endpoint {UNAVAILABLE_ENDPOINT}");
         };
-        let scoped = confine_to_task_root(&caller, &registered.path, &member.board_id)
+        let scoped = confine_to_task_root(caller, &registered.path, &member.board_id)
             .map(|scoped| scoped.for_board(member.board_id.clone()))
             .unwrap_or_else(|_| caller.for_board(member.board_id.clone()));
         let tags = item_tags(&registered.path, &member.id);
@@ -919,6 +947,16 @@ fn require_membership_authority(
     Ok(())
 }
 
+/// One membership change as `scope add|remove|freeze|unfreeze` asks for it,
+/// checked against the revision it was read at (LINKED-11, LINKED-12).
+#[derive(Debug)]
+pub(crate) struct SetChange<'a> {
+    pub set_id: &'a str,
+    pub expected_revision: i64,
+    pub kind: &'a str,
+    pub member: Option<SetMember>,
+}
+
 /// Apply one membership change against its expected revision: a revision
 /// written against a stale number is refused whole and must be re-read and
 /// re-applied (LINKED-11). An already-true change answers the stored
@@ -926,14 +964,17 @@ fn require_membership_authority(
 pub(crate) fn mutate_set(
     connection: &Connection,
     root: &Path,
-    set_id: &str,
-    expected_revision: i64,
-    kind: &str,
-    member: Option<SetMember>,
+    change: SetChange,
     actor: &str,
     reason: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let SetChange {
+        set_id,
+        expected_revision,
+        kind,
+        member,
+    } = change;
     let set_id = require_set_id(set_id)?;
     if !["add", "remove", "freeze", "unfreeze"].contains(&kind) {
         bail!("unknown selected-set change {kind:?}");
@@ -968,7 +1009,7 @@ pub(crate) fn mutate_set(
             if resolve_endpoint(root, &caller, &reference).is_none() {
                 bail!("added member {UNAVAILABLE_ENDPOINT}");
             }
-            require_membership_authority(&caller, root, &[member.clone()])?;
+            require_membership_authority(&caller, root, std::slice::from_ref(&member))?;
             let canonical = SetMember {
                 board_id: reference.board_id,
                 id: reference.id,
@@ -982,7 +1023,7 @@ pub(crate) fn mutate_set(
         "remove" => {
             let member =
                 member.context("`scope remove` needs --board and --id naming the member")?;
-            require_membership_authority(&caller, root, &[member.clone()])?;
+            require_membership_authority(&caller, root, std::slice::from_ref(&member))?;
             let before = members.len();
             members.retain(|existing| existing != &member);
             if members.len() == before {
@@ -1011,12 +1052,14 @@ pub(crate) fn mutate_set(
     }
     append_revision(
         connection,
-        &set_id,
-        revision,
-        kind,
-        &actor,
-        reason.trim(),
-        &members,
+        Revision {
+            set_id: &set_id,
+            revision,
+            kind,
+            author: &actor,
+            reason: reason.trim(),
+            members: &members,
+        },
         now,
     )?;
     Ok(set_receipt(&set_id, revision, kind, &members))
@@ -1132,22 +1175,36 @@ fn binding_receipt(row: &BindingRow, revision: i64, kind: &str) -> serde_json::V
     })
 }
 
+/// The binding `scope bind` and `scope revoke` name: one `(actor, lane,
+/// session)` triple on one set, checked against the revision it was read at
+/// (LINKED-11, LINKED-14).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BindingTarget<'a> {
+    pub set_id: &'a str,
+    pub expected_revision: i64,
+    pub actor: &'a str,
+    pub lane: Option<&'a str>,
+    pub session: Option<&'a str>,
+}
+
 /// Bind one `(actor, lane, session)` triple to a set: audited, exactly one
 /// live binding per lane, rebind only by revoking first (LINKED-14).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn bind(
     connection: &Connection,
     root: &Path,
-    set_id: &str,
-    expected_revision: i64,
-    actor: &str,
-    lane: Option<&str>,
-    session: Option<&str>,
+    target: BindingTarget,
     lease_minutes: i64,
     author: &str,
     reason: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let BindingTarget {
+        set_id,
+        expected_revision,
+        actor,
+        lane,
+        session,
+    } = target;
     let set_id = require_set_id(set_id)?;
     let triple = normalize_triple(actor, lane, session);
     if triple.actor.trim().is_empty() {
@@ -1236,12 +1293,14 @@ pub(crate) fn bind(
     )?;
     append_revision(
         connection,
-        &set_id,
-        revision,
-        kind,
-        &author,
-        reason.trim(),
-        &head.members,
+        Revision {
+            set_id: &set_id,
+            revision,
+            kind,
+            author: &author,
+            reason: reason.trim(),
+            members: &head.members,
+        },
         now,
     )?;
     let row = latest_binding(connection, &set_id, &triple)?.context("binding was not stored")?;
@@ -1252,19 +1311,21 @@ pub(crate) fn bind(
 /// reason in an audited revision (LINKED-13, LINKED-14). Taking ends
 /// immediately; leases already granted keep their heartbeat until expiry or
 /// release, but take nothing further.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn revoke(
     connection: &Connection,
     root: &Path,
-    set_id: &str,
-    expected_revision: i64,
-    actor: &str,
-    lane: Option<&str>,
-    session: Option<&str>,
+    target: BindingTarget,
     author: &str,
     reason: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let BindingTarget {
+        set_id,
+        expected_revision,
+        actor,
+        lane,
+        session,
+    } = target;
     let set_id = require_set_id(set_id)?;
     let triple = normalize_triple(actor, lane, session);
     let reason = reason.trim();
@@ -1307,12 +1368,14 @@ pub(crate) fn revoke(
     )?;
     append_revision(
         connection,
-        &set_id,
-        revision,
-        "exit",
-        &author,
-        reason,
-        &head.members,
+        Revision {
+            set_id: &set_id,
+            revision,
+            kind: "exit",
+            author: &author,
+            reason,
+            members: &head.members,
+        },
         now,
     )?;
     let row = latest_binding(connection, &set_id, &triple)?.context("revocation was not stored")?;
@@ -1358,12 +1421,14 @@ pub(crate) fn release_binding(
     )?;
     append_revision(
         connection,
-        &set_id,
-        revision,
-        "release",
-        &triple.actor,
-        reason.trim(),
-        &head.members,
+        Revision {
+            set_id: &set_id,
+            revision,
+            kind: "release",
+            author: &triple.actor,
+            reason: reason.trim(),
+            members: &head.members,
+        },
         now,
     )?;
     let row = latest_binding(connection, &set_id, &triple)?.context("release was not stored")?;
@@ -1483,10 +1548,10 @@ pub(crate) struct ScopeGuard {
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Some(connection) = self.connection.take() {
-                let _ = connection.execute_batch("ROLLBACK");
-            }
+        if !self.finished
+            && let Some(connection) = self.connection.take()
+        {
+            let _ = connection.execute_batch("ROLLBACK");
         }
     }
 }
@@ -1773,8 +1838,8 @@ impl ScopeGuard {
             )),
             GuardMode::Mismatch {
                 presented,
-                held,
                 held_set,
+                ..
             } => Some(format!(
                 "no claimable task under selected set {held_set}: {} matches no live binding",
                 triple_sentence(presented)
@@ -1929,10 +1994,10 @@ pub(crate) fn holder_handoff_barred(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for binding in live {
-        if let Some((_, head)) = set_head(&connection, &binding.set_id)? {
-            if head.members.contains(&wanted) {
-                return Ok(None);
-            }
+        if let Some((_, head)) = set_head(&connection, &binding.set_id)?
+            && head.members.contains(&wanted)
+        {
+            return Ok(None);
         }
     }
     // Otherwise any standing revocation covering this task bars the handoff,
@@ -1947,15 +2012,15 @@ pub(crate) fn holder_handoff_barred(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for binding in revoked {
-        if let Some((_, head)) = set_head(&connection, &binding.set_id)? {
-            if head.members.contains(&wanted) {
-                return Ok(Some(
-                    binding
-                        .end_reason
-                        .clone()
-                        .unwrap_or_else(|| "no reason recorded".to_owned()),
-                ));
-            }
+        if let Some((_, head)) = set_head(&connection, &binding.set_id)?
+            && head.members.contains(&wanted)
+        {
+            return Ok(Some(
+                binding
+                    .end_reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".to_owned()),
+            ));
         }
     }
     Ok(None)
@@ -2300,21 +2365,34 @@ fn deliverable_receipt(row: &DeliverableRow) -> serde_json::Value {
     })
 }
 
+/// One `contrib declare`: the deliverable a joint task must evidence, its
+/// kind, and the repository a code deliverable pins (LINKED-15, LINKED-21).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeliverableDecl<'a> {
+    pub board: &'a str,
+    pub id: &'a str,
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub repo: &'a str,
+}
+
 /// Declare one deliverable for one joint task, audited and idempotent: the
 /// identical declaration retried answers the stored row, while re-declaring
 /// the same name with a different kind or repository is refused whole.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn declare_deliverable(
     connection: &Connection,
     root: &Path,
-    board: &str,
-    id: &str,
-    name: &str,
-    kind: &str,
-    repo: &str,
+    declaration: DeliverableDecl,
     actor: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let DeliverableDecl {
+        board,
+        id,
+        name,
+        kind,
+        repo,
+    } = declaration;
     let endpoint = require_endpoint_shape(board, id, "declared")?;
     let caller = linked_caller()?;
     if resolve_endpoint(root, &caller, &endpoint).is_none() {
@@ -2613,23 +2691,60 @@ fn contribution_receipt(row: &ContributionRow) -> serde_json::Value {
     })
 }
 
+/// One receipt's evidence fields as stored and matched: what the duplicate
+/// check keys on, the verifier reads, and the insert writes. A `non-code`
+/// receipt leaves every code field empty (LINKED-21).
+#[derive(Debug, Default, Clone, Copy)]
+struct ReceiptFields<'a> {
+    board_id: &'a str,
+    item_id: &'a str,
+    deliverable: &'a str,
+    kind: &'a str,
+    repo: &'a str,
+    commit: &'a str,
+    role: &'a str,
+    sources: &'a [String],
+    mapping: &'a str,
+    consumer_path: &'a [String],
+    consumes: &'a str,
+    verify_run: &'a str,
+    dep_kind: &'a str,
+    repo_path: &'a str,
+    hop_paths: &'a [String],
+}
+
+/// Who recorded one receipt, where, and when, with the references and the
+/// correction it carries (LINKED-15).
+#[derive(Debug, Clone, Copy)]
+struct ReceiptOrigin<'a> {
+    triple: &'a ScopeTriple,
+    host: &'a str,
+    worktree: &'a str,
+    branch: &'a str,
+    observed_at: i64,
+    evidence_refs: &'a [String],
+    note: &'a str,
+    corrects: Option<&'a str>,
+}
+
 /// Verify one code record against readable repositories, or mark it
 /// unverified. Returns `(verification, verify_detail)` and bails only for a
 /// contradiction a readable repository proves: the wrong hash in the stated
 /// repo, a non-ancestor source under a merge mapping, a missing or
 /// non-submodule hop, or a stale leaf pin.
-#[allow(clippy::too_many_arguments)]
-fn verify_code_evidence(
-    repo: &str,
-    commit: &str,
-    role: &str,
-    sources: &[String],
-    mapping: &str,
-    vias: &[String],
-    hop_paths: &[String],
-    consumes: &str,
-    repo_path: Option<&str>,
-) -> Result<(String, String)> {
+fn verify_code_evidence(receipt: &ReceiptFields) -> Result<(String, String)> {
+    let ReceiptFields {
+        repo,
+        commit,
+        role,
+        sources,
+        mapping,
+        consumer_path: vias,
+        hop_paths,
+        consumes,
+        ..
+    } = *receipt;
+    let repo_path = (!receipt.repo_path.is_empty()).then_some(receipt.repo_path);
     let unverified =
         |detail: String| -> Result<(String, String)> { Ok(("unverified".to_owned(), detail)) };
     let Some(path) = repo_path else {
@@ -2839,20 +2954,18 @@ pub(crate) fn record_contribution(
             );
         }
     }
+    let origin = ReceiptOrigin {
+        triple: &triple,
+        host: &host,
+        worktree: &worktree,
+        branch: &branch,
+        observed_at,
+        evidence_refs: &input.evidence_refs,
+        note: &input.note,
+        corrects: None,
+    };
     if kind == "non-code" {
-        return record_non_code(
-            connection,
-            &endpoint.board_id,
-            &endpoint.id,
-            &declared,
-            &triple,
-            input,
-            &host,
-            &worktree,
-            &branch,
-            observed_at,
-            now,
-        );
+        return record_non_code(connection, &endpoint, &declared, input, origin, now);
     }
     if input.roles.len() != 1 {
         bail!("{}", role_refusal(&input.roles));
@@ -2933,7 +3046,11 @@ pub(crate) fn record_contribution(
                 );
             }
             (
-                input.vias.iter().map(|hop| hop.trim().to_owned()).collect(),
+                input
+                    .vias
+                    .iter()
+                    .map(|hop| hop.trim().to_owned())
+                    .collect::<Vec<_>>(),
                 require_full_sha(&input.consumes, "the consumed dependency commit")?,
                 require_evidence_field(&input.verify_run, "verify-run")?,
                 dep_kind.to_owned(),
@@ -2969,28 +3086,26 @@ pub(crate) fn record_contribution(
     } else {
         Some(require_local_path(&input.repo_path, "repo-path")?)
     };
+    let receipt = ReceiptFields {
+        board_id: &endpoint.board_id,
+        item_id: &endpoint.id,
+        deliverable: &deliverable_name,
+        kind,
+        repo: &repo,
+        commit: &commit,
+        role: &role,
+        sources: &sources,
+        mapping: &mapping,
+        consumer_path: &vias,
+        consumes: &consumes,
+        verify_run: &verify_run,
+        dep_kind: &dep_kind,
+        repo_path: repo_path.as_deref().unwrap_or(""),
+        hop_paths: &hop_paths,
+    };
     // The identical receipt retried answers the stored row instead of writing
     // a second one.
-    let sources_json = serde_json::to_string(&sources)?;
-    let consumer_path_json = serde_json::to_string(&vias)?;
-    let hop_paths_json = serde_json::to_string(&hop_paths)?;
-    if let Some(existing) = duplicate_record(
-        connection,
-        &endpoint.board_id,
-        &endpoint.id,
-        &deliverable_name,
-        kind,
-        &repo,
-        &commit,
-        &role,
-        &sources_json,
-        &mapping,
-        &consumer_path_json,
-        &consumes,
-        repo_path.as_deref().unwrap_or(""),
-        &hop_paths_json,
-        &verify_run,
-    )? {
+    if let Some(existing) = duplicate_record(connection, &receipt)? {
         return Ok(contribution_receipt(&existing));
     }
     // A new baseline or candidate commit for the same deliverable and role
@@ -3033,70 +3148,30 @@ pub(crate) fn record_contribution(
         )?;
         Some(corrects.to_owned())
     };
-    let (verification, verify_detail) = verify_code_evidence(
-        &repo,
-        &commit,
-        &role,
-        &sources,
-        &mapping,
-        &vias,
-        &hop_paths,
-        &consumes,
-        repo_path.as_deref(),
-    )?;
+    let (verification, verify_detail) = verify_code_evidence(&receipt)?;
     insert_contribution(
         connection,
-        &endpoint.board_id,
-        &endpoint.id,
-        &deliverable_name,
-        kind,
-        &repo,
-        &commit,
-        &role,
-        &triple,
-        &host,
-        &worktree,
-        &branch,
-        observed_at,
-        now,
-        &input.evidence_refs,
-        &input.note,
-        corrects.as_deref(),
-        &sources,
-        &mapping,
-        &vias,
-        &consumes,
-        &verify_run,
-        &dep_kind,
+        &receipt,
+        &ReceiptOrigin {
+            corrects: corrects.as_deref(),
+            ..origin
+        },
         &verification,
         &verify_detail,
-        repo_path.as_deref().unwrap_or(""),
-        &hop_paths,
-        actor,
+        now,
     )
 }
 
 /// The identical receipt retried: the same endpoint, deliverable, kind,
 /// repository, commit, role, mapping, consumer path, and verification inputs
 /// answer the stored row instead of writing a second one.
-#[allow(clippy::too_many_arguments)]
 fn duplicate_record(
     connection: &Connection,
-    board_id: &str,
-    item_id: &str,
-    deliverable: &str,
-    kind: &str,
-    repo: &str,
-    commit: &str,
-    role: &str,
-    sources_json: &str,
-    mapping: &str,
-    consumer_path_json: &str,
-    consumes: &str,
-    repo_path: &str,
-    hop_paths_json: &str,
-    verify_run: &str,
+    receipt: &ReceiptFields,
 ) -> Result<Option<ContributionRow>> {
+    let sources_json = serde_json::to_string(receipt.sources)?;
+    let consumer_path_json = serde_json::to_string(receipt.consumer_path)?;
+    let hop_paths_json = serde_json::to_string(receipt.hop_paths)?;
     // The key covers the mapping, consumer path, and verification inputs as
     // well as the commit: a correction that keeps the commit but fixes the
     // mapping — or re-records once a machine path is reachable — still lands
@@ -3108,20 +3183,20 @@ fn duplicate_record(
              consumer_path=? AND consumes=? AND repo_path=? AND hop_paths=? AND verify_run=? \
              ORDER BY recorded_at,id LIMIT 1",
             params![
-                board_id,
-                item_id,
-                deliverable,
-                kind,
-                repo,
-                commit,
-                role,
+                receipt.board_id,
+                receipt.item_id,
+                receipt.deliverable,
+                receipt.kind,
+                receipt.repo,
+                receipt.commit,
+                receipt.role,
                 sources_json,
-                mapping,
+                receipt.mapping,
                 consumer_path_json,
-                consumes,
-                repo_path,
+                receipt.consumes,
+                receipt.repo_path,
                 hop_paths_json,
-                verify_run
+                receipt.verify_run
             ],
             contribution_row,
         )
@@ -3205,18 +3280,12 @@ fn correction_target(
 /// kind gate in [`record_contribution`] already refused the cross — and there
 /// is no commit to verify, so verification is recorded as having nothing to
 /// check rather than as a passing check.
-#[allow(clippy::too_many_arguments)]
 fn record_non_code(
     connection: &Connection,
-    board_id: &str,
-    item_id: &str,
+    endpoint: &DependencyRef,
     declared: &DeliverableRow,
-    triple: &ScopeTriple,
     input: &ContributionInput,
-    host: &str,
-    worktree: &str,
-    branch: &str,
-    observed_at: i64,
+    origin: ReceiptOrigin,
     now: i64,
 ) -> Result<serde_json::Value> {
     let stray = [
@@ -3255,8 +3324,8 @@ fn record_non_code(
     } else {
         correction_target(
             connection,
-            board_id,
-            item_id,
+            &endpoint.board_id,
+            &endpoint.id,
             &declared.name,
             corrects,
             None,
@@ -3265,69 +3334,62 @@ fn record_non_code(
     };
     insert_contribution(
         connection,
-        board_id,
-        item_id,
-        &declared.name,
-        "non-code",
-        "",
-        "",
-        "",
-        triple,
-        host,
-        worktree,
-        branch,
-        observed_at,
-        now,
-        &input.evidence_refs,
-        input.note.trim(),
-        corrects.as_deref(),
-        &[],
-        "",
-        &[],
-        "",
-        "",
-        "",
+        &ReceiptFields {
+            board_id: &endpoint.board_id,
+            item_id: &endpoint.id,
+            deliverable: &declared.name,
+            kind: "non-code",
+            ..ReceiptFields::default()
+        },
+        &ReceiptOrigin {
+            note: input.note.trim(),
+            corrects: corrects.as_deref(),
+            ..origin
+        },
         "verified",
         "non-code record: no commit to verify; the lane's evidence stands as recorded",
-        "",
-        &[],
-        triple.actor.as_str(),
+        now,
     )
 }
 
 /// Store one validated receipt and join the registry audit chain, then answer
 /// the stored row.
-#[allow(clippy::too_many_arguments)]
 fn insert_contribution(
     connection: &Connection,
-    board_id: &str,
-    item_id: &str,
-    deliverable: &str,
-    kind: &str,
-    repo: &str,
-    commit: &str,
-    role: &str,
-    triple: &ScopeTriple,
-    host: &str,
-    worktree: &str,
-    branch: &str,
-    observed_at: i64,
-    now: i64,
-    evidence_refs: &[String],
-    note: &str,
-    corrects: Option<&str>,
-    sources: &[String],
-    mapping: &str,
-    consumer_path: &[String],
-    consumes: &str,
-    verify_run: &str,
-    dep_kind: &str,
+    receipt: &ReceiptFields,
+    origin: &ReceiptOrigin,
     verification: &str,
     verify_detail: &str,
-    repo_path: &str,
-    hop_paths: &[String],
-    actor: &str,
+    now: i64,
 ) -> Result<serde_json::Value> {
+    let ReceiptFields {
+        board_id,
+        item_id,
+        deliverable,
+        kind,
+        repo,
+        commit,
+        role,
+        sources,
+        mapping,
+        consumer_path,
+        consumes,
+        verify_run,
+        dep_kind,
+        repo_path,
+        hop_paths,
+    } = *receipt;
+    let ReceiptOrigin {
+        triple,
+        host,
+        worktree,
+        branch,
+        observed_at,
+        evidence_refs,
+        note,
+        corrects,
+    } = *origin;
+    let actor = triple.actor.as_str();
     let id = format!("le-{}", uuid::Uuid::new_v4().simple());
     let evidence_refs_json = serde_json::to_string(
         &evidence_refs
@@ -3647,18 +3709,20 @@ fn closure_receipt(
 /// naming each open deliverable with its reason — nothing closes and no
 /// evidence is rewritten (LINKED-20). The identical close retried answers
 /// the stored closure.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn close_joint(
     connection: &Connection,
     root: &Path,
-    a_board: &str,
-    a_id: &str,
-    b_board: &str,
-    b_id: &str,
+    pair: EndpointPair,
     actor: &str,
     reason: &str,
     now: i64,
 ) -> Result<serde_json::Value> {
+    let EndpointPair {
+        a_board,
+        a_id,
+        b_board,
+        b_id,
+    } = pair;
     let first = require_endpoint_shape(a_board, a_id, "first")?;
     let second = require_endpoint_shape(b_board, b_id, "second")?;
     if first == second {
@@ -3929,10 +3993,12 @@ mod tests {
         let receipt = mutate_set(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            1,
-            "freeze",
-            None,
+            SetChange {
+                set_id: "joint-1",
+                expected_revision: 1,
+                kind: "freeze",
+                member: None,
+            },
             "op",
             "pause",
             now,
@@ -3945,10 +4011,12 @@ mod tests {
         let replay = mutate_set(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            2,
-            "freeze",
-            None,
+            SetChange {
+                set_id: "joint-1",
+                expected_revision: 2,
+                kind: "freeze",
+                member: None,
+            },
             "op",
             "pause",
             now,
@@ -3959,10 +4027,12 @@ mod tests {
         let stale = mutate_set(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            1,
-            "unfreeze",
-            None,
+            SetChange {
+                set_id: "joint-1",
+                expected_revision: 1,
+                kind: "unfreeze",
+                member: None,
+            },
             "op",
             "go",
             now,
@@ -3976,11 +4046,13 @@ mod tests {
         let bound = bind(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            2,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 2,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             60,
             "op",
             "bind",
@@ -3993,11 +4065,13 @@ mod tests {
         let again = bind(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            3,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 3,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             60,
             "op",
             "bind",
@@ -4010,11 +4084,13 @@ mod tests {
         let clash = bind(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            3,
-            "w",
-            Some("driver"),
-            Some("s2"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 3,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s2"),
+            },
             60,
             "op",
             "bind",
@@ -4029,11 +4105,13 @@ mod tests {
         let exit = revoke(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            3,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 3,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             "op",
             "done",
             now,
@@ -4045,11 +4123,13 @@ mod tests {
         let exit_again = revoke(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            4,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 4,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             "op",
             "done",
             now,
@@ -4076,11 +4156,13 @@ mod tests {
         let rearmed = bind(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            4,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 4,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             60,
             "op",
             "again",
@@ -4108,11 +4190,13 @@ mod tests {
         let rearmed = bind(
             &connection,
             Path::new("/none"),
-            "joint-1",
-            6,
-            "w",
-            Some("driver"),
-            Some("s1"),
+            BindingTarget {
+                set_id: "joint-1",
+                expected_revision: 6,
+                actor: "w",
+                lane: Some("driver"),
+                session: Some("s1"),
+            },
             60,
             "op",
             "again",
@@ -4149,10 +4233,12 @@ mod tests {
             mutate_set(
                 &connection,
                 Path::new("/none"),
-                "missing",
-                1,
-                "freeze",
-                None,
+                SetChange {
+                    set_id: "missing",
+                    expected_revision: 1,
+                    kind: "freeze",
+                    member: None,
+                },
                 "op",
                 "x",
                 now,
@@ -4161,11 +4247,13 @@ mod tests {
             bind(
                 &connection,
                 Path::new("/none"),
-                "missing",
-                1,
-                "w",
-                None,
-                None,
+                BindingTarget {
+                    set_id: "missing",
+                    expected_revision: 1,
+                    actor: "w",
+                    lane: None,
+                    session: None,
+                },
                 60,
                 "op",
                 "x",
@@ -4175,11 +4263,13 @@ mod tests {
             revoke(
                 &connection,
                 Path::new("/none"),
-                "missing",
-                1,
-                "w",
-                None,
-                None,
+                BindingTarget {
+                    set_id: "missing",
+                    expected_revision: 1,
+                    actor: "w",
+                    lane: None,
+                    session: None,
+                },
                 "op",
                 "x",
                 now,

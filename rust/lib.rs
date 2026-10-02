@@ -6725,10 +6725,12 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::add_companion(
                 &transaction,
                 &root,
-                args.require("a-board")?,
-                args.require("a-id")?,
-                args.require("b-board")?,
-                args.require("b-id")?,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
                 args.one("as").unwrap_or("system@cli"),
                 now_ms(),
             )?;
@@ -6745,10 +6747,12 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::remove_companion(
                 &transaction,
                 &root,
-                args.require("a-board")?,
-                args.require("a-id")?,
-                args.require("b-board")?,
-                args.require("b-id")?,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
                 args.one("as").unwrap_or("system@cli"),
                 args.one("reason").unwrap_or(""),
                 now_ms(),
@@ -6808,11 +6812,14 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::mutate_set(
                 &transaction,
                 &root,
-                args.require("set")?,
-                args.optional_integer("expect-revision")?
-                    .context("--expect-revision is required")?,
-                kind,
-                member,
+                crate::linked::SetChange {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    kind,
+                    member,
+                },
                 args.one("as").unwrap_or("system@cli"),
                 args.one("reason").unwrap_or(""),
                 now_ms(),
@@ -6830,12 +6837,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::bind(
                 &transaction,
                 &root,
-                args.require("set")?,
-                args.optional_integer("expect-revision")?
-                    .context("--expect-revision is required")?,
-                args.require("actor")?,
-                args.one("lane"),
-                args.one("session"),
+                crate::linked::BindingTarget {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    actor: args.require("actor")?,
+                    lane: args.one("lane"),
+                    session: args.one("session"),
+                },
                 args.optional_integer("lease-minutes")?.unwrap_or(1440),
                 args.one("as").unwrap_or("system@cli"),
                 args.one("reason").unwrap_or(""),
@@ -6854,12 +6864,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::revoke(
                 &transaction,
                 &root,
-                args.require("set")?,
-                args.optional_integer("expect-revision")?
-                    .context("--expect-revision is required")?,
-                args.require("actor")?,
-                args.one("lane"),
-                args.one("session"),
+                crate::linked::BindingTarget {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    actor: args.require("actor")?,
+                    lane: args.one("lane"),
+                    session: args.one("session"),
+                },
                 args.one("as").unwrap_or("system@cli"),
                 args.require("reason")?,
                 now_ms(),
@@ -6909,11 +6922,13 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::declare_deliverable(
                 &transaction,
                 &root,
-                args.require("board")?,
-                args.require("id")?,
-                args.require("deliverable")?,
-                args.one("kind").unwrap_or("code"),
-                args.one("repo").unwrap_or(""),
+                crate::linked::DeliverableDecl {
+                    board: args.require("board")?,
+                    id: args.require("id")?,
+                    name: args.require("deliverable")?,
+                    kind: args.one("kind").unwrap_or("code"),
+                    repo: args.one("repo").unwrap_or(""),
+                },
                 args.one("as").unwrap_or("system@cli"),
                 now_ms(),
             )?;
@@ -6994,10 +7009,12 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let receipt = crate::linked::close_joint(
                 &transaction,
                 &root,
-                args.require("a-board")?,
-                args.require("a-id")?,
-                args.require("b-board")?,
-                args.require("b-id")?,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
                 args.one("as").unwrap_or("system@cli"),
                 args.one("reason").unwrap_or(""),
                 now_ms(),
