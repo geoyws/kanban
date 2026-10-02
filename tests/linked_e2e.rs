@@ -169,9 +169,7 @@ fn user_version(path: &Path) -> i64 {
 }
 
 fn row_count(path: &Path, sql: &str) -> i64 {
-    readonly(path)
-        .query_row(sql, [], |row| row.get(0))
-        .unwrap()
+    readonly(path).query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
 /// The sorted endpoint set of one `link show` answer, for side-to-side
@@ -191,10 +189,7 @@ fn pairing_shape(shown: &Value) -> (String, Vec<(String, String, String)>) {
         })
         .collect::<Vec<_>>();
     endpoints.sort();
-    (
-        pairing["pairingID"].as_str().unwrap().to_owned(),
-        endpoints,
-    )
+    (pairing["pairingID"].as_str().unwrap().to_owned(), endpoints)
 }
 
 /// A1 — Pair two disposable boards; both directions read identical after a
@@ -211,8 +206,19 @@ fn pairing_roundtrip_reads_identical_from_both_sides_after_restart() {
     let added = estate.ok_json(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     let pairing_id = added["pairingID"].as_str().unwrap().to_owned();
@@ -233,8 +239,19 @@ fn pairing_roundtrip_reads_identical_from_both_sides_after_restart() {
     let replay = estate.ok_json(
         &estate.root,
         &[
-            "link", "add", "--a-board", &acies, "--a-id", "t-a1", "--b-board", &unum,
-            "--b-id", "t-u1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &acies,
+            "--a-id",
+            "t-a1",
+            "--b-board",
+            &unum,
+            "--b-id",
+            "t-u1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert_eq!(replay["pairingID"].as_str().unwrap(), pairing_id);
@@ -274,8 +291,19 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let added = estate.ok_json(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     let pairing_id = added["pairingID"].as_str().unwrap().to_owned();
@@ -285,8 +313,19 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let shape = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", "unum", "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            "unum",
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert!(
@@ -299,15 +338,37 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let unknown_board = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", "00000000-0000-0000-0000-000000000000", "--a-id",
-            "t-u1", "--b-board", &acies, "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            "00000000-0000-0000-0000-000000000000",
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     let unknown_item = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-nope", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-nope",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     let foreign = Estate::new("a2-foreign");
@@ -315,8 +376,19 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let foreign_board = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", &other, "--a-id", "t-x", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &other,
+            "--a-id",
+            "t-x",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert_eq!(
@@ -346,8 +418,19 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let selfie = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &unum,
-            "--b-id", "t-u1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &unum,
+            "--b-id",
+            "t-u1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert!(selfie.contains("itself"), "self-pairing refuses: {selfie}");
@@ -355,7 +438,10 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     // Retiring the Acies item leaves the pairing pointing at the pinned
     // incarnation: it reads retired, never retargeted, and nothing new.
     let work_acies = estate.workspace("acies");
-    estate.ok_json(&work_acies, &["task", "remove", "t-a1", "--as", OP, "--json"]);
+    estate.ok_json(
+        &work_acies,
+        &["task", "remove", "t-a1", "--as", OP, "--json"],
+    );
     let retired = estate.ok_json(
         &estate.root,
         &["link", "show", "--board", &unum, "--id", "t-u1", "--json"],
@@ -398,8 +484,19 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     let conflict = estate.refused(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert!(
@@ -411,15 +508,39 @@ fn refusals_hide_cause_and_content_and_pins_survive_recreation() {
     estate.ok_json(
         &estate.root,
         &[
-            "link", "remove", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--reason", "re-pairing", "--json",
+            "link",
+            "remove",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--reason",
+            "re-pairing",
+            "--json",
         ],
     );
     let repaired = estate.ok_json(
         &estate.root,
         &[
-            "link", "add", "--a-board", &unum, "--a-id", "t-u1", "--b-board", &acies,
-            "--b-id", "t-a1", "--as", OP, "--json",
+            "link",
+            "add",
+            "--a-board",
+            &unum,
+            "--a-id",
+            "t-u1",
+            "--b-board",
+            &acies,
+            "--b-id",
+            "t-a1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert_ne!(
@@ -460,15 +581,39 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "add", "--set", "joint-3", "--board", &unum, "--id", "t-in",
-            "--expect-revision", "1", "--as", OP, "--json",
+            "scope",
+            "add",
+            "--set",
+            "joint-3",
+            "--board",
+            &unum,
+            "--id",
+            "t-in",
+            "--expect-revision",
+            "1",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "bind", "--set", "joint-3", "--actor", WORKER, "--lane", LANE,
-            "--session", SESSION, "--expect-revision", "2", "--as", OP, "--json",
+            "scope",
+            "bind",
+            "--set",
+            "joint-3",
+            "--actor",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--expect-revision",
+            "2",
+            "--as",
+            OP,
+            "--json",
         ],
     );
 
@@ -477,7 +622,13 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     let candidates = estate.ok_json(
         &work,
         &[
-            "claim", "--candidates", "--as", WORKER, "--lane", LANE, "--json",
+            "claim",
+            "--candidates",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--json",
         ],
     );
     let offered = candidates
@@ -493,7 +644,15 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     let claimed = estate.ok_json(
         &work,
         &[
-            "claim", "t-in", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "t-in",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     );
     let lease = claimed["claim"]["leaseToken"].as_str().unwrap().to_owned();
@@ -517,7 +676,15 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
         same_sentence.push(estate.refused(
             &work,
             &[
-                "claim", task, "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+                "claim",
+                task,
+                "--as",
+                WORKER,
+                "--lane",
+                LANE,
+                "--session",
+                SESSION,
+                "--json",
             ],
         ));
     }
@@ -526,7 +693,15 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     let next_empty = estate.refused(
         &work,
         &[
-            "claim", "--next", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "--next",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     );
     assert!(
@@ -538,7 +713,14 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     let gated = estate.refused(
         &work,
         &[
-            "claim", "t-gated", "--as", WORKER, "--lane", LANE, "--session", SESSION,
+            "claim",
+            "t-gated",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
             "--json",
         ],
     );
@@ -548,24 +730,41 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     );
     // A lease-taking handoff for the sibling: take it as an unbound lane,
     // offer it over, and watch the bound worker's accept stay pending.
-    let held = estate.ok_json(
-        &work,
-        &["claim", "t-out", "--as", "op2", "--json"],
-    );
+    let held = estate.ok_json(&work, &["claim", "t-out", "--as", "op2", "--json"]);
     let op_lease = held["claim"]["leaseToken"].as_str().unwrap().to_owned();
     let handoff = estate.ok_json(
         &work,
         &[
-            "handoff", "create", "t-out", "--lease", &op_lease, "--as", "op2", "--summary",
-            "take it", "--intent", "cover", "--next-action", "claim", "--json",
+            "handoff",
+            "create",
+            "t-out",
+            "--lease",
+            &op_lease,
+            "--as",
+            "op2",
+            "--summary",
+            "take it",
+            "--intent",
+            "cover",
+            "--next-action",
+            "claim",
+            "--json",
         ],
     );
     let handoff_id = handoff["id"].as_str().unwrap().to_owned();
     same_sentence.push(estate.refused(
         &work,
         &[
-            "handoff", "accept", &handoff_id, "--as", WORKER, "--lane", LANE, "--session",
-            SESSION, "--json",
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     ));
     let listed = estate.ok_json(&work, &["handoff", "list", "--json"]);
@@ -583,14 +782,30 @@ fn bound_worker_takes_only_selected_tasks_on_every_path() {
     same_sentence.push(estate.refused(
         &work,
         &[
-            "claim", "t-out", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "t-out",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     ));
     same_sentence.push(estate.refused(
         &work,
         &[
-            "handoff", "accept", &handoff_id, "--as", WORKER, "--lane", LANE, "--session",
-            SESSION, "--json",
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     ));
     for refusal in &same_sentence {
@@ -637,16 +852,40 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
         estate.ok_json(
             &estate.root,
             &[
-                "scope", "add", "--set", "joint-4", "--board", &unum, "--id", id,
-                "--expect-revision", revision, "--as", OP, "--json",
+                "scope",
+                "add",
+                "--set",
+                "joint-4",
+                "--board",
+                &unum,
+                "--id",
+                id,
+                "--expect-revision",
+                revision,
+                "--as",
+                OP,
+                "--json",
             ],
         );
     }
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "bind", "--set", "joint-4", "--actor", WORKER, "--lane", LANE,
-            "--session", SESSION, "--expect-revision", "3", "--as", OP, "--json",
+            "scope",
+            "bind",
+            "--set",
+            "joint-4",
+            "--actor",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--expect-revision",
+            "3",
+            "--as",
+            OP,
+            "--json",
         ],
     );
 
@@ -654,23 +893,53 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let claimed = estate.ok_json(
         &work,
         &[
-            "claim", "t-1", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "t-1",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     );
     let lease = claimed["claim"]["leaseToken"].as_str().unwrap().to_owned();
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "revoke", "--set", "joint-4", "--actor", WORKER, "--lane", LANE,
-            "--session", SESSION, "--reason", "misuse", "--expect-revision", "4", "--as",
-            OP, "--json",
+            "scope",
+            "revoke",
+            "--set",
+            "joint-4",
+            "--actor",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--reason",
+            "misuse",
+            "--expect-revision",
+            "4",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     // ...but the revoked triple takes nothing further, by any path.
     let second = estate.refused(
         &work,
         &[
-            "claim", "t-2", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "t-2",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     );
     assert!(
@@ -682,8 +951,20 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let onward = estate.refused(
         &work,
         &[
-            "handoff", "create", "t-1", "--lease", &lease, "--as", WORKER, "--summary",
-            "pass", "--intent", "pass", "--next-action", "pass", "--json",
+            "handoff",
+            "create",
+            "t-1",
+            "--lease",
+            &lease,
+            "--as",
+            WORKER,
+            "--summary",
+            "pass",
+            "--intent",
+            "pass",
+            "--next-action",
+            "pass",
+            "--json",
         ],
     );
     assert!(
@@ -696,8 +977,19 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let stale = estate.refused(
         &estate.root,
         &[
-            "scope", "add", "--set", "joint-4", "--board", &unum, "--id", "t-3",
-            "--expect-revision", "4", "--as", OP, "--json",
+            "scope",
+            "add",
+            "--set",
+            "joint-4",
+            "--board",
+            &unum,
+            "--id",
+            "t-3",
+            "--expect-revision",
+            "4",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert!(
@@ -707,22 +999,55 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "add", "--set", "joint-4", "--board", &unum, "--id", "t-3",
-            "--expect-revision", "5", "--as", OP, "--json",
+            "scope",
+            "add",
+            "--set",
+            "joint-4",
+            "--board",
+            &unum,
+            "--id",
+            "t-3",
+            "--expect-revision",
+            "5",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "add", "--set", "joint-4", "--board", &unum, "--id", "t-4",
-            "--expect-revision", "6", "--as", OP, "--json",
+            "scope",
+            "add",
+            "--set",
+            "joint-4",
+            "--board",
+            &unum,
+            "--id",
+            "t-4",
+            "--expect-revision",
+            "6",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     let raced = estate.refused(
         &estate.root,
         &[
-            "scope", "add", "--set", "joint-4", "--board", &unum, "--id", "t-5",
-            "--expect-revision", "6", "--as", OP, "--json",
+            "scope",
+            "add",
+            "--set",
+            "joint-4",
+            "--board",
+            &unum,
+            "--id",
+            "t-5",
+            "--expect-revision",
+            "6",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert!(
@@ -735,7 +1060,14 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let relabeled = estate.refused(
         &work,
         &[
-            "claim", "t-2", "--as", WORKER, "--lane", "other", "--session", SESSION,
+            "claim",
+            "t-2",
+            "--as",
+            WORKER,
+            "--lane",
+            "other",
+            "--session",
+            SESSION,
             "--json",
         ],
     );
@@ -748,8 +1080,21 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let rearmed = estate.ok_json(
         &estate.root,
         &[
-            "scope", "bind", "--set", "joint-4", "--actor", WORKER, "--lane", LANE,
-            "--session", SESSION, "--expect-revision", "7", "--as", OP, "--json",
+            "scope",
+            "bind",
+            "--set",
+            "joint-4",
+            "--actor",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--expect-revision",
+            "7",
+            "--as",
+            OP,
+            "--json",
         ],
     );
     assert_eq!(rearmed["kind"], Value::from("rebind"));
@@ -759,14 +1104,29 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "freeze", "--set", "joint-4", "--expect-revision", "8", "--as", OP,
+            "scope",
+            "freeze",
+            "--set",
+            "joint-4",
+            "--expect-revision",
+            "8",
+            "--as",
+            OP,
             "--json",
         ],
     );
     let frozen = estate.refused(
         &work,
         &[
-            "claim", "t-3", "--as", WORKER, "--lane", LANE, "--session", SESSION, "--json",
+            "claim",
+            "t-3",
+            "--as",
+            WORKER,
+            "--lane",
+            LANE,
+            "--session",
+            SESSION,
+            "--json",
         ],
     );
     assert!(
@@ -778,7 +1138,14 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "unfreeze", "--set", "joint-4", "--expect-revision", "9", "--as", OP,
+            "scope",
+            "unfreeze",
+            "--set",
+            "joint-4",
+            "--expect-revision",
+            "9",
+            "--as",
+            OP,
             "--json",
         ],
     );
@@ -787,7 +1154,14 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     let lookalike = estate.refused(
         &work,
         &[
-            "claim", "t-2", "--as", WORKER, "--lane", "other", "--session", SESSION,
+            "claim",
+            "t-2",
+            "--as",
+            WORKER,
+            "--lane",
+            "other",
+            "--session",
+            SESSION,
             "--json",
         ],
     );
@@ -798,7 +1172,10 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
 
     // Every change sits in the hash-chained log with author, reason, and the
     // full member list.
-    let shown = estate.ok_json(&estate.root, &["scope", "show", "--set", "joint-4", "--json"]);
+    let shown = estate.ok_json(
+        &estate.root,
+        &["scope", "show", "--set", "joint-4", "--json"],
+    );
     assert_eq!(shown["revision"], Value::from(10));
     assert_eq!(shown["members"].as_array().unwrap().len(), 4);
     let audited = estate.ok_json(&estate.root, &["audit", "verify", "--json"]);

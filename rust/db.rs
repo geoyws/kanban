@@ -5429,7 +5429,10 @@ mod tests {
             .unwrap();
 
         migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), REGISTRY_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
         assert_eq!(REGISTRY_SCHEMA_VERSION, 18);
         let boards: i64 = connection
             .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
@@ -5451,7 +5454,10 @@ mod tests {
         // Re-running the step over tables that already stand is a no-op, not
         // a failure: rewound registries re-run it the same way.
         migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), REGISTRY_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
     }
 
     /// `REGISTRY_V18` is additive (LINKED delivery evidence, row `t-9eff9257`,

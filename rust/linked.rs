@@ -41,8 +41,7 @@ pub(crate) const UNAVAILABLE_ENDPOINT: &str =
 /// The shape every shared endpoint is named in: the spelling commissioned
 /// for both slices, defined here from the approved scope rather than taken
 /// from the sibling (LINKED-02, LINKED-05).
-pub(crate) const ENDPOINT_SHAPE: &str =
-    "shared endpoints name (boardID, id) with boardID a board UUID in canonical \
+pub(crate) const ENDPOINT_SHAPE: &str = "shared endpoints name (boardID, id) with boardID a board UUID in canonical \
      lowercase hyphenated form and id the exact item ID; board names, board paths, \
      and @# tokens are display conveniences, never persisted identity and never \
      resolved as identity at write time";
@@ -66,7 +65,11 @@ pub(crate) struct ScopeTriple {
     pub session: String,
 }
 
-pub(crate) fn normalize_triple(actor: &str, lane: Option<&str>, session: Option<&str>) -> ScopeTriple {
+pub(crate) fn normalize_triple(
+    actor: &str,
+    lane: Option<&str>,
+    session: Option<&str>,
+) -> ScopeTriple {
     ScopeTriple {
         actor: actor.to_owned(),
         lane: lane.unwrap_or("").to_owned(),
@@ -143,9 +146,15 @@ fn linked_caller() -> Result<AuthzContext> {
     // authority, mirroring `board_authz`: an empty map denies through the one
     // generic refusal rather than erroring into an oracle.
     match crate::routing::local_caller() {
-        Ok(caller) => Ok(AuthzContext::new(enforcement, caller.authority, String::new())
-            .with_caller(caller.principal_id, caller.worker)),
-        Err(_) => Ok(AuthzContext::new(enforcement, HashMap::new(), String::new())),
+        Ok(caller) => Ok(
+            AuthzContext::new(enforcement, caller.authority, String::new())
+                .with_caller(caller.principal_id, caller.worker),
+        ),
+        Err(_) => Ok(AuthzContext::new(
+            enforcement,
+            HashMap::new(),
+            String::new(),
+        )),
     }
 }
 
@@ -158,10 +167,7 @@ fn confine_to_task_root(
     board_path: &Path,
     board_id: &str,
 ) -> Result<AuthzContext> {
-    let Some(root) = caller
-        .worker()
-        .and_then(|worker| worker.task_root.clone())
-    else {
+    let Some(root) = caller.worker().and_then(|worker| worker.task_root.clone()) else {
         return Ok(caller.for_board(board_id.to_owned()));
     };
     if root.board_id != board_id {
@@ -169,9 +175,7 @@ fn confine_to_task_root(
     }
     let connection = crate::db::open_board_readonly(board_path)?;
     let scope = crate::store::Store::task_subtree_on(&connection, &root.task_id)?;
-    Ok(caller
-        .for_board(board_id.to_owned())
-        .with_task_scope(scope))
+    Ok(caller.for_board(board_id.to_owned()).with_task_scope(scope))
 }
 
 /// Read one item's tags for an authority check. An endpoint that resolved
@@ -242,10 +246,7 @@ fn is_unique_violation(error: &rusqlite::Error) -> bool {
 fn order_resolved(
     first: crate::cross::ResolvedSource,
     second: crate::cross::ResolvedSource,
-) -> (
-    crate::cross::ResolvedSource,
-    crate::cross::ResolvedSource,
-) {
+) -> (crate::cross::ResolvedSource, crate::cross::ResolvedSource) {
     if (second.board_id.clone(), second.item_id.clone())
         < (first.board_id.clone(), first.item_id.clone())
     {
@@ -283,12 +284,7 @@ pub(crate) struct CompanionEndpointView {
 }
 
 /// The liveness of one pinned endpoint as it stands now.
-fn endpoint_state(
-    root: &Path,
-    board_id: &str,
-    item_id: &str,
-    pinned: &str,
-) -> String {
+fn endpoint_state(root: &Path, board_id: &str, item_id: &str, pinned: &str) -> String {
     let registered = match crate::cross::registered_board(root, board_id) {
         Ok(registered) => registered,
         Err(_) => return "retired".to_owned(),
@@ -437,12 +433,8 @@ pub(crate) fn add_companion(
         bail!("second endpoint {UNAVAILABLE_ENDPOINT}");
     };
     let (one, two) = order_resolved(resolved_first, resolved_second);
-    let path_one = root
-        .join("boards")
-        .join(format!("{}.db", one.board_id));
-    let path_two = root
-        .join("boards")
-        .join(format!("{}.db", two.board_id));
+    let path_one = root.join("boards").join(format!("{}.db", one.board_id));
+    let path_two = root.join("boards").join(format!("{}.db", two.board_id));
     require_pairing_authority(&caller, &one, &path_one, &two, &path_two)?;
     if let Some(existing) = live_pairing(
         connection,
@@ -451,8 +443,7 @@ pub(crate) fn add_companion(
         &two.board_id,
         &two.item_id,
     )? {
-        if existing.incarnation_a == one.incarnation && existing.incarnation_b == two.incarnation
-        {
+        if existing.incarnation_a == one.incarnation && existing.incarnation_b == two.incarnation {
             // The identical write retried: answer the stored record rather
             // than writing a second row (LINKED-05, LINKED-24).
             return Ok(companion_receipt(&existing, false));
@@ -461,7 +452,10 @@ pub(crate) fn add_companion(
             "a live pairing already pairs board {} item {} with board {} item {} under different \
              incarnations; re-pairing is explicit: retire it with `link remove` citing this \
              attempt, then pair again. Nothing was written",
-            one.board_id, one.item_id, two.board_id, two.item_id
+            one.board_id,
+            one.item_id,
+            two.board_id,
+            two.item_id
         );
     }
 
@@ -501,9 +495,7 @@ pub(crate) fn add_companion(
             &two.board_id,
             &two.item_id,
         )? {
-            if winner.incarnation_a == one.incarnation
-                && winner.incarnation_b == two.incarnation
-            {
+            if winner.incarnation_a == one.incarnation && winner.incarnation_b == two.incarnation {
                 return Ok(companion_receipt(&winner, false));
             }
         }
@@ -555,28 +547,22 @@ pub(crate) fn remove_companion(
     // Retiring is authorized like pairing, but a retired endpoint can no
     // longer resolve live: authorize against the stored pins instead, so a
     // pairing whose item has since retired can still be retired.
-    let (a_board_id, a_item_id, b_board_id, b_item_id) =
-        if (second.board_id.clone(), second.id.clone()) < (first.board_id.clone(), first.id.clone())
-        {
-            (second.board_id, second.id, first.board_id, first.id)
-        } else {
-            (first.board_id, first.id, second.board_id, second.id)
-        };
-    let live = live_pairing(
-        connection,
-        &a_board_id,
-        &a_item_id,
-        &b_board_id,
-        &b_item_id,
-    )?;
+    let (a_board_id, a_item_id, b_board_id, b_item_id) = if (
+        second.board_id.clone(),
+        second.id.clone(),
+    ) < (
+        first.board_id.clone(),
+        first.id.clone(),
+    ) {
+        (second.board_id, second.id, first.board_id, first.id)
+    } else {
+        (first.board_id, first.id, second.board_id, second.id)
+    };
+    let live = live_pairing(connection, &a_board_id, &a_item_id, &b_board_id, &b_item_id)?;
     let Some(live) = live else {
-        if let Some(retired) = retired_pairing(
-            connection,
-            &a_board_id,
-            &a_item_id,
-            &b_board_id,
-            &b_item_id,
-        )? {
+        if let Some(retired) =
+            retired_pairing(connection, &a_board_id, &a_item_id, &b_board_id, &b_item_id)?
+        {
             return Ok(companion_receipt(&retired, true));
         }
         bail!(
@@ -615,14 +601,8 @@ pub(crate) fn remove_companion(
         &json!({"pairingID": live.id, "reason": reason}).to_string(),
         now,
     )?;
-    let row = retired_pairing(
-        connection,
-        &a_board_id,
-        &a_item_id,
-        &b_board_id,
-        &b_item_id,
-    )?
-    .context("pairing retirement was not stored")?;
+    let row = retired_pairing(connection, &a_board_id, &a_item_id, &b_board_id, &b_item_id)?
+        .context("pairing retirement was not stored")?;
     Ok(companion_receipt(&row, true))
 }
 
@@ -641,10 +621,7 @@ pub(crate) fn show_companions(
          (board_b_id=? AND item_b_id=?)) ORDER BY created_at,id",
     )?;
     let rows = statement
-        .query_map(
-            params![board_id, item_id, board_id, item_id],
-            companion_row,
-        )?
+        .query_map(params![board_id, item_id, board_id, item_id], companion_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     let mut views = Vec::with_capacity(rows.len());
@@ -700,11 +677,9 @@ fn retired_or_refused(
     caller: &AuthzContext,
     reference: &DependencyRef,
 ) -> Result<String> {
-    let refusal = || {
-        anyhow::anyhow!("queried endpoint {UNAVAILABLE_ENDPOINT}")
-    };
-    let Some(registered) = crate::cross::registered_board(root, &reference.board_id)
-        .map_err(|_| refusal())?
+    let refusal = || anyhow::anyhow!("queried endpoint {UNAVAILABLE_ENDPOINT}");
+    let Some(registered) =
+        crate::cross::registered_board(root, &reference.board_id).map_err(|_| refusal())?
     else {
         // Unknown, ambiguous, or archived board: nothing exists to read, and
         // board scope already decided below — but without a board file there
@@ -839,14 +814,28 @@ fn append_revision(
         "INSERT INTO linked_set_revisions(seq,set_id,revision,kind,author,reason,members,\
          created_at,prev_hash,event_hash,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         params![
-            seq, set_id, revision, kind, author, reason, members_json, now, prev_hash, event_hash,
+            seq,
+            set_id,
+            revision,
+            kind,
+            author,
+            reason,
+            members_json,
+            now,
+            prev_hash,
+            event_hash,
             payload
         ],
     )?;
     Ok(())
 }
 
-fn set_receipt(set_id: &str, revision: i64, kind: &str, members: &[SetMember]) -> serde_json::Value {
+fn set_receipt(
+    set_id: &str,
+    revision: i64,
+    kind: &str,
+    members: &[SetMember],
+) -> serde_json::Value {
     json!({
         "set": set_id,
         "revision": revision,
@@ -991,7 +980,8 @@ pub(crate) fn mutate_set(
             members = canonical_members(members);
         }
         "remove" => {
-            let member = member.context("`scope remove` needs --board and --id naming the member")?;
+            let member =
+                member.context("`scope remove` needs --board and --id naming the member")?;
             require_membership_authority(&caller, root, &[member.clone()])?;
             let before = members.len();
             members.retain(|existing| existing != &member);
@@ -1015,15 +1005,9 @@ pub(crate) fn mutate_set(
     }
     let revision = head.revision + 1;
     if kind == "freeze" {
-        connection.execute(
-            "UPDATE linked_sets SET frozen=1 WHERE id=?",
-            [&set_id],
-        )?;
+        connection.execute("UPDATE linked_sets SET frozen=1 WHERE id=?", [&set_id])?;
     } else if kind == "unfreeze" {
-        connection.execute(
-            "UPDATE linked_sets SET frozen=0 WHERE id=?",
-            [&set_id],
-        )?;
+        connection.execute("UPDATE linked_sets SET frozen=0 WHERE id=?", [&set_id])?;
     }
     append_revision(
         connection,
@@ -1123,10 +1107,7 @@ fn live_bindings_for_actor(
 /// The actor's most recently ended-by-revocation binding, across lanes,
 /// sessions, and sets: what keeps refusing under any relabeled triple until an
 /// audited rebind re-arms the actor (LINKED-13, LINKED-14).
-fn latest_revoked_for_actor(
-    connection: &Connection,
-    actor: &str,
-) -> Result<Option<BindingRow>> {
+fn latest_revoked_for_actor(connection: &Connection, actor: &str) -> Result<Option<BindingRow>> {
     Ok(connection
         .query_row(
             "SELECT * FROM linked_bindings WHERE actor=? AND status='revoked' ORDER BY ended_at \
@@ -1231,7 +1212,11 @@ pub(crate) fn bind(
     if let Some(old_id) = lapsed_id {
         connection.execute(
             "UPDATE linked_bindings SET status='released',ended_at=?,end_reason=? WHERE id=?",
-            params![now, "binding lapsed; superseded by an audited rebind", old_id],
+            params![
+                now,
+                "binding lapsed; superseded by an audited rebind",
+                old_id
+            ],
         )?;
     }
     let revision = head.revision + 1;
@@ -1612,7 +1597,10 @@ impl ScopeGuard {
 
     /// Re-read the binding state under the held write intent.
     fn resolve(&mut self, now: i64) -> Result<()> {
-        let connection = self.connection.as_ref().context("scope guard lost its registry")?;
+        let connection = self
+            .connection
+            .as_ref()
+            .context("scope guard lost its registry")?;
         let mut statement = connection.prepare("SELECT id FROM linked_sets ORDER BY id")?;
         let sets = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -2778,6 +2766,19 @@ pub(crate) fn record_contribution(
             input.actor
         );
     }
+    // Under managed enforcement a credentialed worker records only as its own
+    // lane actor: the flag-supplied triple is bound to the credential, so no
+    // worker records for another lane's triple (LINKED-15, IDENT-11).
+    if let Some(worker) = caller.worker()
+        && worker.lane_actor != actor
+    {
+        bail!(
+            "contributions are recorded by the lane that did the work: this worker's lane \
+             actor is {:?}, but --actor names {actor:?}; no lane records for another lane's \
+             triple. Nothing was appended",
+            worker.lane_actor
+        );
+    }
     let triple = normalize_triple(
         actor,
         input.lane.as_deref().map(str::trim),
@@ -2861,7 +2862,10 @@ pub(crate) fn record_contribution(
         bail!("{}", role_refusal(&input.roles));
     }
     let repo = require_repo_identity(&input.repo)?;
-    if repo != declared.repo {
+    // The deliverable pins its implementation repository; the candidate is the
+    // consumer-side proof whose commit lives in the consumer repository by
+    // design (LINKED-18), so only the implementation-side roles carry the pin.
+    if role != "candidate" && repo != declared.repo {
         bail!(
             "deliverable {deliverable_name:?} pins repository {:?}, but the record names \
              {repo:?}: the right hash at the wrong repository proves nothing (LINKED-19). \
@@ -3705,6 +3709,13 @@ pub(crate) fn close_joint(
             two.item_id
         );
     };
+    // Close authority is checked before the stored closure is answered, as
+    // `add_companion` checks before its idempotent lookup: a reader without
+    // write authority learns nothing about whether, when, or by whom joint
+    // work closed.
+    let path_one = root.join("boards").join(format!("{}.db", one.board_id));
+    let path_two = root.join("boards").join(format!("{}.db", two.board_id));
+    require_pairing_authority(&caller, &one, &path_one, &two, &path_two)?;
     if let Some((_, closed_by, closed_at, stored_reason)) = connection
         .query_row(
             "SELECT * FROM linked_closures WHERE pairing_id=?",
@@ -3721,9 +3732,6 @@ pub(crate) fn close_joint(
             &stored_reason,
         ));
     }
-    let path_one = root.join("boards").join(format!("{}.db", one.board_id));
-    let path_two = root.join("boards").join(format!("{}.db", two.board_id));
-    require_pairing_authority(&caller, &one, &path_one, &two, &path_two)?;
     let mut open = Vec::new();
     for (board_id, item_id) in [
         (one.board_id.clone(), one.item_id.clone()),
@@ -3852,11 +3860,20 @@ mod tests {
             incarnation: "inc".to_owned(),
         };
         let (one, two) = order_resolved(mk("b-board", "t-2"), mk("a-board", "t-9"));
-        assert_eq!((one.board_id, one.item_id), ("a-board".to_owned(), "t-9".to_owned()));
-        assert_eq!((two.board_id, two.item_id), ("b-board".to_owned(), "t-2".to_owned()));
+        assert_eq!(
+            (one.board_id, one.item_id),
+            ("a-board".to_owned(), "t-9".to_owned())
+        );
+        assert_eq!(
+            (two.board_id, two.item_id),
+            ("b-board".to_owned(), "t-2".to_owned())
+        );
         // Already ordered passes through untouched.
         let (one, two) = order_resolved(mk("a-board", "t-1"), mk("a-board", "t-2"));
-        assert_eq!((one.item_id, two.item_id), ("t-1".to_owned(), "t-2".to_owned()));
+        assert_eq!(
+            (one.item_id, two.item_id),
+            ("t-1".to_owned(), "t-2".to_owned())
+        );
     }
 
     #[test]
@@ -3874,15 +3891,30 @@ mod tests {
     #[test]
     fn members_canonicalize_sorted_and_deduped() {
         let members = canonical_members(vec![
-            SetMember { board_id: "b".into(), id: "t-2".into() },
-            SetMember { board_id: "a".into(), id: "t-1".into() },
-            SetMember { board_id: "b".into(), id: "t-2".into() },
+            SetMember {
+                board_id: "b".into(),
+                id: "t-2".into(),
+            },
+            SetMember {
+                board_id: "a".into(),
+                id: "t-1".into(),
+            },
+            SetMember {
+                board_id: "b".into(),
+                id: "t-2".into(),
+            },
         ]);
         assert_eq!(
             members,
             vec![
-                SetMember { board_id: "a".into(), id: "t-1".into() },
-                SetMember { board_id: "b".into(), id: "t-2".into() },
+                SetMember {
+                    board_id: "a".into(),
+                    id: "t-1".into()
+                },
+                SetMember {
+                    board_id: "b".into(),
+                    id: "t-2".into()
+                },
             ]
         );
     }
@@ -3895,7 +3927,15 @@ mod tests {
         assert_eq!(receipt["revision"], json!(1));
         // Freezing parks taking; the frozen flag and revision 2 persist.
         let receipt = mutate_set(
-            &connection, Path::new("/none"), "joint-1", 1, "freeze", None, "op", "pause", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            1,
+            "freeze",
+            None,
+            "op",
+            "pause",
+            now,
         )
         .unwrap();
         assert_eq!(receipt["revision"], json!(2));
@@ -3903,13 +3943,29 @@ mod tests {
         assert!(frozen && head.revision == 2 && head.members.is_empty());
         // An already-true change answers the stored revision, not a duplicate.
         let replay = mutate_set(
-            &connection, Path::new("/none"), "joint-1", 2, "freeze", None, "op", "pause", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            2,
+            "freeze",
+            None,
+            "op",
+            "pause",
+            now,
         )
         .unwrap();
         assert_eq!(replay["revision"], json!(2));
         // A stale revision is refused whole and names the current one.
         let stale = mutate_set(
-            &connection, Path::new("/none"), "joint-1", 1, "unfreeze", None, "op", "go", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            1,
+            "unfreeze",
+            None,
+            "op",
+            "go",
+            now,
         )
         .unwrap_err();
         assert!(
@@ -3918,24 +3974,51 @@ mod tests {
         );
         // Binding to the frozen set is allowed; claims on it are what freeze.
         let bound = bind(
-            &connection, Path::new("/none"), "joint-1", 2, "w", Some("driver"), Some("s1"), 60,
-            "op", "bind", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            2,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            60,
+            "op",
+            "bind",
+            now,
         )
         .unwrap();
         assert_eq!(bound["revision"], json!(3));
         assert_eq!(bound["status"], json!("active"));
         // The identical bind replays the stored receipt.
         let again = bind(
-            &connection, Path::new("/none"), "joint-1", 3, "w", Some("driver"), Some("s1"), 60,
-            "op", "bind", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            3,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            60,
+            "op",
+            "bind",
+            now,
         )
         .unwrap();
         assert_eq!(again["bindingID"], bound["bindingID"]);
         // A second lane for the same agent never inherits the first binding's
         // set: it is refused at bind time, and would be refused at claim time.
         let clash = bind(
-            &connection, Path::new("/none"), "joint-1", 3, "w", Some("driver"), Some("s2"), 60,
-            "op", "bind", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            3,
+            "w",
+            Some("driver"),
+            Some("s2"),
+            60,
+            "op",
+            "bind",
+            now,
         )
         .unwrap_err();
         assert!(
@@ -3944,22 +4027,44 @@ mod tests {
         );
         // The authorized exit ends taking and is itself a revision.
         let exit = revoke(
-            &connection, Path::new("/none"), "joint-1", 3, "w", Some("driver"), Some("s1"), "op",
-            "done", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            3,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            "op",
+            "done",
+            now,
         )
         .unwrap();
         assert_eq!(exit["revision"], json!(4));
         assert_eq!(exit["status"], json!("revoked"));
         // Revoking again answers the stored revocation, not a second exit.
         let exit_again = revoke(
-            &connection, Path::new("/none"), "joint-1", 4, "w", Some("driver"), Some("s1"), "op",
-            "done", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            4,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            "op",
+            "done",
+            now,
         )
         .unwrap();
         assert_eq!(exit_again["bindingID"], exit["bindingID"]);
         // A revoked triple releases nothing further; only a rebind re-arms it.
         let released = release_binding(
-            &connection, "joint-1", "w", Some("driver"), Some("s1"), "bye", now,
+            &connection,
+            "joint-1",
+            "w",
+            Some("driver"),
+            Some("s1"),
+            "bye",
+            now,
         )
         .unwrap_err();
         assert!(
@@ -3969,8 +4074,17 @@ mod tests {
         // Rebinding the revoked triple re-arms it through a new audited
         // revision — never a silent resurrection.
         let rearmed = bind(
-            &connection, Path::new("/none"), "joint-1", 4, "w", Some("driver"), Some("s1"), 60,
-            "op", "again", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            4,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            60,
+            "op",
+            "again",
+            now,
         )
         .unwrap();
         assert_eq!(rearmed["revision"], json!(5));
@@ -3980,14 +4094,29 @@ mod tests {
         // Releasing the rearmed binding ends it cleanly, and rebinding after
         // a release re-arms the same way.
         let done = release_binding(
-            &connection, "joint-1", "w", Some("driver"), Some("s1"), "bye", now,
+            &connection,
+            "joint-1",
+            "w",
+            Some("driver"),
+            Some("s1"),
+            "bye",
+            now,
         )
         .unwrap();
         assert_eq!(done["revision"], json!(6));
         assert_eq!(done["status"], json!("released"));
         let rearmed = bind(
-            &connection, Path::new("/none"), "joint-1", 6, "w", Some("driver"), Some("s1"), 60,
-            "op", "again", now,
+            &connection,
+            Path::new("/none"),
+            "joint-1",
+            6,
+            "w",
+            Some("driver"),
+            Some("s1"),
+            60,
+            "op",
+            "again",
+            now,
         )
         .unwrap();
         assert_eq!(rearmed["revision"], json!(7));
@@ -4018,16 +4147,42 @@ mod tests {
         let now = crate::registry::now_ms();
         for refused in [
             mutate_set(
-                &connection, Path::new("/none"), "missing", 1, "freeze", None, "op", "x", now,
+                &connection,
+                Path::new("/none"),
+                "missing",
+                1,
+                "freeze",
+                None,
+                "op",
+                "x",
+                now,
             )
             .unwrap_err(),
             bind(
-                &connection, Path::new("/none"), "missing", 1, "w", None, None, 60, "op", "x",
+                &connection,
+                Path::new("/none"),
+                "missing",
+                1,
+                "w",
+                None,
+                None,
+                60,
+                "op",
+                "x",
                 now,
             )
             .unwrap_err(),
             revoke(
-                &connection, Path::new("/none"), "missing", 1, "w", None, None, "op", "x", now,
+                &connection,
+                Path::new("/none"),
+                "missing",
+                1,
+                "w",
+                None,
+                None,
+                "op",
+                "x",
+                now,
             )
             .unwrap_err(),
             release_binding(&connection, "missing", "w", None, None, "x", now).unwrap_err(),
@@ -4038,7 +4193,9 @@ mod tests {
             );
         }
         let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM linked_set_revisions", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM linked_set_revisions", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0, "refused writes leave no revision");
     }
@@ -4055,9 +4212,15 @@ mod tests {
                 [],
             )
             .unwrap();
-        let live = live_pairing(&connection, "a", "t-1", "b", "t-2").unwrap().unwrap();
+        let live = live_pairing(&connection, "a", "t-1", "b", "t-2")
+            .unwrap()
+            .unwrap();
         assert_eq!(live.id, "lc-1");
-        assert!(retired_pairing(&connection, "a", "t-1", "b", "t-2").unwrap().is_none());
+        assert!(
+            retired_pairing(&connection, "a", "t-1", "b", "t-2")
+                .unwrap()
+                .is_none()
+        );
         connection
             .execute(
                 "UPDATE linked_companions SET retired=1,retired_by='op',retired_at=8,\
@@ -4065,13 +4228,21 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(live_pairing(&connection, "a", "t-1", "b", "t-2").unwrap().is_none());
+        assert!(
+            live_pairing(&connection, "a", "t-1", "b", "t-2")
+                .unwrap()
+                .is_none()
+        );
         let retired = retired_pairing(&connection, "a", "t-1", "b", "t-2")
             .unwrap()
             .unwrap();
         assert_eq!(retired.id, "lc-1");
         // The reverse direction addresses the same stored row.
-        assert!(live_pairing(&connection, "b", "t-2", "a", "t-1").unwrap().is_none());
+        assert!(
+            live_pairing(&connection, "b", "t-2", "a", "t-1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

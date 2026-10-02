@@ -23,8 +23,8 @@ mod dispatcher;
 mod gitctx;
 mod import;
 mod kimi_acp_adapter;
-mod lock;
 mod linked;
+mod lock;
 mod mcp;
 mod model;
 mod opencode_adapter;
@@ -1504,13 +1504,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         false,
     ),
-    (
-        "link",
-        Some("show"),
-        &["board", "id"],
-        &[],
-        true,
-    ),
+    ("link", Some("show"), &["board", "id"], &[], true),
     (
         "scope",
         Some("create"),
@@ -6815,8 +6809,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 &transaction,
                 &root,
                 args.require("set")?,
-                args
-                    .optional_integer("expect-revision")?
+                args.optional_integer("expect-revision")?
                     .context("--expect-revision is required")?,
                 kind,
                 member,
@@ -6838,8 +6831,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 &transaction,
                 &root,
                 args.require("set")?,
-                args
-                    .optional_integer("expect-revision")?
+                args.optional_integer("expect-revision")?
                     .context("--expect-revision is required")?,
                 args.require("actor")?,
                 args.one("lane"),
@@ -6863,8 +6855,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 &transaction,
                 &root,
                 args.require("set")?,
-                args
-                    .optional_integer("expect-revision")?
+                args.optional_integer("expect-revision")?
                     .context("--expect-revision is required")?,
                 args.require("actor")?,
                 args.one("lane"),
@@ -8812,10 +8803,14 @@ fn require_worker_may_run(command: &str, sub: Option<&str>) -> Result<()> {
         .and_then(|caller| caller.worker)
         .map(|worker| worker.row.id)
         .ok_or_else(|| anyhow::anyhow!("denied or not found"))?;
+    // `contrib record` is the lane recording its own work (LINKED-15): the
+    // receipt is gated on the worker's own lane actor and live binding inside
+    // `linked::record_contribution`, so it belongs with the lease-bound set.
     let lease_bound = matches!(
         (command, sub),
         ("claim" | "heartbeat" | "release" | "checkpoint" | "note", _)
             | ("handoff", Some("create" | "accept"))
+            | ("contrib", Some("record"))
     );
     // The read side is exactly the commands whose generated MCP tool reads
     // only, every `access` command excepted. A long-running command has no

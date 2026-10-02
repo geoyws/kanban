@@ -108,6 +108,23 @@ impl Estate {
         })
     }
 
+    /// A refused command: nonzero, and its one error line — the `--json`
+    /// `error` field when the command answers in JSON, else the raw output.
+    fn refused<S: AsRef<OsStr> + std::fmt::Debug>(&self, cwd: &Path, args: &[S]) -> String {
+        let output = self.run(cwd, args);
+        assert!(
+            !output.status.success(),
+            "command should have been refused: {args:?}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        serde_json::from_str::<Value>(&stdout)
+            .ok()
+            .and_then(|value| value["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{stdout}{stderr}"))
+    }
+
     fn add(&self, board: &str, id: &str) {
         let work = self.workspace(board);
         let output = self.run(
