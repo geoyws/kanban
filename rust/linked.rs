@@ -221,6 +221,21 @@ fn require_endpoint_shape(board_id: &str, id: &str, which: &str) -> Result<Depen
     })
 }
 
+/// Whether a SQLite error is a constraint failure (unique, primary key, or
+/// check): the shape a lost write race takes.
+fn is_unique_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _,
+        )
+    )
+}
+
 /// Order two resolved endpoints canonically, so the pair `(X, Y)` and the
 /// pair `(Y, X)` address the same stored row and the symmetry is a property
 /// of that row rather than of two rows kept in step (LINKED-03).
@@ -355,7 +370,7 @@ fn retired_pairing(
     Ok(connection
         .query_row(
             "SELECT * FROM linked_companions WHERE board_a_id=? AND item_a_id=? AND \
-             board_b_id=? AND item_b_id=? AND retired<>0 ORDER BY retired_at DESC LIMIT 1",
+             board_b_id=? AND item_b_id=? AND retired<>0 ORDER BY retired_at DESC, rowid DESC LIMIT 1",
             params![board_a_id, item_a_id, board_b_id, item_b_id],
             companion_row,
         )
@@ -449,8 +464,13 @@ pub(crate) fn add_companion(
             one.board_id, one.item_id, two.board_id, two.item_id
         );
     }
+
     let id = format!("lc-{}", uuid::Uuid::new_v4().simple());
-    connection.execute(
+    // A racing identical add may land its row between the live check above
+    // and this INSERT; the live-only unique index turns that race into a
+    // constraint error, which answers the stored row rather than failing the
+    // retry (LINKED-24). Any other error propagates untouched.
+    if let Err(error) = connection.execute(
         "INSERT INTO linked_companions(id,board_a_id,board_a_registration,item_a_id,\
          item_a_incarnation,board_b_id,board_b_registration,item_b_id,item_b_incarnation,\
          created_by,created_at,retired) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
@@ -467,7 +487,28 @@ pub(crate) fn add_companion(
             actor,
             now,
         ],
-    )?;
+    ) {
+        if !is_unique_violation(&error) {
+            return Err(error.into());
+        }
+        // The winner answers only when it pins the same incarnations this
+        // attempt resolved: a conflicting duplicate still refuses rather
+        // than adopting a stranger's row.
+        if let Some(winner) = live_pairing(
+            connection,
+            &one.board_id,
+            &one.item_id,
+            &two.board_id,
+            &two.item_id,
+        )? {
+            if winner.incarnation_a == one.incarnation
+                && winner.incarnation_b == two.incarnation
+            {
+                return Ok(companion_receipt(&winner, false));
+            }
+        }
+        return Err(error.into());
+    }
     crate::audit::append_registry_event(
         connection,
         &id,
@@ -608,9 +649,6 @@ pub(crate) fn show_companions(
     drop(statement);
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
-        // A caller lacking read on either endpoint reads neither side: the
-        // whole read is refused rather than leaking which endpoint hid it
-        // (LINKED-06).
         let mut endpoints = Vec::with_capacity(2);
         for (endpoint_board, endpoint_item, pinned) in [
             (
@@ -628,11 +666,16 @@ pub(crate) fn show_companions(
                 board_id: endpoint_board.clone(),
                 id: endpoint_item.clone(),
             };
-            if resolve_endpoint(root, &caller, &reference).is_none() {
-                bail!("queried endpoint {UNAVAILABLE_ENDPOINT}");
-            }
+            // A live endpoint resolves and carries its current state; an
+            // endpoint that no longer resolves is either retired (projected
+            // as dangling, LINKED-04) or unreadable to this caller (refused
+            // whole, LINKED-06) — never the replacement row's content.
+            let state = match resolve_endpoint(root, &caller, &reference) {
+                Some(_) => endpoint_state(root, &endpoint_board, &endpoint_item, &pinned),
+                None => retired_or_refused(root, &caller, &reference)?,
+            };
             endpoints.push(CompanionEndpointView {
-                state: endpoint_state(root, &endpoint_board, &endpoint_item, &pinned),
+                state,
                 board_id: endpoint_board,
                 id: endpoint_item,
                 incarnation: pinned,
@@ -646,6 +689,50 @@ pub(crate) fn show_companions(
         });
     }
     Ok(views)
+}
+
+/// The state of an endpoint that no longer resolves: `retired` when its row
+/// is genuinely gone, or the uniform refusal when the row is still there but
+/// unreadable to this caller (denied, corrupt, or token-mismatched — all fail
+/// closed) or the caller may not read its board at all.
+fn retired_or_refused(
+    root: &Path,
+    caller: &AuthzContext,
+    reference: &DependencyRef,
+) -> Result<String> {
+    let refusal = || {
+        anyhow::anyhow!("queried endpoint {UNAVAILABLE_ENDPOINT}")
+    };
+    let Some(registered) = crate::cross::registered_board(root, &reference.board_id)
+        .map_err(|_| refusal())?
+    else {
+        // Unknown, ambiguous, or archived board: nothing exists to read, and
+        // board scope already decided below — but without a board file there
+        // is no row to deny, so check board scope and project retired.
+        caller
+            .for_board(reference.board_id.clone())
+            .check_read(&[])
+            .map_err(|_| refusal())?;
+        return Ok("retired".to_owned());
+    };
+    let scoped = confine_to_task_root(&caller, &registered.path, &reference.board_id)
+        .map_err(|_| refusal())?;
+    scoped.check_read(&[]).map_err(|_| refusal())?;
+    scoped.check_task(&reference.id).map_err(|_| refusal())?;
+    let board = crate::db::open_board_readonly(&registered.path).map_err(|_| refusal())?;
+    let present: bool = board
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?)",
+            [&reference.id],
+            |row| row.get(0),
+        )
+        .map_err(|_| refusal())?;
+    if present {
+        // The row stands but does not resolve to this caller: denied,
+        // corrupt, or token-mismatched. Refuse rather than project.
+        return Err(refusal());
+    }
+    Ok("retired".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1078,7 @@ fn latest_binding(
     Ok(connection
         .query_row(
             "SELECT * FROM linked_bindings WHERE set_id=? AND actor=? AND lane=? AND session=? \
-             ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
             params![set_id, triple.actor, triple.lane, triple.session],
             binding_row,
         )
@@ -1008,7 +1095,7 @@ fn live_bindings_for_lane(
 ) -> Result<Vec<BindingRow>> {
     let mut statement = connection.prepare(
         "SELECT * FROM linked_bindings WHERE actor=? AND lane=? AND status='active' AND \
-         expires_at>? ORDER BY created_at DESC",
+         expires_at>? ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement
         .query_map(params![actor, lane, now], binding_row)?
@@ -1025,12 +1112,29 @@ fn live_bindings_for_actor(
 ) -> Result<Vec<BindingRow>> {
     let mut statement = connection.prepare(
         "SELECT * FROM linked_bindings WHERE actor=? AND status='active' AND expires_at>? \
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement
         .query_map(params![actor, now], binding_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// The actor's most recently ended-by-revocation binding, across lanes,
+/// sessions, and sets: what keeps refusing under any relabeled triple until an
+/// audited rebind re-arms the actor (LINKED-13, LINKED-14).
+fn latest_revoked_for_actor(
+    connection: &Connection,
+    actor: &str,
+) -> Result<Option<BindingRow>> {
+    Ok(connection
+        .query_row(
+            "SELECT * FROM linked_bindings WHERE actor=? AND status='revoked' ORDER BY ended_at \
+             DESC, created_at DESC, rowid DESC LIMIT 1",
+            [actor],
+            binding_row,
+        )
+        .optional()?)
 }
 
 fn binding_receipt(row: &BindingRow, revision: i64, kind: &str) -> serde_json::Value {
@@ -1082,19 +1186,54 @@ pub(crate) fn bind(
             head.revision
         );
     }
-    if let Some(existing) = latest_binding(connection, &set_id, &triple)? {
-        if existing.status == "active" && existing.expires_at > now {
+    // The latest row for this exact triple decides the kind: a live one
+    // replays its stored receipt, while an ended one — revoked, released, or
+    // lapsed — re-arms only through a new audited revision (LINKED-14: the old
+    // triple resumes only through a new revision).
+    let predecessor: Option<BindingRow> = match latest_binding(connection, &set_id, &triple)? {
+        Some(existing) if existing.status == "active" && existing.expires_at > now => {
             return Ok(binding_receipt(&existing, head.revision, "bind"));
         }
-        if existing.status == "revoked" {
-            return Ok(binding_receipt(&existing, head.revision, "bind"));
-        }
-    }
+        Some(existing) => Some(existing),
+        None => None,
+    };
+    let rebind = predecessor.is_some();
+    // One lane holds one live binding: any other live triple on this lane
+    // refuses, so candidates and every claim path always read the same
+    // binding (LINKED-08, LINKED-14).
     let live = live_bindings_for_lane(connection, &triple.actor, &triple.lane, now)?;
+    if let Some(held) = live.first() {
+        bail!(
+            "{} is already bound to selected set {} (session {}); a lane holds one binding at a \
+             time. Revoke or release it first, then bind again. Nothing was written",
+            triple_sentence(&triple),
+            held.set_id,
+            if held.session.is_empty() {
+                "(none)"
+            } else {
+                &held.session
+            }
+        );
+    }
     let caller = linked_caller()?;
     require_membership_authority(&caller, root, &head.members)?;
     let author = nonempty_actor(author)?;
+    let kind = if rebind { "rebind" } else { "bind" };
     let id = format!("lb-{}", uuid::Uuid::new_v4().simple());
+    // A lapsed predecessor still reads `active` but holds no authority; record
+    // its ending before the new row lands, so the live-only unique index never
+    // sees two live rows for one triple. Revoked and released predecessors are
+    // already ended and stay untouched as history.
+    let lapsed_id: Option<String> = match &predecessor {
+        Some(old) if old.status == "active" => Some(old.id.clone()),
+        _ => None,
+    };
+    if let Some(old_id) = lapsed_id {
+        connection.execute(
+            "UPDATE linked_bindings SET status='released',ended_at=?,end_reason=? WHERE id=?",
+            params![now, "binding lapsed; superseded by an audited rebind", old_id],
+        )?;
+    }
     let revision = head.revision + 1;
     connection.execute(
         "INSERT INTO linked_bindings(id,set_id,actor,lane,session,revision_checked,status,\
@@ -1114,14 +1253,14 @@ pub(crate) fn bind(
         connection,
         &set_id,
         revision,
-        "bind",
+        kind,
         &author,
         reason.trim(),
         &head.members,
         now,
     )?;
     let row = latest_binding(connection, &set_id, &triple)?.context("binding was not stored")?;
-    Ok(binding_receipt(&row, revision, "bind"))
+    Ok(binding_receipt(&row, revision, kind))
 }
 
 /// The operator's authorized exit: end one binding by revocation, stating the
@@ -1433,6 +1572,13 @@ impl ScopeGuard {
                     break;
                 }
             }
+            // A standing revocation constrains the actor under any relabeled
+            // triple, so it takes the serializing guard too.
+            if matches!(found, PreCheck::Free)
+                && latest_revoked_for_actor(&readable, &triple.actor)?.is_some()
+            {
+                found = PreCheck::Maybe;
+            }
             found
         };
         drop(readable);
@@ -1501,20 +1647,37 @@ impl ScopeGuard {
             }
         }
         // No live binding on the presented triple, but the actor holds one
-        // elsewhere: the presented triple matches nothing it holds.
+        // elsewhere: the presented triple matches nothing it holds. Prefer a
+        // binding on the same lane for the message; any live one mismatches.
         let live = live_bindings_for_actor(connection, &self.triple.actor, now)?;
-        if let Some(held) = live.into_iter().find(|row| {
-            row.lane == self.triple.lane || row.actor == self.triple.actor
-        }) {
+        if !live.is_empty() {
+            let held = live
+                .iter()
+                .find(|row| row.lane == self.triple.lane)
+                .or(live.first())
+                .expect("non-empty live bindings");
             let held_set = held.set_id.clone();
             self.mode = GuardMode::Mismatch {
                 presented: self.triple.clone(),
                 held: ScopeTriple {
-                    actor: held.actor,
-                    lane: held.lane,
-                    session: held.session,
+                    actor: held.actor.clone(),
+                    lane: held.lane.clone(),
+                    session: held.session.clone(),
                 },
                 held_set,
+            };
+            return Ok(());
+        }
+        // No live binding anywhere for this actor, but a revocation stands:
+        // the actor takes nothing further under any relabeled triple until an
+        // audited rebind re-arms it (LINKED-13, LINKED-14).
+        if let Some(revoked) = latest_revoked_for_actor(connection, &self.triple.actor)? {
+            self.mode = GuardMode::Revoked {
+                set_id: revoked.set_id.clone(),
+                reason: revoked
+                    .end_reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".to_owned()),
             };
             return Ok(());
         }
@@ -1720,38 +1883,13 @@ pub(crate) fn candidate_scope(
             members: Vec::new(),
         }));
     }
-    let mut statement = connection.prepare("SELECT id FROM linked_sets ORDER BY id")?;
-    let sets = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-    for set_id in sets {
-        if let Some(binding) = latest_binding(&connection, &set_id, &triple)? {
-            if binding.status == "revoked" {
-                return Ok(Some(CandidateScope {
-                    frozen: true,
-                    members: Vec::new(),
-                }));
-            }
-        }
-        // Other sessions of the same lane revoked: the lane took part in a
-        // revoked binding and holds nothing live now.
-        let mut bindings = connection.prepare(
-            "SELECT * FROM linked_bindings WHERE set_id=? AND actor=? AND lane=? ORDER BY \
-             created_at DESC LIMIT 1",
-        )?;
-        let latest: Option<BindingRow> = bindings
-            .query_map(params![set_id, triple.actor, triple.lane], binding_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .next();
-        drop(bindings);
-        if latest.is_some_and(|row| row.status == "revoked") {
-            return Ok(Some(CandidateScope {
-                frozen: true,
-                members: Vec::new(),
-            }));
-        }
+    // No live binding anywhere for this actor, but a revocation stands: offer
+    // nothing under any relabeled lane, exactly as the atomic path refuses.
+    if latest_revoked_for_actor(&connection, &triple.actor)?.is_some() {
+        return Ok(Some(CandidateScope {
+            frozen: true,
+            members: Vec::new(),
+        }));
     }
     Ok(None)
 }
@@ -1787,20 +1925,42 @@ pub(crate) fn holder_handoff_barred(
         return Ok(None);
     }
     let session = session.unwrap_or("").to_owned();
+    let now = crate::registry::now_ms();
+    let wanted = SetMember {
+        board_id: board_id.clone(),
+        id: task_id.to_owned(),
+    };
+    // A lease held under a live binding covering this task hands onward: the
+    // acceptor's gate still scopes the other end.
     let mut statement = connection.prepare(
-        "SELECT * FROM linked_bindings WHERE actor=? AND session=? AND status='revoked' ORDER BY \
-         created_at DESC",
+        "SELECT * FROM linked_bindings WHERE actor=? AND session=? AND status='active' AND \
+         expires_at>? ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let live = statement
+        .query_map(params![agent, session, now], binding_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for binding in live {
+        if let Some((_, head)) = set_head(&connection, &binding.set_id)? {
+            if head.members.contains(&wanted) {
+                return Ok(None);
+            }
+        }
+    }
+    // Otherwise any standing revocation covering this task bars the handoff,
+    // whatever lane the holder relabels it under: a revoked lease ends only
+    // via `release`, never by handoff onward.
+    let mut statement = connection.prepare(
+        "SELECT * FROM linked_bindings WHERE actor=? AND status='revoked' ORDER BY ended_at \
+         DESC, created_at DESC",
     )?;
     let revoked = statement
-        .query_map(params![agent, session], binding_row)?
+        .query_map([agent], binding_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for binding in revoked {
         if let Some((_, head)) = set_head(&connection, &binding.set_id)? {
-            if head.members.contains(&SetMember {
-                board_id: board_id.clone(),
-                id: task_id.to_owned(),
-            }) {
+            if head.members.contains(&wanted) {
                 return Ok(Some(
                     binding
                         .end_reason
@@ -3806,6 +3966,32 @@ mod tests {
             format!("{released:#}").contains("no live binding"),
             "release after revocation refuses: {released:#}"
         );
+        // Rebinding the revoked triple re-arms it through a new audited
+        // revision — never a silent resurrection.
+        let rearmed = bind(
+            &connection, Path::new("/none"), "joint-1", 4, "w", Some("driver"), Some("s1"), 60,
+            "op", "again", now,
+        )
+        .unwrap();
+        assert_eq!(rearmed["revision"], json!(5));
+        assert_eq!(rearmed["kind"], json!("rebind"));
+        assert_eq!(rearmed["status"], json!("active"));
+        assert_ne!(rearmed["bindingID"], exit["bindingID"]);
+        // Releasing the rearmed binding ends it cleanly, and rebinding after
+        // a release re-arms the same way.
+        let done = release_binding(
+            &connection, "joint-1", "w", Some("driver"), Some("s1"), "bye", now,
+        )
+        .unwrap();
+        assert_eq!(done["revision"], json!(6));
+        assert_eq!(done["status"], json!("released"));
+        let rearmed = bind(
+            &connection, Path::new("/none"), "joint-1", 6, "w", Some("driver"), Some("s1"), 60,
+            "op", "again", now,
+        )
+        .unwrap();
+        assert_eq!(rearmed["revision"], json!(7));
+        assert_eq!(rearmed["kind"], json!("rebind"));
         // Every change above sits in the hash-chained revision log.
         let report = crate::audit::verify_registry(&connection).unwrap();
         assert!(
@@ -3820,7 +4006,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(revisions, 4, "create, freeze, bind, exit — no duplicates");
+        assert_eq!(
+            revisions, 7,
+            "create, freeze, bind, exit, rebind, release, rebind — no duplicates"
+        );
     }
 
     #[test]

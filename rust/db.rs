@@ -3206,7 +3206,8 @@ retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
 retired_by TEXT,retired_at INTEGER,retire_reason TEXT,
 CHECK(board_a_id <> board_b_id OR item_a_id <> item_b_id)
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_companions_pair ON linked_companions(board_a_id,item_a_id,board_b_id,item_b_id);
+DROP INDEX IF EXISTS idx_linked_companions_pair;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_companions_pair ON linked_companions(board_a_id,item_a_id,board_b_id,item_b_id) WHERE retired=0;
 CREATE INDEX IF NOT EXISTS idx_linked_companions_side_a ON linked_companions(board_a_id,item_a_id,retired);
 CREATE INDEX IF NOT EXISTS idx_linked_companions_side_b ON linked_companions(board_b_id,item_b_id,retired);
 CREATE TABLE IF NOT EXISTS linked_sets(
@@ -3234,7 +3235,8 @@ status TEXT NOT NULL CHECK(status IN ('active','released','revoked')),
 created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
 ended_at INTEGER,end_reason TEXT
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_bindings_triple ON linked_bindings(set_id,actor,lane,session);
+DROP INDEX IF EXISTS idx_linked_bindings_triple;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_bindings_triple ON linked_bindings(set_id,actor,lane,session) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_linked_bindings_actor ON linked_bindings(actor,lane,status);
 "#;
 

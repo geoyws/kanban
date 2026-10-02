@@ -730,12 +730,36 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
         "exactly one racing revision wins: {raced}"
     );
 
+    // A revoked actor takes nothing under a relabeled lane either: the
+    // revocation stands actor-wide until an audited rebind re-arms it.
+    let relabeled = estate.refused(
+        &work,
+        &[
+            "claim", "t-2", "--as", WORKER, "--lane", "other", "--session", SESSION,
+            "--json",
+        ],
+    );
+    assert!(
+        relabeled.contains("was revoked"),
+        "revocation bars relabeled triples: {relabeled}"
+    );
+
+    // Rebinding the revoked triple re-arms it through a new audited revision.
+    let rearmed = estate.ok_json(
+        &estate.root,
+        &[
+            "scope", "bind", "--set", "joint-4", "--actor", WORKER, "--lane", LANE,
+            "--session", SESSION, "--expect-revision", "7", "--as", OP, "--json",
+        ],
+    );
+    assert_eq!(rearmed["kind"], Value::from("rebind"));
+
     // Freezing parks taking while holding runs on; only an audited unfreeze
-    // thaws it.
+    // thaws it. The worker is bound again, so the frozen sentence is what fires.
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "freeze", "--set", "joint-4", "--expect-revision", "7", "--as", OP,
+            "scope", "freeze", "--set", "joint-4", "--expect-revision", "8", "--as", OP,
             "--json",
         ],
     );
@@ -754,7 +778,7 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     estate.ok_json(
         &estate.root,
         &[
-            "scope", "unfreeze", "--set", "joint-4", "--expect-revision", "8", "--as", OP,
+            "scope", "unfreeze", "--set", "joint-4", "--expect-revision", "9", "--as", OP,
             "--json",
         ],
     );
@@ -775,7 +799,7 @@ fn revocation_freeze_and_rebind_serialize_under_authority() {
     // Every change sits in the hash-chained log with author, reason, and the
     // full member list.
     let shown = estate.ok_json(&estate.root, &["scope", "show", "--set", "joint-4", "--json"]);
-    assert_eq!(shown["revision"], Value::from(9));
+    assert_eq!(shown["revision"], Value::from(10));
     assert_eq!(shown["members"].as_array().unwrap().len(), 4);
     let audited = estate.ok_json(&estate.root, &["audit", "verify", "--json"]);
     assert_eq!(
