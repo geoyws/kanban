@@ -99,6 +99,7 @@ integration_targets=(
     cross_board_e2e
     identity_e2e
     worker_identity_e2e
+    linked_e2e
     e2e
 )
 

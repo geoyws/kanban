@@ -55,7 +55,7 @@ pub fn parse_dependency_json(text: &str) -> Result<Vec<DependencyRef>> {
     Ok(set)
 }
 
-fn is_canonical_uuid(text: &str) -> bool {
+pub(crate) fn is_canonical_uuid(text: &str) -> bool {
     Uuid::parse_str(text).is_ok_and(|uuid| uuid.hyphenated().to_string() == text)
 }
 
@@ -119,15 +119,15 @@ pub fn require_cross_aware(target: &TargetBoard) -> Result<()> {
     )
 }
 
-struct RegisteredBoard {
-    path: PathBuf,
-    token: Option<String>,
+pub(crate) struct RegisteredBoard {
+    pub(crate) path: PathBuf,
+    pub(crate) token: Option<String>,
 }
 
 /// The active registry row whose board file stem is `board_id`, read through
 /// the registry's read-only open. Exactly one, or none: two rows sharing a
 /// stem would be an ambiguous alias, and ambiguity resolves to nothing.
-fn registered_board(root: &Path, board_id: &str) -> Result<Option<RegisteredBoard>> {
+pub(crate) fn registered_board(root: &Path, board_id: &str) -> Result<Option<RegisteredBoard>> {
     let registry = crate::db::open_registry_readonly(&root.join("registry.db"))?;
     let token_column = crate::db::registry_holds_registration_tokens(&registry)?;
     let sql = if token_column {

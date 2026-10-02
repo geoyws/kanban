@@ -24,6 +24,7 @@ mod gitctx;
 mod import;
 mod kimi_acp_adapter;
 mod lock;
+mod linked;
 mod mcp;
 mod model;
 mod opencode_adapter;
@@ -194,9 +195,37 @@ Usage:
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
-  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
+  kanban handoff accept ID --as AGENT [--session ID] [--lane LANE] [--lease-minutes N]
              [--caller-scope driver] [--sprint sp-… | --any-sprint] [--model NAME] [--json]
   kanban handoff retire ID --as AGENT --note TEXT [--json]
+  kanban link add --a-board UUID --a-id ID --b-board UUID --b-id ID --as ACTOR [--json]
+             (one stored companion pairing, readable from either side; endpoints
+             name (boardID, id) only -- names, paths and @# tokens are refused)
+  kanban link remove --a-board UUID --a-id ID --b-board UUID --b-id ID --as ACTOR --reason TEXT [--json]
+             (retires both exposures in the same change; an identical retry
+             answers the stored record)
+  kanban link show --board UUID --id ID [--json]
+  kanban scope create --set ID --as ACTOR [--reason TEXT] [--json]
+  kanban scope add --set ID --board UUID --id ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+  kanban scope remove --set ID --board UUID --id ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+             (a revision written against a stale number is refused whole:
+             re-read with scope show and re-apply)
+  kanban scope freeze --set ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+  kanban scope unfreeze --set ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+             (a frozen set parks taking while holding runs on; only an audited
+             unfreeze thaws it)
+  kanban scope bind --set ID --actor AGENT [--lane LANE] [--session ID]
+             [--lease-minutes N] --expect-revision N --as OPERATOR [--reason TEXT] [--json]
+  kanban scope revoke --set ID --actor AGENT [--lane LANE] [--session ID]
+             --reason TEXT --expect-revision N --as OPERATOR [--json]
+             (the authorized exit: taking ends at once, live leases keep their
+             heartbeat until expiry or release, and end only via release)
+  kanban scope release --set ID --as AGENT [--lane LANE] [--session ID] [--reason TEXT] [--json]
+             (the bound worker releases its own binding)
+  kanban scope show --set ID [--json]
+             (a worker bound to a set may claim only its explicitly selected
+             tasks, on every claim path: candidates, --next, named claims,
+             handoff acceptance, and session resumption)
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
@@ -922,6 +951,81 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         &["db", "project", "workspace"],
         "retires a worker in the policy registry, never a board",
     ),
+    // Companion pairings and selected sets live in the registry (LINKED,
+    // ADR-051), never on a board — and a batch's transaction covers one board,
+    // so these rows also keep them out of `transact` (ADR-041).
+    (
+        "link",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "pairs endpoints in the registry, never on a board",
+    ),
+    (
+        "link",
+        Some("remove"),
+        &["db", "project", "workspace"],
+        "retires a pairing in the registry, never on a board",
+    ),
+    (
+        "link",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads a pairing from the registry, never from a board",
+    ),
+    (
+        "scope",
+        Some("create"),
+        &["db", "project", "workspace"],
+        "creates a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "revises a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("remove"),
+        &["db", "project", "workspace"],
+        "revises a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("freeze"),
+        &["db", "project", "workspace"],
+        "freezes a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("unfreeze"),
+        &["db", "project", "workspace"],
+        "unfreezes a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("bind"),
+        &["db", "project", "workspace"],
+        "binds a worker to a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("revoke"),
+        &["db", "project", "workspace"],
+        "revokes a binding in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("release"),
+        &["db", "project", "workspace"],
+        "releases a binding in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads a selected set from the registry, never from a board",
+    ),
 ];
 
 /// Every command, and every flag it accepts.
@@ -1307,6 +1411,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[
             "as",
             "session",
+            "lane",
             "lease-minutes",
             "caller-scope",
             "sprint",
@@ -1317,6 +1422,101 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("handoff", Some("retire"), &["as", "note"], &["id"], false),
+    (
+        "link",
+        Some("add"),
+        &["a-board", "a-id", "b-board", "b-id", "as"],
+        &[],
+        false,
+    ),
+    (
+        "link",
+        Some("remove"),
+        &["a-board", "a-id", "b-board", "b-id", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "link",
+        Some("show"),
+        &["board", "id"],
+        &[],
+        true,
+    ),
+    (
+        "scope",
+        Some("create"),
+        &["set", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("add"),
+        &["set", "board", "id", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("remove"),
+        &["set", "board", "id", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("freeze"),
+        &["set", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("unfreeze"),
+        &["set", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("bind"),
+        &[
+            "set",
+            "actor",
+            "lane",
+            "session",
+            "lease-minutes",
+            "expect-revision",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("revoke"),
+        &[
+            "set",
+            "actor",
+            "lane",
+            "session",
+            "reason",
+            "expect-revision",
+            "as",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("release"),
+        &["set", "as", "lane", "session", "reason"],
+        &[],
+        false,
+    ),
+    ("scope", Some("show"), &["set"], &[], true),
     (
         "import",
         Some("atmux-json"),
@@ -2024,7 +2224,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 16] = [
+const SUBCOMMAND_GROUPS: [&str; 18] = [
     "task",
     "story",
     "handoff",
@@ -2041,6 +2241,8 @@ const SUBCOMMAND_GROUPS: [&str; 16] = [
     "sprint",
     "plugin",
     "worker",
+    "link",
+    "scope",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -6397,6 +6599,192 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
     }
+    // Companion pairings and selected work sets (slice LINKED, ADR-051): the
+    // registry owns the shared records, so these arms open only the registry
+    // and return before the board store opens below. Each write runs in one
+    // `BEGIN IMMEDIATE` transaction beside its audit event: refused whole or
+    // landed whole, never half-written (LINKED-01, LINKED-06, LINKED-11).
+    if command == "link" && sub == Some("add") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::add_companion(
+                &transaction,
+                &root,
+                args.require("a-board")?,
+                args.require("a-id")?,
+                args.require("b-board")?,
+                args.require("b-id")?,
+                args.one("as").unwrap_or("system@cli"),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "link" && sub == Some("remove") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::remove_companion(
+                &transaction,
+                &root,
+                args.require("a-board")?,
+                args.require("a-id")?,
+                args.require("b-board")?,
+                args.require("b-id")?,
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "link" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_companions(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "scope" && sub == Some("create") {
+        let (_, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::create_set(
+                &transaction,
+                args.require("set")?,
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope"
+        && (sub == Some("add")
+            || sub == Some("remove")
+            || sub == Some("freeze")
+            || sub == Some("unfreeze"))
+    {
+        let kind = sub.unwrap_or_default();
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let member = match kind {
+                "add" | "remove" => Some(crate::linked::SetMember {
+                    board_id: args.require("board")?.to_owned(),
+                    id: args.require("id")?.to_owned(),
+                }),
+                _ => None,
+            };
+            let receipt = crate::linked::mutate_set(
+                &transaction,
+                &root,
+                args.require("set")?,
+                args
+                    .optional_integer("expect-revision")?
+                    .context("--expect-revision is required")?,
+                kind,
+                member,
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("bind") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::bind(
+                &transaction,
+                &root,
+                args.require("set")?,
+                args
+                    .optional_integer("expect-revision")?
+                    .context("--expect-revision is required")?,
+                args.require("actor")?,
+                args.one("lane"),
+                args.one("session"),
+                args.optional_integer("lease-minutes")?.unwrap_or(1440),
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("revoke") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::revoke(
+                &transaction,
+                &root,
+                args.require("set")?,
+                args
+                    .optional_integer("expect-revision")?
+                    .context("--expect-revision is required")?,
+                args.require("actor")?,
+                args.one("lane"),
+                args.one("session"),
+                args.one("as").unwrap_or("system@cli"),
+                args.require("reason")?,
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("release") {
+        let (_, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::release_binding(
+                &transaction,
+                args.require("set")?,
+                args.require("as")?,
+                args.one("lane"),
+                args.one("session"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_set(&connection, &root, args.require("set")?, now_ms())?,
+            args.has("json"),
+        );
+    }
     if command == "workspace" && sub == Some("list") {
         // Read-only, like every other read: this is the FIRST call a resuming
         // driver makes (`kb ws ls --json`, before it knows which project it is
@@ -7720,6 +8108,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             AcceptHandoffOptions {
                 agent: args.require("as")?.to_owned(),
                 session: option_string(&args, "session"),
+                caller_lane: option_string(&args, "lane"),
                 lease_ms: lease_ms(&args)?,
                 caller_scope: option_string(&args, "caller-scope"),
                 sprint_override: claim_sprint_override(&args)?,

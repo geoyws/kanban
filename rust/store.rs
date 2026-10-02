@@ -4174,6 +4174,10 @@ pub struct UpdateTask {
 pub struct AcceptHandoffOptions {
     pub agent: String,
     pub session: Option<String>,
+    /// The lane the acceptor presents, completing the `(actor, lane, session)`
+    /// triple the selected-scope gate checks (LINKED-14). `None` matches a
+    /// lane-less binding, exactly like an omitted `--lane` on `claim`.
+    pub caller_lane: Option<String>,
     pub lease_ms: i64,
     pub caller_scope: Option<String>,
     pub sprint_override: Option<String>,
@@ -8042,6 +8046,17 @@ impl Store {
         if let Some(model) = &options.model {
             crate::model::validate_model_name(model)?;
         }
+        // LINKED-07/08: the selected-scope guard is taken before the board
+        // write scope — registry first, board second — so a revocation racing
+        // this claim serializes against it instead of slipping between its
+        // check and its lease (LINKED-11). Unbound callers get a passing guard
+        // and proceed exactly as today.
+        let scope_guard = crate::linked::ScopeGuard::take(
+            &self.connection,
+            &agent,
+            options.caller_lane.as_deref(),
+            options.session_id.as_deref(),
+        )?;
         let transaction = self.begin_write()?;
         // Claims carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
@@ -8082,6 +8097,9 @@ impl Store {
             )?;
             let mut selected = None;
             for candidate in candidates {
+                if !scope_guard.allows(&candidate.id) {
+                    continue;
+                }
                 let tags = task_tags(&transaction, &candidate.id)?;
                 if self.authz.check_write(&tags, &tags).is_ok()
                     && self.authz.permits_task(&candidate.id)
@@ -8090,7 +8108,13 @@ impl Store {
                     break;
                 }
             }
-            selected.context("no claimable task")?
+            // LINKED-08: the same gate bounds the `--next` pool, so candidates
+            // inspection can never offer a row the atomic path refuses. An
+            // emptied pool reports the scope sentence, not "no claimable task".
+            let empty_sentence = scope_guard
+                .empty_pool_sentence()
+                .unwrap_or_else(|| "no claimable task".to_owned());
+            selected.context(empty_sentence)?
         };
         require_claimable_type(&task.id, &task.task_type)?;
         require_no_draft_ancestor(&transaction, &task.id)?;
@@ -8132,6 +8156,10 @@ impl Store {
         {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
+        // LINKED-07/08: the one shared scope gate, after every existing gate
+        // so the scope refusal never masks one (LINKED-09). The binding and
+        // the set revision the grant was checked against ride on the event.
+        let scope_decision = scope_guard.check(&task.id)?;
         let token = Uuid::new_v4().to_string();
         let attempt = next_attempt(&transaction, &task.id)?;
         // The lease names its worker and principal under managed enforcement
@@ -8173,6 +8201,13 @@ impl Store {
                 if let Some(model) = &options.model {
                     payload["model"] = json!(model);
                 }
+                // LINKED-07: the binding and the set revision the grant was
+                // checked against. Conditional, so an unbound claim keeps the
+                // payload byte-identical to a board without linked state.
+                if let Some(decision) = &scope_decision {
+                    payload["scopeSet"] = json!(decision.set_id);
+                    payload["scopeRevision"] = json!(decision.revision);
+                }
                 self.stamp_worker(payload)
             },
             Some(&task.status),
@@ -8181,6 +8216,9 @@ impl Store {
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
         let orphaned_from = orphaned_from(&transaction, &task.id)?;
         transaction.commit()?;
+        // The registry write intent releases only after the board grant
+        // committed: revocation and grant serialize in commit order.
+        scope_guard.commit()?;
         Ok(ClaimReceipt {
             claim: result,
             rules: Vec::new(),
@@ -8215,6 +8253,20 @@ impl Store {
         candidates.retain(|candidate| {
             self.authz.permits_read(&candidate.tags) && self.authz.permits_task(&candidate.id)
         });
+        // LINKED-08: the same gate bounds the read-only inspection, so it
+        // never offers a row the atomic path would refuse. Candidates never
+        // refuses — it withholds.
+        if let Some(scope) = crate::linked::candidate_scope(
+            &self.connection,
+            agent,
+            options
+                .caller_lane
+                .as_deref()
+                .or(options.role_filter.as_deref()),
+        )? {
+            let board_id = crate::linked::board_id_of(&self.connection);
+            candidates.retain(|candidate| scope.allows(&board_id, &candidate.id));
+        }
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
         }
@@ -10153,6 +10205,22 @@ impl Store {
                 bail!("a lease is held over a task, so --lease needs the task id it belongs to")
             }
         };
+        // LINKED-13: a revoked binding's leases end only via `release`, never
+        // by handoff onward. The holder is the lease, not the presenter.
+        if let (Some(task_id), Some(claim)) = (&input.task_id, &claim) {
+            if let Some(reason) = crate::linked::holder_handoff_barred(
+                &transaction,
+                task_id,
+                &claim.agent_id,
+                claim.session_id.as_deref(),
+            )? {
+                bail!(
+                    "task {task_id} is held under a revoked selected-scope binding ({reason}); a \
+                     revoked lease ends only via `release {task_id} --lease TOKEN`, never by \
+                     handoff onward"
+                );
+            }
+        }
         // A handoff has no `blocked` state; its `--blocker` list is where it
         // says what stops the work, so that list is the half the owner gate
         // reads. A session handoff names no task, and there is no row for a
@@ -10237,6 +10305,7 @@ impl Store {
         let AcceptHandoffOptions {
             agent,
             session,
+            caller_lane,
             lease_ms,
             caller_scope,
             sprint_override,
@@ -10252,6 +10321,15 @@ impl Store {
         if let Some(model) = &model {
             crate::model::validate_model_name(model)?;
         }
+        // LINKED-08: the same scope guard as a claim, taken before the board
+        // write scope. Acknowledgements below mint no lease and bypass it;
+        // only the lease-taking branch checks it.
+        let scope_guard = crate::linked::ScopeGuard::take(
+            &self.connection,
+            &agent,
+            caller_lane.as_deref(),
+            session.as_deref(),
+        )?;
         let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
@@ -10424,6 +10502,11 @@ impl Store {
                 task.id
             );
         }
+        // LINKED-08: the one shared scope gate on the lease-taking branch, in
+        // the same position as a claim's — after the existing gates. A handoff
+        // accepted outside the set stays `pending` and grants no lease: the
+        // bail below rolls the status write back with it.
+        let scope_decision = scope_guard.check(&task.id)?;
         let token = Uuid::new_v4().to_string();
         let attempt = next_attempt(&transaction, &task.id)?;
         transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model,attempt,worker_id,principal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
@@ -10456,6 +10539,12 @@ impl Store {
                 if let Some(value) = &model {
                     payload["model"] = json!(value);
                 }
+                // LINKED-07: the binding and revision the grant was checked
+                // against; conditional so unbound accepts stay byte-identical.
+                if let Some(decision) = &scope_decision {
+                    payload["scopeSet"] = json!(decision.set_id);
+                    payload["scopeRevision"] = json!(decision.revision);
+                }
                 self.stamp_worker(payload)
             },
             Some(&task.status),
@@ -10466,6 +10555,7 @@ impl Store {
         let claim =
             active_claim(&transaction, &task.id, now)?.context("accepted claim disappeared")?;
         transaction.commit()?;
+        scope_guard.commit()?;
         Ok((updated, Some(claim)))
     }
 
@@ -13297,6 +13387,7 @@ mod tests {
                 AcceptHandoffOptions {
                     agent: "agent".into(),
                     session: None,
+                    caller_lane: None,
                     lease_ms: 60_000,
                     caller_scope: None,
                     sprint_override: None,
@@ -19253,6 +19344,7 @@ mod tests {
                 AcceptHandoffOptions {
                     agent: "managed".into(),
                     session: None,
+                    caller_lane: None,
                     lease_ms: 60_000,
                     caller_scope: None,
                     sprint_override: None,
