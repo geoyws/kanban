@@ -10969,6 +10969,13 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         .unwrap(),
     )
     .unwrap();
+    // The dispatcher refuses a config any other user could read (PLUGIN), so
+    // the fixture sets the mode rather than inheriting the umask.
+    fs::set_permissions(
+        fixture.data.join("dispatchers.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let before = fs::read(&board).unwrap();
     let mut covered = 0;
     // Long-running commands cannot be run to completion and compared, so `mcp`
