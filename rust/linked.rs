@@ -367,7 +367,7 @@ fn retired_pairing(
     Ok(connection
         .query_row(
             "SELECT * FROM linked_companions WHERE board_a_id=? AND item_a_id=? AND \
-             board_b_id=? AND item_b_id=? AND retired<>0 ORDER BY retired_at DESC LIMIT 1",
+             board_b_id=? AND item_b_id=? AND retired<>0 ORDER BY retired_at DESC, rowid DESC LIMIT 1",
             params![board_a_id, item_a_id, board_b_id, item_b_id],
             companion_row,
         )
@@ -1075,7 +1075,7 @@ fn latest_binding(
     Ok(connection
         .query_row(
             "SELECT * FROM linked_bindings WHERE set_id=? AND actor=? AND lane=? AND session=? \
-             ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
             params![set_id, triple.actor, triple.lane, triple.session],
             binding_row,
         )
@@ -1092,7 +1092,7 @@ fn live_bindings_for_lane(
 ) -> Result<Vec<BindingRow>> {
     let mut statement = connection.prepare(
         "SELECT * FROM linked_bindings WHERE actor=? AND lane=? AND status='active' AND \
-         expires_at>? ORDER BY created_at DESC",
+         expires_at>? ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement
         .query_map(params![actor, lane, now], binding_row)?
@@ -1109,7 +1109,7 @@ fn live_bindings_for_actor(
 ) -> Result<Vec<BindingRow>> {
     let mut statement = connection.prepare(
         "SELECT * FROM linked_bindings WHERE actor=? AND status='active' AND expires_at>? \
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC, rowid DESC",
     )?;
     let rows = statement
         .query_map(params![actor, now], binding_row)?
@@ -1127,7 +1127,7 @@ fn latest_revoked_for_actor(
     Ok(connection
         .query_row(
             "SELECT * FROM linked_bindings WHERE actor=? AND status='revoked' ORDER BY ended_at \
-             DESC, created_at DESC LIMIT 1",
+             DESC, created_at DESC, rowid DESC LIMIT 1",
             [actor],
             binding_row,
         )
@@ -1931,7 +1931,7 @@ pub(crate) fn holder_handoff_barred(
     // acceptor's gate still scopes the other end.
     let mut statement = connection.prepare(
         "SELECT * FROM linked_bindings WHERE actor=? AND session=? AND status='active' AND \
-         expires_at>? ORDER BY created_at DESC",
+         expires_at>? ORDER BY created_at DESC, rowid DESC",
     )?;
     let live = statement
         .query_map(params![agent, session, now], binding_row)?
