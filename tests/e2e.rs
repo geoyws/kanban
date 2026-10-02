@@ -2746,13 +2746,13 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
             .any(|result| result["sourceId"] == "t-before-search")
     );
     let reopened = Connection::open(board).unwrap();
+    // An ordinary open of a registered board stops at the pre-CROSS schema;
+    // the CROSS step is the owner's, taken by `init` (ADR-056 §5).
     assert_eq!(
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
-            .as_i64()
-            .unwrap()
+        38
     );
     assert_eq!(
         reopened
@@ -5126,7 +5126,14 @@ fn compiled_binary_honours_every_selector_the_manifest_says_it_accepts() {
             let flag = format!("--{selector}");
             let mut args = vec![command];
             args.extend(sub);
-            args.extend([flag.as_str(), value, "--json"]);
+            args.extend([flag.as_str(), value]);
+            // `batch` publishes no positionals but still needs its item list
+            // (docs/specs/batch.md BA-01): one valid read item, so the run
+            // proves the selector was honoured instead of refused.
+            if command == "batch" {
+                args.extend(["--items", r#"[{"name":"tag_list","arguments":{}}]"#]);
+            }
+            args.push("--json");
             let output = fixture.run(&fixture.main, &args);
             assert!(
                 output.status.success(),
@@ -5664,10 +5671,13 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(after, current, "the board was not migrated forward");
+    // An ordinary open of a registered board migrates forward only to the
+    // pre-CROSS schema; the CROSS step is the owner's, taken by `init`
+    // (ADR-056 §5). `current` above is 39 because `init` took it.
+    assert_eq!(after, 38, "the board was not migrated forward");
     let rewound = Connection::open(&board).unwrap();
     rewound
-        .pragma_update(None, "user_version", current - 1)
+        .pragma_update(None, "user_version", after - 1)
         .unwrap();
     drop(rewound);
     let listed_after_last_step = fixture.ok_json(
@@ -5680,7 +5690,7 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        after_last_step, current,
+        after_last_step, after,
         "the final migration step did not rerun"
     );
 }
@@ -10904,11 +10914,61 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "access enforcement show" => vec!["access", "enforcement", "show"],
             "worker show" => vec!["worker", "show", "w-00000000"],
             "worker list" => vec!["worker", "list"],
+            // `batch` publishes no positionals but still needs its item list
+            // (docs/specs/batch.md BA-01): one valid read item.
+            "batch" => vec![
+                "batch",
+                "--items",
+                r#"[{"name":"tag_list","arguments":{}}]"#,
+            ],
+            // `plugin call` writes nothing by spec (PLUGIN-06), so the loop
+            // runs it for real against the action installed below.
+            "plugin call" => vec!["plugin", "call", "acme", "lookup"],
+            "plugin list" => vec!["plugin", "list"],
             _ => return None,
         };
         Some(base.into_iter().map(str::to_owned).collect())
     };
 
+    // One installed plugin action, so `plugin call` above runs for real
+    // (docs/specs/plugin.md PLUGIN-06: it writes no board row, no registry
+    // row and no event). The data root must be private or the call refuses;
+    // the fixture leaves its modes to the umask, so lock it down first.
+    fs::set_permissions(&fixture.data, fs::Permissions::from_mode(0o700)).unwrap();
+    let plugin_script = fixture.root.join("schema-plugin.sh");
+    fs::write(
+        &plugin_script,
+        "#!/bin/sh\nIFS= read -r request || true\nprintf '%s\\n' \
+         '{\"protocolVersion\":1,\"revision\":\"r1\",\"output\":{}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&plugin_script, fs::Permissions::from_mode(0o755)).unwrap();
+    let plugin_sha = format!("{:x}", Sha256::digest(fs::read(&plugin_script).unwrap()));
+    fs::write(
+        fixture.data.join("dispatchers.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 2,
+            "consumers": {
+                "acme": {
+                    "capabilities": ["plugin.read"],
+                    "secrets": {},
+                    "actions": {
+                        "lookup": {
+                            "kind": "plugin",
+                            "capability": "plugin.read",
+                            "executable": plugin_script.to_str().unwrap(),
+                            "args": [],
+                            "revision": "r1",
+                            "sha256": plugin_sha,
+                            "timeoutMs": 30_000
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let before = fs::read(&board).unwrap();
     let mut covered = 0;
     // Long-running commands cannot be run to completion and compared, so `mcp`
@@ -22670,8 +22730,14 @@ const CAPPED_LISTINGS: &[CappedListing] = &[
 fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_meets() {
     // Enumerated from the surface the binary publishes, so a listing that
     // grows `--limit` later has to join the table or fail here. `watch` is
-    // the one exception: its `--limit` sizes a batch, and it computes and
-    // reports truncation itself.
+    // one exception: its `--limit` sizes a batch, and it computes and
+    // reports truncation itself. `worker list` is the other, by spec: it
+    // answers at most its default with `"truncated": true` when more exist
+    // (docs/specs/identity.md IDENT-15), which the refusal table below
+    // cannot express. Its bound is proven instead by
+    // `worker_list_is_bounded_and_the_manifest_carries_the_worker_tools` in
+    // tests/worker_identity_e2e.rs: 501 workers list as 50 rows plus
+    // `"truncated": true`, and `--limit 501` is refused naming 500.
     let fixture = Fixture::new("capped-surface");
     fixture.ok_json(&fixture.main, &["init", "--name", "SURFACE", "--json"]);
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -22682,7 +22748,7 @@ fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_mee
             .unwrap()
             .iter()
             .any(|flag| flag["name"] == "limit");
-        if !takes_limit || name == "watch" {
+        if !takes_limit || name == "watch" || name == "worker list" {
             continue;
         }
         let words = name.split(' ').collect::<Vec<_>>();
@@ -23575,6 +23641,16 @@ const ENUM_ARGUMENTS: &[EnumArgument] = &[
         prepare: seed_nothing,
         argv: &["access", "audit", "--capability", "@bogus@", "--json"],
     },
+    EnumArgument {
+        // The steer slice's `--note-kind` filter (WATCH-05): validated before
+        // the stream starts, so a bogus kind is refused without blocking.
+        label: "watch-note-kind",
+        operation: "watch",
+        argument: "note-kind",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["watch", "--note-kind", "@bogus@", "--cursor", "0", "--json"],
+    },
 ];
 
 /// ADR-008: an enum-valued refusal names the whole set it accepts, so the
@@ -24067,13 +24143,13 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
     assert_eq!(rows[1]["archived"], true);
 
     let connection = Connection::open(&board).unwrap();
+    // An ordinary open of a registered board stops at the pre-CROSS schema;
+    // the CROSS step is the owner's, taken by `init` (ADR-056 §5).
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
-            .as_i64()
-            .unwrap()
+        38
     );
     assert_eq!(
         connection
@@ -42099,13 +42175,13 @@ fn a_v29_board_gains_task_models_and_claim_model_and_existing_claims_read_null()
     );
 
     let connection = Connection::open(&board).unwrap();
+    // An ordinary open of a registered board stops at the pre-CROSS schema;
+    // the CROSS step is the owner's, taken by `init` (ADR-056 §5).
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
-            .as_i64()
-            .unwrap()
+        38
     );
     // The table, its index, and the column are all there.
     assert_eq!(
@@ -43933,6 +44009,13 @@ fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
     }
 
     let fixture = deploy_tier_board("hax-ok", "kanban");
+    // `init` takes the owner's open, so the board is already past the CROSS
+    // step; the property below is that the deploy attempts do not move it
+    // from wherever `init` left it (ADR-056 §5).
+    let before = Connection::open(board_path_for_project(&fixture, &fixture.main, "kanban"))
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
     let first = deploy_tier_accepted(&deploy_tier_start(
         &fixture,
         "@_bdt",
@@ -43955,7 +44038,7 @@ fn deploy_start_accepts_dev_tiers_on_hax_for_unum_and_geoyws_boards() {
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
     assert_eq!(
-        schema, 38,
+        schema, before,
         "a dev-tier attempt on hax moved the board schema"
     );
 }
