@@ -3751,36 +3751,36 @@ fn apply_migration_step(
     // to "whatever migration is last": a later version must not inherit
     // the rewind skip just by existing.
     let board_v31_step = current + 1 == 31;
-    let v31_columns = board_v31_step && board_v31_columns_exist(&transaction)?;
-    let v31_rewind = v31_columns && board_v31_shape_exists(&transaction)?;
+    let v31_columns = board_v31_step && board_v31_columns_exist(transaction)?;
+    let v31_rewind = v31_columns && board_v31_shape_exists(transaction)?;
     // The v32 ALTERs cannot re-run against columns that already stand,
     // so a board rewound past its own physical v32 shape skips the step
     // instead of failing on a duplicate column.
     let board_v32_step = current + 1 == 32;
-    let v32_stands = board_v32_step && board_v32_result_shape_exists(&transaction)?;
+    let v32_stands = board_v32_step && board_v32_result_shape_exists(transaction)?;
     // The v34 ALTER cannot re-run against a column that already stands,
     // so a board rewound past its own physical v34 shape skips the step
     // instead of failing on a duplicate column.
     let board_v34_step = current + 1 == 34;
-    let v34_stands = board_v34_step && board_v34_result_shape_exists(&transaction)?;
+    let v34_stands = board_v34_step && board_v34_result_shape_exists(transaction)?;
     // The v35 ALTER, for the same reason and by the same guard.
     let board_v35_step = current + 1 == 35;
-    let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
+    let v35_stands = board_v35_step && board_v35_result_shape_exists(transaction)?;
     // The v38 identity columns are added one by one where missing, ahead
     // of the step's own batch (see `BOARD_V38`).
     if current + 1 == 38 {
-        apply_board_v38_columns(&transaction)?;
+        apply_board_v38_columns(transaction)?;
     }
     // The CROSS steps: board v39 and registry v16. Each ALTER is skipped
     // when its column already stands (a rewound file); the shape test is
     // table-specific, so the other ladder's step never matches (a board
     // has no `boards` table, a registry no `tasks`).
-    let board_v39_step = current + 1 == 39 && table_has_column(&transaction, "tasks", "id")?;
-    let v39_column = board_v39_step && table_has_column(&transaction, "tasks", "incarnation")?;
+    let board_v39_step = current + 1 == 39 && table_has_column(transaction, "tasks", "id")?;
+    let v39_column = board_v39_step && table_has_column(transaction, "tasks", "incarnation")?;
     let registry_v16_step =
-        current + 1 == 16 && table_has_column(&transaction, "boards", "board_path")?;
+        current + 1 == 16 && table_has_column(transaction, "boards", "board_path")?;
     let v16_column =
-        registry_v16_step && table_has_column(&transaction, "boards", "registration_token")?;
+        registry_v16_step && table_has_column(transaction, "boards", "registration_token")?;
     if v39_column {
         transaction.execute_batch(BOARD_CROSS_REWIND)?;
     } else if v16_column {
@@ -3799,7 +3799,7 @@ fn apply_migration_step(
         }
     }
     if board_v39_step && let Some(token) = bind {
-        bind_registration_token(&transaction, token)?;
+        bind_registration_token(transaction, token)?;
     }
     Ok(())
 }
