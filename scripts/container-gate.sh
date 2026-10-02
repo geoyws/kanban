@@ -29,13 +29,21 @@
 # so at most N heavy gates run on this host at once and a start beyond that
 # waits for a slot. The container runs in the FOREGROUND inside the slot: a
 # detached `docker run -d` would return at once and free the slot while the
-# gate was still running. Without medic installed the run is unlimited and
-# says so.
+# gate was still running. The limiter is $GATE_SLOT when set; a set value
+# that is not an executable file is refused before anything runs, never
+# silently dropped to an unlimited run. Unset, it is looked up next to the
+# medic checkout that ~/.agents/skills links into. A slot already held by a
+# parent (`MEDIC_GATE_HELD`, exported by `gate-slot run`) is honoured: with a
+# limiter, gate-slot itself verifies the token and runs without taking a
+# second slot; with no limiter found, the run proceeds inside the parent's
+# slot and says so. With neither, the run is unlimited and says so.
 #
 # Environment:
 #   KANBAN_GATE_STATE  cache and log directory (default ~/.cache/kanban-gate)
 #   KANBAN_GATE_IMAGE  image tag (default kanban-gate:1.95-chrome-u<uid>);
 #                      built from scripts/container-gate.Dockerfile if absent
+#   GATE_SLOT          path to medic's gate-slot executable (default: looked
+#                      up from ~/.agents/skills); refused if not executable
 set -Eeuo pipefail
 
 die() {
@@ -85,6 +93,20 @@ if [[ -n "$loop_target" ]]; then
     [[ "$iterations" =~ ^[1-9][0-9]*$ ]] || die "--loop needs --iterations N (N >= 1)"
 elif [[ -n "$iterations" ]]; then
     die "--iterations applies only to --loop"
+fi
+
+# Resolve the limiter before anything else touches docker, so a bad
+# GATE_SLOT stops the run instead of letting it start unlimited.
+if [[ -n "${GATE_SLOT+set}" ]]; then
+    [[ -f "$GATE_SLOT" && -x "$GATE_SLOT" ]] ||
+        die "GATE_SLOT is set but is not an executable file: '$GATE_SLOT'; refusing to run unlimited (fix or unset it)"
+    gate_slot="$GATE_SLOT"
+else
+    gate_slot=""
+    if skills="$(realpath ~/.agents/skills 2>/dev/null)"; then
+        medic_slot="$skills/../../medic/skills/gate-slot/bin/gate-slot"
+        [[ ! -x "$medic_slot" ]] || gate_slot="$medic_slot"
+    fi
 fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -206,9 +228,12 @@ run_container=(
     bash -c "$inner" inner "$inner_uid" "$inner_gid" "$loop_target" "$loop_test" "${iterations:-0}"
 )
 
-gate_slot="$(realpath ~/.agents/skills 2>/dev/null)/../../medic/skills/gate-slot/bin/gate-slot"
-if [[ -x "$gate_slot" ]]; then
+if [[ -n "$gate_slot" ]]; then
     run=("$gate_slot" run --name "$name" -- "${run_container[@]}")
+elif [[ -n "${MEDIC_GATE_HELD:-}" ]]; then
+    printf 'container-gate: gate-slot not found; running inside the parent slot held by MEDIC_GATE_HELD=%s\n' \
+        "$MEDIC_GATE_HELD" >&2
+    run=("${run_container[@]}")
 else
     printf 'container-gate: warning: gate-slot not found (medic absent); running unlimited\n' >&2
     run=("${run_container[@]}")

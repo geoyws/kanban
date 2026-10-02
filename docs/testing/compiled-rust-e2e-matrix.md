@@ -64,7 +64,14 @@ which runs this same script unchanged inside the image
 checkout mounted read-only, and prints the candidate SHA and image ID for
 the receipt. It holds one of the host's medic `gate-slot` slots for as long
 as the container runs, so parallel lanes queue instead of overloading the
-machine. `--loop TARGET TEST --iterations N` runs one test N times to
+machine. `GATE_SLOT` names the limiter explicitly, for a host whose
+`~/.agents/skills` is not a link into the medic checkout the default lookup
+relies on; a `GATE_SLOT` that is not an executable file is refused rather
+than run unlimited. A run started inside a slot a parent already holds
+(`MEDIC_GATE_HELD`) uses that slot instead of queueing for a second one;
+`scripts/container-gate.test.sh` (a release-gate step) pins all of this
+against stub `docker` and `gate-slot` commands.
+`--loop TARGET TEST --iterations N` runs one test N times to
 measure a flake; that count is investigation, never gate evidence. The first
 Linux runs (2026-09-24, `t-a3928b36`) found a test no macOS gate had ever
 compiled and a delivery race macOS never showed, which is the reason.
