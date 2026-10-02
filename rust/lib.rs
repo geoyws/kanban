@@ -226,6 +226,28 @@ Usage:
              (a worker bound to a set may claim only its explicitly selected
              tasks, on every claim path: candidates, --next, named claims,
              handoff acceptance, and session resumption)
+  kanban contrib declare --board UUID --id ID --deliverable NAME --kind code|non-code
+             [--repo REPO] --as ACTOR [--json]
+             (declares one deliverable for a joint task; code pins the
+             implementation repository, non-code carries none)
+  kanban contrib record --board UUID --id ID --deliverable NAME [--kind code|non-code]
+             --actor AGENT [--lane LANE] [--session ID] --host HOST --worktree PATH
+             --branch BRANCH --observed-at MS --repo REPO --commit SHA --role ROLE
+             [--source SHA ...] [--mapping merge|squash] [--via PATH ...]
+             [--hop-path PATH ...] [--consumes SHA] [--dep-kind submodule]
+             [--verify-run REF] [--repo-path PATH] [--evidence-ref REF ...]
+             [--note TEXT] [--corrects ID] --as AGENT [--json]
+             (appends one contribution receipt with full identity, exactly one
+             of the four evidence roles, and read-only git verification;
+             a correction is a new receipt naming the corrected one)
+  kanban contrib show --board UUID --id ID [--json]
+             (per-side history from either board, without marking the peer)
+  kanban contrib status --board UUID --id ID [--json]
+             (per-deliverable evidence status; partial reads as partial)
+  kanban contrib close --a-board UUID --a-id ID --b-board UUID --b-id ID --as OPERATOR
+             [--reason TEXT] [--json]
+             (closes joint work only when every deliverable on both boards is
+             evidenced; otherwise names each open deliverable)
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
@@ -501,6 +523,13 @@ pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
 /// everywhere else they appear — which is nowhere today, and that split is
 /// the reason this stays per-operation like the rest of [`LIST_VALUED`].
 pub(crate) const VERDICT_ADD_REPEATABLE: [&str; 2] = ["sha", "evidence"];
+/// A contribution receipt's list-valued flags, on the one subcommand they
+/// belong to: `--role` arrives whole so that zero or two roles is the
+/// LINKED-16 role refusal rather than a parser refusal, and `--source`,
+/// `--via`, `--hop-path`, and `--evidence-ref` each take one value per
+/// occurrence. Kept per-operation like the rest of [`LIST_VALUED`].
+pub(crate) const CONTRIB_RECORD_REPEATABLE: [&str; 5] =
+    ["role", "source", "via", "hop-path", "evidence-ref"];
 /// A worker's own grant list, one `--grant` per pair (IDENT-04).
 pub(crate) const WORKER_REGISTER_REPEATABLE: [&str; 1] = ["grant"];
 struct ListValued {
@@ -509,7 +538,7 @@ struct ListValued {
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 12] = [
+const LIST_VALUED: [ListValued; 13] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -569,6 +598,11 @@ const LIST_VALUED: [ListValued; 12] = [
         command: "worker",
         sub: Some("register"),
         flags: &WORKER_REGISTER_REPEATABLE,
+    },
+    ListValued {
+        command: "contrib",
+        sub: Some("record"),
+        flags: &CONTRIB_RECORD_REPEATABLE,
     },
 ];
 
@@ -1025,6 +1059,40 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         Some("show"),
         &["db", "project", "workspace"],
         "reads a selected set from the registry, never from a board",
+    ),
+    // Contribution and integration receipts live in the registry beside the
+    // pairing they evidence (LINKED, ADR-051), never on a board — and a
+    // batch's transaction covers one board, so these rows also keep them out
+    // of `transact` (ADR-041).
+    (
+        "contrib",
+        Some("declare"),
+        &["db", "project", "workspace"],
+        "declares a deliverable for a joint task in the registry, never on a board",
+    ),
+    (
+        "contrib",
+        Some("record"),
+        &["db", "project", "workspace"],
+        "appends a contribution receipt in the registry, never on a board",
+    ),
+    (
+        "contrib",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads per-side delivery evidence from the registry, never from a board",
+    ),
+    (
+        "contrib",
+        Some("status"),
+        &["db", "project", "workspace"],
+        "reads per-deliverable evidence status from the registry, never from a board",
+    ),
+    (
+        "contrib",
+        Some("close"),
+        &["db", "project", "workspace"],
+        "closes joint work for a pairing in the registry, never on a board",
     ),
 ];
 
@@ -1517,6 +1585,56 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("scope", Some("show"), &["set"], &[], true),
+    (
+        "contrib",
+        Some("declare"),
+        &["board", "id", "deliverable", "kind", "repo", "as"],
+        &[],
+        false,
+    ),
+    (
+        "contrib",
+        Some("record"),
+        &[
+            "board",
+            "id",
+            "deliverable",
+            "kind",
+            "actor",
+            "lane",
+            "session",
+            "host",
+            "worktree",
+            "branch",
+            "observed-at",
+            "repo",
+            "commit",
+            "role",
+            "source",
+            "mapping",
+            "via",
+            "hop-path",
+            "consumes",
+            "dep-kind",
+            "verify-run",
+            "repo-path",
+            "evidence-ref",
+            "note",
+            "corrects",
+            "as",
+        ],
+        &[],
+        false,
+    ),
+    ("contrib", Some("show"), &["board", "id"], &[], true),
+    ("contrib", Some("status"), &["board", "id"], &[], true),
+    (
+        "contrib",
+        Some("close"),
+        &["a-board", "a-id", "b-board", "b-id", "as", "reason"],
+        &[],
+        false,
+    ),
     (
         "import",
         Some("atmux-json"),
@@ -2224,7 +2342,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 18] = [
+const SUBCOMMAND_GROUPS: [&str; 19] = [
     "task",
     "story",
     "handoff",
@@ -2243,6 +2361,7 @@ const SUBCOMMAND_GROUPS: [&str; 18] = [
     "worker",
     "link",
     "scope",
+    "contrib",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -6784,6 +6903,118 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             &crate::linked::show_set(&connection, &root, args.require("set")?, now_ms())?,
             args.has("json"),
         );
+    }
+    // Contribution and integration receipts (slice LINKED delivery evidence,
+    // ADR-051 §4): the registry owns the deliverables, receipts, and joint
+    // closures, so these arms open only the registry and return before the
+    // board store opens below. Each write runs in one `BEGIN IMMEDIATE`
+    // transaction beside its audit event: refused whole or landed whole,
+    // never half-written (LINKED-15, LINKED-20).
+    if command == "contrib" && sub == Some("declare") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::declare_deliverable(
+                &transaction,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+                args.require("deliverable")?,
+                args.one("kind").unwrap_or("code"),
+                args.one("repo").unwrap_or(""),
+                args.one("as").unwrap_or("system@cli"),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "contrib" && sub == Some("record") {
+        let input = crate::linked::ContributionInput {
+            board: args.require("board")?.to_owned(),
+            id: args.require("id")?.to_owned(),
+            deliverable: args.require("deliverable")?.to_owned(),
+            kind: args.one("kind").unwrap_or("code").to_owned(),
+            actor: args.require("actor")?.to_owned(),
+            lane: args.one("lane").map(str::to_owned),
+            session: args.one("session").map(str::to_owned),
+            host: args.one("host").unwrap_or("").to_owned(),
+            worktree: args.one("worktree").unwrap_or("").to_owned(),
+            branch: args.one("branch").unwrap_or("").to_owned(),
+            observed_at: args.one("observed-at").unwrap_or("").to_owned(),
+            repo: args.one("repo").unwrap_or("").to_owned(),
+            commit: args.one("commit").unwrap_or("").to_owned(),
+            roles: args.many("role"),
+            sources: args.many("source"),
+            mapping: args.one("mapping").unwrap_or("").to_owned(),
+            vias: args.many("via"),
+            hop_paths: args.many("hop-path"),
+            consumes: args.one("consumes").unwrap_or("").to_owned(),
+            dep_kind: args.one("dep-kind").unwrap_or("").to_owned(),
+            verify_run: args.one("verify-run").unwrap_or("").to_owned(),
+            repo_path: args.one("repo-path").unwrap_or("").to_owned(),
+            evidence_refs: args.many("evidence-ref"),
+            note: args.one("note").unwrap_or("").to_owned(),
+            corrects: args.one("corrects").unwrap_or("").to_owned(),
+            author: args.one("as").unwrap_or("system@cli").to_owned(),
+        };
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt =
+                crate::linked::record_contribution(&transaction, &root, &input, now_ms())?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "contrib" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_contributions(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "contrib" && sub == Some("status") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::contribution_status(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "contrib" && sub == Some("close") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::close_joint(
+                &transaction,
+                &root,
+                args.require("a-board")?,
+                args.require("a-id")?,
+                args.require("b-board")?,
+                args.require("b-id")?,
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
     }
     if command == "workspace" && sub == Some("list") {
         // Read-only, like every other read: this is the FIRST call a resuming

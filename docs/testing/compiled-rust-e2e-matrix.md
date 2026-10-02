@@ -24,7 +24,7 @@ script runs them — cheapest first, `e2e` last:
 `cursor_worker_adapter_e2e`, `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
 `codex_app_server_adapter_e2e`, `secret_guard_e2e`, `done_gate_e2e`,
 `authz_bypass_matrix_e2e`, `plugin_e2e`, `cross_board_e2e`, `identity_e2e`,
-`worker_identity_e2e`, `linked_e2e`, and `e2e`. Each
+`worker_identity_e2e`, `linked_e2e`, `linked_evidence_e2e`, and `e2e`. Each
 invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 `std::process::Command`; those process-boundary assertions are
 compiled-process evidence. The gate as a whole is a
@@ -508,13 +508,13 @@ set at creation (`cd55cbc`).
 | `LINKED-12` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | append-only audited revisions; `audit verify` healthy (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
 | `LINKED-13` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | frozen parks taking; revoked ends taking, keeps heartbeats (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
 | `LINKED-14` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | triple-checked claims; authorized exit/rebind only (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
-| `LINKED-15` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (append-only contributions with full identity; no short hashes) |
-| `LINKED-16` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exactly one of the four evidence roles) |
-| `LINKED-17` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (merge/squash mapping retained) |
-| `LINKED-18` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exact consumer commit plus complete nested path) |
-| `LINKED-19` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (moving latest and near-misses satisfy nothing) |
-| `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
-| `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
+| `LINKED-15` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | append-only receipts with full identity; missing field and short hash refused; corrections leave originals byte-identical (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-16` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | exactly one of the four evidence roles; none/two roles refused naming all four (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-17` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | squash/merge source mapping retained; unmapped implementations keep the deliverable open; non-absorbing merge refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-18` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path`; `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | exact consumer commit over the full nested committed-gitlink path; missing hop and non-submodule refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-19` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | moving `latest`, short/wrong hash, wrong repo path, stale pin, changed candidate each refused naming the mismatch; unreadable repo records `unverified`, never success (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-20` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing`; `per_side_history_leaves_the_untouched_peer_unmarked` | close refused naming each open deliverable; per-side history never marks the untouched peer (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-21` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | `non-code` disposition; cross-kind records refused naming the kind mismatch (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
 | `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |

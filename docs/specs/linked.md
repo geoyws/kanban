@@ -624,13 +624,13 @@ tree, and every `none` says so.
 | `LINKED-12` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | append-only audited revisions; `audit verify` healthy (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
 | `LINKED-13` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | frozen parks taking; revoked ends taking, keeps heartbeats (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
 | `LINKED-14` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | triple-checked claims; authorized exit/rebind only (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
-| `LINKED-15` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (append-only contributions with full identity; no short hashes) |
-| `LINKED-16` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exactly one of the four evidence roles) |
-| `LINKED-17` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (merge/squash mapping retained) |
-| `LINKED-18` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exact consumer commit plus complete nested path) |
-| `LINKED-19` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (moving latest and near-misses satisfy nothing) |
-| `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
-| `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
+| `LINKED-15` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | append-only receipts with full identity; missing field and short hash refused; corrections leave originals byte-identical (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-16` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | exactly one of the four evidence roles; none/two roles refused naming all four (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-17` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | squash/merge source mapping retained; unmapped implementations keep the deliverable open; non-absorbing merge refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-18` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path`; `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | exact consumer commit over the full nested committed-gitlink path; missing hop and non-submodule refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-19` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | moving `latest`, short/wrong hash, wrong repo path, stale pin, changed candidate each refused naming the mismatch; unreadable repo records `unverified`, never success (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-20` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing`; `per_side_history_leaves_the_untouched_peer_unmarked` | close refused naming each open deliverable; per-side history never marks the untouched peer (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-21` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | `non-code` disposition; cross-kind records refused naming the kind mismatch (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
 | `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
@@ -720,3 +720,10 @@ reachable from §4 and from §8.
   scope gate, `tests/linked_e2e.rs` (A1-A4), and unit tests for the set/binding logic. §8
   trace rows for those thirteen requirements name the real tests; the matrix section moves
   verbatim-identically. No requirement text changes, so no re-review is claimed here.
+- `2026-10-02` — `t-9eff9257` implemented delivery evidence (`LINKED-15`..`LINKED-21`):
+  registry v18 tables (`linked_deliverables`, `linked_contributions`, `linked_closures`), the
+  `contrib declare|record|show|status|close` verbs with read-only local git verification
+  (missing access records `unverified`, never success; no credentials stored), and
+  `tests/linked_evidence_e2e.rs` (A5, A6, per-side history) over real temp-dir git repos.
+  §8 rows for those seven requirements name the real tests; the matrix moves identically.
+  Checks are pending on the deployment gate; no requirement text changes.

@@ -206,7 +206,7 @@ fn pairing_roundtrip_reads_identical_from_both_sides_after_restart() {
     let acies = estate.board("acies");
     estate.add("unum", "t-u1", &[]);
     estate.add("acies", "t-a1", &[]);
-    assert_eq!(user_version(&estate.data.join("registry.db")), 17);
+    assert_eq!(user_version(&estate.data.join("registry.db")), 18);
 
     let added = estate.ok_json(
         &estate.root,

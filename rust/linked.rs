@@ -91,7 +91,7 @@ fn triple_sentence(triple: &ScopeTriple) -> String {
     )
 }
 
-/// Whether this registry file holds the LINKED tables (registry v17). A
+/// Whether this registry file holds the LINKED tables (registry v18). A
 /// pre-upgrade registry has no shared state at all, so writes refuse naming
 /// the owner upgrade while reads — including the claim gate — behave exactly
 /// as if nobody ever paired anything.
@@ -101,6 +101,9 @@ pub(crate) fn linked_tables_present(connection: &Connection) -> Result<bool> {
         "linked_sets",
         "linked_set_revisions",
         "linked_bindings",
+        "linked_deliverables",
+        "linked_contributions",
+        "linked_closures",
     ] {
         let exists: i64 = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -119,10 +122,10 @@ fn require_linked_tables(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "this registry has not taken its linked upgrade (registry v17), so it holds no \
-         companions, selected sets, or bindings. Its owner upgrades it by running the same \
-         `kanban init --name NAME` that registered its boards; unpaired boards keep working \
-         exactly as before"
+        "this registry has not taken its linked upgrade (registry v18), so it holds no \
+         companions, selected sets, bindings, or delivery evidence. Its owner upgrades it by \
+         running the same `kanban init --name NAME` that registered its boards; unpaired \
+         boards keep working exactly as before"
     )
 }
 
@@ -1834,6 +1837,1785 @@ pub(crate) fn open_linked_registry_for_read() -> Result<(PathBuf, Connection)> {
     Ok((root, connection))
 }
 
+// ---------------------------------------------------------------------------
+// Delivery evidence: append-only contribution and integration receipts.
+// ---------------------------------------------------------------------------
+//
+// Slice LINKED delivery evidence (docs/specs/linked.md LINKED-15..LINKED-21,
+// row `t-9eff9257`), built on the shared records above rather than beside
+// them: every receipt names its `(boardID, id)` endpoint through
+// [`require_endpoint_shape`], resolves it through [`resolve_endpoint`] so an
+// unknown or denied endpoint gets the one [`UNAVAILABLE_ENDPOINT`] sentence,
+// and joins the registry audit chain through
+// [`crate::audit::append_registry_event`] exactly like the companion writes.
+// Nothing here edits or deletes: a correction is a new receipt naming the
+// receipt it corrects, and the superseded bytes stay stored byte-identical.
+//
+// Verification runs read-only git plumbing (`cat-file`, `merge-base`,
+// `ls-tree`) against caller-given local machine paths, with
+// `--no-optional-locks` and prompting disabled so a verify never writes and
+// never waits on a credential. No credential flag exists and none is stored.
+// A path that holds no readable repository records the receipt `unverified`,
+// which satisfies nothing: missing access is never success (LINKED-19,
+// LINKED-20). A readable repository whose objects contradict the record —
+// wrong hash, wrong path, stale pin, non-submodule entry, changed candidate
+// without a correction — refuses the write with the exact mismatch.
+
+/// The four evidence roles, exactly one of which every code contribution
+/// declares (LINKED-16).
+pub(crate) const EVIDENCE_ROLES: [&str; 4] =
+    ["baseline", "implementation", "integration", "candidate"];
+
+/// The refusal a record with no role, two roles, or an unknown role gets: it
+/// names the four roles and quotes what was declared (LINKED-16).
+fn role_refusal(roles: &[String]) -> String {
+    let declared = if roles.is_empty() {
+        "none".to_owned()
+    } else {
+        roles
+            .iter()
+            .map(|role| format!("{role:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "a contribution declares exactly one evidence role — baseline (the starting HEAD the \
+         work began from), implementation (a commit the work produced), integration (the \
+         accepted merge or squash commit), or candidate (the tested consumer commit) — but \
+         this record declares {declared}. A query for one role never returns another; nothing \
+         was appended"
+    )
+}
+
+/// A full object ID and nothing shorter: 40 hex (SHA-1) or 64 hex (SHA-256),
+/// lowercased on the way in. Short hashes are refused at write time, never
+/// expanded, and a moving `latest`/`HEAD` pointer is refused as what it is:
+/// not proof of any deliverable (LINKED-15, LINKED-19).
+fn require_full_sha(value: &str, what: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed == "latest" || trimmed == "HEAD" || trimmed == "head" {
+        bail!(
+            "{what} names {trimmed:?}, a moving pointer: it is not proof of any deliverable. \
+             Record the full 40- or 64-character object ID observed at the observed time; \
+             nothing was appended"
+        );
+    }
+    if (trimmed.len() == 40 || trimmed.len() == 64)
+        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(trimmed.to_lowercase());
+    }
+    if trimmed.len() >= 7 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "{what} carries a shortened object ID {trimmed:?}: short hashes are refused at \
+             write time, never expanded. Record the full 40- or 64-character object ID; \
+             nothing was appended"
+        );
+    }
+    bail!(
+        "{what} must be the full 40- or 64-character hexadecimal object ID, got {trimmed:?}; \
+         nothing was appended"
+    );
+}
+
+/// A stable repository identity: an opaque non-empty name, never a credential
+/// carrier. A URL with userinfo is refused before it lands, because no
+/// credential is ever stored on a receipt; machine access travels separately
+/// in `--repo-path`, a local path.
+fn require_repo_identity(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "a contribution missing its repository identity is refused naming the missing \
+             field: name the stable repository identity; nothing was appended"
+        );
+    }
+    if let Some(at) = trimmed.find('@')
+        && trimmed[..at].contains("://")
+    {
+        bail!(
+            "repository identity {trimmed:?} carries credentials in a URL: no credentials are \
+             stored on a contribution receipt. Name the stable repository identity without \
+             userinfo (machine access goes through --repo-path, a local path); nothing was \
+             appended"
+        );
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// A read-only machine path: local filesystem only. Remote addresses are out
+/// of scope — a verify must never reach the network — so they are refused
+/// with the local-path fix rather than probed.
+fn require_local_path(value: &str, flag: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "--{flag} names an empty path: pass a local filesystem path or omit the flag (the \
+             receipt is then recorded unverified); nothing was appended"
+        );
+    }
+    if trimmed.contains("://") {
+        bail!(
+            "--{flag} names {trimmed:?}: machine paths are local filesystem paths read \
+             read-only; remote repositories are out of scope. Point at a local checkout or \
+             omit the flag (the receipt is then recorded unverified); nothing was appended"
+        );
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// The observed time as milliseconds since the Unix epoch: when the work was
+/// observed, distinct from the recorded time the registry stamps itself.
+fn require_observed_at(raw: &str) -> Result<i64> {
+    match raw.trim().parse::<i64>() {
+        Ok(ms) if ms > 0 => Ok(ms),
+        _ => bail!(
+            "--observed-at must be the observed time as milliseconds since the Unix epoch, got \
+             {:?}; nothing was appended",
+            raw.trim()
+        ),
+    }
+}
+
+/// Any other required receipt field: the actor, host, worktree, branch, and
+/// the deliverable name. A contribution missing any identity field is refused
+/// naming the missing field (LINKED-15).
+fn require_evidence_field(value: &str, flag: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "a contribution missing --{flag} is refused naming the missing field; nothing was \
+             appended"
+        );
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Whether the machine path holds a readable repository, probed read-only:
+/// `--no-optional-locks` takes no locks and `GIT_TERMINAL_PROMPT=0` never
+/// prompts, so the probe neither writes nor waits on a credential.
+fn git_repo_readable(path: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["--no-optional-locks", "-C", path, "rev-parse", "--git-dir"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Whether `sha` is an object in the readable repository at `path`. The
+/// caller checks readability first; a missing object there is a mismatch to
+/// refuse, not missing access.
+fn git_object_present(path: &str, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["--no-optional-locks", "-C", path, "cat-file", "-e", sha])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Whether `ancestor` reaches `descendant` in the readable repository at
+/// `path`: `Some(true)` absorbs, `Some(false)` does not, `None` when git
+/// itself could not answer (read as unverified, never as proof either way).
+fn git_is_ancestor(path: &str, ancestor: &str, descendant: &str) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "-C",
+            path,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    if output.status.code() == Some(1) {
+        return Some(false);
+    }
+    None
+}
+
+/// The gitlink committed for `subpath` at `commit` in the readable repository
+/// at `path`: `Ok(sha)` for a `160000 commit` entry, `Err(detail)` carrying
+/// the exact refusal — a missing entry, or an entry that is not a submodule —
+/// for everything else. Only committed gitlinks are ever verified, never the
+/// working tree (LINKED-18).
+fn git_committed_gitlink(path: &str, commit: &str, subpath: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "-C",
+            path,
+            "ls-tree",
+            commit,
+            "--",
+            subpath,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| format!("could not read the repository at {path}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "dependency path {subpath:?} names no entry committed at consumer commit \
+             {commit} in the repository at {path}"
+        ));
+    }
+    let raw = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let entry = String::from_utf8_lossy(&raw).trim().to_owned();
+    let mut parts = entry.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("160000"), Some("commit"), Some(sha)) => Ok(sha.to_owned()),
+        _ => Err(format!(
+            "dependency path {subpath:?} at consumer commit {commit} is not a committed \
+             gitlink (submodule): the committed entry is {entry:?}. Only submodule \
+             dependencies carry consumer proof; subtrees, vendored copies, and \
+             language-package pins are explicitly refused"
+        )),
+    }
+}
+
+/// One declared deliverable for one joint task: the unit `contrib close`
+/// evidences and refuses over. A `code` deliverable pins the implementation
+/// repository every baseline/implementation/integration record must name; a
+/// `non-code` one carries no repository, because there is no commit to hash
+/// (LINKED-21).
+#[derive(Debug, Clone)]
+struct DeliverableRow {
+    board_id: String,
+    item_id: String,
+    name: String,
+    kind: String,
+    repo: String,
+    declared_by: String,
+    declared_at: i64,
+}
+
+fn deliverable_row(row: &rusqlite::Row) -> rusqlite::Result<DeliverableRow> {
+    Ok(DeliverableRow {
+        board_id: row.get("board_id")?,
+        item_id: row.get("item_id")?,
+        name: row.get("name")?,
+        kind: row.get("kind")?,
+        repo: row.get("repo")?,
+        declared_by: row.get("declared_by")?,
+        declared_at: row.get("declared_at")?,
+    })
+}
+
+fn deliverable(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    name: &str,
+) -> Result<Option<DeliverableRow>> {
+    Ok(connection
+        .query_row(
+            "SELECT * FROM linked_deliverables WHERE board_id=? AND item_id=? AND name=?",
+            params![board_id, item_id, name],
+            deliverable_row,
+        )
+        .optional()?)
+}
+
+fn deliverables_for(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+) -> Result<Vec<DeliverableRow>> {
+    let mut statement = connection.prepare(
+        "SELECT * FROM linked_deliverables WHERE board_id=? AND item_id=? ORDER BY name",
+    )?;
+    let rows = statement
+        .query_map(params![board_id, item_id], deliverable_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn deliverable_receipt(row: &DeliverableRow) -> serde_json::Value {
+    json!({
+        "boardID": row.board_id,
+        "id": row.item_id,
+        "deliverable": row.name,
+        "kind": row.kind,
+        "repo": row.repo,
+        "declaredBy": row.declared_by,
+        "declaredAt": row.declared_at,
+    })
+}
+
+/// Declare one deliverable for one joint task, audited and idempotent: the
+/// identical declaration retried answers the stored row, while re-declaring
+/// the same name with a different kind or repository is refused whole.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn declare_deliverable(
+    connection: &Connection,
+    root: &Path,
+    board: &str,
+    id: &str,
+    name: &str,
+    kind: &str,
+    repo: &str,
+    actor: &str,
+    now: i64,
+) -> Result<serde_json::Value> {
+    let endpoint = require_endpoint_shape(board, id, "declared")?;
+    let caller = linked_caller()?;
+    if resolve_endpoint(root, &caller, &endpoint).is_none() {
+        bail!("declared endpoint {UNAVAILABLE_ENDPOINT}");
+    }
+    let name = require_evidence_field(name, "deliverable")?;
+    let kind = match kind.trim() {
+        "code" => "code",
+        "non-code" => "non-code",
+        other => bail!(
+            "deliverable kind must be code or non-code, got {other:?}: a code record never \
+             satisfies a non-code deliverable, and a non-code record never satisfies a code \
+             one (LINKED-21). Nothing was declared"
+        ),
+    };
+    let repo = if kind == "code" {
+        require_repo_identity(repo)?
+    } else if repo.trim().is_empty() {
+        String::new()
+    } else {
+        bail!(
+            "a non-code deliverable carries no repository: there is no commit to hash and no \
+             role to declare (LINKED-21). Omit --repo; nothing was declared"
+        )
+    };
+    let actor = actor.trim();
+    if actor.is_empty() {
+        bail!(
+            "a deliverable missing its declaring actor is refused naming the missing field: \
+             pass --as; nothing was declared"
+        );
+    }
+    require_membership_authority(
+        &caller,
+        root,
+        &[SetMember {
+            board_id: endpoint.board_id.clone(),
+            id: endpoint.id.clone(),
+        }],
+    )?;
+    if let Some(existing) = deliverable(connection, &endpoint.board_id, &endpoint.id, &name)? {
+        if existing.kind == kind && existing.repo == repo {
+            // The identical declaration retried: answer the stored row.
+            return Ok(deliverable_receipt(&existing));
+        }
+        bail!(
+            "deliverable {name:?} for board {} item {} is already declared {} with repository \
+             {:?}: re-declaring it differently is refused whole. Nothing was declared",
+            endpoint.board_id,
+            endpoint.id,
+            existing.kind,
+            existing.repo
+        );
+    }
+    connection.execute(
+        "INSERT INTO linked_deliverables(board_id,item_id,name,kind,repo,declared_by,\
+         declared_at) VALUES(?,?,?,?,?,?,?)",
+        params![endpoint.board_id, endpoint.id, name, kind, repo, actor, now],
+    )?;
+    crate::audit::append_registry_event(
+        connection,
+        &format!("{}:{}:{}", endpoint.board_id, endpoint.id, name),
+        "linked_deliverable_declared",
+        actor,
+        &json!({
+            "boardID": endpoint.board_id,
+            "id": endpoint.id,
+            "deliverable": name,
+            "kind": kind,
+            "repo": repo,
+        })
+        .to_string(),
+        now,
+    )?;
+    let stored = deliverable(connection, &endpoint.board_id, &endpoint.id, &name)?
+        .context("deliverable was not stored")?;
+    Ok(deliverable_receipt(&stored))
+}
+
+/// One stored receipt: the full identity LINKED-15 requires — repository,
+/// full object IDs, actor/lane/session, host/worktree/branch, observed and
+/// recorded times, evidence references — plus the LINKED-17 mapping, the
+/// LINKED-18 consumer path, and the verification outcome. Correction links
+/// point at superseded receipts; no row is ever updated or deleted.
+#[derive(Debug, Clone)]
+struct ContributionRow {
+    id: String,
+    board_id: String,
+    item_id: String,
+    deliverable: String,
+    kind: String,
+    repo: String,
+    commit_sha: String,
+    role: String,
+    actor: String,
+    lane: String,
+    session: String,
+    host: String,
+    worktree: String,
+    branch: String,
+    observed_at: i64,
+    recorded_at: i64,
+    evidence_refs: Vec<String>,
+    note: String,
+    corrects: Option<String>,
+    sources: Vec<String>,
+    mapping: String,
+    consumer_path: Vec<String>,
+    consumes: String,
+    verify_run: String,
+    dep_kind: String,
+    verification: String,
+    verify_detail: String,
+    repo_path: String,
+    hop_paths: Vec<String>,
+}
+
+fn contribution_row(row: &rusqlite::Row) -> rusqlite::Result<ContributionRow> {
+    let id: String = row.get("id")?;
+    let evidence_refs: String = row.get("evidence_refs")?;
+    let sources: String = row.get("sources")?;
+    let consumer_path: String = row.get("consumer_path")?;
+    let hop_paths: String = row.get("hop_paths")?;
+    Ok(ContributionRow {
+        id: id.clone(),
+        board_id: row.get("board_id")?,
+        item_id: row.get("item_id")?,
+        deliverable: row.get("deliverable")?,
+        kind: row.get("kind")?,
+        repo: row.get("repo")?,
+        commit_sha: row.get("commit_sha")?,
+        role: row.get("role")?,
+        actor: row.get("actor")?,
+        lane: row.get("lane")?,
+        session: row.get("session")?,
+        host: row.get("host")?,
+        worktree: row.get("worktree")?,
+        branch: row.get("branch")?,
+        observed_at: row.get("observed_at")?,
+        recorded_at: row.get("recorded_at")?,
+        evidence_refs: serde_json::from_str(&evidence_refs).unwrap_or_default(),
+        note: row.get("note")?,
+        corrects: row.get("corrects")?,
+        sources: serde_json::from_str(&sources).unwrap_or_default(),
+        mapping: row.get("mapping")?,
+        consumer_path: serde_json::from_str(&consumer_path).unwrap_or_default(),
+        consumes: row.get("consumes")?,
+        verify_run: row.get("verify_run")?,
+        dep_kind: row.get("dep_kind")?,
+        verification: row.get("verification")?,
+        verify_detail: row.get("verify_detail")?,
+        repo_path: row.get("repo_path")?,
+        hop_paths: serde_json::from_str(&hop_paths).unwrap_or_default(),
+    })
+}
+
+fn contribution_by_id(connection: &Connection, id: &str) -> Result<Option<ContributionRow>> {
+    Ok(connection
+        .query_row(
+            "SELECT * FROM linked_contributions WHERE id=?",
+            [id],
+            contribution_row,
+        )
+        .optional()?)
+}
+
+fn contributions_for(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    deliverable: &str,
+) -> Result<Vec<ContributionRow>> {
+    let mut statement = connection.prepare(
+        "SELECT * FROM linked_contributions WHERE board_id=? AND item_id=? AND deliverable=? \
+         ORDER BY recorded_at,id",
+    )?;
+    let rows = statement
+        .query_map(params![board_id, item_id, deliverable], contribution_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn current_records(records: &[ContributionRow]) -> Vec<&ContributionRow> {
+    let superseded: std::collections::HashSet<&str> = records
+        .iter()
+        .filter_map(|record| record.corrects.as_deref())
+        .collect();
+    records
+        .iter()
+        .filter(|record| !superseded.contains(record.id.as_str()))
+        .collect()
+}
+
+/// Whether the triple holds a live binding whose selected set contains the
+/// endpoint: the §2 in-scope rule that contributions are recorded only inside
+/// the selected set the worker is bound to. Frozen sets still take evidence —
+/// freezing parks taking claims, never the receipts for work already running.
+fn binding_covers(
+    connection: &Connection,
+    triple: &ScopeTriple,
+    board_id: &str,
+    item_id: &str,
+    now: i64,
+) -> Result<bool> {
+    let mut statement = connection.prepare(
+        "SELECT set_id FROM linked_bindings WHERE actor=? AND lane=? AND session=? AND \
+         status='active' AND expires_at>?",
+    )?;
+    let sets = statement
+        .query_map(
+            params![triple.actor, triple.lane, triple.session, now],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for set_id in sets {
+        let Some((_, head)) = set_head(connection, &set_id)? else {
+            continue;
+        };
+        if head
+            .members
+            .iter()
+            .any(|member| member.board_id == board_id && member.id == item_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Everything `contrib record` carries, collected by the dispatcher from its
+/// flags. Repeatable flags arrive whole (`--role` twice is a role refusal,
+/// not a parser refusal); every absence and mismatch is refused below with
+/// the field it is missing.
+#[derive(Debug, Default)]
+pub(crate) struct ContributionInput {
+    pub board: String,
+    pub id: String,
+    pub deliverable: String,
+    pub kind: String,
+    pub actor: String,
+    pub lane: Option<String>,
+    pub session: Option<String>,
+    pub host: String,
+    pub worktree: String,
+    pub branch: String,
+    pub observed_at: String,
+    pub repo: String,
+    pub commit: String,
+    pub roles: Vec<String>,
+    pub sources: Vec<String>,
+    pub mapping: String,
+    pub vias: Vec<String>,
+    pub hop_paths: Vec<String>,
+    pub consumes: String,
+    pub dep_kind: String,
+    pub verify_run: String,
+    pub repo_path: String,
+    pub evidence_refs: Vec<String>,
+    pub note: String,
+    pub corrects: String,
+    pub author: String,
+}
+
+fn contribution_receipt(row: &ContributionRow) -> serde_json::Value {
+    json!({
+        "contributionID": row.id,
+        "boardID": row.board_id,
+        "id": row.item_id,
+        "deliverable": row.deliverable,
+        "kind": row.kind,
+        "repo": row.repo,
+        "commit": row.commit_sha,
+        "role": row.role,
+        "actor": row.actor,
+        "lane": row.lane,
+        "session": row.session,
+        "host": row.host,
+        "worktree": row.worktree,
+        "branch": row.branch,
+        "observedAt": row.observed_at,
+        "recordedAt": row.recorded_at,
+        "evidenceRefs": row.evidence_refs,
+        "note": row.note,
+        "corrects": row.corrects,
+        "sources": row.sources,
+        "mapping": row.mapping,
+        "consumerPath": row.consumer_path,
+        "consumes": row.consumes,
+        "verifyRun": row.verify_run,
+        "depKind": row.dep_kind,
+        "verification": row.verification,
+        "verifyDetail": row.verify_detail,
+        "repoPath": row.repo_path,
+        "hopPaths": row.hop_paths,
+    })
+}
+
+/// Verify one code record against readable repositories, or mark it
+/// unverified. Returns `(verification, verify_detail)` and bails only for a
+/// contradiction a readable repository proves: the wrong hash in the stated
+/// repo, a non-ancestor source under a merge mapping, a missing or
+/// non-submodule hop, or a stale leaf pin.
+#[allow(clippy::too_many_arguments)]
+fn verify_code_evidence(
+    repo: &str,
+    commit: &str,
+    role: &str,
+    sources: &[String],
+    mapping: &str,
+    vias: &[String],
+    hop_paths: &[String],
+    consumes: &str,
+    repo_path: Option<&str>,
+) -> Result<(String, String)> {
+    let unverified =
+        |detail: String| -> Result<(String, String)> { Ok(("unverified".to_owned(), detail)) };
+    let Some(path) = repo_path else {
+        return unverified(format!(
+            "no --repo-path was given for repository {repo:?}: the receipt is recorded \
+             unverified, and unverified evidence satisfies no deliverable"
+        ));
+    };
+    if !git_repo_readable(path) {
+        return unverified(format!(
+            "no readable repository at {path:?} for repository {repo:?}: recorded \
+             unverified, and missing access is never success"
+        ));
+    }
+    if !git_object_present(path, commit) {
+        bail!(
+            "commit {commit:?} is not an object in repository {repo:?} at {path:?}: expected \
+             an existing full object ID, presented {commit:?} (LINKED-19). Nothing was appended"
+        );
+    }
+    for source in sources {
+        if !git_object_present(path, source) {
+            bail!(
+                "--source commit {source:?} is not an object in repository {repo:?} at \
+                 {path:?}: expected an existing full object ID, presented {source:?} \
+                 (LINKED-19). Nothing was appended"
+            );
+        }
+    }
+    if role == "integration" && mapping == "merge" {
+        for source in sources {
+            match git_is_ancestor(path, source, commit) {
+                Some(true) => {}
+                Some(false) => bail!(
+                    "integration commit {commit:?} does not absorb --source {source:?}: the \
+                     source is no ancestor of the merge in repository {repo:?} at {path:?} \
+                     (LINKED-17). Nothing was appended"
+                ),
+                None => {
+                    return unverified(format!(
+                        "ancestry in the repository at {path:?} could not be read: recorded \
+                         unverified, and missing access is never success"
+                    ));
+                }
+            }
+        }
+    }
+    if role == "candidate" {
+        let mut resolved = commit.to_owned();
+        for (index, hop) in vias.iter().enumerate() {
+            let parent: &str = if index == 0 {
+                path
+            } else {
+                let Some(hop_repo) = hop_paths.get(index - 1) else {
+                    return unverified(format!(
+                        "no machine path for dependency hop {} ({hop:?}): pass one --hop-path \
+                         per nested hop after the first, or accept an unverified receipt. \
+                         Recorded unverified; unverified evidence satisfies no deliverable",
+                        index + 1
+                    ));
+                };
+                if !git_repo_readable(hop_repo) {
+                    return unverified(format!(
+                        "no readable repository at {hop_repo:?} for dependency hop {} \
+                         ({hop:?}): recorded unverified, and missing access is never success",
+                        index + 1
+                    ));
+                }
+                hop_repo.as_str()
+            };
+            if index > 0 && !git_object_present(parent, &resolved) {
+                bail!(
+                    "dependency hop {} ({hop:?}) expects commit {resolved:?}, which is not an \
+                     object in the repository at {parent}: the recorded pin is stale \
+                     (LINKED-19). Nothing was appended",
+                    index + 1
+                );
+            }
+            match git_committed_gitlink(parent, &resolved, hop) {
+                Ok(gitlink) => resolved = gitlink,
+                Err(detail) => bail!("{detail} (LINKED-18, LINKED-19). Nothing was appended"),
+            }
+        }
+        if resolved != consumes {
+            bail!(
+                "the committed gitlinks resolve to {resolved:?}, but the record consumes \
+                 {consumes:?}: the pin is stale — expected the committed leaf, presented \
+                 {consumes:?} (LINKED-19). Nothing was appended"
+            );
+        }
+        return Ok((
+            "verified".to_owned(),
+            format!(
+                "consumer commit {commit} is an object in {repo:?} at {path}; {} committed \
+                 gitlink(s) walked to the consumed dependency commit {consumes}",
+                vias.len()
+            ),
+        ));
+    }
+    let mut detail = format!("commit {commit} is an object in {repo:?} at {path}");
+    if role == "integration" {
+        detail.push_str(&format!(
+            "; {mapping} mapping covers {} source(s)",
+            sources.len()
+        ));
+    }
+    Ok(("verified".to_owned(), detail))
+}
+
+/// Append one contribution receipt: the LINKED-15 identity (repository, full
+/// object IDs, actor/lane/session, host/worktree/branch, observed time,
+/// evidence references), exactly one of the four LINKED-16 roles, the
+/// LINKED-17 source mapping on integrations, and the LINKED-18 consumer
+/// commit with its full nested gitlink path on candidates. The lane that did
+/// the work records its own triple, and only inside the selected set that
+/// triple is bound to; every refusal below lands before any row does.
+pub(crate) fn record_contribution(
+    connection: &Connection,
+    root: &Path,
+    input: &ContributionInput,
+    now: i64,
+) -> Result<serde_json::Value> {
+    let endpoint = require_endpoint_shape(&input.board, &input.id, "recorded")?;
+    let caller = linked_caller()?;
+    if resolve_endpoint(root, &caller, &endpoint).is_none() {
+        bail!("recorded endpoint {UNAVAILABLE_ENDPOINT}");
+    }
+    let actor = input.actor.trim();
+    if actor.is_empty() || input.author.trim() != actor {
+        bail!(
+            "contributions are recorded by the lane that did the work: --as {:?} must equal \
+             --actor {:?}; no lane records for another lane's triple. Nothing was appended",
+            input.author,
+            input.actor
+        );
+    }
+    let triple = normalize_triple(
+        actor,
+        input.lane.as_deref().map(str::trim),
+        input.session.as_deref().map(str::trim),
+    );
+    if !binding_covers(connection, &triple, &endpoint.board_id, &endpoint.id, now)? {
+        bail!(
+            "no live binding for {} covers board {} item {}: record contributions only inside \
+             the selected set the worker is bound to. Nothing was appended",
+            triple_sentence(&triple),
+            endpoint.board_id,
+            endpoint.id
+        );
+    }
+    let deliverable_name = require_evidence_field(&input.deliverable, "deliverable")?;
+    let Some(declared) = deliverable(
+        connection,
+        &endpoint.board_id,
+        &endpoint.id,
+        &deliverable_name,
+    )?
+    else {
+        bail!(
+            "no deliverable {deliverable_name:?} is declared for board {} item {}: declare it \
+             with `contrib declare` first. Nothing was appended",
+            endpoint.board_id,
+            endpoint.id
+        );
+    };
+    let kind = if input.kind.trim().is_empty() {
+        "code"
+    } else {
+        input.kind.trim()
+    };
+    if kind != "code" && kind != "non-code" {
+        bail!(
+            "record kind must be code or non-code, got {:?}. Nothing was appended",
+            input.kind
+        );
+    }
+    if kind != declared.kind {
+        bail!(
+            "kind mismatch: deliverable {deliverable_name:?} is declared {}, but the record is \
+             {kind}: a non-code record never satisfies a code deliverable, and a code record \
+             never satisfies a non-code one (LINKED-21). Nothing was appended",
+            declared.kind
+        );
+    }
+    let host = require_evidence_field(&input.host, "host")?;
+    let worktree = require_evidence_field(&input.worktree, "worktree")?;
+    let branch = require_evidence_field(&input.branch, "branch")?;
+    let observed_at = require_observed_at(&input.observed_at)?;
+    for reference in &input.evidence_refs {
+        if reference.trim().is_empty() {
+            bail!(
+                "--evidence-ref names an empty reference: pass a reference or omit the flag. \
+                 Nothing was appended"
+            );
+        }
+    }
+    if kind == "non-code" {
+        return record_non_code(
+            connection,
+            &endpoint.board_id,
+            &endpoint.id,
+            &declared,
+            &triple,
+            input,
+            &host,
+            &worktree,
+            &branch,
+            observed_at,
+            now,
+        );
+    }
+    if input.roles.len() != 1 {
+        bail!("{}", role_refusal(&input.roles));
+    }
+    let role = input.roles[0].trim().to_lowercase();
+    if !EVIDENCE_ROLES.contains(&role.as_str()) {
+        bail!("{}", role_refusal(&input.roles));
+    }
+    let repo = require_repo_identity(&input.repo)?;
+    if repo != declared.repo {
+        bail!(
+            "deliverable {deliverable_name:?} pins repository {:?}, but the record names \
+             {repo:?}: the right hash at the wrong repository proves nothing (LINKED-19). \
+             Nothing was appended",
+            declared.repo
+        );
+    }
+    let commit = require_full_sha(&input.commit, "the record's commit")?;
+    let mut sources = Vec::with_capacity(input.sources.len());
+    for source in &input.sources {
+        sources.push(require_full_sha(source, "a --source commit")?);
+    }
+    sources.sort();
+    sources.dedup();
+    let mapping = match role.as_str() {
+        "integration" => {
+            if sources.is_empty() {
+                bail!(
+                    "an integration commit absorbs implementation commits: pass each absorbed \
+                     commit with --source and the shape with --mapping merge|squash. A squash \
+                     whose mapping is absent reads as unevidenced, not as self-evident \
+                     (LINKED-17). Nothing was appended"
+                );
+            }
+            match input.mapping.trim() {
+                "merge" => "merge".to_owned(),
+                "squash" => "squash".to_owned(),
+                other => {
+                    bail!("--mapping must be merge or squash, got {other:?}. Nothing was appended")
+                }
+            }
+        }
+        _ => {
+            if !sources.is_empty() || !input.mapping.trim().is_empty() {
+                bail!(
+                    "only an integration record carries --source/--mapping: a {role} record \
+                     with absorbed commits is two roles in one (LINKED-16). Nothing was \
+                     appended"
+                );
+            }
+            String::new()
+        }
+    };
+    let (vias, consumes, verify_run, dep_kind) = match role.as_str() {
+        "candidate" => {
+            if input.vias.is_empty() || input.vias.iter().any(|hop| hop.trim().is_empty()) {
+                bail!(
+                    "a consumer-side proof names the exact consumer commit tested and the exact \
+                     dependency path that reached it, including every nested hop (LINKED-18): \
+                     pass each hop with --via. A proof that names the commit but not the path, \
+                     or a path with a hop missing, satisfies nothing. Nothing was appended"
+                );
+            }
+            let dep_kind = if input.dep_kind.trim().is_empty() {
+                "submodule"
+            } else {
+                input.dep_kind.trim()
+            };
+            if dep_kind != "submodule" {
+                bail!(
+                    "dependency kind {dep_kind:?} is explicitly refused: only submodule \
+                     (gitlink) dependencies carry consumer proof. Subtrees, vendored copies, \
+                     and language-package pins are out of scope; consume the dependency as a \
+                     submodule or record no candidate. Nothing was appended"
+                );
+            }
+            (
+                input.vias.iter().map(|hop| hop.trim().to_owned()).collect(),
+                require_full_sha(&input.consumes, "the consumed dependency commit")?,
+                require_evidence_field(&input.verify_run, "verify-run")?,
+                dep_kind.to_owned(),
+            )
+        }
+        _ => {
+            let stray = [
+                ("via", !input.vias.is_empty()),
+                ("hop-path", !input.hop_paths.is_empty()),
+                ("consumes", !input.consumes.trim().is_empty()),
+                ("dep-kind", !input.dep_kind.trim().is_empty()),
+                ("verify-run", !input.verify_run.trim().is_empty()),
+            ]
+            .into_iter()
+            .find(|(_, present)| *present)
+            .map(|(flag, _)| flag);
+            if let Some(flag) = stray {
+                bail!(
+                    "only a candidate record carries --via/--hop-path/--consumes/--dep-kind/\
+                     --verify-run: a {role} record with a consumer path is two roles in one \
+                     (LINKED-16). --{flag} does not belong on it; nothing was appended"
+                );
+            }
+            (Vec::new(), String::new(), String::new(), String::new())
+        }
+    };
+    let mut hop_paths = Vec::with_capacity(input.hop_paths.len());
+    for hop_path in &input.hop_paths {
+        hop_paths.push(require_local_path(hop_path, "hop-path")?);
+    }
+    let repo_path = if input.repo_path.trim().is_empty() {
+        None
+    } else {
+        Some(require_local_path(&input.repo_path, "repo-path")?)
+    };
+    // The identical receipt retried answers the stored row instead of writing
+    // a second one.
+    let sources_json = serde_json::to_string(&sources)?;
+    let consumer_path_json = serde_json::to_string(&vias)?;
+    let hop_paths_json = serde_json::to_string(&hop_paths)?;
+    if let Some(existing) = duplicate_record(
+        connection,
+        &endpoint.board_id,
+        &endpoint.id,
+        &deliverable_name,
+        kind,
+        &repo,
+        &commit,
+        &role,
+        &sources_json,
+        &mapping,
+        &consumer_path_json,
+        &consumes,
+        repo_path.as_deref().unwrap_or(""),
+        &hop_paths_json,
+        &verify_run,
+    )? {
+        return Ok(contribution_receipt(&existing));
+    }
+    // A new baseline or candidate commit for the same deliverable and role
+    // supersedes explicitly or not at all: a changed candidate without
+    // `--corrects` proves nothing (LINKED-19). Multiple implementation
+    // commits coexist by design, and integrations accumulate with their own
+    // mappings — coverage is the union across them (LINKED-17).
+    let corrects = input.corrects.trim();
+    if corrects.is_empty()
+        && (role == "baseline" || role == "candidate")
+        && let Some(current) = current_role_record(
+            connection,
+            &endpoint.board_id,
+            &endpoint.id,
+            &deliverable_name,
+            &role,
+        )?
+        && current.commit_sha != commit
+    {
+        bail!(
+            "{role} for deliverable {deliverable_name:?} already pins commit {} (receipt {}): \
+             a different commit {commit:?} needs --corrects {} naming the receipt it \
+             supersedes. A changed candidate cannot satisfy a deliverable on its own \
+             (LINKED-19). Nothing was appended",
+            current.commit_sha,
+            current.id,
+            current.id
+        );
+    }
+    let corrects = if corrects.is_empty() {
+        None
+    } else {
+        correction_target(
+            connection,
+            &endpoint.board_id,
+            &endpoint.id,
+            &deliverable_name,
+            corrects,
+            Some(&role),
+        )?;
+        Some(corrects.to_owned())
+    };
+    let (verification, verify_detail) = verify_code_evidence(
+        &repo,
+        &commit,
+        &role,
+        &sources,
+        &mapping,
+        &vias,
+        &hop_paths,
+        &consumes,
+        repo_path.as_deref(),
+    )?;
+    insert_contribution(
+        connection,
+        &endpoint.board_id,
+        &endpoint.id,
+        &deliverable_name,
+        kind,
+        &repo,
+        &commit,
+        &role,
+        &triple,
+        &host,
+        &worktree,
+        &branch,
+        observed_at,
+        now,
+        &input.evidence_refs,
+        &input.note,
+        corrects.as_deref(),
+        &sources,
+        &mapping,
+        &vias,
+        &consumes,
+        &verify_run,
+        &dep_kind,
+        &verification,
+        &verify_detail,
+        repo_path.as_deref().unwrap_or(""),
+        &hop_paths,
+        actor,
+    )
+}
+
+/// The identical receipt retried: the same endpoint, deliverable, kind,
+/// repository, commit, role, mapping, consumer path, and verification inputs
+/// answer the stored row instead of writing a second one.
+#[allow(clippy::too_many_arguments)]
+fn duplicate_record(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    deliverable: &str,
+    kind: &str,
+    repo: &str,
+    commit: &str,
+    role: &str,
+    sources_json: &str,
+    mapping: &str,
+    consumer_path_json: &str,
+    consumes: &str,
+    repo_path: &str,
+    hop_paths_json: &str,
+    verify_run: &str,
+) -> Result<Option<ContributionRow>> {
+    // The key covers the mapping, consumer path, and verification inputs as
+    // well as the commit: a correction that keeps the commit but fixes the
+    // mapping — or re-records once a machine path is reachable — still lands
+    // as a new receipt, while an identical retry answers the stored row.
+    Ok(connection
+        .query_row(
+            "SELECT * FROM linked_contributions WHERE board_id=? AND item_id=? AND deliverable=? \
+             AND kind=? AND repo=? AND commit_sha=? AND role=? AND sources=? AND mapping=? AND \
+             consumer_path=? AND consumes=? AND repo_path=? AND hop_paths=? AND verify_run=? \
+             ORDER BY recorded_at,id LIMIT 1",
+            params![
+                board_id,
+                item_id,
+                deliverable,
+                kind,
+                repo,
+                commit,
+                role,
+                sources_json,
+                mapping,
+                consumer_path_json,
+                consumes,
+                repo_path,
+                hop_paths_json,
+                verify_run
+            ],
+            contribution_row,
+        )
+        .optional()?)
+}
+
+/// The current (non-superseded) receipt for one deliverable and role, if any.
+fn current_role_record(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    deliverable: &str,
+    role: &str,
+) -> Result<Option<ContributionRow>> {
+    let records = contributions_for(connection, board_id, item_id, deliverable)?;
+    Ok(current_records(&records)
+        .into_iter()
+        .find(|record| record.role == role)
+        .cloned())
+}
+
+/// Check one `--corrects` link: it names a live receipt for this task and
+/// deliverable (and this role, for code), which no later receipt already
+/// corrects. Corrections chain onto the current record; the corrected bytes
+/// stay stored.
+fn correction_target(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    deliverable: &str,
+    corrects: &str,
+    role: Option<&str>,
+) -> Result<()> {
+    let Some(target) = contribution_by_id(connection, corrects)? else {
+        bail!(
+            "--corrects names {corrects:?}, which is no contribution receipt: a correction is \
+             a new record naming the record it corrects. Nothing was appended"
+        );
+    };
+    if target.board_id != board_id || target.item_id != item_id || target.deliverable != deliverable
+    {
+        bail!(
+            "--corrects names {corrects:?}, which evidences board {} item {} deliverable \
+             {:?}: a correction names a record for this task and deliverable. Nothing was \
+             appended",
+            target.board_id,
+            target.item_id,
+            target.deliverable
+        );
+    }
+    if let Some(role) = role {
+        let target_role = if target.kind == "code" {
+            target.role.clone()
+        } else {
+            "non-code".to_owned()
+        };
+        if target_role != role {
+            bail!(
+                "--corrects names {corrects:?}, a {target_role} record: a {role} correction \
+                 names a {role} record. Nothing was appended"
+            );
+        }
+    }
+    let superseded: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM linked_contributions WHERE corrects=?)",
+        [corrects],
+        |row| row.get(0),
+    )?;
+    if superseded {
+        bail!(
+            "--corrects names {corrects:?}, which another record already corrects: corrections \
+             chain onto the current record. Nothing was appended"
+        );
+    }
+    Ok(())
+}
+
+/// Append a `non-code` receipt: the same actor/lane/session, task, and
+/// evidence discipline as LINKED-15, exempt from the object-ID and role rules
+/// (LINKED-21). A `non-code` record never satisfies a code deliverable — the
+/// kind gate in [`record_contribution`] already refused the cross — and there
+/// is no commit to verify, so verification is recorded as having nothing to
+/// check rather than as a passing check.
+#[allow(clippy::too_many_arguments)]
+fn record_non_code(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    declared: &DeliverableRow,
+    triple: &ScopeTriple,
+    input: &ContributionInput,
+    host: &str,
+    worktree: &str,
+    branch: &str,
+    observed_at: i64,
+    now: i64,
+) -> Result<serde_json::Value> {
+    let stray = [
+        ("commit", !input.commit.trim().is_empty()),
+        ("role", !input.roles.is_empty()),
+        ("repo", !input.repo.trim().is_empty()),
+        ("repo-path", !input.repo_path.trim().is_empty()),
+        ("source", !input.sources.is_empty()),
+        ("mapping", !input.mapping.trim().is_empty()),
+        ("via", !input.vias.is_empty()),
+        ("hop-path", !input.hop_paths.is_empty()),
+        ("consumes", !input.consumes.trim().is_empty()),
+        ("dep-kind", !input.dep_kind.trim().is_empty()),
+        ("verify-run", !input.verify_run.trim().is_empty()),
+    ]
+    .into_iter()
+    .find(|(_, present)| *present)
+    .map(|(flag, _)| flag);
+    if let Some(flag) = stray {
+        bail!(
+            "a non-code record carries no commit and declares no role: it is exempt from the \
+             object-ID and role rules of LINKED-15..LINKED-19 (LINKED-21). --{flag} does not \
+             belong on it. Nothing was appended"
+        );
+    }
+    if input.note.trim().is_empty() && input.evidence_refs.is_empty() {
+        bail!(
+            "a non-code record still carries evidence: pass --note or at least one \
+             --evidence-ref naming the decision, review, document, or approval. Nothing was \
+             appended"
+        );
+    }
+    let corrects = input.corrects.trim();
+    let corrects = if corrects.is_empty() {
+        None
+    } else {
+        correction_target(
+            connection,
+            board_id,
+            item_id,
+            &declared.name,
+            corrects,
+            None,
+        )?;
+        Some(corrects.to_owned())
+    };
+    insert_contribution(
+        connection,
+        board_id,
+        item_id,
+        &declared.name,
+        "non-code",
+        "",
+        "",
+        "",
+        triple,
+        host,
+        worktree,
+        branch,
+        observed_at,
+        now,
+        &input.evidence_refs,
+        input.note.trim(),
+        corrects.as_deref(),
+        &[],
+        "",
+        &[],
+        "",
+        "",
+        "",
+        "verified",
+        "non-code record: no commit to verify; the lane's evidence stands as recorded",
+        "",
+        &[],
+        triple.actor.as_str(),
+    )
+}
+
+/// Store one validated receipt and join the registry audit chain, then answer
+/// the stored row.
+#[allow(clippy::too_many_arguments)]
+fn insert_contribution(
+    connection: &Connection,
+    board_id: &str,
+    item_id: &str,
+    deliverable: &str,
+    kind: &str,
+    repo: &str,
+    commit: &str,
+    role: &str,
+    triple: &ScopeTriple,
+    host: &str,
+    worktree: &str,
+    branch: &str,
+    observed_at: i64,
+    now: i64,
+    evidence_refs: &[String],
+    note: &str,
+    corrects: Option<&str>,
+    sources: &[String],
+    mapping: &str,
+    consumer_path: &[String],
+    consumes: &str,
+    verify_run: &str,
+    dep_kind: &str,
+    verification: &str,
+    verify_detail: &str,
+    repo_path: &str,
+    hop_paths: &[String],
+    actor: &str,
+) -> Result<serde_json::Value> {
+    let id = format!("le-{}", uuid::Uuid::new_v4().simple());
+    let evidence_refs_json = serde_json::to_string(
+        &evidence_refs
+            .iter()
+            .map(|reference| reference.trim().to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    let sources_json = serde_json::to_string(sources)?;
+    let consumer_path_json = serde_json::to_string(consumer_path)?;
+    let hop_paths_json = serde_json::to_string(hop_paths)?;
+    connection.execute(
+        "INSERT INTO linked_contributions(id,board_id,item_id,deliverable,kind,repo,commit_sha,\
+         role,actor,lane,session,host,worktree,branch,observed_at,recorded_at,evidence_refs,\
+         note,corrects,sources,mapping,consumer_path,consumes,verify_run,dep_kind,\
+         verification,verify_detail,repo_path,hop_paths) \
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            id,
+            board_id,
+            item_id,
+            deliverable,
+            kind,
+            repo,
+            commit,
+            role,
+            triple.actor,
+            triple.lane,
+            triple.session,
+            host,
+            worktree,
+            branch,
+            observed_at,
+            now,
+            evidence_refs_json,
+            note,
+            corrects,
+            sources_json,
+            mapping,
+            consumer_path_json,
+            consumes,
+            verify_run,
+            dep_kind,
+            verification,
+            verify_detail,
+            repo_path,
+            hop_paths_json,
+        ],
+    )?;
+    crate::audit::append_registry_event(
+        connection,
+        &id,
+        "linked_contribution_recorded",
+        actor,
+        &json!({
+            "contributionID": id,
+            "boardID": board_id,
+            "id": item_id,
+            "deliverable": deliverable,
+            "kind": kind,
+            "role": role,
+            "commit": commit,
+            "verification": verification,
+        })
+        .to_string(),
+        now,
+    )?;
+    let stored = contribution_by_id(connection, &id)?.context("contribution was not stored")?;
+    Ok(contribution_receipt(&stored))
+}
+
+/// The checkable core of one code deliverable, assembled from its current
+/// (non-superseded) receipts: whether each of the four roles carries verified
+/// proof, and which unverified receipts are waiting on machine access. Every
+/// current integration keeps its own mapping, so a squash and a later merge
+/// each retain theirs (LINKED-17); coverage is the union across them.
+#[derive(Debug, Default)]
+struct CodeEvidence {
+    baseline: bool,
+    implementations: Vec<String>,
+    integrations: Vec<(String, Vec<String>)>,
+    candidate: bool,
+    unverified: Vec<String>,
+}
+
+/// What a code deliverable still lacks: one sentence per gap, so a close
+/// names each open deliverable with its reason (LINKED-20). Unverified
+/// receipts are listed too — they read as partial, never as joint
+/// (LINKED-19, LINKED-20) — as is an integration whose mapping leaves
+/// recorded implementation commits uncovered (LINKED-17).
+fn code_missing(view: &CodeEvidence, deliverable: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !view.baseline {
+        missing.push(format!(
+            "deliverable {deliverable:?}: no verified baseline (the starting HEAD) is recorded"
+        ));
+    }
+    if view.implementations.is_empty() {
+        missing.push(format!(
+            "deliverable {deliverable:?}: no verified implementation commits are recorded"
+        ));
+    }
+    if view.integrations.is_empty() {
+        missing.push(format!(
+            "deliverable {deliverable:?}: no verified integration with its source mapping is \
+             recorded"
+        ));
+    } else {
+        let unmapped: Vec<&str> = view
+            .implementations
+            .iter()
+            .filter(|commit| {
+                !view
+                    .integrations
+                    .iter()
+                    .any(|(_, sources)| sources.contains(commit))
+            })
+            .map(String::as_str)
+            .collect();
+        if !unmapped.is_empty() {
+            let covering: Vec<&str> = view
+                .integrations
+                .iter()
+                .map(|(integrated, _)| integrated.as_str())
+                .collect();
+            missing.push(format!(
+                "deliverable {deliverable:?}: integrations {} leave unmapped implementation \
+                 commits {}: record the explicit mapping (LINKED-17)",
+                covering.join(", "),
+                unmapped.join(", ")
+            ));
+        }
+    }
+    if !view.candidate {
+        missing.push(format!(
+            "deliverable {deliverable:?}: no verified consumer candidate with its complete \
+             nested path is recorded"
+        ));
+    }
+    for pending in &view.unverified {
+        missing.push(format!(
+            "deliverable {deliverable:?}: {pending}; unverified evidence satisfies nothing"
+        ));
+    }
+    missing
+}
+
+/// One deliverable with its receipts and its verdict: evidenced only when
+/// every role carries exact verified proof (LINKED-20).
+struct DeliverableEvidence {
+    row: DeliverableRow,
+    records: Vec<ContributionRow>,
+    missing: Vec<String>,
+    evidenced: bool,
+}
+
+fn deliverable_evidence(
+    connection: &Connection,
+    row: &DeliverableRow,
+) -> Result<DeliverableEvidence> {
+    let records = contributions_for(connection, &row.board_id, &row.item_id, &row.name)?;
+    let current = current_records(&records);
+    let (missing, evidenced) = if row.kind == "non-code" {
+        if current.is_empty() {
+            (
+                vec![format!(
+                    "deliverable {:?}: no non-code record (decision, review, document, or \
+                     approval) is recorded",
+                    row.name
+                )],
+                false,
+            )
+        } else {
+            (Vec::new(), true)
+        }
+    } else {
+        let mut view = CodeEvidence::default();
+        for record in &current {
+            if record.verification != "verified" {
+                view.unverified.push(format!(
+                    "receipt {} ({} {}) is {}: {}",
+                    record.id,
+                    record.role,
+                    record.commit_sha,
+                    record.verification,
+                    record.verify_detail
+                ));
+                continue;
+            }
+            match record.role.as_str() {
+                "baseline" => view.baseline = true,
+                "implementation" => view.implementations.push(record.commit_sha.clone()),
+                "integration" => {
+                    view.integrations
+                        .push((record.commit_sha.clone(), record.sources.clone()));
+                }
+                "candidate" => view.candidate = true,
+                _ => {}
+            }
+        }
+        view.implementations.sort();
+        view.implementations.dedup();
+        let missing = code_missing(&view, &row.name);
+        let evidenced = missing.is_empty();
+        (missing, evidenced)
+    };
+    Ok(DeliverableEvidence {
+        row: row.clone(),
+        records,
+        missing,
+        evidenced,
+    })
+}
+
+fn deliverable_history(evidence: &DeliverableEvidence) -> serde_json::Value {
+    json!({
+        "deliverable": evidence.row.name,
+        "kind": evidence.row.kind,
+        "repo": evidence.row.repo,
+        "declaredBy": evidence.row.declared_by,
+        "declaredAt": evidence.row.declared_at,
+        "evidenced": evidence.evidenced,
+        "missing": evidence.missing,
+        "records": evidence.records.iter().map(contribution_receipt).collect::<Vec<_>>(),
+    })
+}
+
+/// Per-side history: every deliverable of one endpoint with every receipt,
+/// read from either board's side without writing anything and without marking
+/// the untouched peer as worked — a read here appends no row anywhere.
+pub(crate) fn show_contributions(
+    connection: &Connection,
+    root: &Path,
+    board: &str,
+    id: &str,
+) -> Result<serde_json::Value> {
+    let endpoint = require_endpoint_shape(board, id, "queried")?;
+    let caller = linked_caller()?;
+    if resolve_endpoint(root, &caller, &endpoint).is_none() {
+        bail!("queried endpoint {UNAVAILABLE_ENDPOINT}");
+    }
+    let mut deliverables = Vec::new();
+    for row in deliverables_for(connection, &endpoint.board_id, &endpoint.id)? {
+        deliverables.push(deliverable_history(&deliverable_evidence(
+            connection, &row,
+        )?));
+    }
+    Ok(json!({
+        "boardID": endpoint.board_id,
+        "id": endpoint.id,
+        "deliverables": deliverables,
+    }))
+}
+
+/// Per-deliverable evidence status for one endpoint: what reads as evidenced
+/// and, for the rest, the exact gap. Partial evidence reads as partial, by
+/// deliverable, never as joint (LINKED-20).
+pub(crate) fn contribution_status(
+    connection: &Connection,
+    root: &Path,
+    board: &str,
+    id: &str,
+) -> Result<serde_json::Value> {
+    let endpoint = require_endpoint_shape(board, id, "queried")?;
+    let caller = linked_caller()?;
+    if resolve_endpoint(root, &caller, &endpoint).is_none() {
+        bail!("queried endpoint {UNAVAILABLE_ENDPOINT}");
+    }
+    let mut deliverables = Vec::new();
+    let mut evidenced = true;
+    for row in deliverables_for(connection, &endpoint.board_id, &endpoint.id)? {
+        let evidence = deliverable_evidence(connection, &row)?;
+        evidenced &= evidence.evidenced;
+        deliverables.push(json!({
+            "deliverable": evidence.row.name,
+            "kind": evidence.row.kind,
+            "repo": evidence.row.repo,
+            "evidenced": evidence.evidenced,
+            "records": evidence.records.len(),
+            "missing": evidence.missing,
+        }));
+    }
+    Ok(json!({
+        "boardID": endpoint.board_id,
+        "id": endpoint.id,
+        "evidenced": evidenced && !deliverables.is_empty(),
+        "deliverables": deliverables,
+    }))
+}
+
+fn closure_row(row: &rusqlite::Row) -> rusqlite::Result<(String, String, i64, String)> {
+    Ok((
+        row.get("pairing_id")?,
+        row.get("closed_by")?,
+        row.get("closed_at")?,
+        row.get("reason")?,
+    ))
+}
+
+fn closure_receipt(
+    pairing: &CompanionRow,
+    closed_by: &str,
+    closed_at: i64,
+    reason: &str,
+) -> serde_json::Value {
+    json!({
+        "pairingID": pairing.id,
+        "boardA": {"boardID": pairing.board_a_id, "id": pairing.item_a_id},
+        "boardB": {"boardID": pairing.board_b_id, "id": pairing.item_b_id},
+        "closedBy": closed_by,
+        "closedAt": closed_at,
+        "reason": reason,
+    })
+}
+
+/// Close joint work for one live pairing: every deliverable declared on both
+/// endpoints must carry exact verified evidence, or the close is refused
+/// naming each open deliverable with its reason — nothing closes and no
+/// evidence is rewritten (LINKED-20). The identical close retried answers
+/// the stored closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn close_joint(
+    connection: &Connection,
+    root: &Path,
+    a_board: &str,
+    a_id: &str,
+    b_board: &str,
+    b_id: &str,
+    actor: &str,
+    reason: &str,
+    now: i64,
+) -> Result<serde_json::Value> {
+    let first = require_endpoint_shape(a_board, a_id, "first")?;
+    let second = require_endpoint_shape(b_board, b_id, "second")?;
+    if first == second {
+        bail!(
+            "cannot close joint work of an item with itself: the two endpoints name the same (boardID, id)"
+        );
+    }
+    let caller = linked_caller()?;
+    let Some(resolved_first) = resolve_endpoint(root, &caller, &first) else {
+        bail!("first endpoint {UNAVAILABLE_ENDPOINT}");
+    };
+    let Some(resolved_second) = resolve_endpoint(root, &caller, &second) else {
+        bail!("second endpoint {UNAVAILABLE_ENDPOINT}");
+    };
+    let (one, two) = order_resolved(resolved_first, resolved_second);
+    let Some(pairing) = live_pairing(
+        connection,
+        &one.board_id,
+        &one.item_id,
+        &two.board_id,
+        &two.item_id,
+    )?
+    else {
+        if retired_pairing(
+            connection,
+            &one.board_id,
+            &one.item_id,
+            &two.board_id,
+            &two.item_id,
+        )?
+        .is_some()
+        {
+            bail!(
+                "the pairing of board {} item {} with board {} item {} is retired: joint work \
+                 closes only on a live pairing. Nothing was closed",
+                one.board_id,
+                one.item_id,
+                two.board_id,
+                two.item_id
+            );
+        }
+        bail!(
+            "no live pairing pairs board {} item {} with board {} item {}: joint work closes \
+             only for paired endpoints. Nothing was closed",
+            one.board_id,
+            one.item_id,
+            two.board_id,
+            two.item_id
+        );
+    };
+    if let Some((_, closed_by, closed_at, stored_reason)) = connection
+        .query_row(
+            "SELECT * FROM linked_closures WHERE pairing_id=?",
+            [&pairing.id],
+            closure_row,
+        )
+        .optional()?
+    {
+        // The identical close retried: answer the stored closure.
+        return Ok(closure_receipt(
+            &pairing,
+            &closed_by,
+            closed_at,
+            &stored_reason,
+        ));
+    }
+    let path_one = root.join("boards").join(format!("{}.db", one.board_id));
+    let path_two = root.join("boards").join(format!("{}.db", two.board_id));
+    require_pairing_authority(&caller, &one, &path_one, &two, &path_two)?;
+    let mut open = Vec::new();
+    for (board_id, item_id) in [
+        (one.board_id.clone(), one.item_id.clone()),
+        (two.board_id.clone(), two.item_id.clone()),
+    ] {
+        let rows = deliverables_for(connection, &board_id, &item_id)?;
+        if rows.is_empty() {
+            open.push(format!(
+                "board {board_id} item {item_id}: no deliverables are declared — declare each \
+                 deliverable with `contrib declare` and evidence it first"
+            ));
+        }
+        for row in &rows {
+            let evidence = deliverable_evidence(connection, row)?;
+            for gap in &evidence.missing {
+                open.push(format!("board {board_id} item {item_id}: {gap}"));
+            }
+        }
+    }
+    if !open.is_empty() {
+        bail!(
+            "joint work is not closable: {}. Nothing was closed",
+            open.join("; ")
+        );
+    }
+    let actor = actor.trim();
+    if actor.is_empty() {
+        bail!(
+            "a close missing its closing actor is refused naming the missing field: pass \
+             --as. Nothing was closed"
+        );
+    }
+    connection.execute(
+        "INSERT INTO linked_closures(pairing_id,closed_by,closed_at,reason) VALUES(?,?,?,?)",
+        params![pairing.id, actor, now, reason.trim()],
+    )?;
+    crate::audit::append_registry_event(
+        connection,
+        &pairing.id,
+        "linked_joint_closed",
+        actor,
+        &json!({
+            "pairingID": pairing.id,
+            "boardA": {"boardID": pairing.board_a_id, "id": pairing.item_a_id},
+            "boardB": {"boardID": pairing.board_b_id, "id": pairing.item_b_id},
+        })
+        .to_string(),
+        now,
+    )?;
+    Ok(closure_receipt(&pairing, actor, now, reason.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2101,5 +3883,272 @@ mod tests {
         assert_eq!(retired.id, "lc-1");
         // The reverse direction addresses the same stored row.
         assert!(live_pairing(&connection, "b", "t-2", "a", "t-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn evidence_sha_rule_takes_full_ids_and_refuses_short_and_moving() {
+        let full40 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        assert_eq!(
+            require_full_sha(full40, "the record's commit").unwrap(),
+            full40
+        );
+        let upper = "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709";
+        assert_eq!(
+            require_full_sha(upper, "the record's commit").unwrap(),
+            full40,
+            "object IDs lowercase on the way in"
+        );
+        let full64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            require_full_sha(full64, "the record's commit").unwrap(),
+            full64
+        );
+        for moving in ["latest", "HEAD", "head"] {
+            let refused = require_full_sha(moving, "the record's commit").unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("moving pointer"),
+                "a moving pointer is refused as proof: {refused:#}"
+            );
+        }
+        let short = require_full_sha("da39a3e", "the record's commit").unwrap_err();
+        assert!(
+            format!("{short:#}").contains("shortened"),
+            "short hashes are refused, never expanded: {short:#}"
+        );
+        for bad in [
+            "",
+            "xyz",
+            "main",
+            "da39a3ee5e6b4b0d3255bfef95601890afd8070g",
+        ] {
+            let refused = require_full_sha(bad, "the record's commit").unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("full 40- or 64-character"),
+                "a non-ID is refused: {bad:?} got {refused:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_refusal_names_the_four_roles_and_quotes_what_was_declared() {
+        for roles in [
+            Vec::new(),
+            vec!["baseline".to_owned(), "candidate".to_owned()],
+            vec!["review".to_owned()],
+        ] {
+            let refused = role_refusal(&roles);
+            for role in EVIDENCE_ROLES {
+                assert!(
+                    refused.contains(role),
+                    "the refusal names all four roles: {refused}"
+                );
+            }
+        }
+        assert!(role_refusal(&[]).contains("none"), "no role quotes none");
+        let two = role_refusal(&["baseline".to_owned(), "candidate".to_owned()]);
+        assert!(
+            two.contains("\"baseline\"") && two.contains("\"candidate\""),
+            "two roles are both quoted: {two}"
+        );
+    }
+
+    #[test]
+    fn repo_identity_refuses_empty_and_credential_urls() {
+        assert_eq!(
+            require_repo_identity("acme/billing").unwrap(),
+            "acme/billing"
+        );
+        assert_eq!(
+            require_repo_identity("https://github.com/acme/billing").unwrap(),
+            "https://github.com/acme/billing",
+            "a bare URL without userinfo is a stable identity"
+        );
+        let empty = require_repo_identity("  ").unwrap_err();
+        assert!(
+            format!("{empty:#}").contains("missing"),
+            "empty identity names the missing field: {empty:#}"
+        );
+        let creds = require_repo_identity("https://user:pass@github.com/acme/billing").unwrap_err();
+        assert!(
+            format!("{creds:#}").contains("credentials"),
+            "userinfo URLs are refused before they land: {creds:#}"
+        );
+    }
+
+    #[test]
+    fn machine_paths_must_be_local_and_observed_at_epoch_millis() {
+        assert_eq!(
+            require_local_path("/tmp/checkout", "repo-path").unwrap(),
+            "/tmp/checkout"
+        );
+        let remote = require_local_path("ssh://host/srv/repo", "repo-path").unwrap_err();
+        assert!(
+            format!("{remote:#}").contains("local filesystem"),
+            "remote machine paths are out of scope: {remote:#}"
+        );
+        assert_eq!(require_observed_at("1790900000000").unwrap(), 1790900000000);
+        for bad in ["0", "-7", "yesterday", ""] {
+            assert!(
+                require_observed_at(bad).is_err(),
+                "observed time {bad:?} is refused"
+            );
+        }
+    }
+
+    fn fake_record(
+        id: &str,
+        role: &str,
+        commit: &str,
+        verification: &str,
+        corrects: Option<&str>,
+    ) -> ContributionRow {
+        ContributionRow {
+            id: id.to_owned(),
+            board_id: "b".to_owned(),
+            item_id: "t-1".to_owned(),
+            deliverable: "d".to_owned(),
+            kind: "code".to_owned(),
+            repo: "acme/billing".to_owned(),
+            commit_sha: commit.to_owned(),
+            role: role.to_owned(),
+            actor: "w".to_owned(),
+            lane: "driver".to_owned(),
+            session: "s1".to_owned(),
+            host: "hax".to_owned(),
+            worktree: "/work".to_owned(),
+            branch: "wt/x".to_owned(),
+            observed_at: 7,
+            recorded_at: 8,
+            evidence_refs: Vec::new(),
+            note: String::new(),
+            corrects: corrects.map(str::to_owned),
+            sources: Vec::new(),
+            mapping: String::new(),
+            consumer_path: Vec::new(),
+            consumes: String::new(),
+            verify_run: String::new(),
+            dep_kind: String::new(),
+            verification: verification.to_owned(),
+            verify_detail: String::new(),
+            repo_path: String::new(),
+            hop_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn superseded_receipts_count_for_nothing() {
+        let records = vec![
+            fake_record("le-1", "candidate", "a", "verified", None),
+            fake_record("le-2", "candidate", "b", "verified", Some("le-1")),
+        ];
+        let current = current_records(&records);
+        assert_eq!(
+            current
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["le-2"],
+            "the corrected receipt stays stored but counts for nothing"
+        );
+    }
+
+    #[test]
+    fn code_missing_names_each_gap_and_nothing_when_complete() {
+        let empty = code_missing(&CodeEvidence::default(), "d");
+        assert_eq!(
+            empty.len(),
+            4,
+            "baseline, implementation, integration, candidate: {empty:?}"
+        );
+        let complete = CodeEvidence {
+            baseline: true,
+            implementations: vec!["c1".to_owned(), "c2".to_owned()],
+            integrations: vec![("i".to_owned(), vec!["c1".to_owned(), "c2".to_owned()])],
+            candidate: true,
+            unverified: Vec::new(),
+        };
+        assert!(code_missing(&complete, "d").is_empty());
+        let partial = CodeEvidence {
+            integrations: vec![("i".to_owned(), vec!["c1".to_owned()])],
+            ..complete_shallow()
+        };
+        let gaps = code_missing(&partial, "d");
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("c2") && gap.contains("unmapped")),
+            "an integration that absorbs unmapped commits satisfies nothing: {gaps:?}"
+        );
+        let waiting = CodeEvidence {
+            unverified: vec![
+                "receipt le-9 (candidate c3) is unverified: no --repo-path".to_owned(),
+            ],
+            ..complete_shallow()
+        };
+        let gaps = code_missing(&waiting, "d");
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("le-9") && gap.contains("satisfies nothing")),
+            "unverified evidence reads as partial, never as joint: {gaps:?}"
+        );
+        let split = CodeEvidence {
+            integrations: vec![
+                ("i1".to_owned(), vec!["c1".to_owned()]),
+                ("i2".to_owned(), vec!["c2".to_owned()]),
+            ],
+            ..complete_shallow()
+        };
+        assert!(
+            code_missing(&split, "d").is_empty(),
+            "coverage is the union across current integrations"
+        );
+    }
+
+    fn complete_shallow() -> CodeEvidence {
+        CodeEvidence {
+            baseline: true,
+            implementations: vec!["c1".to_owned(), "c2".to_owned()],
+            integrations: Vec::new(),
+            candidate: true,
+            unverified: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn binding_covers_only_the_bound_triple_and_its_members() {
+        let (_root, connection) = temp_registry();
+        connection
+            .execute(
+                "INSERT INTO linked_sets(id,created_by,created_at) VALUES('joint-u','op',10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO linked_set_revisions(seq,set_id,revision,kind,author,reason,members,\
+                 created_at,prev_hash,event_hash,payload) \
+                 VALUES(1,'joint-u',1,'create','op','x','[{\"boardID\":\"b\",\"id\":\"t-1\"}]',11,\
+                 'p','e','{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO linked_bindings(id,set_id,actor,lane,session,revision_checked,\
+                 status,created_at,expires_at) \
+                 VALUES('bb-1','joint-u','w','driver','s1',1,'active',12,9999999999999)",
+                [],
+            )
+            .unwrap();
+        let triple = normalize_triple("w", Some("driver"), Some("s1"));
+        assert!(binding_covers(&connection, &triple, "b", "t-1", 100).unwrap());
+        assert!(
+            !binding_covers(&connection, &triple, "b", "t-2", 100).unwrap(),
+            "membership outside the selected set is not covered"
+        );
+        let lookalike = normalize_triple("w", Some("other"), Some("s1"));
+        assert!(
+            !binding_covers(&connection, &lookalike, "b", "t-1", 100).unwrap(),
+            "another lane's triple is not covered"
+        );
     }
 }

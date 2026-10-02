@@ -100,6 +100,7 @@ integration_targets=(
     identity_e2e
     worker_identity_e2e
     linked_e2e
+    linked_evidence_e2e
     e2e
 )
 
