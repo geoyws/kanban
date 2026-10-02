@@ -3689,6 +3689,15 @@ fn bind_registration_token(connection: &Connection, token: &str) -> Result<()> {
 /// registration incarnation: it is bound in the SAME transaction as the
 /// CROSS step (`BOARD_SCHEMA_VERSION` 39), so no CROSS-aware registered board
 /// ever commits without its token (ADR-057 §3).
+///
+/// A file at version 0 is a newborn, and it is born whole: every step up to
+/// `limit` runs in ONE transaction, and `user_version` goes from 0 to `limit`
+/// at its commit. Stepped one commit at a time, a newborn passed through
+/// every version below the CROSS step on its way to birth, and a reader in
+/// another process — `init`'s CROSS probe — could not tell it from a legacy
+/// file (ADR-056 §5: fresh files are born CROSS-aware). A birth that fails
+/// part-way now leaves version 0, never a file that reads as pre-CROSS.
+/// An existing file still climbs one committed step at a time.
 fn migrate_through(
     connection: &mut Connection,
     migrations: &[&str],
@@ -3716,63 +3725,81 @@ fn migrate_through(
             transaction.commit()?;
             return Ok(());
         }
-        // The rebuild guard belongs to the v31 step alone (index 30), never
-        // to "whatever migration is last": a later version must not inherit
-        // the rewind skip just by existing.
-        let board_v31_step = current + 1 == 31;
-        let v31_columns = board_v31_step && board_v31_columns_exist(&transaction)?;
-        let v31_rewind = v31_columns && board_v31_shape_exists(&transaction)?;
-        // The v32 ALTERs cannot re-run against columns that already stand,
-        // so a board rewound past its own physical v32 shape skips the step
-        // instead of failing on a duplicate column.
-        let board_v32_step = current + 1 == 32;
-        let v32_stands = board_v32_step && board_v32_result_shape_exists(&transaction)?;
-        // The v34 ALTER cannot re-run against a column that already stands,
-        // so a board rewound past its own physical v34 shape skips the step
-        // instead of failing on a duplicate column.
-        let board_v34_step = current + 1 == 34;
-        let v34_stands = board_v34_step && board_v34_result_shape_exists(&transaction)?;
-        // The v35 ALTER, for the same reason and by the same guard.
-        let board_v35_step = current + 1 == 35;
-        let v35_stands = board_v35_step && board_v35_result_shape_exists(&transaction)?;
-        // The v38 identity columns are added one by one where missing, ahead
-        // of the step's own batch (see `BOARD_V38`).
-        if current + 1 == 38 {
-            apply_board_v38_columns(&transaction)?;
+        let newborn = current == 0;
+        loop {
+            apply_migration_step(&transaction, migrations, current, bind)?;
+            current += 1;
+            if !newborn || current >= limit {
+                break;
+            }
         }
-        // The CROSS steps: board v39 and registry v16. Each ALTER is skipped
-        // when its column already stands (a rewound file); the shape test is
-        // table-specific, so the other ladder's step never matches (a board
-        // has no `boards` table, a registry no `tasks`).
-        let board_v39_step = current + 1 == 39 && table_has_column(&transaction, "tasks", "id")?;
-        let v39_column = board_v39_step && table_has_column(&transaction, "tasks", "incarnation")?;
-        let registry_v16_step =
-            current + 1 == 16 && table_has_column(&transaction, "boards", "board_path")?;
-        let v16_column =
-            registry_v16_step && table_has_column(&transaction, "boards", "registration_token")?;
-        if v39_column {
-            transaction.execute_batch(BOARD_CROSS_REWIND)?;
-        } else if v16_column {
-            transaction.execute_batch(REGISTRY_CROSS_REWIND)?;
-        } else if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
-            if v31_columns {
-                transaction.execute_batch(
+        transaction.pragma_update(None, "user_version", current as i64)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// One step of the ladder, `current` to `current + 1`, inside the caller's
+/// transaction. The caller stamps `user_version` and commits.
+fn apply_migration_step(
+    transaction: &Connection,
+    migrations: &[&str],
+    current: usize,
+    bind: Option<&str>,
+) -> Result<()> {
+    // The rebuild guard belongs to the v31 step alone (index 30), never
+    // to "whatever migration is last": a later version must not inherit
+    // the rewind skip just by existing.
+    let board_v31_step = current + 1 == 31;
+    let v31_columns = board_v31_step && board_v31_columns_exist(transaction)?;
+    let v31_rewind = v31_columns && board_v31_shape_exists(transaction)?;
+    // The v32 ALTERs cannot re-run against columns that already stand,
+    // so a board rewound past its own physical v32 shape skips the step
+    // instead of failing on a duplicate column.
+    let board_v32_step = current + 1 == 32;
+    let v32_stands = board_v32_step && board_v32_result_shape_exists(transaction)?;
+    // The v34 ALTER cannot re-run against a column that already stands,
+    // so a board rewound past its own physical v34 shape skips the step
+    // instead of failing on a duplicate column.
+    let board_v34_step = current + 1 == 34;
+    let v34_stands = board_v34_step && board_v34_result_shape_exists(transaction)?;
+    // The v35 ALTER, for the same reason and by the same guard.
+    let board_v35_step = current + 1 == 35;
+    let v35_stands = board_v35_step && board_v35_result_shape_exists(transaction)?;
+    // The v38 identity columns are added one by one where missing, ahead
+    // of the step's own batch (see `BOARD_V38`).
+    if current + 1 == 38 {
+        apply_board_v38_columns(transaction)?;
+    }
+    // The CROSS steps: board v39 and registry v16. Each ALTER is skipped
+    // when its column already stands (a rewound file); the shape test is
+    // table-specific, so the other ladder's step never matches (a board
+    // has no `boards` table, a registry no `tasks`).
+    let board_v39_step = current + 1 == 39 && table_has_column(transaction, "tasks", "id")?;
+    let v39_column = board_v39_step && table_has_column(transaction, "tasks", "incarnation")?;
+    let registry_v16_step =
+        current + 1 == 16 && table_has_column(transaction, "boards", "board_path")?;
+    let v16_column =
+        registry_v16_step && table_has_column(transaction, "boards", "registration_token")?;
+    if v39_column {
+        transaction.execute_batch(BOARD_CROSS_REWIND)?;
+    } else if v16_column {
+        transaction.execute_batch(REGISTRY_CROSS_REWIND)?;
+    } else if !v31_rewind && !v32_stands && !v34_stands && !v35_stands {
+        if v31_columns {
+            transaction.execute_batch(
                     "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
                 )?;
-            }
-            transaction.execute_batch(migrations[current])?;
-            if v31_columns {
-                transaction.execute_batch(
+        }
+        transaction.execute_batch(migrations[current])?;
+        if v31_columns {
+            transaction.execute_batch(
                     "UPDATE attention SET\n                       check_question=(SELECT check_question FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_choices=(SELECT check_choices FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_answer=(SELECT check_answer FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_explanation=(SELECT check_explanation FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_about=(SELECT check_about FROM attention_v31_check_backup b WHERE b.id=attention.id)\n                     WHERE id IN (SELECT id FROM attention_v31_check_backup);\n                     DROP TABLE attention_v31_check_backup;",
                 )?;
-            }
         }
-        if board_v39_step && let Some(token) = bind {
-            bind_registration_token(&transaction, token)?;
-        }
-        transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
-        transaction.commit()?;
-        current += 1;
+    }
+    if board_v39_step && let Some(token) = bind {
+        bind_registration_token(transaction, token)?;
     }
     Ok(())
 }
@@ -6116,6 +6143,48 @@ mod tests {
             probe_board_schema(&half).expect("probe the finished board"),
             BoardSchema::Board
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A newborn registry is born whole or not at all (ADR-056 §5). Stepped
+    /// one commit at a time, a birth that stopped part-way — here at the v15
+    /// step, which a planted `workers` table makes fail — left a file at
+    /// version 14 with every earlier table standing: exactly a pre-CROSS
+    /// legacy registry to `init`'s CROSS probe, which then demanded the root
+    /// to itself for an upgrade that was never there.
+    #[test]
+    fn a_newborn_registry_never_commits_part_of_its_ladder() {
+        let root = std::env::temp_dir().join(format!("kanban-newborn-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("registry.db");
+        let planted = Connection::open(&path).expect("create the newborn");
+        planted
+            .execute_batch("CREATE TABLE workers(id TEXT);")
+            .expect("plant a table the v15 step collides with");
+        drop(planted);
+        assert_eq!(stored_schema_version(&path), Some(0));
+
+        assert!(
+            open_registry(&path).is_err(),
+            "the v15 step must fail against the planted table"
+        );
+        assert_eq!(
+            stored_schema_version(&path),
+            Some(0),
+            "a failed birth committed part of the ladder"
+        );
+        let check = Connection::open(&path).expect("reopen the newborn");
+        assert!(
+            !table_has_column(&check, "workspaces", "root_path").expect("inspect"),
+            "the v1 step outlived the failed birth"
+        );
+        check
+            .execute_batch("DROP TABLE workers;")
+            .expect("remove the planted table");
+        drop(check);
+
+        drop(open_registry(&path).expect("birth the registry"));
+        assert_eq!(stored_schema_version(&path), Some(REGISTRY_SCHEMA_VERSION));
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -136,6 +136,14 @@ binaries are excluded by the source board and registry schema gates chosen for t
    Scratch SQLite BEGIN IMMEDIATE remains its local writer serialization. A token-less registered board
    inside a root is NOT scratch and stays at its old schema until owner init upgrades it under root
    exclusivity.
+   A newborn board or registry file (version 0) is no legacy file and is built WHOLE: every step up to
+   its open's ceiling runs in ONE transaction, and user_version goes from 0 to that ceiling at its commit,
+   so no reader in another process ever observes a newborn at a pre-CROSS version, and a birth that fails
+   part-way leaves version 0. A fresh registry is therefore born CROSS-aware, and owner init's read-only
+   probe reads a registry at version 0 as a birth not yet committed (by any command, init or not), with
+   nothing pending, rather than demanding the root for an upgrade that is not there. Every committed step
+   of an existing file stamps its version, so a legacy file is never at version 0 and its pending CROSS
+   step still takes the root exclusively. (Clarified 2026-10-02, row t-e83799a5.)
    Define scratch by the realpath-derived R check, not only the caller's configured data_root(): token-less
    file is scratch only when its realpath is NOT an R/boards/UUID.db under any R containing registry.db. If
    that apparent registry exists but is unreadable, or the file is orphaned/unregistered within such R,

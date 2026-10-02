@@ -2017,6 +2017,94 @@ fn compiled_binary_init_waits_for_an_in_flight_init_instead_of_seeing_a_pending_
     );
 }
 
+/// The race above with a NON-init command on the other side, pinned. Any
+/// command on an empty data root creates the registry, holding only the root
+/// `.lock` shared — never `.init.lock`, so serializing inits on it does not
+/// help. Its birth transaction is in flight: the file stands at user_version
+/// 0, write-locked. Stepped one commit at a time, that birth also passed
+/// through every pre-CROSS version. An `init` probing for a pending CROSS
+/// step read the newborn as a legacy registry, took the root exclusively
+/// against the command's shared hold, and refused "upgrade is pending ...
+/// needs <root> to itself". A newborn is born whole, so 0 is an unfinished
+/// birth and nothing is pending: `init` takes the root shared and waits on
+/// the birth instead (ADR-056 §5, fresh files are born CROSS-aware).
+#[test]
+fn compiled_binary_init_waits_for_a_registry_another_command_is_creating() {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let fixture = Fixture::new("init-newborn-registry");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&fixture.data)
+        .unwrap();
+    let root_lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(fixture.data.join(".lock"))
+        .unwrap();
+    root_lock.lock_shared().unwrap();
+    // The creating command's open, at version 0, with its one birth
+    // transaction begun and not yet committed.
+    let newborn = Connection::open(fixture.data.join("registry.db")).unwrap();
+    newborn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+        .unwrap();
+    newborn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let mut init = fixture
+        .command(&fixture.main)
+        .args(["init", "--name", "Newborn", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Before the fix init refused at once. Waiting on the birth transaction
+    // (15s busy budget), it cannot exit while that is held.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if init.try_wait().unwrap().is_some() {
+            let output = init.wait_with_output().unwrap();
+            panic!(
+                "init did not wait for the registry being born; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    newborn.execute_batch("ROLLBACK").unwrap();
+    drop(newborn);
+    drop(root_lock);
+
+    let output = init.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    assert_eq!(
+        registry
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        16,
+        "the registry init created must be born CROSS-aware"
+    );
+    assert_eq!(
+        registry
+            .query_row(
+                "SELECT count(*) FROM boards WHERE name='Newborn' AND registration_token IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
 #[test]
 fn compiled_binary_enforces_pull_routing_task_graph_and_story_gates() {
     let fixture = Fixture::new("workflow");

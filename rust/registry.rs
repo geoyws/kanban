@@ -1866,7 +1866,9 @@ impl Registry {
     /// data root has a CROSS step to take — the registry is pre-CROSS, or the
     /// active board of that name is pre-CROSS or carries no registration
     /// token yet (ADR-056 §5, ADR-057 §3). A missing registry or board has
-    /// nothing pending: both are born CROSS-aware. A board token that DIFFERS
+    /// nothing pending: both are born CROSS-aware. Nor has a registry at
+    /// version 0, which is a newborn whose one birth transaction has not yet
+    /// committed — never a legacy file. A board token that DIFFERS
     /// from the registry's also answers pending, so that `init` reaches the
     /// owned open and refuses it there, under the exclusive lock.
     pub fn init_cross_pending(name: &str) -> Result<bool> {
@@ -1876,6 +1878,14 @@ impl Registry {
             return Ok(false);
         }
         let registry_version = crate::db::stored_schema_version(&registry_path);
+        // Version 0 is a newborn, not a legacy file: a registry is born whole,
+        // 0 to current in one transaction, so 0 is a birth not yet committed
+        // (a non-init command creating the registry this instant), and an
+        // ordinary open takes it straight to current. It holds no boards, so
+        // nothing waits on a CROSS step (ADR-056 §5).
+        if registry_version == Some(0) {
+            return Ok(false);
+        }
         if crate::db::cross_step_pending(registry_version, crate::db::REGISTRY_PRE_CROSS_VERSION) {
             return Ok(true);
         }
