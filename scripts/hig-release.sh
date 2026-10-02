@@ -20,6 +20,18 @@ BINARIES=(
 )
 MAX_RELEASES=10
 HOSTNAME_BIN="${HOSTNAME_BIN:-/bin/hostname}"
+# The ssh destination of each remote install target, one name per host. A
+# remote target installs exactly as hig does (install_remote); nothing else
+# about a remote host differs from another.
+SSH_HOST_HIG="hig"
+SSH_HOST_HAL="hal"
+# --replace-wrapper: an install may replace a bin link that is an operator
+# symlink pointing outside the install root (hal's kb -> kb-remote.sh before
+# the P7 cutover). Without it such a link is refused like any foreign link.
+REPLACE_WRAPPER=0
+# The operator symlinks this activation replaced, as "link<TAB>target", so a
+# failed activation puts each one back exactly as it was.
+REPLACED_WRAPPERS=()
 BIN_DIR_DEFAULT="${BIN_DIR_DEFAULT:-${HOME:-/root}/.local/bin}"
 # The one platform a Kanban release IS (ADR-044 §1): every packaged binary is
 # this, whatever the machine that built it runs natively. A build is native
@@ -65,22 +77,32 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   hig-release.sh package hax [--output DIR] [--builder-image REF@sha256:HEX]
-  hig-release.sh install <hax|hig> --package DIR --install-root DIR [--hax-install-root DIR]
-  hig-release.sh rollback <hax|hig> --install-root DIR [--steps N]
+  hig-release.sh install <hax|hig|hal> --package DIR --install-root DIR [--hax-install-root DIR] [--replace-wrapper]
+  hig-release.sh rollback <hax|hig|hal> --install-root DIR [--steps N]
 
-  install runs on hax for both targets: install_package refuses any other
+  install runs on hax for every target: install_package refuses any other
   host before dispatching, so a hig-shell 'install hig' dies with
-  'target hax requires host hax'. A hig install runs install_remote over
-  ssh from hax and copies the package itself (tar over the same ssh), so
-  no relay is needed and hig never needs to reach hax. It requires
-  --hax-install-root pointing at the hax install root that holds the
-  release's canonical activation receipt. Working invocation, from hax:
+  'target hax requires host hax'. A hig or hal install runs install_remote
+  over ssh from hax and copies the package itself (tar over the same ssh),
+  so no relay is needed and the remote host never needs to reach hax. It
+  requires --hax-install-root pointing at the hax install root that holds
+  the release's canonical activation receipt, and after the remote
+  activation it compares the sha256 of every installed file with that
+  receipt and prints the result as byteIdentity. Working invocation, from
+  hax:
     hig-release.sh install hig --package DIR \
       --install-root /root/.local/share/kanban-releases \
       --hax-install-root /root/.local/share/kanban-releases
-  --install-root is required and has no default. The live store on both
-  hosts is /root/.local/share/kanban-releases (George, a-e5391903): only
+  'install hal' is the same command with hal in place of hig. Only packages
+  whose targets name hal can be installed there.
+  --install-root is required and has no default. The live store on every
+  host is /root/.local/share/kanban-releases (George, a-e5391903): only
   root reads it, so no ancestor needs other-traverse.
+  A bin link that is a symlink pointing anywhere but the install root's
+  current/ is the operator's and is refused; --replace-wrapper replaces such
+  a symlink (never a regular file) and restores it if the activation fails.
+  On hal that link is kb -> kb-remote.sh, and replacing it is the P7
+  cutover step.
 EOF
   exit 64
 }
@@ -273,13 +295,13 @@ package_targets_json() {
   local target="$1"
   case "$target" in
     hax)
-      printf '["hax","hig"]'
+      printf '["hax","hig","hal"]'
       ;;
-    hig)
+    hig|hal)
       die "package target must be hax"
       ;;
     *)
-      die "target must be hax or hig, got $target"
+      die "target must be hax, hig or hal, got $target"
       ;;
   esac
 }
@@ -377,7 +399,7 @@ validate_release_files() {
   jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.targets | type == "array") and
-    (.targets | length == 2) and
+    ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
@@ -490,7 +512,7 @@ validate_receipt() {
   jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
     receipt_provenance_ok and
     (.targets | type == "array") and
-    (.targets | length == 2) and
+    ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
@@ -571,7 +593,7 @@ validate_hax_activation_receipt() {
     (.target == "hax") and
     (.installerHost == "hax") and
     (.targets | type == "array") and
-    (.targets | length == 2) and
+    ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
@@ -729,7 +751,10 @@ ensure_safe_release_view() {
   for binary in "$@"; do
     link="$bin_dir/$binary"
     if [[ -e "$link" || -L "$link" ]]; then
-      managed_symlink "$link" "$install_root" current ||
+      managed_symlink "$link" "$install_root" current && continue
+      # --replace-wrapper admits an operator SYMLINK only; a regular file is
+      # never replaced (atomic_symlink refuses it too).
+      [[ "$REPLACE_WRAPPER" == 1 && -L "$link" ]] ||
         die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
     fi
   done
@@ -772,6 +797,35 @@ ensure_public_binary_links() {
   done
 }
 
+# Called after ensure_safe_release_view, before any link is written: records
+# each operator symlink --replace-wrapper is about to replace, so
+# restore_replaced_wrappers can put it back if the activation fails.
+# Embedded verbatim in the remote install script (see install_remote).
+record_replaced_wrappers() {
+  local install_root="$1"
+  local bin_dir="$2"
+  shift 2
+  [[ "$REPLACE_WRAPPER" == 1 ]] || return 0
+  local binary link previous
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    [[ -L "$link" ]] || continue
+    managed_symlink "$link" "$install_root" current && continue
+    previous="$(readlink "$link")"
+    REPLACED_WRAPPERS+=("$link"$'\t'"$previous")
+    printf 'hig-release: --replace-wrapper: replacing operator symlink %s -> %s\n' "$link" "$previous" >&2
+  done
+}
+
+# Embedded verbatim in the remote install script (see install_remote).
+restore_replaced_wrappers() {
+  local entry status=0
+  for entry in ${REPLACED_WRAPPERS[@]+"${REPLACED_WRAPPERS[@]}"}; do
+    atomic_symlink "${entry#*$'\t'}" "${entry%%$'\t'*}" || status=1
+  done
+  return "$status"
+}
+
 rollback_activation_view() {
   local status=$?
   local install_root="$1"
@@ -803,6 +857,7 @@ rollback_activation_view() {
       rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
     done
   fi
+  restore_replaced_wrappers
 
   # Restoring the links restores the PATHS. No service runs from a release
   # since `kanban serve` was retired (ADR-053), so no process has to follow
@@ -898,8 +953,17 @@ prune_releases() {
 
 validate_target() {
   case "$1" in
-    hax|hig) ;;
-    *) die "target must be hax or hig, got $1" ;;
+    hax|hig|hal) ;;
+    *) die "target must be hax, hig or hal, got $1" ;;
+  esac
+}
+
+# The ssh destination of a remote install target (see SSH_HOST_*).
+ssh_host_for() {
+  case "$1" in
+    hig) printf '%s' "$SSH_HOST_HIG" ;;
+    hal) printf '%s' "$SSH_HOST_HAL" ;;
+    *) die "target $1 is not a remote install target" ;;
   esac
 }
 
@@ -917,7 +981,7 @@ package_validate() {
   jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.targets | type == "array") and
-    (.targets | length == 2) and
+    ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
@@ -1425,6 +1489,7 @@ install_release_tree() {
   local previous_current="" current_switched=0 release_created=0
   release_id="$(release_id_from_receipt "$receipt")"
   ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+  record_replaced_wrappers "$install_root" "$bin_dir" "${BINARIES[@]}"
   # What the installer creates it makes traversable (0755); it never changes
   # the mode of a directory that already existed.
   local had_root=0 had_releases=0
@@ -1482,6 +1547,7 @@ install_release_tree() {
         rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
       done
     fi
+    restore_replaced_wrappers || true
     trap - ERR
     return 1
   fi
@@ -1572,6 +1638,10 @@ install_local() {
         bin_dir="${1#*=}"
         shift
         ;;
+      --replace-wrapper)
+        REPLACE_WRAPPER=1
+        shift
+        ;;
       *)
         die "unknown install flag $1"
         ;;
@@ -1628,6 +1698,10 @@ install_remote() {
         hax_install_root="${1#*=}"
         shift
         ;;
+      --replace-wrapper)
+        REPLACE_WRAPPER=1
+        shift
+        ;;
       *)
         die "unknown install flag $1"
         ;;
@@ -1642,7 +1716,7 @@ install_remote() {
   [[ -f "$receipt" ]] || die "package receipt is required: $receipt"
   package_validate "$package_dir" "$target"
   validate_receipt "$receipt" "$target" "$package_dir"
-  [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for hig installs"
+  [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for $target installs"
   [[ -d "$hax_install_root" ]] || die "hax install root does not exist: $hax_install_root"
   validate_hax_activation_receipt "$hax_install_root" "$target" "$package_dir"
   local release_id release_dir release_meta
@@ -1650,13 +1724,14 @@ install_remote() {
   release_dir="$(release_dir "$install_root" "$release_id")"
   release_meta="$(release_receipt "$install_root" "$release_id")"
 
-  local remote_stage
-  remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
-  tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
-  ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
+  local ssh_host remote_stage
+  ssh_host="$(ssh_host_for "$target")"
+  remote_stage="$(ssh "$ssh_host" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
+  tar -C "$package_dir" -cf - . | ssh "$ssh_host" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
+  ssh "$ssh_host" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
   local remote_status=0
   # Keep the quoted heredoc outside command substitution for Bash 3.2.
-  if HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
+  if HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$ssh_host" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "$REPLACE_WRAPPER" "${BINARIES[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
 stage_root="$1"
@@ -1666,7 +1741,10 @@ install_root="$4"
 target="$5"
 bin_dir="$6"
 keep="$7"
-shift 7
+# 1 when the operator passed --replace-wrapper on hax (see ensure_safe_release_view).
+REPLACE_WRAPPER="$8"
+REPLACED_WRAPPERS=()
+shift 8
 # The release set arrives as the caller's BINARIES instead of a literal list
 # embedded here: a second copy of the set is exactly what drifted before, and
 # a remote installer that links fewer binaries than the package carries would
@@ -2002,7 +2080,10 @@ ensure_safe_release_view() {
   for binary in "$@"; do
     link="$bin_dir/$binary"
     if [[ -e "$link" || -L "$link" ]]; then
-      managed_symlink "$link" "$install_root" current ||
+      managed_symlink "$link" "$install_root" current && continue
+      # --replace-wrapper admits an operator SYMLINK only; a regular file is
+      # never replaced (atomic_symlink refuses it too).
+      [[ "$REPLACE_WRAPPER" == 1 && -L "$link" ]] ||
         die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
     fi
   done
@@ -2045,6 +2126,30 @@ ensure_public_binary_links() {
   done
 }
 
+record_replaced_wrappers() {
+  local install_root="$1"
+  local bin_dir="$2"
+  shift 2
+  [[ "$REPLACE_WRAPPER" == 1 ]] || return 0
+  local binary link previous
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    [[ -L "$link" ]] || continue
+    managed_symlink "$link" "$install_root" current && continue
+    previous="$(readlink "$link")"
+    REPLACED_WRAPPERS+=("$link"$'\t'"$previous")
+    printf 'hig-release: --replace-wrapper: replacing operator symlink %s -> %s\n' "$link" "$previous" >&2
+  done
+}
+
+restore_replaced_wrappers() {
+  local entry status=0
+  for entry in ${REPLACED_WRAPPERS[@]+"${REPLACED_WRAPPERS[@]}"}; do
+    atomic_symlink "${entry#*$'\t'}" "${entry%%$'\t'*}" || status=1
+  done
+  return "$status"
+}
+
 rollback_activation_view() {
   local status=$?
   local install_root="$1"
@@ -2073,6 +2178,7 @@ rollback_activation_view() {
       rm -f -- "$bin_dir/$binary"
     done
   fi
+  restore_replaced_wrappers
 
   # Restoring the links restores the PATHS. No service runs from a release
   # since `kanban serve` was retired (ADR-053), so no process has to follow
@@ -2176,7 +2282,7 @@ reject_carried_release_identity "$manifest"
   jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
     receipt_provenance_ok and
     (.targets | type == "array") and
-    (.targets | length == 2) and
+    ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
@@ -2202,6 +2308,7 @@ done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @ts
 
 release_id="$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
 ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+record_replaced_wrappers "$install_root" "$bin_dir" "${BINARIES[@]}"
 # What the installer creates it makes traversable (0755); it never changes
 # the mode of a directory that already existed.
 had_root=0; had_releases=0
@@ -2264,6 +2371,7 @@ if (( activation_status != 0 )); then
       rm -f -- "$bin_dir/$binary"
     done
   fi
+  restore_replaced_wrappers || true
   trap - ERR
   exit 1
 fi
@@ -2297,7 +2405,7 @@ fi
 
 jq -e --arg target "$target" '
   (.targets | type == "array") and
-  (.targets | length == 2) and
+  ((.targets | length == 2) or ((.targets | length == 3) and (.targets | index("hal") != null))) and
   (.targets | index("hax") != null) and
   (.targets | index("hig") != null) and
   (.targets | index($target) != null)
@@ -2319,6 +2427,18 @@ REMOTE
   else
     remote_status=$?
   fi
+  # Byte identity, measured after the remote activation rather than inferred
+  # from the transfer: the sha256 of every file the remote release dir holds,
+  # against the canonical activation receipt hax recorded for this release.
+  local identity='null'
+  if (( remote_status == 0 )); then
+    identity="$(remote_byte_identity "$ssh_host" "$(release_receipt "$hax_install_root" "$release_id")" "$release_dir")"
+    if [[ "$(jq -r '.verified' <<<"$identity")" != true ]]; then
+      printf 'hig-release: %s is installed on %s but is NOT byte-identical to the hax canonical receipt (%s); roll it back on %s with: hig-release.sh rollback %s --install-root %s\n' \
+        "$release_dir" "$target" "$(jq -r '[.files[] | select(.identical | not) | .name] | join(", ")' <<<"$identity")" "$target" "$target" "$install_root" >&2
+      remote_status=1
+    fi
+  fi
   jq -n -S \
     --arg installRoot "$install_root" \
     --arg releaseId "$release_id" \
@@ -2328,8 +2448,31 @@ REMOTE
     --arg packageDir "$package_dir" \
     --arg target "$target" \
     --arg binDir "$bin_dir" \
-    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir}'
+    --argjson byteIdentity "$identity" \
+    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir}
+    + (if $byteIdentity == null then {} else {byteIdentity: $byteIdentity} end)'
   return "$remote_status"
+}
+
+# The sha256 of every file in the remote release dir next to the hax
+# canonical receipt's: each binary against files[].sha256, manifest.json
+# against manifestSha256. Prints {verified, haxReceipt, files[]}; verified is
+# true only when every file is present remotely and identical.
+remote_byte_identity() {
+  local ssh_host="$1"
+  local hax_receipt="$2"
+  local release_dir="$3"
+  local remote_sums
+  # shellcheck disable=SC2029 # expanded here on hax on purpose, like the transfer
+  remote_sums="$(ssh "$ssh_host" "cd '$release_dir' && sha256sum -- manifest.json ${BINARIES[*]}")" || remote_sums=""
+  jq -n -S -c --slurpfile hax "$hax_receipt" --arg sums "$remote_sums" --arg hax_receipt "$hax_receipt" '
+    $hax[0] as $r
+    | ($sums | split("\n")
+        | map(select(length > 0) | capture("^(?<sha>[0-9a-f]{64}) [ *](?<name>.+)$") | {(.name): .sha})
+        | add // {}) as $remote
+    | ([$r.files[] | {name, haxSha256: .sha256}] + [{name: "manifest.json", haxSha256: $r.manifestSha256}])
+    | map(. + {sha256: ($remote[.name] // null)} | . + {identical: (.sha256 == .haxSha256)})
+    | {verified: all(.[]; .identical), haxReceipt: $hax_receipt, files: .}'
 }
 
 rollback_release() {
@@ -2442,7 +2585,7 @@ install_package() {
     hax)
       install_local "$target" "$@"
       ;;
-    hig)
+    hig|hal)
       install_remote "$target" "$@"
       ;;
   esac

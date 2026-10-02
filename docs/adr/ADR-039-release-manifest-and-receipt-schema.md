@@ -626,6 +626,17 @@ service-traversed root needs no installer change. `/var/lib/kanban` and
 `/var/lib/kanban-releases` are no longer declared canonical; they are one
 possible future layout behind a new approval.
 
+Addendum 2026-10-03 (hal as a third install target, [ADR-034 amendment
+2026-10-03](ADR-034-hig-release-packages-and-board-rule-transfer.md)):
+`targets` stays a writer constant, but the constant is now
+`["hax","hig","hal"]`. Validators accept exactly two shapes: the legacy
+`["hax","hig"]` (length 2) and the three-target set that also names `hal`;
+either must still contain the requested install target. Because the manifest
+is what `releaseId` hashes, this is the manifest migration the Context warns of,
+taken on purpose: packages built before it keep their ids and their two
+targets, install on hax and hig as before, and are refused on hal. The
+receipt's `targets` remains identical to the manifest's.
+
 ## References
 
 - `scripts/hig-release.sh` — the whole release path; every citation above

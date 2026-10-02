@@ -29369,7 +29369,7 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
     let manifest_path = output_dir.join("manifest.json");
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     assert_eq!(manifest["formatVersion"], 1);
-    assert_eq!(manifest["targets"], json!(["hax", "hig"]));
+    assert_eq!(manifest["targets"], json!(["hax", "hig", "hal"]));
     assert_eq!(
         manifest["sourceCommit"],
         "0123456789abcdef0123456789abcdef01234567"
@@ -29387,7 +29387,7 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
     let receipt_path = output_dir.with_extension("receipt.json");
     let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["host"], "hax");
-    assert_eq!(receipt["targets"], json!(["hax", "hig"]));
+    assert_eq!(receipt["targets"], json!(["hax", "hig", "hal"]));
     assert_eq!(
         receipt["manifestSha256"],
         json!(file_sha256(&manifest_path))
@@ -29459,7 +29459,7 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         json!(hax_release_dir.to_str().unwrap())
     );
     assert_eq!(hax_release_receipt_json["target"], "hax");
-    assert_eq!(hax_release_receipt_json["targets"], json!(["hax", "hig"]));
+    assert_eq!(hax_release_receipt_json["targets"], json!(["hax", "hig", "hal"]));
     assert_eq!(
         hax_release_receipt_json["manifestSha256"],
         json!(file_sha256(&manifest_path))
@@ -33172,6 +33172,10 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         // a cross-field invariant would install a receipt the local leg
         // refuses.
         "receipt_provenance_defs",
+        // --replace-wrapper: which operator symlinks an activation replaces
+        // and how a failed one puts them back must be the same on both legs.
+        "record_replaced_wrappers",
+        "restore_replaced_wrappers",
     ] {
         let header = format!("\n{name}() {{\n");
         let definitions: Vec<(usize, &str)> = script

@@ -91,6 +91,7 @@ if [[ ! -f skills/kb/SKILL.md ]]; then
 fi
 run 'kb skill wrapper tests' bash skills/kb/tests/kb-wrapper-tests.sh
 run 'migrate ACC body blocks' bash scripts/migrate-acc-body-blocks.test.sh
+run 'hig release remote targets' bash scripts/hig-release.test.sh
 
 # Cheapest target first, `e2e` last: it is the long one and the only one
 # that drives a browser.
