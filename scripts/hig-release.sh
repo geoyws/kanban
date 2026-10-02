@@ -627,7 +627,7 @@ bin_link_path() {
 
 # The five functions below are embedded verbatim in the remote install script
 # (see install_remote); hig_release_script_local_and_remote_install_guards_are_identical
-# in tests/e2e.rs fails when the two copies drift.
+# in tests/e2e_release.rs fails when the two copies drift.
 physical_dir() {
   (cd -P -- "$1" 2>/dev/null && pwd -P)
 }

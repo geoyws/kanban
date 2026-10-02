@@ -1362,12 +1362,14 @@ documented gate and the enforced gate cannot drift. It runs
 `cargo clippy --locked --all-targets -- -D warnings`,
 `cargo test --locked --lib` (including the two ignored fixed-descriptor
 remap tests, serially), the pinned `skills/kb` package's own wrapper tests,
-and then every integration target one at a time with `--test-threads=1`,
-ending with `e2e` — because `e2e` drives a real Chrome and must never run
-concurrently with another cargo command. `KANBAN_CHROME` passes through it
-to name that browser on a host whose system Chrome is broken. It goes green
+then every other integration target one at a time with `--test-threads=1`,
+and last the `e2e_*` area targets side by side, each still
+`--test-threads=1`: they were one serial `e2e` target until it alone took
+most of the 60-minute budget, and each of their cases owns a pid-unique
+fixture. `KANBAN_CHROME` passes through it
+to name a browser on a host whose system Chrome is broken. It goes green
 because the system became true, never because a measurement was loosened:
-too slow means faster or serialized, never sampled, which is why it carries
+too slow means faster or split, never sampled, which is why it carries
 no skip, sample or quick flag. Step order and reasons are written out in
 [`docs/testing/compiled-rust-e2e-matrix.md`](docs/testing/compiled-rust-e2e-matrix.md).
 
