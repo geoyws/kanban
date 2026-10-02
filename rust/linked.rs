@@ -218,6 +218,21 @@ fn require_endpoint_shape(board_id: &str, id: &str, which: &str) -> Result<Depen
     })
 }
 
+/// Whether a SQLite error is a constraint failure (unique, primary key, or
+/// check): the shape a lost write race takes.
+fn is_unique_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _,
+        )
+    )
+}
+
 /// Order two resolved endpoints canonically, so the pair `(X, Y)` and the
 /// pair `(Y, X)` address the same stored row and the symmetry is a property
 /// of that row rather than of two rows kept in step (LINKED-03).
@@ -446,20 +461,6 @@ pub(crate) fn add_companion(
             one.board_id, one.item_id, two.board_id, two.item_id
         );
     }
-/// Whether a SQLite error is a constraint failure (unique, primary key, or
-/// check): the shape a lost write race takes.
-fn is_unique_violation(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _,
-        )
-    )
-}
 
     let id = format!("lc-{}", uuid::Uuid::new_v4().simple());
     // A racing identical add may land its row between the live check above
@@ -729,6 +730,7 @@ fn retired_or_refused(
         return Err(refusal());
     }
     Ok("retired".to_owned())
+}
 
 // ---------------------------------------------------------------------------
 // Selected sets, revisions, bindings.
@@ -1185,13 +1187,14 @@ pub(crate) fn bind(
     // replays its stored receipt, while an ended one — revoked, released, or
     // lapsed — re-arms only through a new audited revision (LINKED-14: the old
     // triple resumes only through a new revision).
-    let rebind = match latest_binding(connection, &set_id, &triple)? {
+    let predecessor: Option<BindingRow> = match latest_binding(connection, &set_id, &triple)? {
         Some(existing) if existing.status == "active" && existing.expires_at > now => {
             return Ok(binding_receipt(&existing, head.revision, "bind"));
         }
-        Some(_) => true,
-        None => false,
+        Some(existing) => Some(existing),
+        None => None,
     };
+    let rebind = predecessor.is_some();
     // One lane holds one live binding: any other live triple on this lane
     // refuses, so candidates and every claim path always read the same
     // binding (LINKED-08, LINKED-14).
@@ -1214,6 +1217,20 @@ pub(crate) fn bind(
     let author = nonempty_actor(author)?;
     let kind = if rebind { "rebind" } else { "bind" };
     let id = format!("lb-{}", uuid::Uuid::new_v4().simple());
+    // A lapsed predecessor still reads `active` but holds no authority; record
+    // its ending before the new row lands, so the live-only unique index never
+    // sees two live rows for one triple. Revoked and released predecessors are
+    // already ended and stay untouched as history.
+    let lapsed_id: Option<String> = match &predecessor {
+        Some(old) if old.status == "active" => Some(old.id.clone()),
+        _ => None,
+    };
+    if let Some(old_id) = lapsed_id {
+        connection.execute(
+            "UPDATE linked_bindings SET status='released',ended_at=?,end_reason=? WHERE id=?",
+            params![now, "binding lapsed; superseded by an audited rebind", old_id],
+        )?;
+    }
     let revision = head.revision + 1;
     connection.execute(
         "INSERT INTO linked_bindings(id,set_id,actor,lane,session,revision_checked,status,\
@@ -1664,7 +1681,6 @@ impl ScopeGuard {
         self.mode = GuardMode::Pass;
         Ok(())
     }
-
 
     /// Check one named task: `Ok(Some(decision))` grants with the revision to
     /// record, `Ok(None)` is unconstrained, `Err` is the one refusal every

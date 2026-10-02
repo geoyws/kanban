@@ -3235,7 +3235,8 @@ status TEXT NOT NULL CHECK(status IN ('active','released','revoked')),
 created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
 ended_at INTEGER,end_reason TEXT
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_bindings_triple ON linked_bindings(set_id,actor,lane,session);
+DROP INDEX IF EXISTS idx_linked_bindings_triple;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_bindings_triple ON linked_bindings(set_id,actor,lane,session) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_linked_bindings_actor ON linked_bindings(actor,lane,status);
 "#;
 
