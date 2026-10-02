@@ -6329,16 +6329,19 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     };
     // `init` serializes on `.init.lock` (ADR-008, 2026-09-01) BEFORE it
     // probes for a pending CROSS step, not after. The probe reads stored
-    // schema versions, and a registry or board that a concurrent `init` is
-    // creating this instant passes through version 0 and every pre-CROSS
-    // step on its way to birth — indistinguishable, version for version, from
-    // a legacy file. Probed outside the init lock, the loser of a same-name
-    // race mistook the winner's newborn files for a pending upgrade and
-    // refused that the root was busy, instead of reaching the duplicate-name
-    // refusal. Under it, every other `init` has finished, so a version at or
-    // below pre-CROSS is a genuine one. This lock is not the root lock: the
-    // probe still runs before that, which stays exclusive only when a step is
-    // truly pending (ADR-056 §5). Nothing takes `.init.lock` after `.lock`.
+    // schema versions, and the board a concurrent `init` is registering this
+    // instant sits at version 0 between its registry row's commit and its own
+    // birth — which that probe cannot tell from a board whose upgrade waits.
+    // Probed outside the init lock, the loser of a same-name race mistook the
+    // winner's newborn files for a pending upgrade and refused that the root
+    // was busy, instead of reaching the duplicate-name refusal. Under it,
+    // every other `init` has finished. A NON-init command creating the
+    // registry takes no `.init.lock`; for that race a newborn is born whole,
+    // 0 to current in one transaction (`db::migrate_through`), and the probe
+    // reads a registry at version 0 as that unfinished birth, never as
+    // pre-CROSS. This lock is not the root lock: the probe still runs before
+    // that, which stays exclusive only when a step is truly pending (ADR-056
+    // §5). Nothing takes `.init.lock` after `.lock`.
     let _initialization = (command == "init").then(lock::initialization).transpose()?;
     // `init` on a registry or board whose CROSS step is still pending is the
     // owner's upgrade boundary (ADR-056 §5): detected read-only here, before

@@ -456,11 +456,19 @@ name refusal rather than leaking SQLite lock errors across the command boundary.
 
 `init` takes `.init.lock` before anything else it decides, including the
 read-only probe for a pending CROSS step (ADR-056 §5), and only then the root
-`.lock`. A registry or board a concurrent `init` is creating passes through
-version 0 and every pre-CROSS version on its way to birth, so a probe run
-outside the init lock read the winner's newborn files as a pending upgrade and
-the loser refused that the root was busy instead of reaching the duplicate-name
-refusal. Nothing takes `.init.lock` after `.lock`, so the order cannot deadlock.
+`.lock`. A registry or board a concurrent `init` is creating sits at version 0
+until its birth commits, so a probe run outside the init lock read the winner's
+newborn files as a pending upgrade and the loser refused that the root was busy
+instead of reaching the duplicate-name refusal. Nothing takes `.init.lock`
+after `.lock`, so the order cannot deadlock.
+
+A non-init command creating the registry on an empty data root takes no
+`.init.lock`, so that lock cannot order it against `init`. Instead a newborn
+registry or board is built whole, version 0 to its ceiling in one transaction
+(clarified 2026-10-02), so it never presents a pre-CROSS version; and the probe
+reads a registry at version 0 as that uncommitted birth, with nothing pending.
+`init` then takes the root shared and waits on the birth, rather than refusing
+an upgrade that is not there.
 
 ## References
 
