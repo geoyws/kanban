@@ -6327,10 +6327,23 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         true => None,
         false => direct_db(&args),
     };
+    // `init` serializes on `.init.lock` (ADR-008, 2026-09-01) BEFORE it
+    // probes for a pending CROSS step, not after. The probe reads stored
+    // schema versions, and a registry or board that a concurrent `init` is
+    // creating this instant passes through version 0 and every pre-CROSS
+    // step on its way to birth — indistinguishable, version for version, from
+    // a legacy file. Probed outside the init lock, the loser of a same-name
+    // race mistook the winner's newborn files for a pending upgrade and
+    // refused that the root was busy, instead of reaching the duplicate-name
+    // refusal. Under it, every other `init` has finished, so a version at or
+    // below pre-CROSS is a genuine one. This lock is not the root lock: the
+    // probe still runs before that, which stays exclusive only when a step is
+    // truly pending (ADR-056 §5). Nothing takes `.init.lock` after `.lock`.
+    let _initialization = (command == "init").then(lock::initialization).transpose()?;
     // `init` on a registry or board whose CROSS step is still pending is the
     // owner's upgrade boundary (ADR-056 §5): detected read-only here, before
-    // any lock, and taken only under the root EXCLUSIVELY. Every other init
-    // keeps the shared lock.
+    // the root lock, and taken only under the root EXCLUSIVELY. Every other
+    // init keeps the shared lock.
     let cross_upgrade = command == "init"
         && match args.one("name") {
             Some(name) => Registry::init_cross_pending(name)?,
@@ -6375,7 +6388,6 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         } else {
             Some(args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?))
         };
-        let _initialization = lock::initialization()?;
         let mut registry = if cross_upgrade {
             Registry::open_owned()?
         } else {

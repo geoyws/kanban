@@ -454,6 +454,14 @@ existing shared/exclusive `.lock` semantics unchanged. The separate lock makes
 `init` serialize before `Registry::open`, so the loser reaches the duplicate-
 name refusal rather than leaking SQLite lock errors across the command boundary.
 
+`init` takes `.init.lock` before anything else it decides, including the
+read-only probe for a pending CROSS step (ADR-056 §5), and only then the root
+`.lock`. A registry or board a concurrent `init` is creating passes through
+version 0 and every pre-CROSS version on its way to birth, so a probe run
+outside the init lock read the winner's newborn files as a pending upgrade and
+the loser refused that the root was busy instead of reaching the duplicate-name
+refusal. Nothing takes `.init.lock` after `.lock`, so the order cannot deadlock.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

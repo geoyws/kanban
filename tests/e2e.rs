@@ -2931,6 +2931,88 @@ fn compiled_binary_rejects_two_simultaneous_init_attempts_with_the_same_name() {
     );
 }
 
+/// The same-name race above, with its losing interleaving pinned rather than
+/// left to scheduling. An `init` in flight holds `.init.lock` and the root
+/// `.lock` shared while the registry it is creating sits at user_version 0 —
+/// on its way to birth, and to a version probe indistinguishable from a
+/// pre-CROSS file. A second `init` that probed for a pending CROSS step
+/// before serializing on `.init.lock` read that newborn as an upgrade, took
+/// the root exclusively against the first one's shared hold, and refused
+/// "upgrade is pending ... needs <root> to itself" instead of waiting its
+/// turn and reaching the duplicate-name refusal (ADR-008 2026-09-01,
+/// ADR-056 §5: new registration keeps shared root plus init lock).
+#[test]
+fn compiled_binary_init_waits_for_an_in_flight_init_instead_of_seeing_a_pending_upgrade() {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let fixture = Fixture::new("init-in-flight");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&fixture.data)
+        .unwrap();
+    let open_marker = |name: &str| {
+        fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture.data.join(name))
+            .unwrap()
+    };
+    let init_lock = open_marker(".init.lock");
+    init_lock.lock().unwrap();
+    let root_lock = open_marker(".lock");
+    root_lock.lock_shared().unwrap();
+    // The first thing a fresh registry open writes: the header, at version 0.
+    {
+        let newborn = Connection::open(fixture.data.join("registry.db")).unwrap();
+        newborn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .unwrap();
+    }
+
+    let mut second = fixture
+        .command(&fixture.main)
+        .args(["init", "--name", "SAME", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Before the fix the second init refused at once. Waiting on the first
+    // init's `.init.lock` (15s budget), it cannot exit while that is held.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if second.try_wait().unwrap().is_some() {
+            let output = second.wait_with_output().unwrap();
+            panic!(
+                "init did not wait for the in-flight init; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(root_lock);
+    drop(init_lock);
+
+    let output = second.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    assert_eq!(
+        registry
+            .query_row("SELECT count(*) FROM boards WHERE name='SAME'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
 #[test]
 fn compiled_binary_enforces_pull_routing_task_graph_and_story_gates() {
     let fixture = Fixture::new("workflow");
