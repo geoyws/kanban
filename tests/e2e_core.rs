@@ -542,8 +542,12 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 16);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 16);
+    // Registry schema 18: LINKED added v17 (pairings) and v18 (sets/deliverables).
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 18);
+    assert_eq!(
+        doctor["registrySchemaVersion"],
+        doctor["supportedRegistrySchemaVersion"]
+    );
     assert_eq!(doctor["supportedBoardSchemaVersion"], 39);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 39);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 39);
@@ -2090,7 +2094,7 @@ fn compiled_binary_init_waits_for_a_registry_another_command_is_creating() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16,
+        18, // the current registry schema (LINKED v17/v18 on top of CROSS v16)
         "the registry init created must be born CROSS-aware"
     );
     assert_eq!(
@@ -6014,8 +6018,12 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         lines[0].contains(&format!("board schema {supported}")),
         "version output: {version}"
     );
+    let registry_supported =
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedRegistrySchemaVersion"]
+            .as_i64()
+            .unwrap();
     assert!(
-        lines[0].contains("registry schema 16"),
+        lines[0].contains(&format!("registry schema {registry_supported}")),
         "version output: {version}"
     );
     // The banner is one line now that the embedded operator UI is gone:

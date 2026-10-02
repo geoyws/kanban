@@ -275,7 +275,8 @@ fn a_new_estate_is_born_cross_aware_with_one_token_in_registry_and_file() {
     let board = estate.board("Alpha");
     estate.add_ok("Alpha", "t-1", &[]);
     let registry = readonly(&estate.data.join("registry.db"));
-    assert_eq!(user_version(&registry), 16);
+    // The current registry schema: CROSS v16 plus LINKED v17/v18.
+    assert_eq!(user_version(&registry), 18);
     let file = readonly(&estate.board_file(&board));
     assert_eq!(user_version(&file), 39);
     let token = registry_token(&estate, &board).expect("the registry minted a token");
@@ -667,7 +668,7 @@ fn owner_init_is_the_only_upgrade_boundary_and_refuses_a_live_holder() {
     );
     assert_eq!(
         user_version(&readonly(&estate.data.join("registry.db"))),
-        16
+        18 // the current registry schema (CROSS v16 plus LINKED v17/v18)
     );
     let target_file = readonly(&estate.board_file(&target));
     assert_eq!(user_version(&target_file), 39);

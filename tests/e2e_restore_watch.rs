@@ -2966,10 +2966,87 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         ],
     );
     let attention_id = attention["id"].as_str().unwrap().to_owned();
-    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    // The LINKED read verbs (docs/specs/linked.md) answer from shared registry
+    // records spanning two boards, so the estate gets a second registered
+    // board, a pairing, a claim-scope set and a declared deliverable — each
+    // read below then runs against a real record, not an empty answer.
+    let peer = fixture.root.join("peer");
+    fs::create_dir_all(&peer).unwrap();
+    fixture.ok_json(&peer, &["init", "--name", "SCHEMA-PEER", "--json"]);
+    fixture.ok_json(
+        &peer,
+        &["task", "add", "Peer work", "--id", "t-p1", "--json"],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "SCHEMA");
+    let peer_board = board_path_for_project(&fixture, &fixture.main, "SCHEMA-PEER");
+    let board_id = board.file_stem().unwrap().to_str().unwrap().to_owned();
+    let peer_board_id = peer_board.file_stem().unwrap().to_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "link",
+            "add",
+            "--a-board",
+            &board_id,
+            "--a-id",
+            "t-1",
+            "--b-board",
+            &peer_board_id,
+            "--b-id",
+            "t-p1",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "scope",
+            "create",
+            "--set",
+            "schema-readonly",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "scope",
+            "add",
+            "--set",
+            "schema-readonly",
+            "--board",
+            &peer_board_id,
+            "--id",
+            "t-p1",
+            "--expect-revision",
+            "1",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "contrib",
+            "declare",
+            "--board",
+            &board_id,
+            "--id",
+            "t-1",
+            "--deliverable",
+            "review",
+            "--kind",
+            "non-code",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
 
     let arguments = |name: &str| -> Option<Vec<String>> {
         let base: Vec<&str> = match name {
@@ -3030,6 +3107,10 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             // runs it for real against the action installed below.
             "plugin call" => vec!["plugin", "call", "acme", "lookup"],
             "plugin list" => vec!["plugin", "list"],
+            "link show" => vec!["link", "show", "--board", &board_id, "--id", "t-1"],
+            "scope show" => vec!["scope", "show", "--set", "schema-readonly"],
+            "contrib show" => vec!["contrib", "show", "--board", &board_id, "--id", "t-1"],
+            "contrib status" => vec!["contrib", "status", "--board", &board_id, "--id", "t-1"],
             _ => return None,
         };
         Some(base.into_iter().map(str::to_owned).collect())
@@ -3082,6 +3163,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
     )
     .unwrap();
     let before = fs::read(&board).unwrap();
+    let peer_before = fs::read(&peer_board).unwrap();
     let mut covered = 0;
     // Long-running commands cannot be run to completion and compared, so `mcp`
     // and `watch` are excluded by the property the manifest publishes, not by
@@ -3129,6 +3211,11 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             fs::read(&board).unwrap(),
             before,
             "{name} is labelled readOnly and modified the board"
+        );
+        assert_eq!(
+            fs::read(&peer_board).unwrap(),
+            peer_before,
+            "{name} is labelled readOnly and modified the peer board"
         );
         covered += 1;
     }
