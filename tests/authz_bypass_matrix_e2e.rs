@@ -3923,7 +3923,7 @@ fn managed_pages_fill_past_denied_rows_with_a_true_truncation_probe() {
     // read the task, exactly like the CLI-written ones below them. The
     // placeholder hashes keep the audit head initialized for the CLI writes
     // that follow; chain verification is not what this test measures (the
-    // direct-estate `UPDATE events` precedent in `tests/e2e.rs` mutates rows
+    // direct-estate `UPDATE events` precedent in `tests/e2e_core.rs` mutates rows
     // the same way).
     let board = Connection::open(&estate.board_a).unwrap();
     for index in 0..55 {

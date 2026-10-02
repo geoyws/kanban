@@ -13,17 +13,24 @@ steps: it runs
 `cargo test --locked --lib`, the two ignored
 fixed-descriptor remap unit tests serially, the pinned `skills/kb` package's
 own `bash skills/kb/tests/kb-wrapper-tests.sh`, and then every integration
-target one at a time. Read the script for the order and the reasons; what
+target, the `e2e_*` areas last. Read the script for the order and the
+reasons; what
 follows is only what a reader of this matrix needs to know about the Rust
 half of it.
 
-**The integration targets are the thirteen in `tests/`**, in the order the
-script runs them — cheapest first, `e2e` last:
-`claude_print_adapter_e2e`, `codex_queue_adapter_e2e`,
-`access_refusals_e2e`, `opencode_adapter_e2e`, `kimi_acp_adapter_e2e`,
-`cursor_worker_adapter_e2e`, `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
-`codex_app_server_adapter_e2e`, `authz_bypass_matrix_e2e`, `identity_e2e`,
-`worker_identity_e2e`, and `e2e`. Each
+**The integration targets are every `tests/*.rs` file**, listed by the
+script in two arrays it checks against `tests/`. `integration_targets`
+run one at a time, cheapest first: `claude_print_adapter_e2e`,
+`codex_queue_adapter_e2e`, `access_refusals_e2e`, `opencode_adapter_e2e`,
+`kimi_acp_adapter_e2e`, `cursor_worker_adapter_e2e`,
+`zcode_notify_adapter_e2e`, `dispatcher_e2e`,
+`codex_app_server_adapter_e2e`, `secret_guard_e2e`, `done_gate_e2e`,
+`authz_bypass_matrix_e2e`, `plugin_e2e`, `cross_board_e2e`, `identity_e2e`
+and `worker_identity_e2e`. `e2e_areas` run last and side by side:
+`e2e_core`, `e2e_restore_watch`, `e2e_mcp_batch_attention`, `e2e_limits`,
+`e2e_tags_workspace_rules`, `e2e_release`, `e2e_release_receipts` and
+`e2e_lifecycle`, which share their fixtures and helpers through
+`tests/e2e_support/mod.rs`. Each
 invokes the relevant production `CARGO_BIN_EXE_*` binaries through
 `std::process::Command`; those process-boundary assertions are
 compiled-process evidence. The gate as a whole is a
@@ -38,13 +45,23 @@ pairs), so as uid 0 every managed command in that target answers
 failing test by test, and it never skips: run it as a normal user or in the
 Linux gate container.
 
-**Serialization is a rule, not a preference.** Each target runs as its own
-`cargo test --locked --test TARGET -- --test-threads=1`, and no cargo
-command runs concurrently with another. Some cases drive a real Chrome
-against loopback listeners they own; two of those at once contend for
-one browser cache, ephemeral ports and the whole machine, and what that
-produces is a flake that reads like a product bug. A single
-`cargo test --all-targets` is therefore NOT this gate.
+**Single-threaded inside every target is a rule, not a preference.** Each
+target runs as its own `cargo test --locked --test TARGET --
+--test-threads=1`. The cases spawn processes, hold locks and time out
+against wall clocks, so a single `cargo test --all-targets`, which runs a
+target's cases on every core at once, is NOT this gate. Across targets the
+only concurrency is the `e2e_*` areas with each other, after one shared
+build: every case in them owns its fixture under a temp root named by its
+own pid, and none drives a browser (the web view and its Chrome cases were
+deleted by `t-fec3da9e`). Each area writes its output to its own file, and
+the script prints them whole once all have exited.
+
+Until `t-2aeec40c` the eight areas were one serial target, `e2e`
+(`tests/e2e.rs`), whose run alone took 49–56 minutes on the test host and
+pushed the gate past its 60-minute container-to-verdict budget. The split
+moved every case unchanged; specification rows and receipts above and below
+that cite `tests/e2e.rs` or `cargo test --test e2e -- --list` predate it, and
+the same names now enumerate with `--test e2e_<area>`.
 
 **`KANBAN_CHROME`** is passed through by the script and is the first entry
 in the browser discovery order below. It is how a host whose system Chrome
@@ -71,7 +88,8 @@ compiled and a delivery race macOS never showed, which is the reason.
 
 **The standing constraint on all of it:** the gate goes green because the
 system became true, never because a measurement was loosened. Too slow
-means make it faster or serialize it — never sample it. There is no
+means make it faster, or split it into targets that still run every case —
+never sample it. There is no
 `--only`, no `--skip`, no quick mode and no environment variable that turns
 a step off, and adding one would be the loosening this sentence exists to
 forbid.
@@ -86,7 +104,8 @@ The three-surface aggregate-listing finding now runs as compiled-process evidenc
 Measured once end to end on 2026-09-20 on `@@mbp` (darwin-arm64, M3 Max)
 with `KANBAN_CHROME` pointed at Playwright Chromium: 17 steps green in
 44m10s, of which the `e2e` target is 2338s of 415 serialized cases. That
-is the number to make smaller by making it faster, not by cutting it up.
+is the number to make smaller by making it faster or splitting it, never by
+dropping a case.
 
 Addendum 2026-09-29 (t-2b6a496e): the estate norm moved on 2026-09-28
 (migration epic e-0ea4e50b; placement in dotfiles/infra-root, never here):
@@ -94,6 +113,18 @@ Unum and geoyws gates run on the estate test host inside the Linux gate
 image. First green there: commit `ee8d062`, 17 steps, `e2e` 319/0
 (image `kanban-gate:1.95-chrome-u0`, inner user `nobody`). The 2026-09-20
 `@@mbp` measurement above stays as history.
+
+Addendum 2026-10-02 (t-2aeec40c): on the test host, in a Linux container
+capped at 6 CPUs, as `nobody`, the serial `e2e` target measured 2855s for
+356 cases. Of that, 54 `hig-release.sh` cases took 1822s (one alone 421s,
+`hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release`),
+and `every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_meets`
+took 139s. With the other steps that left a 58-minute gate. Cut into the
+eight `e2e_*` areas and run side by side, the same 356 cases passed, with
+the areas step taking 1472s, and the whole gate ran 2129s from container
+start to verdict, from a cold target directory. That run was an
+equivalent of the gate image (the Rust base image plus `jq`), not the gate
+image itself.
 
 The two fixed-descriptor remap unit tests are isolated unit evidence, not
 compiled-process E2E; they are `#[ignore]`d and are run serially and in

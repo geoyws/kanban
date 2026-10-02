@@ -9,14 +9,17 @@
 - Every release gate must spawn the compiled binary across real process
   boundaries; in-process domain tests do not count as E2E evidence.
 - The gate is one command: `scripts/release-gate.sh`. It is `fmt`, `clippy`,
-  the unit suite, the `skills/kb` wrapper tests and every integration target
-  serialized with `-- --test-threads=1`, `e2e` last. Run
+  the unit suite, the `skills/kb` wrapper tests, every other integration
+  target one at a time with `-- --test-threads=1`, and last the `e2e_*` area
+  targets side by side, each still `-- --test-threads=1`. Run
   it rather than a hand-assembled list, and never a bare
-  `cargo test --all-targets`: the browser suite must not run concurrently
-  with another cargo command. `KANBAN_CHROME` names the browser on a host
-  whose system Chrome is broken. It goes green because the system became
-  true, never because a measurement was loosened — too slow means faster or
-  serialized, never sampled. Steps and reasons:
+  `cargo test --all-targets`: inside a target the cases run one at a time,
+  and only the `e2e_*` areas, whose cases each own a pid-unique fixture,
+  run concurrently with each other. A complete run fits 60 minutes from
+  container start to verdict on the test host. `KANBAN_CHROME` names the
+  browser on a host whose system Chrome is broken. It goes green because the
+  system became true, never because a measurement was loosened — too slow
+  means faster or split, never sampled. Steps and reasons:
   [`docs/testing/compiled-rust-e2e-matrix.md`](docs/testing/compiled-rust-e2e-matrix.md).
 - See [ADR-006](docs/adr/ADR-006-rust-runtime-and-compiled-binary-e2e.md).
 
