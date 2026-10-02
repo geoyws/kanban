@@ -1322,3 +1322,163 @@ fn a_worker_may_not_run_watch() {
         stderr(&output)
     );
 }
+
+/// LINKED-15 under IDENT-11: a credentialed worker bound to a selected set
+/// records its own contribution receipt under managed enforcement, and only
+/// under its own lane actor. Naming another lane's actor — even one that holds
+/// a live binding of its own on the same task — is refused before anything is
+/// appended.
+#[test]
+fn a_bound_worker_records_contributions_only_as_its_own_lane_actor() {
+    let estate = Estate::managed("contrib");
+    let b = estate.board_id.clone();
+    let (_w1, k1) = estate.worker(ACTOR);
+    let task = estate.add_task("joint work");
+
+    // The coordinator selects the task, binds both lane actors to it on
+    // their own lanes, and declares one code deliverable.
+    estate.ok(
+        None,
+        &["scope", "create", "--set", "joint-w", "--as", ALICE],
+    );
+    estate.ok(
+        None,
+        &[
+            "scope",
+            "add",
+            "--set",
+            "joint-w",
+            "--board",
+            &b,
+            "--id",
+            &task,
+            "--expect-revision",
+            "1",
+            "--as",
+            ALICE,
+        ],
+    );
+    estate.ok(
+        None,
+        &[
+            "scope",
+            "bind",
+            "--set",
+            "joint-w",
+            "--actor",
+            ACTOR,
+            "--lane",
+            "driver",
+            "--session",
+            "s1",
+            "--expect-revision",
+            "2",
+            "--as",
+            ALICE,
+        ],
+    );
+    estate.ok(
+        None,
+        &[
+            "scope",
+            "bind",
+            "--set",
+            "joint-w",
+            "--actor",
+            SUCCESSOR,
+            "--lane",
+            "driver-2",
+            "--session",
+            "s2",
+            "--expect-revision",
+            "3",
+            "--as",
+            ALICE,
+        ],
+    );
+    estate.ok(
+        None,
+        &[
+            "contrib",
+            "declare",
+            "--board",
+            &b,
+            "--id",
+            &task,
+            "--deliverable",
+            "ship",
+            "--kind",
+            "code",
+            "--repo",
+            "acme/billing",
+            "--as",
+            ALICE,
+        ],
+    );
+    let receipts = || -> i64 {
+        estate
+            .registry()
+            .query_row("SELECT COUNT(*) FROM linked_contributions", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let commit = "a".repeat(40);
+    let record = |actor: &'static str, lane: &'static str, session: &'static str| {
+        vec![
+            "contrib".to_owned(),
+            "record".to_owned(),
+            "--board".to_owned(),
+            b.clone(),
+            "--id".to_owned(),
+            task.clone(),
+            "--deliverable".to_owned(),
+            "ship".to_owned(),
+            "--actor".to_owned(),
+            actor.to_owned(),
+            "--lane".to_owned(),
+            lane.to_owned(),
+            "--session".to_owned(),
+            session.to_owned(),
+            "--host".to_owned(),
+            "hax".to_owned(),
+            "--worktree".to_owned(),
+            "/tmp/wt".to_owned(),
+            "--branch".to_owned(),
+            "wt/x".to_owned(),
+            "--observed-at".to_owned(),
+            "1790900000000".to_owned(),
+            "--repo".to_owned(),
+            "acme/billing".to_owned(),
+            "--commit".to_owned(),
+            commit.clone(),
+            "--role".to_owned(),
+            "baseline".to_owned(),
+            "--as".to_owned(),
+            actor.to_owned(),
+        ]
+    };
+
+    // Under its own lane actor the worker's receipt is appended.
+    assert_eq!(receipts(), 0);
+    let mut own = record(ACTOR, "driver", "s1");
+    own.push("--json".to_owned());
+    let own = own.iter().map(String::as_str).collect::<Vec<_>>();
+    let receipt = estate.ok_json(Some(&k1), &own);
+    assert_eq!(receipt["actor"], json!(ACTOR));
+    assert_eq!(receipt["lane"], json!("driver"));
+    assert_eq!(receipt["role"], json!("baseline"));
+    assert_eq!(receipts(), 1, "the worker's own receipt is appended");
+
+    // The same credential naming the other lane's actor is refused naming the
+    // mismatch, although that actor's triple holds a live binding covering
+    // the task: nothing is appended.
+    let other = record(SUCCESSOR, "driver-2", "s2");
+    let other = other.iter().map(String::as_str).collect::<Vec<_>>();
+    estate.refused(
+        Some(&k1),
+        &other,
+        &format!("this worker's lane actor is {ACTOR:?}, but --actor names {SUCCESSOR:?}"),
+    );
+    assert_eq!(receipts(), 1, "a refused receipt appends nothing");
+}

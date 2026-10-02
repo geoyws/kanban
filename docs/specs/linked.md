@@ -595,41 +595,42 @@ image `f542f975e2dc`, host gate slot): 439 tests, each of the eight names presen
 once — that count is the 2026-09-26 record; the web retirement (ADR-053) has since removed
 the served-surface tests, so the current tree lists fewer and no fresh full enumeration is
 claimed here.
-Every other requirement is greenfield registry behaviour with no observing test
-at the baseline, so its row is `none` and its Note says `no e2e coverage` plainly and names
-the owning implementation row — `t-0dcbb1a9` (companions and claim scope per its work-package
-title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257` (contributions and
-consumer integration per its work-package title, `LINKED-15`..`LINKED-21`), or `t-db6937ba`
-(exposure and workflow proof per its work-package title, `LINKED-22`, `LINKED-24`,
-`LINKED-25`; `LINKED-23` is withdrawn with the served surface and owned by no implementation
-row) — which writes the fixed test set the implementation lands under. This is the precedent `docs/specs/spa.md`
-set at creation (`cd55cbc`): real names where the behaviour is observable today, `none` plus the
+`t-0dcbb1a9` (companions and claim scope per its work-package title, `LINKED-01`..`LINKED-08`,
+`LINKED-10`..`LINKED-14`) has landed its fixed test set — `tests/linked_e2e.rs`, four tests
+covering acceptance A1-A4 — so those thirteen rows name the real tests below. Every other
+greenfield requirement keeps its `none` row with `no e2e coverage` plainly, naming the owning
+implementation row — `t-9eff9257` (contributions and consumer integration per its work-package
+title, `LINKED-15`..`LINKED-21`) or `t-db6937ba` (exposure and workflow proof per its
+work-package title, `LINKED-22`, `LINKED-24`, `LINKED-25`; `LINKED-23` is withdrawn with the
+served surface and owned by no implementation row) — which writes the fixed test set the
+implementation lands under. This is the precedent `docs/specs/spa.md`
+set at creation (`cd55cbc`): real names where the behaviour is observable, `none` plus the
 owning row where it is not — and no invented name anywhere: every name below was verified in the
 tree, and every `none` says so.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
-| `LINKED-01` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one stored pairing read identically from both sides) |
-| `LINKED-02` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (`(boardID, id)` identity; display-name/path/token writes refused) |
-| `LINKED-03` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (symmetric edges; no one-sided live exposure) |
-| `LINKED-04` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (incarnation pins across rename/retire/recreate) |
-| `LINKED-05` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (restart-identical reads from both sides) |
-| `LINKED-06` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (unknown/denied refusals with no partial writes or leakage) |
-| `LINKED-07` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (durable binding; only selected tasks claimable) |
-| `LINKED-08` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one gate across candidates, next, named, handoff, session resumption) |
+| `LINKED-01` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | one stored pairing read identically from both sides (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-02` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | `(boardID, id)` identity; display-name/path/token writes refused (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-03` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | symmetric edges; no one-sided live exposure (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-04` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | incarnation pins across rename/retire/recreate (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-05` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | restart-identical reads from both sides (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-06` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | unknown/denied refusals with no partial writes or leakage (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-07` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | durable binding; only selected tasks claimable (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-08` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | one gate across candidates, next, named, handoff, session resumption (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
 | `LINKED-09` | MUST | process | `compiled_binary_allows_exactly_one_concurrent_claimer`; `claim_candidates_are_read_only_and_match_the_atomic_scheduler`; `completion_gates_apply_to_lease_taking_handoff_acceptance`; `completion_gates_track_prerequisite_lifecycle_and_cleared_dependencies`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease`; `claim_next_and_candidates_skip_restricted_rows_unless_the_model_matches`; `handoff_accept_honours_the_task_model_allow_list`; `a_transacted_write_is_identical_to_the_same_write_on_its_own` | atomic ownership, read-only scheduler parity, handoff gates, lease rotation, scheduler filtering, and single-board transact identity today; all re-run unchanged beside the new scope gate |
-| `LINKED-10` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (descendants and neighbours stay out until explicitly added) |
-| `LINKED-11` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (revocation/claim serialization; stale-revision refusal) |
-| `LINKED-12` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (append-only audited revisions; `audit verify` healthy) |
-| `LINKED-13` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (frozen parks taking; revoked ends taking, keeps heartbeats) |
-| `LINKED-14` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (triple-checked claims; authorized exit/rebind only) |
-| `LINKED-15` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (append-only contributions with full identity; no short hashes) |
-| `LINKED-16` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exactly one of the four evidence roles) |
-| `LINKED-17` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (merge/squash mapping retained) |
-| `LINKED-18` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exact consumer commit plus complete nested path) |
-| `LINKED-19` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (moving latest and near-misses satisfy nothing) |
-| `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
-| `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
+| `LINKED-10` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | descendants and neighbours stay out until explicitly added (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-11` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | revocation/claim serialization; stale-revision refusal (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-12` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | append-only audited revisions; `audit verify` healthy (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-13` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | frozen parks taking; revoked ends taking, keeps heartbeats (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-14` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | triple-checked claims; authorized exit/rebind only (`tests/linked_e2e.rs`, landed by `t-0dcbb1a9`) |
+| `LINKED-15` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | append-only receipts with full identity; missing field and short hash refused; corrections leave originals byte-identical (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-16` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | exactly one of the four evidence roles; none/two roles refused naming all four (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-17` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | squash/merge source mapping retained; unmapped implementations keep the deliverable open; non-absorbing merge refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-18` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path`; `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | exact consumer commit over the full nested committed-gitlink path; missing hop and non-submodule refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-19` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | moving `latest`, short/wrong hash, wrong repo path, stale pin, changed candidate each refused naming the mismatch; unreadable repo records `unverified`, never success (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-20` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing`; `per_side_history_leaves_the_untouched_peer_unmarked` | close refused naming each open deliverable; per-side history never marks the untouched peer (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-21` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | `non-code` disposition; cross-kind records refused naming the kind mismatch (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
 | `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
@@ -640,8 +641,10 @@ tree, and every `none` says so.
 row. By group: shared records 6 (`LINKED-01`..`LINKED-06`), bounded claims 8
 (`LINKED-07`..`LINKED-14`), delivery evidence 7 (`LINKED-15`..`LINKED-21`), surfaces and the
 sibling slice 4 (`LINKED-22`..`LINKED-25`, of which `LINKED-23` is withdrawn). LINKED-09
-carries one row naming eight existing tests; the remaining 23 active requirements carry
-`none` rows, each owned by `t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states.
+carries one row naming eight existing tests; `LINKED-01`..`LINKED-08` and `LINKED-10`..`LINKED-14`
+carry thirteen rows naming the four `tests/linked_e2e.rs` tests `t-0dcbb1a9` landed; the
+remaining 10 active requirements carry `none` rows, each owned by `t-9eff9257` or `t-db6937ba`
+as its Note states.
 
 **How §4 reaches every MUST.** A1 covers `LINKED-01`, `LINKED-02`, `LINKED-03`, `LINKED-05`; A2
 covers `LINKED-02`, `LINKED-04`, `LINKED-06`; A3 covers `LINKED-07`, `LINKED-08`, `LINKED-10`;
@@ -712,3 +715,15 @@ reachable from §4 and from §8.
   material open questions. The reviewer checked current CLI/model/test
   citations; the yield transport failed, so its prose receipt is recorded on
   board task `t-fe137b57`. This is specification readiness only.
+- `2026-10-02` — `t-0dcbb1a9` landed companions and claim scope (`LINKED-01`..`LINKED-08`,
+  `LINKED-10`..`LINKED-14`): registry v17 tables, the `link`/`scope` verbs, the one shared
+  scope gate, `tests/linked_e2e.rs` (A1-A4), and unit tests for the set/binding logic. §8
+  trace rows for those thirteen requirements name the real tests; the matrix section moves
+  verbatim-identically. No requirement text changes, so no re-review is claimed here.
+- `2026-10-02` — `t-9eff9257` implemented delivery evidence (`LINKED-15`..`LINKED-21`):
+  registry v18 tables (`linked_deliverables`, `linked_contributions`, `linked_closures`), the
+  `contrib declare|record|show|status|close` verbs with read-only local git verification
+  (missing access records `unverified`, never success; no credentials stored), and
+  `tests/linked_evidence_e2e.rs` (A5, A6, per-side history) over real temp-dir git repos.
+  §8 rows for those seven requirements name the real tests; the matrix moves identically.
+  Checks are pending on the deployment gate; no requirement text changes.

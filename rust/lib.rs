@@ -23,6 +23,7 @@ mod dispatcher;
 mod gitctx;
 mod import;
 mod kimi_acp_adapter;
+mod linked;
 mod lock;
 mod mcp;
 mod model;
@@ -194,9 +195,59 @@ Usage:
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
-  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
+  kanban handoff accept ID --as AGENT [--session ID] [--lane LANE] [--lease-minutes N]
              [--caller-scope driver] [--sprint sp-… | --any-sprint] [--model NAME] [--json]
   kanban handoff retire ID --as AGENT --note TEXT [--json]
+  kanban link add --a-board UUID --a-id ID --b-board UUID --b-id ID --as ACTOR [--json]
+             (one stored companion pairing, readable from either side; endpoints
+             name (boardID, id) only -- names, paths and @# tokens are refused)
+  kanban link remove --a-board UUID --a-id ID --b-board UUID --b-id ID --as ACTOR --reason TEXT [--json]
+             (retires both exposures in the same change; an identical retry
+             answers the stored record)
+  kanban link show --board UUID --id ID [--json]
+  kanban scope create --set ID --as ACTOR [--reason TEXT] [--json]
+  kanban scope add --set ID --board UUID --id ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+  kanban scope remove --set ID --board UUID --id ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+             (a revision written against a stale number is refused whole:
+             re-read with scope show and re-apply)
+  kanban scope freeze --set ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+  kanban scope unfreeze --set ID --expect-revision N --as ACTOR [--reason TEXT] [--json]
+             (a frozen set parks taking while holding runs on; only an audited
+             unfreeze thaws it)
+  kanban scope bind --set ID --actor AGENT [--lane LANE] [--session ID]
+             [--lease-minutes N] --expect-revision N --as OPERATOR [--reason TEXT] [--json]
+  kanban scope revoke --set ID --actor AGENT [--lane LANE] [--session ID]
+             --reason TEXT --expect-revision N --as OPERATOR [--json]
+             (the authorized exit: taking ends at once, live leases keep their
+             heartbeat until expiry or release, and end only via release)
+  kanban scope release --set ID --as AGENT [--lane LANE] [--session ID] [--reason TEXT] [--json]
+             (the bound worker releases its own binding)
+  kanban scope show --set ID [--json]
+             (a worker bound to a set may claim only its explicitly selected
+             tasks, on every claim path: candidates, --next, named claims,
+             handoff acceptance, and session resumption)
+  kanban contrib declare --board UUID --id ID --deliverable NAME --kind code|non-code
+             [--repo REPO] --as ACTOR [--json]
+             (declares one deliverable for a joint task; code pins the
+             implementation repository, non-code carries none)
+  kanban contrib record --board UUID --id ID --deliverable NAME [--kind code|non-code]
+             --actor AGENT [--lane LANE] [--session ID] --host HOST --worktree PATH
+             --branch BRANCH --observed-at MS --repo REPO --commit SHA --role ROLE
+             [--source SHA ...] [--mapping merge|squash] [--via PATH ...]
+             [--hop-path PATH ...] [--consumes SHA] [--dep-kind submodule]
+             [--verify-run REF] [--repo-path PATH] [--evidence-ref REF ...]
+             [--note TEXT] [--corrects ID] --as AGENT [--json]
+             (appends one contribution receipt with full identity, exactly one
+             of the four evidence roles, and read-only git verification;
+             a correction is a new receipt naming the corrected one)
+  kanban contrib show --board UUID --id ID [--json]
+             (per-side history from either board, without marking the peer)
+  kanban contrib status --board UUID --id ID [--json]
+             (per-deliverable evidence status; partial reads as partial)
+  kanban contrib close --a-board UUID --a-id ID --b-board UUID --b-id ID --as OPERATOR
+             [--reason TEXT] [--json]
+             (closes joint work only when every deliverable on both boards is
+             evidenced; otherwise names each open deliverable)
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
@@ -472,6 +523,13 @@ pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
 /// everywhere else they appear — which is nowhere today, and that split is
 /// the reason this stays per-operation like the rest of [`LIST_VALUED`].
 pub(crate) const VERDICT_ADD_REPEATABLE: [&str; 2] = ["sha", "evidence"];
+/// A contribution receipt's list-valued flags, on the one subcommand they
+/// belong to: `--role` arrives whole so that zero or two roles is the
+/// LINKED-16 role refusal rather than a parser refusal, and `--source`,
+/// `--via`, `--hop-path`, and `--evidence-ref` each take one value per
+/// occurrence. Kept per-operation like the rest of [`LIST_VALUED`].
+pub(crate) const CONTRIB_RECORD_REPEATABLE: [&str; 5] =
+    ["role", "source", "via", "hop-path", "evidence-ref"];
 /// A worker's own grant list, one `--grant` per pair (IDENT-04).
 pub(crate) const WORKER_REGISTER_REPEATABLE: [&str; 1] = ["grant"];
 struct ListValued {
@@ -480,7 +538,7 @@ struct ListValued {
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 12] = [
+const LIST_VALUED: [ListValued; 13] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -540,6 +598,11 @@ const LIST_VALUED: [ListValued; 12] = [
         command: "worker",
         sub: Some("register"),
         flags: &WORKER_REGISTER_REPEATABLE,
+    },
+    ListValued {
+        command: "contrib",
+        sub: Some("record"),
+        flags: &CONTRIB_RECORD_REPEATABLE,
     },
 ];
 
@@ -921,6 +984,115 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         Some("retire"),
         &["db", "project", "workspace"],
         "retires a worker in the policy registry, never a board",
+    ),
+    // Companion pairings and selected sets live in the registry (LINKED,
+    // ADR-051), never on a board — and a batch's transaction covers one board,
+    // so these rows also keep them out of `transact` (ADR-041).
+    (
+        "link",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "pairs endpoints in the registry, never on a board",
+    ),
+    (
+        "link",
+        Some("remove"),
+        &["db", "project", "workspace"],
+        "retires a pairing in the registry, never on a board",
+    ),
+    (
+        "link",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads a pairing from the registry, never from a board",
+    ),
+    (
+        "scope",
+        Some("create"),
+        &["db", "project", "workspace"],
+        "creates a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "revises a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("remove"),
+        &["db", "project", "workspace"],
+        "revises a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("freeze"),
+        &["db", "project", "workspace"],
+        "freezes a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("unfreeze"),
+        &["db", "project", "workspace"],
+        "unfreezes a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("bind"),
+        &["db", "project", "workspace"],
+        "binds a worker to a selected set in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("revoke"),
+        &["db", "project", "workspace"],
+        "revokes a binding in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("release"),
+        &["db", "project", "workspace"],
+        "releases a binding in the registry, never on a board",
+    ),
+    (
+        "scope",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads a selected set from the registry, never from a board",
+    ),
+    // Contribution and integration receipts live in the registry beside the
+    // pairing they evidence (LINKED, ADR-051), never on a board — and a
+    // batch's transaction covers one board, so these rows also keep them out
+    // of `transact` (ADR-041).
+    (
+        "contrib",
+        Some("declare"),
+        &["db", "project", "workspace"],
+        "declares a deliverable for a joint task in the registry, never on a board",
+    ),
+    (
+        "contrib",
+        Some("record"),
+        &["db", "project", "workspace"],
+        "appends a contribution receipt in the registry, never on a board",
+    ),
+    (
+        "contrib",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads per-side delivery evidence from the registry, never from a board",
+    ),
+    (
+        "contrib",
+        Some("status"),
+        &["db", "project", "workspace"],
+        "reads per-deliverable evidence status from the registry, never from a board",
+    ),
+    (
+        "contrib",
+        Some("close"),
+        &["db", "project", "workspace"],
+        "closes joint work for a pairing in the registry, never on a board",
     ),
 ];
 
@@ -1307,6 +1479,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[
             "as",
             "session",
+            "lane",
             "lease-minutes",
             "caller-scope",
             "sprint",
@@ -1317,6 +1490,145 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("handoff", Some("retire"), &["as", "note"], &["id"], false),
+    (
+        "link",
+        Some("add"),
+        &["a-board", "a-id", "b-board", "b-id", "as"],
+        &[],
+        false,
+    ),
+    (
+        "link",
+        Some("remove"),
+        &["a-board", "a-id", "b-board", "b-id", "as", "reason"],
+        &[],
+        false,
+    ),
+    ("link", Some("show"), &["board", "id"], &[], true),
+    (
+        "scope",
+        Some("create"),
+        &["set", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("add"),
+        &["set", "board", "id", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("remove"),
+        &["set", "board", "id", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("freeze"),
+        &["set", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("unfreeze"),
+        &["set", "expect-revision", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("bind"),
+        &[
+            "set",
+            "actor",
+            "lane",
+            "session",
+            "lease-minutes",
+            "expect-revision",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("revoke"),
+        &[
+            "set",
+            "actor",
+            "lane",
+            "session",
+            "reason",
+            "expect-revision",
+            "as",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "scope",
+        Some("release"),
+        &["set", "as", "lane", "session", "reason"],
+        &[],
+        false,
+    ),
+    ("scope", Some("show"), &["set"], &[], true),
+    (
+        "contrib",
+        Some("declare"),
+        &["board", "id", "deliverable", "kind", "repo", "as"],
+        &[],
+        false,
+    ),
+    (
+        "contrib",
+        Some("record"),
+        &[
+            "board",
+            "id",
+            "deliverable",
+            "kind",
+            "actor",
+            "lane",
+            "session",
+            "host",
+            "worktree",
+            "branch",
+            "observed-at",
+            "repo",
+            "commit",
+            "role",
+            "source",
+            "mapping",
+            "via",
+            "hop-path",
+            "consumes",
+            "dep-kind",
+            "verify-run",
+            "repo-path",
+            "evidence-ref",
+            "note",
+            "corrects",
+            "as",
+        ],
+        &[],
+        false,
+    ),
+    ("contrib", Some("show"), &["board", "id"], &[], true),
+    ("contrib", Some("status"), &["board", "id"], &[], true),
+    (
+        "contrib",
+        Some("close"),
+        &["a-board", "a-id", "b-board", "b-id", "as", "reason"],
+        &[],
+        false,
+    ),
     (
         "import",
         Some("atmux-json"),
@@ -2024,7 +2336,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 16] = [
+const SUBCOMMAND_GROUPS: [&str; 19] = [
     "task",
     "story",
     "handoff",
@@ -2041,6 +2353,9 @@ const SUBCOMMAND_GROUPS: [&str; 16] = [
     "sprint",
     "plugin",
     "worker",
+    "link",
+    "scope",
+    "contrib",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -6412,6 +6727,318 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
     }
+    // Companion pairings and selected work sets (slice LINKED, ADR-051): the
+    // registry owns the shared records, so these arms open only the registry
+    // and return before the board store opens below. Each write runs in one
+    // `BEGIN IMMEDIATE` transaction beside its audit event: refused whole or
+    // landed whole, never half-written (LINKED-01, LINKED-06, LINKED-11).
+    if command == "link" && sub == Some("add") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::add_companion(
+                &transaction,
+                &root,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
+                args.one("as").unwrap_or("system@cli"),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "link" && sub == Some("remove") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::remove_companion(
+                &transaction,
+                &root,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "link" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_companions(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "scope" && sub == Some("create") {
+        let (_, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::create_set(
+                &transaction,
+                args.require("set")?,
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope"
+        && (sub == Some("add")
+            || sub == Some("remove")
+            || sub == Some("freeze")
+            || sub == Some("unfreeze"))
+    {
+        let kind = sub.unwrap_or_default();
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let member = match kind {
+                "add" | "remove" => Some(crate::linked::SetMember {
+                    board_id: args.require("board")?.to_owned(),
+                    id: args.require("id")?.to_owned(),
+                }),
+                _ => None,
+            };
+            let receipt = crate::linked::mutate_set(
+                &transaction,
+                &root,
+                crate::linked::SetChange {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    kind,
+                    member,
+                },
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("bind") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::bind(
+                &transaction,
+                &root,
+                crate::linked::BindingTarget {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    actor: args.require("actor")?,
+                    lane: args.one("lane"),
+                    session: args.one("session"),
+                },
+                args.optional_integer("lease-minutes")?.unwrap_or(1440),
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("revoke") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::revoke(
+                &transaction,
+                &root,
+                crate::linked::BindingTarget {
+                    set_id: args.require("set")?,
+                    expected_revision: args
+                        .optional_integer("expect-revision")?
+                        .context("--expect-revision is required")?,
+                    actor: args.require("actor")?,
+                    lane: args.one("lane"),
+                    session: args.one("session"),
+                },
+                args.one("as").unwrap_or("system@cli"),
+                args.require("reason")?,
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("release") {
+        let (_, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::release_binding(
+                &transaction,
+                args.require("set")?,
+                args.require("as")?,
+                args.one("lane"),
+                args.one("session"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "scope" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_set(&connection, &root, args.require("set")?, now_ms())?,
+            args.has("json"),
+        );
+    }
+    // Contribution and integration receipts (slice LINKED delivery evidence,
+    // ADR-051 §4): the registry owns the deliverables, receipts, and joint
+    // closures, so these arms open only the registry and return before the
+    // board store opens below. Each write runs in one `BEGIN IMMEDIATE`
+    // transaction beside its audit event: refused whole or landed whole,
+    // never half-written (LINKED-15, LINKED-20).
+    if command == "contrib" && sub == Some("declare") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::declare_deliverable(
+                &transaction,
+                &root,
+                crate::linked::DeliverableDecl {
+                    board: args.require("board")?,
+                    id: args.require("id")?,
+                    name: args.require("deliverable")?,
+                    kind: args.one("kind").unwrap_or("code"),
+                    repo: args.one("repo").unwrap_or(""),
+                },
+                args.one("as").unwrap_or("system@cli"),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "contrib" && sub == Some("record") {
+        let input = crate::linked::ContributionInput {
+            board: args.require("board")?.to_owned(),
+            id: args.require("id")?.to_owned(),
+            deliverable: args.require("deliverable")?.to_owned(),
+            kind: args.one("kind").unwrap_or("code").to_owned(),
+            actor: args.require("actor")?.to_owned(),
+            lane: args.one("lane").map(str::to_owned),
+            session: args.one("session").map(str::to_owned),
+            host: args.one("host").unwrap_or("").to_owned(),
+            worktree: args.one("worktree").unwrap_or("").to_owned(),
+            branch: args.one("branch").unwrap_or("").to_owned(),
+            observed_at: args.one("observed-at").unwrap_or("").to_owned(),
+            repo: args.one("repo").unwrap_or("").to_owned(),
+            commit: args.one("commit").unwrap_or("").to_owned(),
+            roles: args.many("role"),
+            sources: args.many("source"),
+            mapping: args.one("mapping").unwrap_or("").to_owned(),
+            vias: args.many("via"),
+            hop_paths: args.many("hop-path"),
+            consumes: args.one("consumes").unwrap_or("").to_owned(),
+            dep_kind: args.one("dep-kind").unwrap_or("").to_owned(),
+            verify_run: args.one("verify-run").unwrap_or("").to_owned(),
+            repo_path: args.one("repo-path").unwrap_or("").to_owned(),
+            evidence_refs: args.many("evidence-ref"),
+            note: args.one("note").unwrap_or("").to_owned(),
+            corrects: args.one("corrects").unwrap_or("").to_owned(),
+            author: args.one("as").unwrap_or("system@cli").to_owned(),
+        };
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt =
+                crate::linked::record_contribution(&transaction, &root, &input, now_ms())?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
+    if command == "contrib" && sub == Some("show") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::show_contributions(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "contrib" && sub == Some("status") {
+        let (root, connection) = crate::linked::open_linked_registry_for_read()?;
+        return print(
+            &crate::linked::contribution_status(
+                &connection,
+                &root,
+                args.require("board")?,
+                args.require("id")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "contrib" && sub == Some("close") {
+        let (root, mut connection) = crate::linked::open_linked_registry_for_write()?;
+        let receipt = {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let receipt = crate::linked::close_joint(
+                &transaction,
+                &root,
+                crate::linked::EndpointPair {
+                    a_board: args.require("a-board")?,
+                    a_id: args.require("a-id")?,
+                    b_board: args.require("b-board")?,
+                    b_id: args.require("b-id")?,
+                },
+                args.one("as").unwrap_or("system@cli"),
+                args.one("reason").unwrap_or(""),
+                now_ms(),
+            )?;
+            transaction.commit()?;
+            receipt
+        };
+        return print(&receipt, args.has("json"));
+    }
     if command == "workspace" && sub == Some("list") {
         // Read-only, like every other read: this is the FIRST call a resuming
         // driver makes (`kb ws ls --json`, before it knows which project it is
@@ -7735,6 +8362,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             AcceptHandoffOptions {
                 agent: args.require("as")?.to_owned(),
                 session: option_string(&args, "session"),
+                caller_lane: option_string(&args, "lane"),
                 lease_ms: lease_ms(&args)?,
                 caller_scope: option_string(&args, "caller-scope"),
                 sprint_override: claim_sprint_override(&args)?,
@@ -8207,10 +8835,14 @@ fn require_worker_may_run(command: &str, sub: Option<&str>) -> Result<()> {
         .and_then(|caller| caller.worker)
         .map(|worker| worker.row.id)
         .ok_or_else(|| anyhow::anyhow!("denied or not found"))?;
+    // `contrib record` is the lane recording its own work (LINKED-15): the
+    // receipt is gated on the worker's own lane actor and live binding inside
+    // `linked::record_contribution`, so it belongs with the lease-bound set.
     let lease_bound = matches!(
         (command, sub),
         ("claim" | "heartbeat" | "release" | "checkpoint" | "note", _)
             | ("handoff", Some("create" | "accept"))
+            | ("contrib", Some("record"))
     );
     // The read side is exactly the commands whose generated MCP tool reads
     // only, every `access` command excepted. A long-running command has no

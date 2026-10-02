@@ -543,9 +543,12 @@ pub fn verify_registry(connection: &Connection) -> Result<AuditReport> {
         previous = stored_hash.clone().unwrap_or(expected);
     }
     // The three policy journals (ADR-038 clause 4) join the same registry hash
-    // chain. Their chains are independent but verified together, so `audit
+    // chain, as does the LINKED selected-set revision journal (LINKED-12).
+    // Their chains are independent but verified together, so `audit
     // verify` and `doctor` fail on truncation, reordering, or substitution in
-    // any one of them, not only in `rule_events`.
+    // any one of them, not only in `rule_events`. A journal whose table is
+    // absent — a registry that predates its migration — is simply not verified
+    // yet, never a failure.
     if sqlite_table_present(connection, "policy_events") {
         for (domain, table, subject_sql, kind_sql, payload_sql, created_sql) in [
             (
@@ -572,7 +575,18 @@ pub fn verify_registry(connection: &Connection) -> Result<AuditReport> {
                 "payload",
                 "occurred_at",
             ),
+            (
+                "linked_set_revisions",
+                "linked_set_revisions",
+                "set_id",
+                "kind",
+                "payload",
+                "created_at",
+            ),
         ] {
+            if !sqlite_table_present(connection, table) {
+                continue;
+            }
             let (_, _, journal_errors) = verify_journal(
                 connection,
                 domain,

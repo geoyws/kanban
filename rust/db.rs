@@ -3186,8 +3186,115 @@ UPDATE boards SET registration_token=lower(hex(randomblob(16))) WHERE registrati
 CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_registration_token ON boards(registration_token);
 "#;
 
+/// The LINKED shared-records step (docs/specs/linked.md LINKED-01..LINKED-14,
+/// ADR-051): the registry-owned companion pairings, selected work sets with
+/// their audited revision journal, and worker bindings. Pure `CREATE TABLE /
+/// INDEX IF NOT EXISTS`, so it is rewind-safe by construction and needs no
+/// `migrate_through` guard. An ordinary step above the CROSS ceiling: fresh
+/// registries are born with it, registries past the CROSS step take it on any
+/// writable open, and pre-CROSS registries wait for the owner's `init`.
+/// Boards are untouched by this slice, so `BOARD_SCHEMA_VERSION` does not move.
+const REGISTRY_V17: &str = r#"
+CREATE TABLE IF NOT EXISTS linked_companions(
+id TEXT PRIMARY KEY,
+board_a_id TEXT NOT NULL,board_a_registration TEXT NOT NULL,
+item_a_id TEXT NOT NULL,item_a_incarnation TEXT NOT NULL,
+board_b_id TEXT NOT NULL,board_b_registration TEXT NOT NULL,
+item_b_id TEXT NOT NULL,item_b_incarnation TEXT NOT NULL,
+created_by TEXT NOT NULL,created_at INTEGER NOT NULL,
+retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+retired_by TEXT,retired_at INTEGER,retire_reason TEXT,
+CHECK(board_a_id <> board_b_id OR item_a_id <> item_b_id)
+) STRICT;
+DROP INDEX IF EXISTS idx_linked_companions_pair;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_companions_pair ON linked_companions(board_a_id,item_a_id,board_b_id,item_b_id) WHERE retired=0;
+CREATE INDEX IF NOT EXISTS idx_linked_companions_side_a ON linked_companions(board_a_id,item_a_id,retired);
+CREATE INDEX IF NOT EXISTS idx_linked_companions_side_b ON linked_companions(board_b_id,item_b_id,retired);
+CREATE TABLE IF NOT EXISTS linked_sets(
+id TEXT PRIMARY KEY,
+created_by TEXT NOT NULL,created_at INTEGER NOT NULL,
+frozen INTEGER NOT NULL DEFAULT 0 CHECK(frozen IN (0,1))
+) STRICT;
+CREATE TABLE IF NOT EXISTS linked_set_revisions(
+seq INTEGER PRIMARY KEY,
+set_id TEXT NOT NULL,revision INTEGER NOT NULL,
+kind TEXT NOT NULL CHECK(kind IN ('create','add','remove','freeze','unfreeze','bind','exit','rebind','release')),
+author TEXT NOT NULL,reason TEXT NOT NULL,
+members TEXT NOT NULL CHECK(json_valid(members)),
+created_at INTEGER NOT NULL,
+prev_hash TEXT,event_hash TEXT,
+payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_set_revisions_set_rev ON linked_set_revisions(set_id,revision);
+CREATE TABLE IF NOT EXISTS linked_bindings(
+id TEXT PRIMARY KEY,
+set_id TEXT NOT NULL,
+actor TEXT NOT NULL,lane TEXT NOT NULL DEFAULT '',session TEXT NOT NULL DEFAULT '',
+revision_checked INTEGER NOT NULL,
+status TEXT NOT NULL CHECK(status IN ('active','released','revoked')),
+created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
+ended_at INTEGER,end_reason TEXT
+) STRICT;
+DROP INDEX IF EXISTS idx_linked_bindings_triple;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_bindings_triple ON linked_bindings(set_id,actor,lane,session) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_linked_bindings_actor ON linked_bindings(actor,lane,status);
+"#;
+
+/// The LINKED delivery-evidence step (docs/specs/linked.md LINKED-15..LINKED-21,
+/// row `t-9eff9257`): the declared deliverables per joint task, the append-only
+/// contribution and integration receipts that evidence them, and the joint
+/// closures. Pure `CREATE TABLE / INDEX IF NOT EXISTS`, so it is rewind-safe
+/// by construction and needs no `migrate_through` guard. An ordinary step above
+/// the CROSS ceiling like `REGISTRY_V17`: fresh registries are born with it,
+/// registries past the CROSS step take it on any writable open, and pre-CROSS
+/// registries wait for the owner's `init`. Boards are untouched by this slice,
+/// so `BOARD_SCHEMA_VERSION` does not move.
+const REGISTRY_V18: &str = r#"
+CREATE TABLE IF NOT EXISTS linked_deliverables(
+board_id TEXT NOT NULL,
+item_id TEXT NOT NULL,
+name TEXT NOT NULL,
+kind TEXT NOT NULL CHECK(kind IN ('code','non-code')),
+repo TEXT NOT NULL DEFAULT '',
+declared_by TEXT NOT NULL,
+declared_at INTEGER NOT NULL,
+PRIMARY KEY(board_id,item_id,name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS linked_contributions(
+id TEXT PRIMARY KEY,
+board_id TEXT NOT NULL,
+item_id TEXT NOT NULL,
+deliverable TEXT NOT NULL,
+kind TEXT NOT NULL CHECK(kind IN ('code','non-code')),
+repo TEXT NOT NULL DEFAULT '',
+commit_sha TEXT NOT NULL DEFAULT '',
+role TEXT NOT NULL DEFAULT '' CHECK(role IN ('','baseline','implementation','integration','candidate')),
+actor TEXT NOT NULL,lane TEXT NOT NULL DEFAULT '',session TEXT NOT NULL DEFAULT '',
+host TEXT NOT NULL DEFAULT '',worktree TEXT NOT NULL DEFAULT '',branch TEXT NOT NULL DEFAULT '',
+observed_at INTEGER NOT NULL,recorded_at INTEGER NOT NULL,
+evidence_refs TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(evidence_refs)),
+note TEXT NOT NULL DEFAULT '',
+corrects TEXT,
+sources TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(sources)),
+mapping TEXT NOT NULL DEFAULT '',
+consumer_path TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(consumer_path)),
+consumes TEXT NOT NULL DEFAULT '',
+verify_run TEXT NOT NULL DEFAULT '',
+dep_kind TEXT NOT NULL DEFAULT '',
+verification TEXT NOT NULL CHECK(verification IN ('verified','unverified')),
+verify_detail TEXT NOT NULL DEFAULT '',
+repo_path TEXT NOT NULL DEFAULT '',
+hop_paths TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(hop_paths))
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_linked_contributions_endpoint ON linked_contributions(board_id,item_id,deliverable,recorded_at,id);
+CREATE TABLE IF NOT EXISTS linked_closures(
+pairing_id TEXT PRIMARY KEY,
+closed_by TEXT NOT NULL,closed_at INTEGER NOT NULL,reason TEXT NOT NULL DEFAULT ''
+) STRICT;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 39;
-pub const REGISTRY_SCHEMA_VERSION: usize = 16;
+pub const REGISTRY_SCHEMA_VERSION: usize = 18;
 /// The newest schema that is not CROSS-aware. An ordinary open of a
 /// registered board or of a registry never migrates past it: the CROSS step
 /// is the owner's, taken by `init` under the exclusive data-root lock
@@ -4584,6 +4691,8 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V14,
     REGISTRY_V15,
     REGISTRY_V16,
+    REGISTRY_V17,
+    REGISTRY_V18,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -5327,6 +5436,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "direct");
+    }
+
+    /// `REGISTRY_V17` is additive (LINKED shared records, ADR-051): it adds
+    /// the companion, selected-set, revision-journal, and binding tables
+    /// without altering any existing registry table or any board schema, and
+    /// a registry at v16 takes it on an ordinary writable open.
+    #[test]
+    fn registry_v17_adds_linked_tables_and_preserves_existing_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..16]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 16);
+        connection
+            .execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at,archived) \
+                 VALUES('/root/boards/00000000-0000-0000-0000-000000000001.db','keep',10,11,0)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
+        assert_eq!(REGISTRY_SCHEMA_VERSION, 18);
+        let boards: i64 = connection
+            .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(boards, 1, "board rows survive the linked migration");
+        for table in [
+            "linked_companions",
+            "linked_sets",
+            "linked_set_revisions",
+            "linked_bindings",
+        ] {
+            assert!(
+                sqlite_table_exists(&connection, table).unwrap(),
+                "linked migration must create {table}"
+            );
+        }
+        // Re-running the step over tables that already stand is a no-op, not
+        // a failure: rewound registries re-run it the same way.
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
+    }
+
+    /// `REGISTRY_V18` is additive (LINKED delivery evidence, row `t-9eff9257`,
+    /// LINKED-15..LINKED-21): it adds the deliverable, contribution-receipt,
+    /// and joint-closure tables without altering any existing registry table
+    /// or any board schema, and a registry at v17 takes it on an ordinary
+    /// writable open.
+    #[test]
+    fn registry_v18_adds_evidence_tables_and_preserves_existing_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..17]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 17);
+        connection
+            .execute(
+                "INSERT INTO linked_sets(id,created_by,created_at) VALUES('keep','op',10)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
+        assert_eq!(REGISTRY_SCHEMA_VERSION, 18);
+        let sets: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM linked_sets WHERE id='keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sets, 1, "linked rows survive the evidence migration");
+        for table in [
+            "linked_deliverables",
+            "linked_contributions",
+            "linked_closures",
+        ] {
+            assert!(
+                sqlite_table_exists(&connection, table).unwrap(),
+                "evidence migration must create {table}"
+            );
+        }
+        // Re-running the step over tables that already stand is a no-op, not
+        // a failure: rewound registries re-run it the same way.
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(
+            schema_version(&connection).unwrap(),
+            REGISTRY_SCHEMA_VERSION
+        );
     }
 
     use super::*;

@@ -25,8 +25,9 @@ run one at a time, cheapest first: `claude_print_adapter_e2e`,
 `kimi_acp_adapter_e2e`, `cursor_worker_adapter_e2e`,
 `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
 `codex_app_server_adapter_e2e`, `secret_guard_e2e`, `done_gate_e2e`,
-`authz_bypass_matrix_e2e`, `plugin_e2e`, `cross_board_e2e`, `identity_e2e`
-and `worker_identity_e2e`. `e2e_areas` run last and side by side:
+`authz_bypass_matrix_e2e`, `plugin_e2e`, `cross_board_e2e`, `identity_e2e`,
+`worker_identity_e2e`, `linked_e2e` and `linked_evidence_e2e`. `e2e_areas`
+run last and side by side:
 `e2e_core`, `e2e_restore_watch`, `e2e_mcp_batch_attention`, `e2e_limits`,
 `e2e_tags_workspace_rules`, `e2e_release`, `e2e_release_receipts` and
 `e2e_lifecycle`, which share their fixtures and helpers through
@@ -508,14 +509,15 @@ withdrawn LINKED-23 and names no active LINKED requirement; `http` names no
 active LINKED requirement and is kept in the specification only so the withdrawn
 row stays readable. Of the 25 IDs, never reused — 24 active requirements, all
 `MUST`, plus 1 withdrawn (`LINKED-23`, with the served surface per ADR-053):
-24 carry `process` rows and 1 carries the withdrawn `chrome` row; 23 active rows
+24 carry `process` rows and 1 carries the withdrawn `chrome` row; 10 active rows
 carry `none` and say `no e2e coverage` plainly, each owned by the
-implementation row its Note names — `t-0dcbb1a9` (companions and claim scope per its
-work-package title, `LINKED-01`..`LINKED-08`, `LINKED-10`..`LINKED-14`), `t-9eff9257`
-(contributions and consumer integration per its work-package title, `LINKED-15`..`LINKED-21`),
-or `t-db6937ba` (exposure and workflow proof per its work-package title,
-`LINKED-22`, `LINKED-24`, `LINKED-25`; `LINKED-23` is withdrawn with the served
-surface and owned by no implementation row). LINKED-09 carries one row naming eight
+implementation row its Note names — `t-9eff9257` (contributions and consumer
+integration per its work-package title, `LINKED-15`..`LINKED-21`) or `t-db6937ba`
+(exposure and workflow proof per its work-package title, `LINKED-22`, `LINKED-24`,
+`LINKED-25`; `LINKED-23` is withdrawn with the served surface and owned by no
+implementation row). `t-0dcbb1a9` (companions and claim scope, `LINKED-01`..`LINKED-08`,
+`LINKED-10`..`LINKED-14`) landed `tests/linked_e2e.rs` with four tests, named in place of
+`none` in those rows. LINKED-09 carries one row naming eight
 existing tests (`tests/e2e.rs:2854`, `:3375`, `:37959`, `:37706`, `:1370`, `:40424`,
 `:40527`, `:15890`, in row order), verified as `fn <name>(` at the 2026-10-01
 citation baseline; they prove today's gates on today's surface and are
@@ -530,27 +532,27 @@ set at creation (`cd55cbc`).
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `LINKED-01` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one stored pairing read identically from both sides) |
-| `LINKED-02` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (`(boardID, id)` identity; display-name/path/token writes refused) |
-| `LINKED-03` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (symmetric edges; no one-sided live exposure) |
-| `LINKED-04` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (incarnation pins across rename/retire/recreate) |
-| `LINKED-05` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (restart-identical reads from both sides) |
-| `LINKED-06` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (unknown/denied refusals with no partial writes or leakage) |
-| `LINKED-07` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (durable binding; only selected tasks claimable) |
-| `LINKED-08` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (one gate across candidates, next, named, handoff, session resumption) |
+| `LINKED-01` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | one stored pairing read identically from both sides (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-02` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | `(boardID, id)` identity; display-name/path/token writes refused (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-03` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | symmetric edges; no one-sided live exposure (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-04` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | incarnation pins across retire/recreate (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-05` | MUST | process | `pairing_roundtrip_reads_identical_from_both_sides_after_restart` | restart-identical reads from both sides (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-06` | MUST | process | `refusals_hide_cause_and_content_and_pins_survive_recreation` | unknown/denied refusals with no partial writes or leakage (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-07` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | durable binding; only selected tasks claimable (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-08` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | one gate across candidates, next, named, handoff, session resumption (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
 | `LINKED-09` | MUST | process | `compiled_binary_allows_exactly_one_concurrent_claimer`; `claim_candidates_are_read_only_and_match_the_atomic_scheduler`; `completion_gates_apply_to_lease_taking_handoff_acceptance`; `completion_gates_track_prerequisite_lifecycle_and_cleared_dependencies`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease`; `claim_next_and_candidates_skip_restricted_rows_unless_the_model_matches`; `handoff_accept_honours_the_task_model_allow_list`; `a_transacted_write_is_identical_to_the_same_write_on_its_own` | atomic ownership, read-only scheduler parity, handoff gates, lease rotation, scheduler filtering, and single-board transact identity today; all re-run unchanged beside the new scope gate |
-| `LINKED-10` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (descendants and neighbours stay out until explicitly added) |
-| `LINKED-11` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (revocation/claim serialization; stale-revision refusal) |
-| `LINKED-12` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (append-only audited revisions; `audit verify` healthy) |
-| `LINKED-13` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (frozen parks taking; revoked ends taking, keeps heartbeats) |
-| `LINKED-14` | MUST | process | `none` | no e2e coverage — to be written by `t-0dcbb1a9` (triple-checked claims; authorized exit/rebind only) |
-| `LINKED-15` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (append-only contributions with full identity; no short hashes) |
-| `LINKED-16` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exactly one of the four evidence roles) |
-| `LINKED-17` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (merge/squash mapping retained) |
-| `LINKED-18` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (exact consumer commit plus complete nested path) |
-| `LINKED-19` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (moving latest and near-misses satisfy nothing) |
-| `LINKED-20` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (no false joint marking; close needs all deliverables) |
-| `LINKED-21` | MUST | process | `none` | no e2e coverage — to be written by `t-9eff9257` (`non-code` disposition; cross-kind refusals) |
+| `LINKED-10` | MUST | process | `bound_worker_takes_only_selected_tasks_on_every_path` | descendants and neighbours stay out until explicitly added (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-11` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | revocation/claim serialization; stale-revision refusal (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-12` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | append-only audited revisions; `audit verify` healthy (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-13` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | frozen parks taking; revoked ends taking, keeps heartbeats (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-14` | MUST | process | `revocation_freeze_and_rebind_serialize_under_authority` | triple-checked claims; authorized exit/rebind only (`tests/linked_e2e.rs`, `t-0dcbb1a9`) |
+| `LINKED-15` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | append-only receipts with full identity; missing field and short hash refused; corrections leave originals byte-identical (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-16` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | exactly one of the four evidence roles; none/two roles refused naming all four (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-17` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path` | squash/merge source mapping retained; unmapped implementations keep the deliverable open; non-absorbing merge refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-18` | MUST | process | `evidence_records_four_roles_squash_mapping_and_nested_path`; `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | exact consumer commit over the full nested committed-gitlink path; missing hop and non-submodule refused (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-19` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | moving `latest`, short/wrong hash, wrong repo path, stale pin, changed candidate each refused naming the mismatch; unreadable repo records `unverified`, never success (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-20` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing`; `per_side_history_leaves_the_untouched_peer_unmarked` | close refused naming each open deliverable; per-side history never marks the untouched peer (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
+| `LINKED-21` | MUST | process | `near_misses_prove_nothing_and_partial_evidence_closes_nothing` | `non-code` disposition; cross-kind records refused naming the kind mismatch (`tests/linked_evidence_e2e.rs`, `t-9eff9257`) |
 | `LINKED-22` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (CLI/MCP agreement over the real stdio server) |
 | `LINKED-23` | WITHDRAWN 2026-09-30 (`a-53b18f9a`) | chrome (retired) | `none` | George withdrew the served-UI obligation after ADR-053 retired its surface; no test to be written, no implementation row; ID reserved, never reused. Original wording remains above as history. |
 | `LINKED-24` | MUST | process | `none` | no e2e coverage — to be written by `t-db6937ba` (mid-flight failure, save/reopen, retry-answers-stored) |
@@ -558,9 +560,10 @@ set at creation (`cd55cbc`).
 
 25 IDs, never reused: 24 active requirements, all `MUST`, no `SHOULD` and no
 `MAY`, plus 1 withdrawn (`LINKED-23`). LINKED-09 carries one row naming eight existing
-tests, re-run unchanged; the remaining 23 active requirements carry `none` rows, each owned by
-`t-0dcbb1a9`, `t-9eff9257`, or `t-db6937ba` as its Note states (`LINKED-23` withdrawn with the
-served surface, owned by no implementation row).
+tests, re-run unchanged; `LINKED-01`..`LINKED-08` and `LINKED-10`..`LINKED-14` name the four
+`tests/linked_e2e.rs` tests `t-0dcbb1a9` landed; the remaining 10 active requirements carry
+`none` rows, each owned by `t-9eff9257` or `t-db6937ba` as its Note states (`LINKED-23`
+withdrawn with the served surface, owned by no implementation row).
 
 ## Requirements trace — `docs/specs/claim-routing.md` CLAIM-01..CLAIM-08
 
