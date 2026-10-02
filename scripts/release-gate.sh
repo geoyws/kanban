@@ -165,6 +165,7 @@ if [[ ! -f skills/kb/SKILL.md ]]; then
 fi
 run 'kb skill wrapper tests' bash skills/kb/tests/kb-wrapper-tests.sh
 run 'migrate ACC body blocks' bash scripts/migrate-acc-body-blocks.test.sh
+run 'container gate limiter lookup' bash scripts/container-gate.test.sh
 
 # The serial integration targets, in the order listed above.
 for target in "${integration_targets[@]}"; do
